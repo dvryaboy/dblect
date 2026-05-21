@@ -70,6 +70,7 @@ class Node:
     schema: str | None
     raw_code: str | None
     compiled_code: str | None
+    original_file_path: str | None
     columns: Mapping[str, Column]
     depends_on: frozenset[str] = field(default_factory=cast("type[frozenset[str]]", frozenset))
 
@@ -170,6 +171,7 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         schema=schema,
         raw_code=raw_code,
         compiled_code=compiled_code,
+        original_file_path=getattr(n, "original_file_path", None),
         columns=_columns_from_parsed(getattr(n, "columns", {}) or {}),
         depends_on=frozenset(depends_on_nodes),
     )
@@ -186,6 +188,7 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
         schema=getattr(s, "schema", None),
         raw_code=None,
         compiled_code=None,
+        original_file_path=getattr(s, "original_file_path", None),
         columns=_columns_from_parsed(getattr(s, "columns", {}) or {}),
         depends_on=frozenset(),
     )
