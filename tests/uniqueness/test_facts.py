@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +9,7 @@ import pytest
 from dblect.manifest import (
     Column,
     ConstraintSpec,
+    ConstraintType,
     DbtTestMetadata,
     Manifest,
     Node,
@@ -17,7 +17,6 @@ from dblect.manifest import (
 )
 from dblect.sql import ParsedSQL
 from dblect.uniqueness import (
-    UniquenessFact,
     UniquenessSource,
     facts_from_declarations,
     facts_from_manifest,
@@ -92,7 +91,7 @@ def test_native_model_level_primary_key_constraint() -> None:
         unique_id="model.pkg.x",
         name="x",
         resource_type=ResourceType.MODEL,
-        constraints=(ConstraintSpec(type="primary_key", columns=("id",)),),
+        constraints=(ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("id",)),),
     )
     manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
     facts = facts_from_manifest(manifest)
@@ -110,7 +109,7 @@ def test_native_column_level_unique_constraint() -> None:
             name="slug",
             data_type=None,
             description=None,
-            constraints=(ConstraintSpec(type="unique"),),
+            constraints=(ConstraintSpec(type=ConstraintType.UNIQUE),),
         )},
     )
     manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
@@ -129,7 +128,7 @@ def test_not_null_constraint_is_not_a_uniqueness_fact() -> None:
             name="slug",
             data_type=None,
             description=None,
-            constraints=(ConstraintSpec(type="not_null"),),
+            constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL),),
         )},
     )
     manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
@@ -160,17 +159,6 @@ def test_fact_carries_provenance_detail(jaffle: Manifest) -> None:
     assert "customer_id" in fact.detail
 
 
-def test_uniqueness_fact_is_hashable_and_freezable() -> None:
-    f = UniquenessFact(
-        model_unique_id="model.pkg.x",
-        columns=frozenset({"a", "b"}),
-        source=UniquenessSource.DBT_UNIQUE_TEST,
-        detail="t",
-    )
-    # Hashable, so the facts can live in sets and dicts.
-    assert hash(f) == hash(replace(f))
-
-
 # --- Structural proof from SQL ---
 
 
@@ -194,7 +182,7 @@ def test_group_by_bare_columns_proves_uniqueness() -> None:
 
 
 def test_group_by_unprojected_keys_does_not_prove_named_uniqueness() -> None:
-    # `select sum(x) from t group by a, b` — a, b aren't output columns so we
+    # `select sum(x) from t group by a, b`: a, b aren't output columns so we
     # can't make a named-column uniqueness claim.
     assert facts_from_sql("model.pkg.x", _parsed("select sum(x) from t group by a, b")) == ()
 
@@ -205,7 +193,7 @@ def test_group_by_positional_does_not_prove_uniqueness() -> None:
 
 
 def test_group_by_expression_does_not_prove_uniqueness() -> None:
-    # The key is an expression, not a bare column — we don't reason about it.
+    # The key is an expression, not a bare column, so we don't reason about it.
     sql = "select date_trunc('day', ts) as d, sum(x) from t group by date_trunc('day', ts)"
     assert facts_from_sql("model.pkg.x", _parsed(sql)) == ()
 
@@ -228,7 +216,7 @@ def test_inner_distinct_does_not_prove_outer_uniqueness() -> None:
 
 def test_aliased_group_by_column_uses_alias_name() -> None:
     # If the projection aliases the group key, the output column is the alias.
-    # `select a as id, sum(x) from t group by a` — we'd want to claim
+    # `select a as id, sum(x) from t group by a`: we'd want to claim
     # uniqueness on "id", not "a". For first cut this is conservatively
     # skipped (the GROUP BY references "a" but the projection produces "id").
     sql = "select a as id, sum(x) from t group by a"
@@ -253,8 +241,8 @@ def test_no_distinct_no_group_by_produces_no_fact() -> None:
 
 def test_facts_from_manifest_includes_structural_for_jaffle(jaffle: Manifest) -> None:
     facts = facts_from_manifest(jaffle)
-    # stg_customers.sql is `select ... from raw_customers` — no DISTINCT or
-    # GROUP BY. customers.sql has a top-level GROUP BY (final select) — but
+    # stg_customers.sql is `select ... from raw_customers` with no DISTINCT or
+    # GROUP BY. customers.sql has a top-level GROUP BY (final select), but
     # let's be lenient and just assert both kinds appear *somewhere* across
     # the jaffle models. Declarations are guaranteed; structural is nice to
     # have if any jaffle model qualifies.

@@ -28,15 +28,15 @@ Practical implication: extending the framework with a new operator or a new refi
 
 ### Adoption gradient: zero, partial, full investment
 
-The framework gives useful output at every level of declaration investment. Three tiers ship in v1:
+The framework gives useful output at every level of declaration investment. Three layers ship in v1:
 
-- *Tier 0:* Zero declarations. Static analyzer catches ordering hazards, unsafe `ROW_NUMBER() = 1` patterns, ambiguous tiebreakers in window functions; runtime executes models in dbt-duckdb to check replay-determinism and heuristic invariants. No semantic types involved. `dblect init` produces first findings end-to-end in under a minute on typical projects.
-- *Tier 1:* Declare semantic types on the critical chain (revenue, customer_id, order_date). Run propagation. Most projects find at least one real bug within the first hour.
-- *Tier 2:* Add conservation and cardinality contracts on the few joins where fanout matters. The PBT runtime half engages with the intent catalog. Hours-to-days commitment.
+- *Zero-declaration audit:* Static analyzer catches ordering hazards, unsafe `ROW_NUMBER() = 1` patterns, ambiguous tiebreakers in window functions; runtime executes models in dbt-duckdb to check replay-determinism and heuristic invariants. No semantic types involved. `dblect init` produces first findings end-to-end in under a minute on typical projects.
+- *Typed critical chain:* Declare semantic types on the critical chain (revenue, customer_id, order_date). Run propagation. Most projects find at least one real bug within the first hour.
+- *Focused contracts:* Add conservation and cardinality contracts on the few joins where fanout matters. The PBT runtime half engages with the intent catalog. Hours-to-days commitment.
 
-A future tier (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is the `@contract.check` decorator plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
+A future layer (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is the `@contract.check` decorator plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
 
-No tier requires the next. A team that stops at Tier 1 has a working semantic typecheck and never sees the words "lattice" or "operator signature." This gradient is the answer to the recurring tension between formal rigor underneath and practical adoption on top.
+No layer requires the next. A team that stops at the typed-critical-chain layer has a working semantic typecheck and never sees the words "lattice" or "operator signature." This gradient is the answer to the recurring tension between formal rigor underneath and practical adoption on top.
 
 ### Surface stays Pandera-shaped
 
@@ -66,7 +66,7 @@ The annotation surface stays small. v1 supports `dblect: preserves`, `dblect: di
 
 Refinement propagation through window functions interacts with cardinality, ordering, and scope refinements simultaneously, and the prior art is thin. Adding them to the v1 calculus is substantial formal work for marginal demo value.
 
-The v1 move: mark window function regions as type-erasing boundaries for refinement purposes, same treatment as UDFs and recursive CTEs. Re-annotation is required at the output of a window region. The separate ordering-hazard detector (Tier 0) still flags dangerous patterns like `ROW_NUMBER() = 1` without ambiguous tiebreaks.
+The v1 move: mark window function regions as type-erasing boundaries for refinement purposes, same treatment as UDFs and recursive CTEs. Re-annotation is required at the output of a window region. The separate ordering-hazard detector in the static analyser still flags dangerous patterns like `ROW_NUMBER() = 1` without ambiguous tiebreaks.
 
 This is a scope decision, not a permanent exclusion. v2 or later can add window propagation once the v1 calculus is stable and the formal core has paper-proof-quality coverage of the operators it does handle.
 

@@ -88,24 +88,24 @@ Status messages (manifest path, dbt parse invocation) go to stderr so JSON consu
 
 Key types in [`manifest/parse.py`](../../src/dblect/manifest/parse.py):
 
-- **`Manifest`** — `schema_version`, `nodes: Mapping[str, Node]`, plus `models` / `sources` / `seeds` / `snapshots` properties that filter by resource type.
-- **`Node`** — `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`, `constraints`, `test_metadata`, `attached_node`. The last three carry dbt-specific information that the uniqueness layer consumes: `constraints` for native dbt 1.5+ constraints on models, `test_metadata` (a `DbtTestMetadata`) for the `name`+`kwargs` of generic tests, and `attached_node` for the model a test is attached to.
-- **`ResourceType`** — `MODEL`, `SOURCE`, `SEED`, `SNAPSHOT`, `OTHER` (catches tests, analyses, operations).
-- **`Column`** — `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
-- **`ConstraintSpec`** — `type` (e.g. `"primary_key"`, `"unique"`, `"not_null"`, `"check"`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
-- **`DbtTestMetadata`** — `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type).
+- **`Manifest`**: `schema_version`, `nodes: Mapping[str, Node]`, plus `models` / `sources` / `seeds` / `snapshots` properties that filter by resource type.
+- **`Node`**: `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`, `constraints`, `test_metadata`, `attached_node`. The last three carry dbt-specific information that the uniqueness layer consumes: `constraints` for native dbt 1.5+ constraints on models, `test_metadata` (a `DbtTestMetadata`) for the `name`+`kwargs` of generic tests, and `attached_node` for the model a test is attached to.
+- **`ResourceType`**: `MODEL`, `SOURCE`, `SEED`, `SNAPSHOT`, `OTHER` (catches tests, analyses, operations).
+- **`Column`**: `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
+- **`ConstraintSpec`**: `type` (e.g. `"primary_key"`, `"unique"`, `"not_null"`, `"check"`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
+- **`DbtTestMetadata`**: `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type).
 
 The DAG lives in [`manifest/dag.py`](../../src/dblect/manifest/dag.py). `Dag.build(nodes, edges)` validates that every edge references a known node, detects cycles (raises `CycleError` with the witness cycle), and exposes `upstream(uid)`, `downstream(uid)`, `transitive_upstream(uid)`, `transitive_downstream(uid)`, and `topological_order()`. `Manifest.dag` materializes one from the project's `depends_on` graph, silently dropping edges to nodes the manifest didn't expose (e.g. upstream models from packages the project doesn't include).
 
-Topological order is deterministic — ties are broken by node-id sort — so the audit walker iterates models in a stable order. Tests in `tests/manifest/test_dag.py` include hypothesis-generated acyclic DAGs to verify the order-respects-edges and transitive-closure invariants.
+Topological order is deterministic (ties are broken by node-id sort) so the audit walker iterates models in a stable order. Tests in `tests/manifest/test_dag.py` include hypothesis-generated acyclic DAGs to verify the order-respects-edges and transitive-closure invariants.
 
 ## The SQL layer (`src/dblect/sql/`)
 
 Three modules:
 
-- [**`parse.py`**](../../src/dblect/sql/parse.py) — Jinja redaction + sqlglot parsing.
-- [**`patterns.py`**](../../src/dblect/sql/patterns.py) — list queries and detectors over the AST.
-- [**`_sqlglot.py`**](../../src/dblect/sql/_sqlglot.py) — typed accessors over sqlglot's `Any`-heavy attribute surface.
+- [**`parse.py`**](../../src/dblect/sql/parse.py): Jinja redaction + sqlglot parsing.
+- [**`patterns.py`**](../../src/dblect/sql/patterns.py): list queries and detectors over the AST.
+- [**`_sqlglot.py`**](../../src/dblect/sql/_sqlglot.py): typed accessors over sqlglot's `Any`-heavy attribute surface.
 
 ### `ParsedSQL.parse(sql, dialect)`
 
@@ -122,15 +122,15 @@ dbt SQL is Jinja-laced, and sqlglot can't parse Jinja directly. The parser redac
 
 ### Detectors and findings
 
-`patterns.py` exposes six detectors, all pure functions over `ParsedSQL` returning `tuple[Finding, ...]`:
+`patterns.py` exposes the static detectors, all pure functions over `ParsedSQL` returning `tuple[Finding, ...]`:
 
 | Detector | What it flags |
 | --- | --- |
-| `detect_null_group_after_outer_join` | `LEFT/RIGHT/FULL JOIN ... GROUP BY <nullable-side-col>` — unmatched rows collapse into a NULL group. |
-| `detect_coalesce_on_join_key` | `COALESCE(col, ...)` where `col` also appears in a JOIN's ON clause — silently masks "no match" vs. "match with NULL". |
+| `detect_null_group_after_outer_join` | `LEFT/RIGHT/FULL JOIN ... GROUP BY <nullable-side-col>`. Unmatched rows collapse into a NULL group. |
+| `detect_coalesce_on_join_key` | `COALESCE(col, ...)` where `col` also appears in a JOIN's ON clause. Silently masks "no match" vs. "match with NULL". |
 | `detect_unordered_window` | Any of `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` over a window with no `ORDER BY`. |
 | `detect_unordered_aggregate` | `ARRAY_AGG`/`STRING_AGG`/`GROUP_CONCAT` without `ORDER BY` or `WITHIN GROUP`. Element order across rows is undefined. |
-| `detect_where_on_outer_joined_nullable` | `WHERE <nullable-side-col> = X` (or `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`) — silently inverts the OUTER JOIN to INNER. `IS [NOT] NULL` and `COALESCE(col, ...)` are protected. |
+| `detect_where_on_outer_joined_nullable` | `WHERE <nullable-side-col> = X` (or `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`). Silently inverts the OUTER JOIN to INNER. `IS [NOT] NULL` and `COALESCE(col, ...)` are protected. |
 | `detect_non_deterministic_function` | `current_timestamp` / `now()` / `random()` / `uuid()` / etc. in load-bearing positions: JOIN ON, GROUP BY targets, window PARTITION BY, window ORDER BY. WHERE/HAVING are intentionally exempt (the incremental-lookback idiom). |
 
 `scan_all(parsed)` runs them all and returns concatenated findings. `all_findings(parseds)` batches over an iterable.
@@ -147,7 +147,7 @@ class Finding:
     line_end: int
 ```
 
-Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier` descendants and takes min/max over each one's `meta["line"]`. sqlglot only stamps positions on identifiers, not on every expression — nodes with no identifier descendants (rare; literal-only expressions) report `(0, 0)`.
+Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier` descendants and takes min/max over each one's `meta["line"]`. sqlglot only stamps positions on identifiers, not on every expression, so nodes with no identifier descendants (rare; literal-only expressions) report `(0, 0)`.
 
 The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_group_bys`, `list_aggregations`) that return dblect-shaped summary value types. Consumers don't need to import sqlglot to read structural facts about a statement.
 
@@ -155,10 +155,10 @@ The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_
 
 ## The uniqueness layer (`src/dblect/uniqueness/`)
 
-This package collects **uniqueness facts** — claims that a particular set of columns is jointly unique on a model — and uses them to ground a detector that fires only when it can prove a hazard. Two layers:
+This package collects **uniqueness facts** (claims that a particular set of columns is jointly unique on a model) and uses them to ground a detector that fires only when it can prove a hazard. Two layers:
 
-- [**`facts.py`**](../../src/dblect/uniqueness/facts.py) — collects facts from declarations and SQL.
-- [**`detector.py`**](../../src/dblect/uniqueness/detector.py) — the window order-keys detector that consumes those facts.
+- [**`facts.py`**](../../src/dblect/uniqueness/facts.py): collects facts from declarations and SQL.
+- [**`detector.py`**](../../src/dblect/uniqueness/detector.py): the window order-keys detector that consumes those facts.
 
 ### Where facts come from
 
@@ -176,11 +176,11 @@ Three public entry points:
 - **`facts_from_declarations(manifest)`** reads dbt test nodes (single-column `unique` and dbt-utils `unique_combination_of_columns`) and native dbt 1.5+ `ConstraintSpec` lists (model-level and column-level). Each fact carries a `detail` field naming the test or constraint so reviewers can trace the claim back.
 - **`facts_from_sql(model_unique_id, parsed)`** infers facts from a model's own SQL. Two rules today:
   - Top-level `SELECT DISTINCT a, b` proves the output is unique on `(a, b)`.
-  - Top-level `SELECT a, b, ... FROM ... GROUP BY a, b` proves the output is unique on `(a, b)` — but only when every GROUP BY target is a bare column that's also in the projection (positional, expression, and unprojected keys are skipped conservatively).
+  - Top-level `SELECT a, b, ... FROM ... GROUP BY a, b` proves the output is unique on `(a, b)`, but only when every GROUP BY target is a bare column that's also in the projection (positional, expression, and unprojected keys are skipped conservatively).
   - CTEs are unwrapped to find the body SELECT. Set operations (`UNION` etc.) are out of scope.
 - **`facts_from_manifest(manifest)`** is the combined entry the walker uses. Returns `Mapping[model_uid, tuple[UniquenessFact, ...]]` with every known fact for every model. Models with no known facts are absent from the mapping; callers should treat missing as "we don't know."
 
-The whole layer is **opportunistic by design**: it uses what the project gives it and stays silent everywhere else. There's no warning when a model has no declared keys — that would be noise on every project that doesn't aggressively declare.
+The whole layer is **opportunistic by design**: it uses what the project gives it and stays silent everywhere else. There's no warning when a model has no declared keys, because that would be noise on every project that doesn't aggressively declare.
 
 ### The window order-keys detector
 
@@ -189,20 +189,20 @@ The whole layer is **opportunistic by design**: it uses what the project gives i
 - Only the **top-level SELECT** is inspected.
 - The model's top-level FROM must resolve to a **single ref'd model** (no joins at the top level; multi-source needs column-level lineage we don't have yet).
 - The source model must have **at least one uniqueness fact**. With no grounding, we stay silent.
-- A fact whose columns are a **subset** of the window's key set counts as coverage — any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
+- A fact whose columns are a **subset** of the window's key set counts as coverage. Any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
 - Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
 
 `make_detector(manifest, facts)` curries the function against the audit-scoped context (the manifest's model name→unique_id index plus the precomputed facts) and returns a plain `Detector` callable the walker drops into its detector pipeline.
 
-The detector is enabled by default. Because it's opportunistic, no opt-in flag is needed — projects without declared uniqueness simply see no findings from it. Findings of kind `NON_UNIQUE_WINDOW_ORDER_KEYS` are suppressible via the standard `-- noqa-fixture:` syntax.
+The detector is enabled by default. Because it's opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from it. Findings of kind `NON_UNIQUE_WINDOW_ORDER_KEYS` are suppressible via the standard `-- noqa-fixture:` syntax.
 
 ## The audit layer (`src/dblect/audit/`)
 
 Three modules:
 
-- [**`walker.py`**](../../src/dblect/audit/walker.py) — `run_audit(manifest)` iterates models, runs detectors, applies suppression.
-- [**`suppress.py`**](../../src/dblect/audit/suppress.py) — parses `-- noqa-fixture:` directives, matches them to findings.
-- [**`reporter.py`**](../../src/dblect/audit/reporter.py) — `render_text` and `render_json`.
+- [**`walker.py`**](../../src/dblect/audit/walker.py): `run_audit(manifest)` iterates models, runs detectors, applies suppression.
+- [**`suppress.py`**](../../src/dblect/audit/suppress.py): parses `-- noqa-fixture:` directives, matches them to findings.
+- [**`reporter.py`**](../../src/dblect/audit/reporter.py): `render_text` and `render_json`.
 
 ### Walker
 
@@ -211,8 +211,8 @@ Three modules:
 1. Computes `facts_from_manifest(manifest)` once up front, then curries the uniqueness-aware detector against it. The curried detector joins the configured `detectors` list so the per-model loop runs everything in one pass.
 2. Iterates `manifest.models` in unique_id sort order for stable output.
 3. For each model:
-   - Skips if `raw_code is None` (sources, seeds, packages that don't ship SQL) — recorded as `SkippedModel(reason="no raw_code")`.
-   - Calls `ParsedSQL.parse(raw_code, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure** — one bad model shouldn't blind the audit to the rest.
+   - Skips if `raw_code is None` (sources, seeds, packages that don't ship SQL), recorded as `SkippedModel(reason="no raw_code")`.
+   - Calls `ParsedSQL.parse(raw_code, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure**: one bad model shouldn't blind the audit to the rest.
    - Runs each detector, collecting `Finding`s.
    - Calls `parse_directives(raw_code)` to extract `-- noqa-fixture:` comments. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
    - Calls `apply(findings, directives)` to partition into active vs. suppressed.
@@ -260,8 +260,8 @@ Keys are sorted for stable diffs. The `schema_version` field exists so consumers
 
 A `typer.Typer` app registered as the `dblect` console script. Two commands today:
 
-- **`dblect version`** — prints the installed version.
-- **`dblect audit [PROJECT_DIR]`** — runs the audit.
+- **`dblect version`**: prints the installed version.
+- **`dblect audit [PROJECT_DIR]`**: runs the audit.
 
 Audit options:
 
@@ -285,13 +285,13 @@ Each failure mode raises `typer.BadParameter` with an actionable message. The "n
 
 [`run_model(project_dir, model_name, *, fixtures=None, ...) -> RunResult`](../../src/dblect/execution/run.py) copies a dbt project to a temp directory, optionally rewrites seeds with caller-supplied row dicts, runs `dbt seed` then `dbt run --select +<model>` against an ephemeral DuckDB file, and reads the produced table back through the DuckDB driver. Output rows come back in `RunResult` as `tuple[tuple[Any, ...], ...]` with column names alongside.
 
-`RunError` carries `phase` (`"seed"` / `"run"` / `"query"`), exit code, stdout, stderr — so callers can branch on what failed without parsing dbt's output.
+`RunError` carries `phase` (`"seed"` / `"run"` / `"query"`), exit code, stdout, stderr, so callers can branch on what failed without parsing dbt's output.
 
-**This harness is not on the `dblect audit` path** today. It's the substrate the runtime-PBT and replay-determinism layers will sit on once those land. Right now it's exercised by `tests/execution/test_run.py` against the vendored jaffle fixture — confirming the harness works end-to-end so the runtime layer has something to build on.
+**This harness is not on the `dblect audit` path** today. It's the substrate the runtime-PBT and replay-determinism layers will sit on once those land. Right now it's exercised by `tests/execution/test_run.py` against the vendored jaffle fixture, confirming the harness works end-to-end so the runtime layer has something to build on.
 
 ## Tests
 
-~195 tests across the layers, organized by package:
+The test suite is organized by package:
 
 ```
 tests/manifest/    - manifest parsing + DAG topology (incl. PBT over generated acyclic DAGs)
@@ -309,13 +309,13 @@ Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression 
 
 ## What's deliberately not here yet
 
-Forward-looking pieces that are designed but not built — see [docs/design/](../design/) for each:
+Forward-looking pieces that are designed but not built. See [docs/design/](../design/) for each:
 
-- **Semantic types** and the typed-contract DSL (the doc set's "Tier 1" and "Tier 2").
+- **Semantic types** and the typed-contract DSL (the semantic-types and focused-contracts layers in the design docs).
 - **Runtime checks**: replay-determinism via differential execution, heuristic invariants (row-count sanity, PK uniqueness, monotonicity), generator-driven structural PBT.
 - **Generator framework**: contract-directed generation, intent catalog, multi-table coordinated generation.
 - **Flag/var inference**: discovering dbt vars from SQL and scaffolding typed flag declarations.
 - **`dblect init`**: scaffolds `dblect/`, generates editor stubs from the manifest, integrates with the project's package manager.
 - **MCP server**, **HTML reports**, **SARIF output**, **YAML suppression config**.
 
-Each of those is its own body of work. The current static analyzer is independent of them — it's the layer everything else builds on top of.
+Each of those is its own body of work. The current static analyzer is independent of them. It's the layer everything else builds on top of.

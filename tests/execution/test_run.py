@@ -77,7 +77,7 @@ def test_custom_fixture_rows_flow_through(jaffle_project_dir: Path) -> None:
 
 
 def test_run_error_surfaces_dbt_compile_failure(jaffle_project_dir: Path, tmp_path: Path) -> None:
-    from dblect.execution import RunError, run_model
+    from dblect.execution import Phase, RunError, run_model
 
     broken = tmp_path / "broken_project"
     shutil.copytree(jaffle_project_dir, broken)
@@ -90,7 +90,7 @@ def test_run_error_surfaces_dbt_compile_failure(jaffle_project_dir: Path, tmp_pa
     # dbt parses the full project at the start of every subcommand, so a
     # broken `ref` surfaces during `dbt seed` (the first thing we run)
     # rather than waiting for `dbt run`.
-    assert excinfo.value.phase == "seed"
+    assert excinfo.value.phase is Phase.SEED
     assert excinfo.value.returncode != 0
 
 

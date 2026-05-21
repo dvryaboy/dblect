@@ -58,9 +58,9 @@ This document specifies the algorithm, the output format, and the implementation
 
 ## Algorithm
 
-The algorithm runs in four phases: discovery, per-model analysis, aggregation, and output generation.
+The algorithm runs in four stages: discovery, per-model analysis, aggregation, and output generation.
 
-### Phase 1: Discovery
+### Discovery
 
 1. Invoke `dbt parse` (or read an existing manifest) to produce `manifest.json`.
 2. Load all macros from the manifest into a name-indexed registry, including project macros, package macros, and dbt built-ins.
@@ -68,7 +68,7 @@ The algorithm runs in four phases: discovery, per-model analysis, aggregation, a
 4. Load `profiles.yml` (if present and accessible) to extract target-specific var overrides.
 5. Determine the active adapter from the configured target.
 
-### Phase 2: Per-model analysis
+### Per-model analysis
 
 For each model in the manifest:
 
@@ -101,7 +101,7 @@ class VarUsage:
 - `MacroArg(macro, position)`: passed as an argument to a macro we could not follow
 - `Unknown`: any other position
 
-### Phase 3: Aggregation
+### Aggregation
 
 After all models are analyzed:
 
@@ -124,7 +124,7 @@ class DiscoveredVar:
     unfollowed_usages: list[UnfollowedUsage]
 ```
 
-### Phase 4: Output generation
+### Output generation
 
 1. Render each `DiscoveredVar` as a Python `SemanticFlag` class (template below).
 2. Sort classes alphabetically and write to the output file.
@@ -360,11 +360,11 @@ Inference failed: 2
 - Recommendation: declare these vars manually or refactor the macro
 ```
 
-## Implementation phases
+## Implementation stages
 
-The implementation breaks into three weekly phases, each producing a working deliverable.
+The implementation breaks into three weekly stages, each producing a working deliverable.
 
-### Phase 1: Basic discovery and direct usage inference (week 1)
+### Basic discovery and direct usage inference (week 1)
 
 - Manifest reading and project file parsing
 - Jinja2 AST walker for direct `var()` and `env_var()` references
@@ -373,9 +373,9 @@ The implementation breaks into three weekly phases, each producing a working del
 - Generated Python file output
 - Basic diagnostic report
 
-At the end of phase 1, the tool handles projects whose vars are all referenced directly (no macro indirection). This covers the majority of small dbt projects.
+At the end of this stage, the tool handles projects whose vars are all referenced directly (no macro indirection). This covers the majority of small dbt projects.
 
-### Phase 2: Macro following (week 2)
+### Macro following (week 2)
 
 - Macro lookup from the manifest
 - Recursive expansion with depth limit and cycle detection
@@ -384,9 +384,9 @@ At the end of phase 1, the tool handles projects whose vars are all referenced d
 - Adapter dispatch resolution
 - Per-usage confidence tracking through macro trails
 
-At the end of phase 2, the tool handles projects with non-trivial macro use. The jaffle-shop generator and dbt-utils-heavy projects become tractable.
+At the end of this stage, the tool handles projects with non-trivial macro use. The jaffle-shop generator and dbt-utils-heavy projects become tractable.
 
-### Phase 3: Polish and edge cases (week 3)
+### Polish and edge cases (week 3)
 
 - Custom Jinja extension handling (parse what we can, opaque the rest)
 - Runtime-dependent macro detection
@@ -395,7 +395,7 @@ At the end of phase 2, the tool handles projects with non-trivial macro use. The
 - Diagnostic report quality improvements
 - Integration testing against several real dbt projects
 
-At the end of phase 3, the tool is ready for the v1 release. The known limitations are documented and surfaced clearly in the diagnostic report.
+At the end of this stage, the tool is ready for the v1 release. The known limitations are documented and surfaced clearly in the diagnostic report.
 
 ## Testing strategy
 
@@ -421,7 +421,7 @@ As we encounter dbt projects in the wild that trigger new patterns, add minimize
 
 ## Open questions
 
-1. **Vars used only in seeds, sources, or documentation:** dbt vars can appear in non-model contexts. Phase 1 covers models only. Should we extend to seeds and sources in phase 2 or defer to v2?
+1. **Vars used only in seeds, sources, or documentation:** dbt vars can appear in non-model contexts. The initial discovery stage covers models only. Should we extend to seeds and sources in the macro-following stage or defer to v2?
 
 2. **Closed-world vs open-world default for inferred domains:** Currently the spec marks inferred enum domains as "tentative." Is this strong enough, or should we surface a more explicit confirmation step before treating the inferred domain as authoritative for world enumeration?
 

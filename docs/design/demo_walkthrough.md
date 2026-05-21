@@ -1,8 +1,8 @@
 # Demo walkthrough: jaffle_shop_duckdb
 
-*Status: scaffolds the v1 demo. File contents, command output, and timings are illustrative — they describe what the demo should produce once the framework is implemented to spec, not literal output from a current build.*
+*Status: scaffolds the v1 demo. File contents, command output, and timings are illustrative; they describe what the demo should produce once the framework is implemented to spec, not literal output from a current build.*
 
-This document walks an analyst through dblect end-to-end against the [jaffle_shop_duckdb](https://github.com/dbt-labs/jaffle_shop_duckdb) project. It picks three planted bugs, each one a different *layer of value* dblect uniquely adds, plus one zero-config Tier 0 catch that fires before any planting.
+This document walks an analyst through dblect end-to-end against the [jaffle_shop_duckdb](https://github.com/dbt-labs/jaffle_shop_duckdb) project. It picks three planted bugs, each one a different *layer of value* dblect uniquely adds, plus one zero-config audit catch that fires before any planting.
 
 ## The arc
 
@@ -10,10 +10,10 @@ Five steps, each ending in a finding the existing toolchain (dbt tests + data-di
 
 | # | What we do | What dblect catches | What data-diff would show |
 |---|---|---|---|
-| 0 | `dblect init` (no declarations) | Latent NULL-group risk in `customers.sql` (Tier 0 static finding) | n/a — no PR yet |
-| 1 | Annotate `Money(currency="USD")` on the critical chain | Nothing yet — types align | n/a — no SQL change |
+| 0 | `dblect init` (no declarations) | Latent NULL-group risk in `customers.sql` (zero-declaration static finding) | n/a, no PR yet |
+| 1 | Annotate `Money(currency="USD")` on the critical chain | Nothing yet, types align | n/a, no SQL change |
 | 2 | Plant **currency creep** | Type mismatch at PR time, no execution | Scattered CLV value drift, cause invisible |
-| 3 | Plant **returns-from-CLV flag** | Conservation contract fails in the flag's True world | Nothing — default unchanged |
+| 3 | Plant **returns-from-CLV flag** | Conservation contract fails in the flag's True world | Nothing; default unchanged |
 | 4 | Plant **apple_pay payment method** | Conservation contract fails under Fanout intent, with shrunk counterexample | The new rows' totals don't reconcile, *if those rows are in the snapshot* |
 
 Three planted bugs, three "what dblect uniquely does" moments: **meaning** (step 2), **configuration space** (step 3), **structural shape** (step 4). Step 0 is the install-day hook.
@@ -27,7 +27,7 @@ cd jaffle_shop_duckdb
 
 The project has three CSV seeds (`raw_customers`, `raw_orders`, `raw_payments`), three staging models, and two marts (`orders`, `customers`). dbt-duckdb is the adapter, so everything runs locally with no warehouse credentials.
 
-## Step 0 — `dblect init`
+## Step 0: `dblect init`
 
 One command:
 
@@ -44,7 +44,7 @@ $ dblect init
 [dblect] Parsing dbt project (dbt parse)... done in 1.8s
 [dblect] Generated stubs for 5 dbt models → dblect/_stubs/models.py
 
-[dblect] Running Tier 0 audit:
+[dblect] Running audit:
   ✓ Static SQL analysis            5 models       0.4s
   ✓ Ambiguous-ordering detection   5 models       0.2s
   ✓ Replay determinism             5/5 ran        2.1s
@@ -71,11 +71,11 @@ $ dblect init
   • Add contracts:         dblect focus <model>
 ```
 
-Zero declarations, zero seed planting. dblect reads the SQL, sees the LEFT JOIN feeding a GROUP BY on the right-side key, and warns. The pattern is real — it's been latent in jaffle since the original release — and it's the kind of thing that would silently lose money in a production warehouse if a real orphan payment ever arrived.
+Zero declarations, zero seed planting. dblect reads the SQL, sees the LEFT JOIN feeding a GROUP BY on the right-side key, and warns. The pattern is real (it's been latent in jaffle since the original release) and it's the kind of thing that would silently lose money in a production warehouse if a real orphan payment ever arrived.
 
 **Comparison.** dbt's own `relationships` test on `customer_id` would catch orphan FKs in the source data, but only after the data exists. dblect catches the *structural pattern* in the SQL before any orphan arrives.
 
-## Step 1 — declare types on the critical chain
+## Step 1: declare types on the critical chain
 
 Create `dblect/types.py`:
 
@@ -170,7 +170,7 @@ $ dblect check
 
 The chain is consistent: `Money(currency="USD")` flows from `stg_payments.amount` through `orders.amount` and the per-method columns, and through `customer_payments` into `customers.customer_lifetime_value`. Nothing is wrong yet. We've installed the immune system; now we'll demonstrate what it sees.
 
-## Step 2 — plant currency creep (semantic-meaning correctness)
+## Step 2: plant currency creep (semantic-meaning correctness)
 
 A PR introduces multi-currency support in the source data without updating the downstream model SQL. This is a real evolution pattern: marketing rolls out international, raw payments start carrying a currency column, but the existing models don't know about it yet.
 
@@ -186,7 +186,7 @@ id,order_id,payment_method,amount,currency
 ...
 ```
 
-**Change 2.** `models/staging/stg_payments.sql` — pass `currency` through:
+**Change 2.** `models/staging/stg_payments.sql`, to pass `currency` through:
 
 ```sql
 select
@@ -217,7 +217,7 @@ $ dblect check
            orders.credit_card_amount, orders.coupon_amount,
            orders.bank_transfer_amount, orders.gift_card_amount
            customers.customer_lifetime_value
-           Type cascade from stg_payments.amount — all downstream MoneyUSD
+           Type cascade from stg_payments.amount: all downstream MoneyUSD
            annotations now hold mixed-currency values.
 
 [dblect] 1 root finding, 6 cascaded findings.
@@ -237,7 +237,7 @@ The dblect finding lands at PR review time, before merge. The data-diff finding 
 
 **Cleanup.** Revert both changes; check is clean again. The framework remembers the finding in `.dblect/` and would replay it as a regression test if a similar pattern recurs.
 
-## Step 3 — plant the returns-from-CLV flag (configuration space)
+## Step 3: plant the returns-from-CLV flag (configuration space)
 
 A dev wants to support excluding returned/returning-pending orders from CLV for an analyst team that prefers "active revenue only." They add it behind a var so the existing default behavior is preserved.
 
@@ -256,7 +256,7 @@ class ExcludeReturnsFromCLV(SemanticFlag):
     # The framework still enumerates worlds for contract checking.
 ```
 
-**Change 2.** Add a CLV-conservation contract on `Customers` (this is the contract the team committed to when they originally built CLV — it just hadn't been written down):
+**Change 2.** Add a CLV-conservation contract on `Customers` (this is the contract the team committed to when they originally built CLV, it just hadn't been written down):
 
 ```python
 # dblect/contracts/marts.py  (additions)
@@ -280,7 +280,7 @@ class Customers(ModelContract):
         )
 ```
 
-**Change 3.** `models/customers.sql` — gate the `customer_payments` calculation on the flag:
+**Change 3.** `models/customers.sql`, to gate the `customer_payments` calculation on the flag:
 
 ```sql
 customer_payments as (
@@ -344,7 +344,7 @@ The framework runs the contract under *both* possible values of the flag, even t
 
 **Cleanup.** Revert; check is clean.
 
-## Step 4 — plant apple_pay (structural shape under adversarial inputs)
+## Step 4: plant apple_pay (structural shape under adversarial inputs)
 
 A new payment method joins the platform. The product team adds rows to the source data and updates the staging accepted_values, but misses the hard-coded Jinja list in `orders.sql`.
 
@@ -356,7 +356,7 @@ A new payment method joins the platform. The product team adds rows to the sourc
 117,8,apple_pay,500
 ```
 
-**Change 2.** `models/staging/schema.yml` — update the `accepted_values` test:
+**Change 2.** `models/staging/schema.yml`, to update the `accepted_values` test:
 
 ```yaml
 - name: payment_method
@@ -366,7 +366,7 @@ A new payment method joins the platform. The product team adds rows to the sourc
           values: ['credit_card', 'coupon', 'bank_transfer', 'gift_card', 'apple_pay']
 ```
 
-**Change 3.** Add a per-method-conservation contract to `Orders` (this is what the model's design implicitly committed to — total = sum of per-method amounts — it just hadn't been written down):
+**Change 3.** Add a per-method-conservation contract to `Orders` (this is what the model's design implicitly committed to, where total = sum of per-method amounts; it just hadn't been written down):
 
 ```python
 # dblect/contracts/marts.py  (additions to Orders)
@@ -385,7 +385,7 @@ class Orders(ModelContract):
         )
 ```
 
-Note we deliberately don't change `orders.sql` — the Jinja list still has only the original four methods. dbt's accepted_values test passes (because we updated it). dbt builds successfully. The bug is invisible to dbt.
+Note we deliberately don't change `orders.sql`. The Jinja list still has only the original four methods. dbt's accepted_values test passes (because we updated it). dbt builds successfully. The bug is invisible to dbt.
 
 Run the check:
 
@@ -438,7 +438,7 @@ $ dblect check
 [dblect] 1 contract failed (1 world, 2 intents).
 ```
 
-The contract is straightforward analytic algebra. The framework's contribution is that it ran the contract under the **Fanout(N=2)** intent — one order with two payments, one of which is the new apple_pay method — and the inevitable inconsistency surfaced. A hand-written dbt test might have caught this *if* the author had thought of apple_pay specifically; intent-driven generation finds it because Fanout is exactly the structural shape that exercises the per-method/total reconciliation.
+The contract is straightforward analytic algebra. The framework's contribution is that it ran the contract under the **Fanout(N=2)** intent (one order with two payments, one of which is the new apple_pay method) and the inevitable inconsistency surfaced. A hand-written dbt test might have caught this *if* the author had thought of apple_pay specifically; intent-driven generation finds it because Fanout is exactly the structural shape that exercises the per-method/total reconciliation.
 
 **Comparison to data-diff.** Data-diff catches the symptom only if the snapshot it compares includes apple_pay rows. On the day the PR lands, the seed has apple_pay rows, so the diff between the previous build (no apple_pay) and this build shows the per-method columns changed for affected orders. But the diff doesn't surface the *contract* that's now broken, and if the apple_pay rows happen to be filtered out of the comparison sample, the diff sees nothing.
 
@@ -448,11 +448,11 @@ The contract is straightforward analytic algebra. The framework's contribution i
 
 Three planted bugs, three different "this is what dblect uniquely does" moments, each one outside data-diff's structural reach in a different way:
 
-1. **Currency creep** — meaning-level catch, no execution needed. Data-diff sees value drift; dblect names the type contract that broke and points at the source.
-2. **Returns-from-CLV flag** — configuration-space catch. Data-diff sees nothing (default branch unchanged); dblect enumerates both worlds and identifies which one breaks the conservation contract.
-3. **Apple_pay conservation** — structural-shape catch under adversarial inputs. Data-diff sees the symptom only on shapes present in the snapshot; dblect's intent catalog generates the Fanout shape on purpose and surfaces the latent bug with a minimal counterexample.
+1. **Currency creep**: meaning-level catch, no execution needed. Data-diff sees value drift; dblect names the type contract that broke and points at the source.
+2. **Returns-from-CLV flag**: configuration-space catch. Data-diff sees nothing (default branch unchanged); dblect enumerates both worlds and identifies which one breaks the conservation contract.
+3. **Apple_pay conservation**: structural-shape catch under adversarial inputs. Data-diff sees the symptom only on shapes present in the snapshot; dblect's intent catalog generates the Fanout shape on purpose and surfaces the latent bug with a minimal counterexample.
 
-Plus a Tier 0 finding before any planting: the latent NULL-group risk in `customers.sql` that's been in jaffle since the original release.
+Plus an audit finding before any planting: the latent NULL-group risk in `customers.sql` that's been in jaffle since the original release.
 
 ## The final `dblect/` tree
 
@@ -481,6 +481,6 @@ These are deferred but worth doing once the v1 framework is up:
 - **A flag-flip preflight pass.** Show `dblect impact --flag exclude_returns_from_clv` listing every contract and column affected before the flag is flipped in production.
 - **A typed counterexample replay.** After step 4, show `dblect show-case <id>` materializing the shrunk apple_pay fixture in DuckDB so the developer can run the bug interactively.
 - **PR-mode integration.** Show the dblect output rendered as GitHub PR annotations on the actual bug-planting commit.
-- **A multi-currency follow-through.** After step 2, show what it looks like to *fix* the bug properly — re-type `amount` as `Money` (currency-as-data), declare a per-customer currency-coherence contract, watch the framework validate the fix under the same data.
+- **A multi-currency follow-through.** After step 2, show what it looks like to *fix* the bug properly: re-type `amount` as `Money` (currency-as-data), declare a per-customer currency-coherence contract, watch the framework validate the fix under the same data.
 
 These extensions are demo extensions, not v1 framework extensions. The framework supports them all; they just take more screen time than the headline arc.

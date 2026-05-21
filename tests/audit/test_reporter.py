@@ -206,7 +206,7 @@ def test_json_is_stable_under_unsorted_input() -> None:
     b = _lf("model.pkg.b", "models/b.sql", _finding(line_start=5))
     r1 = AuditReport(findings=(a, b), suppressed=(), skipped=(), models_scanned=2)
     r2 = AuditReport(findings=(b, a), suppressed=(), skipped=(), models_scanned=2)
-    # JSON ordering follows the input findings order, NOT a sort — so the two
+    # JSON ordering follows the input findings order, NOT a sort, so the two
     # reports are different documents. This test pins that contract so we
     # don't accidentally reorder later.
     assert render_json(r1) != render_json(r2)
@@ -216,6 +216,6 @@ def test_json_against_real_jaffle(jaffle_manifest_path: Path) -> None:
     manifest = Manifest.from_file(jaffle_manifest_path)
     report = run_audit(manifest)
     payload = json.loads(render_json(report))
-    assert payload["summary"]["models_scanned"] == 5
+    assert payload["summary"]["models_scanned"] == len(manifest.models)
     kinds = {f["kind"] for f in payload["findings"]}
     assert "null_group_after_outer_join" in kinds

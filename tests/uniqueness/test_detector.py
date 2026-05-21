@@ -96,7 +96,7 @@ def test_no_facts_for_source_stays_silent() -> None:
 
 
 def test_unresolved_source_name_stays_silent() -> None:
-    # The FROM table doesn't map to any known model — we don't reason about it.
+    # The FROM table doesn't map to any known model, so we don't reason about it.
     parsed = _parse(
         "select row_number() over (partition by customer_id order by ts) from unknown_table"
     )
@@ -163,8 +163,8 @@ def test_multiple_windows_each_evaluated_independently() -> None:
         facts=_facts("model.pkg.src", ("id",)),
         model_name_to_uid={"src": "model.pkg.src"},
     )
-    # First window: (customer_id, ts) — not covered. Flagged.
-    # Second window: (id, ts) — superkey of `id`. Silent.
+    # First window: (customer_id, ts), not covered. Flagged.
+    # Second window: (id, ts), superkey of `id`. Silent.
     assert len(findings) == 1
     assert "customer_id" in findings[0].sql_snippet
 

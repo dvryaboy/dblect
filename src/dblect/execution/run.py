@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
@@ -38,19 +39,23 @@ import duckdb
 import yaml  # type: ignore[import-untyped]
 
 
+class Phase(StrEnum):
+    """Which stage of `run_model` failed when a `RunError` was raised."""
+
+    SEED = "seed"
+    RUN = "run"
+    QUERY = "query"
+
+
 class RunError(RuntimeError):
-    """Raised when a dbt subprocess fails or the produced table can't be read.
+    """Raised when a dbt subprocess fails or the produced table can't be read."""
 
-    `phase` is one of ``"seed"``, ``"run"``, ``"query"`` so callers can
-    branch on what failed without parsing stderr.
-    """
-
-    phase: str
+    phase: Phase
     returncode: int
     stdout: str
     stderr: str
 
-    def __init__(self, phase: str, returncode: int, stdout: str, stderr: str) -> None:
+    def __init__(self, phase: Phase, returncode: int, stdout: str, stderr: str) -> None:
         super().__init__(f"dbt {phase} failed (exit {returncode})\n{stderr or stdout}")
         self.phase = phase
         self.returncode = returncode
@@ -143,7 +148,7 @@ def run_model(
             env=env,
         )
         if seed_proc.returncode != 0:
-            raise RunError("seed", seed_proc.returncode, seed_proc.stdout, seed_proc.stderr)
+            raise RunError(Phase.SEED, seed_proc.returncode, seed_proc.stdout, seed_proc.stderr)
 
         run_proc = _run_dbt(
             dbt_executable,
@@ -157,12 +162,12 @@ def run_model(
             env=env,
         )
         if run_proc.returncode != 0:
-            raise RunError("run", run_proc.returncode, run_proc.stdout, run_proc.stderr)
+            raise RunError(Phase.RUN, run_proc.returncode, run_proc.stdout, run_proc.stderr)
 
         try:
             columns, rows = _query_table(duckdb_path, model_name)
         except duckdb.Error as e:
-            raise RunError("query", 0, "", str(e)) from e
+            raise RunError(Phase.QUERY, 0, "", str(e)) from e
 
         if keep_artifacts_in is not None:
             keep_artifacts_in.mkdir(parents=True, exist_ok=True)

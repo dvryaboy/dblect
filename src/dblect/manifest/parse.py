@@ -44,18 +44,40 @@ class ResourceType(StrEnum):
             return cls.OTHER
 
 
+class ConstraintType(StrEnum):
+    """The kinds of constraints dbt 1.5+ understands.
+
+    ``OTHER`` covers vendor- or dialect-specific constraint types we don't
+    recognise so the parse stays total. Comparisons should go through the
+    enum members rather than raw strings to keep typos out of the call sites.
+    """
+
+    PRIMARY_KEY = "primary_key"
+    UNIQUE = "unique"
+    NOT_NULL = "not_null"
+    CHECK = "check"
+    FOREIGN_KEY = "foreign_key"
+    OTHER = "other"
+
+    @classmethod
+    def from_raw(cls, raw: str) -> ConstraintType:
+        try:
+            return cls(raw.lower())
+        except ValueError:
+            return cls.OTHER
+
+
 @dataclass(frozen=True, slots=True)
 class ConstraintSpec:
     """A constraint declared on a model or column in schema.yml (dbt 1.5+).
 
-    ``type`` is the constraint kind (``"primary_key"``, ``"unique"``,
-    ``"not_null"``, ``"check"``, ``"foreign_key"``). ``columns`` carries the
-    column set for model-level constraints; column-level constraints leave it
-    empty (the column they're attached to is implicit). ``expression`` carries
-    a CHECK constraint's predicate text, if any.
+    ``columns`` carries the column set for model-level constraints; column-
+    level constraints leave it empty (the column they're attached to is
+    implicit). ``expression`` carries a CHECK constraint's predicate text,
+    if any.
     """
 
-    type: str
+    type: ConstraintType
     columns: tuple[str, ...] = ()
     expression: str | None = None
 
@@ -138,7 +160,7 @@ class Manifest:
         for uid, n in parsed.nodes.items():
             nodes[uid] = _node_from_parsed(uid, n)
 
-        # Sources live under `sources` in the manifest — promote them into
+        # Sources live under `sources` in the manifest. Promote them into
         # the same Node namespace so the DAG is uniform.
         for uid, s in (parsed.sources or {}).items():
             nodes[uid] = _source_from_parsed(uid, s)
@@ -247,7 +269,7 @@ def _columns_from_parsed(raw: Mapping[str, Any]) -> Mapping[str, Column]:
 def _constraints_from_parsed(raw: Any) -> tuple[ConstraintSpec, ...]:
     return tuple(
         ConstraintSpec(
-            type=str(getattr(c, "type", "")),
+            type=ConstraintType.from_raw(str(getattr(c, "type", ""))),
             columns=tuple(getattr(c, "columns", None) or ()),
             expression=getattr(c, "expression", None),
         )

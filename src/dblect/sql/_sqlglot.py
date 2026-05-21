@@ -13,10 +13,19 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+
+
+class JoinSide(StrEnum):
+    INNER = "inner"
+    LEFT = "left"
+    RIGHT = "right"
+    FULL = "full"
+    CROSS = "cross"
 
 
 def from_of(sel: exp.Select) -> exp.From | None:
@@ -52,12 +61,26 @@ def fn_of(w: exp.Window) -> Expr | None:
     return cast("Expr | None", w.this)
 
 
-def side_of(j: exp.Join) -> str:
-    return (j.side or "").upper()
+def join_side_of(j: exp.Join) -> JoinSide:
+    """The side of `j` as a `JoinSide`.
 
-
-def kind_of(j: exp.Join) -> str:
-    return (j.kind or "").upper()
+    Reads sqlglot's ``side`` and ``kind`` token strings. ``CROSS`` overrides
+    side (sqlglot keeps it on ``kind``); a missing/empty side defaults to
+    ``INNER``, which is the SQL default for ``a JOIN b`` without a qualifier.
+    """
+    side = (j.side or "").upper()
+    kind = (j.kind or "").upper()
+    if "CROSS" in kind:
+        return JoinSide.CROSS
+    match side:
+        case "LEFT":
+            return JoinSide.LEFT
+        case "RIGHT":
+            return JoinSide.RIGHT
+        case "FULL":
+            return JoinSide.FULL
+        case _:
+            return JoinSide.INNER
 
 
 def name_of(e: Expr) -> str:

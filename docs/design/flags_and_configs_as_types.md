@@ -269,7 +269,7 @@ For everyday use, the implication is straightforward: declare the columns you ca
 
 ### Switch types as an optional convenience
 
-An alternative authoring surface — a `Revenue.switch(on=flag, cases={True: ..., False: ...})` shorthand on the type itself — was considered as an early-iteration design. The canonical surface is the `SemanticFlag` class with `affects = RefinementEffect(...)` shown throughout this document, because it scales cleanly to flags that target multiple axes or multiple types (`CompositeEffect`, `ConditionalEffect`) and keeps the registry of flag effects in one place. A `switch()` shorthand may still ship as a thin convenience that produces the same registry entry as a single-axis `RefinementEffect`, if the engineering cost is small. Whether to bother is unsettled; nothing in the rest of the design depends on it.
+An alternative authoring surface (a `Revenue.switch(on=flag, cases={True: ..., False: ...})` shorthand on the type itself) was considered as an early-iteration design. The canonical surface is the `SemanticFlag` class with `affects = RefinementEffect(...)` shown throughout this document, because it scales cleanly to flags that target multiple axes or multiple types (`CompositeEffect`, `ConditionalEffect`) and keeps the registry of flag effects in one place. A `switch()` shorthand may still ship as a thin convenience that produces the same registry entry as a single-axis `RefinementEffect`, if the engineering cost is small. Whether to bother is unsettled; nothing in the rest of the design depends on it.
 
 ## What's coming, what's deferred
 

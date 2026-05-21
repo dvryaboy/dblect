@@ -28,6 +28,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import JoinSide
 from dblect.sql.parse import ParsedSQL
 
 
@@ -40,14 +41,6 @@ class FindingKind(StrEnum):
     NON_DETERMINISTIC_FUNCTION = "non_deterministic_function"
     NON_UNIQUE_WINDOW_ORDER_KEYS = "non_unique_window_order_keys"
     MALFORMED_SUPPRESSION = "malformed_suppression"
-
-
-class JoinSide(StrEnum):
-    INNER = "inner"
-    LEFT = "left"
-    RIGHT = "right"
-    FULL = "full"
-    CROSS = "cross"
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +179,7 @@ def list_joins(parsed: ParsedSQL) -> tuple[JoinSummary, ...]:
             on = sg.on_of(j)
             out.append(
                 JoinSummary(
-                    side=_join_side(j),
+                    side=sg.join_side_of(j),
                     left_table=left,
                     right_table=sg.name_of(j.this),
                     on_sql=sg.render_sql(on) if on is not None else None,
@@ -447,7 +440,7 @@ def detect_non_deterministic_function(parsed: ParsedSQL) -> tuple[Finding, ...]:
                         FindingKind.NON_DETERMINISTIC_FUNCTION,
                         message=(
                             f"{func_name} appears in {label}; this position is "
-                            "load-bearing — the value affects which rows go where "
+                            "load-bearing because the value affects which rows go where "
                             "(filtering, grouping, ranking). Output buckets drift "
                             "with wall-clock time. If intentional, suppress with "
                             "`-- noqa-fixture:`; if not, bucket by the absolute "
@@ -479,22 +472,6 @@ def all_findings(parseds: Iterable[ParsedSQL]) -> tuple[Finding, ...]:
     return tuple(f for p in parseds for f in scan_all(p))
 
 
-def _join_side(j: exp.Join) -> JoinSide:
-    side = sg.side_of(j)
-    kind = sg.kind_of(j)
-    if "CROSS" in kind:
-        return JoinSide.CROSS
-    match side:
-        case "LEFT":
-            return JoinSide.LEFT
-        case "RIGHT":
-            return JoinSide.RIGHT
-        case "FULL":
-            return JoinSide.FULL
-        case _:
-            return JoinSide.INNER
-
-
 def _order_targets(order: exp.Order | None) -> tuple[str, ...]:
     if order is None:
         return ()
@@ -509,7 +486,7 @@ def _nullable_tables(sel: exp.Select) -> set[str]:
     accumulated_left: set[str] = {sg.name_of(from_.this)} if from_.this is not None else set()
     for j in sg.joins_of(sel):
         right_name = sg.name_of(j.this)
-        side = _join_side(j)
+        side = sg.join_side_of(j)
         if side is JoinSide.LEFT:
             nullable.add(right_name)
         elif side is JoinSide.RIGHT:

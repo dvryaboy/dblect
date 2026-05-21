@@ -2,7 +2,7 @@
 
 A window function like ``row_number() over (partition by p order by k)`` is
 deterministic only when ``(p, k)`` is unique within the input row scope.
-Otherwise the ranking has ties and the result is non-deterministic — the same
+Otherwise the ranking has ties and the result is non-deterministic: the same
 input can produce different outputs across runs.
 
 This detector is **opportunistic**: it fires only when the project gives us
@@ -41,7 +41,7 @@ def detect_non_unique_window_order_keys(
     """Flag window ORDER BYs whose partition+order keys aren't a unique tuple.
 
     Only the top-level SELECT is inspected, and only when it reads from a
-    single ref'd model. The check is silent for everything else — multi-join
+    single ref'd model. The check is silent for everything else: multi-join
     queries, queries reading from CTEs that we can't trace, queries where the
     source has no declared uniqueness facts.
     """
@@ -161,7 +161,7 @@ def _key_covered_by_facts(
     """True if any uniqueness fact's column set is a subset of `key_set`.
 
     If `(a)` is declared unique on the source and the window key is
-    `(a, ts)`, the window key is unique by extension — a superkey is still a
+    `(a, ts)`, the window key is unique by extension: a superkey is still a
     key. So a fact covers a key set when its columns are a subset.
     """
     return any(fact.columns <= key_set for fact in facts)

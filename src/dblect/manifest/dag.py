@@ -16,7 +16,7 @@ class CycleError(ValueError):
     """Raised when a DAG operation discovers a cycle.
 
     `cycle` lists the node identifiers in the order they were traversed when
-    the cycle was found — useful for error messages, not a unique canonical form.
+    the cycle was found, useful for error messages but not a unique canonical form.
     """
 
     cycle: tuple[str, ...]

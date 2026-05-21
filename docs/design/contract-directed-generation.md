@@ -32,11 +32,11 @@ The practical consequence is that the realism budget shrinks. Generating data th
 
 The proposed generator architecture has three layers.
 
-**Intents.** A small library of generator templates, each parameterized by the contract type and the columns and grain involved. Each intent produces a structural shape known to stress a contract category. The v1 catalog is nine intents (Fanout, Orphan, NullKey, EmptyGroup, OrderingTie, ReplayShuffle, Duplicate, LateRow, Boundary), enumerated in detail below. Each contract category lights up a subset of these — conservation contracts get Fanout/Orphan/NullKey/EmptyGroup, cardinality gets Fanout/Orphan/Boundary, and so on. The catalog is deliberately finite and small; bug classes that aren't captured by the v1 intents are explicitly deferred to v2 (see below).
+**Intents.** A small library of generator templates, each parameterized by the contract type and the columns and grain involved. Each intent produces a structural shape known to stress a contract category. The v1 catalog is nine intents (Fanout, Orphan, NullKey, EmptyGroup, OrderingTie, ReplayShuffle, Duplicate, LateRow, Boundary), enumerated in detail below. Each contract category lights up a subset of these: conservation contracts get Fanout/Orphan/NullKey/EmptyGroup, cardinality gets Fanout/Orphan/Boundary, and so on. The catalog is deliberately finite and small; bug classes that aren't captured by the v1 intents are explicitly deferred to v2 (see below).
 
 **Fill.** Once an intent fixes the structural shape on the contract-relevant columns, the rest of the schema is filled in with cheap defaults respecting foreign keys and declared semantic types. The fill layer uses a Hegel state-machine-style construction (the approach is right for foreign-key integrity by construction) but pulls values from small palettes rather than trying to match production distributions. The fill exists to make dbt run without complaining, and that is enough.
 
-**Profile overlay (optional).** When a profile is available from production sampling, the fill palettes get swapped for profile-derived strategies. Cardinality distributions on join keys, null rates, and time ranges come from real data. The intents still drive the structural shape; the profile adjusts the residual distributions toward realism. This is the layer that lets the OSS Tier 0 case ship a credible default without making the user write generator code.
+**Profile overlay (optional).** When a profile is available from production sampling, the fill palettes get swapped for profile-derived strategies. Cardinality distributions on join keys, null rates, and time ranges come from real data. The intents still drive the structural shape; the profile adjusts the residual distributions toward realism. This is the layer that lets the OSS zero-declaration case ship a credible default without making the user write generator code.
 
 The composition runs intents over the contract's relevant columns, hands off the residual schema to the fill layer, and optionally pulls overlay distributions from a profile. Each (contract, intent) pair becomes a separate test budget, so the framework explores all the structural shapes for each contract rather than betting random search will find them.
 
@@ -88,7 +88,7 @@ Nine intents. Each is a generation template that fixes shape on specific columns
 
 **8. LateRow.** Generate a row whose event_timestamp is earlier than already-processed data's watermark, then process it in a "current" batch. Fixes the event_timestamp column. Catches: late-data tolerance failures, incremental dbt models that miss back-dated events, aggregations that span partitions wrong.
 
-**9. Boundary(bound).** For cardinality contracts only — generate at and just over the declared bound (e.g., for "at most 1 per customer", generate groups of size 1 and size 2). Fixes the count-per-group. Catches: cardinality contracts that pass under typical data and fail at the edge.
+**9. Boundary(bound).** For cardinality contracts only. Generate at and just over the declared bound (e.g., for "at most 1 per customer", generate groups of size 1 and size 2). Fixes the count-per-group. Catches: cardinality contracts that pass under typical data and fail at the edge.
 
 ### What each contract category gets
 
@@ -111,7 +111,7 @@ The v1 scope on the generator side:
 3. Foreign-key-honoring construction for the fill layer, derived automatically from dbt's `relationships` tests with no separate declaration needed.
 4. Per-contract shrinking with goal-directed minimization and foreign-key integrity preservation.
 5. Failing-example memory keyed by contract and intent, Hypothesis serialization conventions where they apply.
-6. Profile overlay as an optional Tier 0 enhancement, derived from production sampling.
+6. Profile overlay as an optional enhancement to the zero-declaration audit, derived from production sampling.
 
 ## What v2 defers
 

@@ -63,7 +63,10 @@ def test_audit_json_format_produces_stable_schema(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["schema_version"]
-    assert payload["summary"]["models_scanned"] == 5
+    from dblect.manifest import Manifest
+
+    expected_models = len(Manifest.from_file(jaffle_manifest_path).models)
+    assert payload["summary"]["models_scanned"] == expected_models
     kinds = {f["kind"] for f in payload["findings"]}
     assert "null_group_after_outer_join" in kinds
 

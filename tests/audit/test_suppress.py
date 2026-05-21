@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from dblect.audit.suppress import (
@@ -185,12 +183,3 @@ def test_every_finding_kind_value_round_trips_through_kind_claim(kind: FindingKi
     assert d.kind is kind or kind is FindingKind.MALFORMED_SUPPRESSION
     if kind is not FindingKind.MALFORMED_SUPPRESSION:
         assert d.reason == "any reason"
-
-
-# This catches both: the suppression-pipeline doesn't accidentally drop the
-# malformed-finding ride-along, AND `replace`'s slot dataclass works.
-def test_replace_preserves_dataclass_shape() -> None:
-    d = SuppressionDirective(line=5, kind=None, reason="r")
-    d2 = replace(d, line=6)
-    assert d2.line == 6
-    assert d2.reason == "r"

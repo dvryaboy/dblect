@@ -31,7 +31,7 @@ from typing import Any, cast
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
-from dblect.manifest import ConstraintSpec, Manifest, Node, ResourceType
+from dblect.manifest import ConstraintSpec, ConstraintType, Manifest, Node, ResourceType
 from dblect.sql import ParsedSQL, SQLParseError
 from dblect.sql import _sqlglot as sg
 
@@ -60,9 +60,9 @@ def facts_from_manifest(
 
     Combines two layers:
 
-    * **Declaration ingestion** — dbt unique tests, dbt-utils composite-key
+    * **Declaration ingestion**: dbt unique tests, dbt-utils composite-key
       tests, dbt 1.5+ native constraints (model-level and column-level).
-    * **Structural proof from SQL** — ``SELECT DISTINCT`` and ``GROUP BY``
+    * **Structural proof from SQL**: ``SELECT DISTINCT`` and ``GROUP BY``
       shapes in each model's ``raw_code``.
 
     Models with no known facts are absent from the mapping; callers should
@@ -161,29 +161,27 @@ def _facts_from_native_constraints(nodes: Iterable[Node]) -> Iterable[Uniqueness
                     model_unique_id=node.unique_id,
                     columns=cols,
                     source=UniquenessSource.NATIVE_CONSTRAINT,
-                    detail=f"model-level {c.type}",
+                    detail=f"model-level {c.type.value}",
                 )
         # Column-level constraints: the column they're attached to is implicit.
         for col_name, col in node.columns.items():
             for c in col.constraints:
-                if _is_uniqueness_constraint(c.type):
+                if c.type in _UNIQUENESS_CONSTRAINT_TYPES:
                     yield UniquenessFact(
                         model_unique_id=node.unique_id,
                         columns=frozenset({col_name}),
                         source=UniquenessSource.NATIVE_CONSTRAINT,
-                        detail=f"column-level {c.type} on {col_name}",
+                        detail=f"column-level {c.type.value} on {col_name}",
                     )
 
 
-_UNIQUENESS_CONSTRAINT_TYPES: frozenset[str] = frozenset({"primary_key", "unique"})
-
-
-def _is_uniqueness_constraint(type_str: str) -> bool:
-    return type_str.lower() in _UNIQUENESS_CONSTRAINT_TYPES
+_UNIQUENESS_CONSTRAINT_TYPES: frozenset[ConstraintType] = frozenset(
+    {ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE}
+)
 
 
 def _uniqueness_columns(c: ConstraintSpec) -> frozenset[str] | None:
-    if not _is_uniqueness_constraint(c.type):
+    if c.type not in _UNIQUENESS_CONSTRAINT_TYPES:
         return None
     if not c.columns:
         return None
@@ -226,7 +224,7 @@ def _facts_from_group_by(model_unique_id: str, sel: exp.Select) -> Iterable[Uniq
     """``SELECT cols, ... FROM ... GROUP BY cols`` proves the output is unique on those cols.
 
     Only emits a fact when every GROUP BY target resolves to a bare column
-    that's also in the SELECT projection — i.e., the uniqueness claim can be
+    that's also in the SELECT projection. That is, the uniqueness claim can be
     expressed in terms of named output columns. ``GROUP BY 1, 2`` (positional)
     and GROUP BY over computed expressions are skipped to keep the rule
     conservative.
@@ -258,7 +256,7 @@ def _project_output_columns(sel: exp.Select) -> list[str]:
 
     Only counts projections that resolve to a named output column: bare
     ``exp.Column`` references and ``exp.Alias`` wrappers. Computed expressions
-    without an alias get no name and are skipped — they can't participate in
+    without an alias get no name and are skipped, since they can't participate in
     a column-name uniqueness claim.
     """
     names: list[str] = []

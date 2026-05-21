@@ -8,7 +8,7 @@ trailing block so PR reviewers can audit what was muted and why.
 The JSON format is a stable, documented schema for CI and editor
 integrations. It includes a ``schema_version`` field so consumers can
 detect breaking changes; we'll bump it any time the shape changes
-incompatibly.
+incompatibly. The shape is reflected in the `JsonReport` TypedDict below.
 """
 
 from __future__ import annotations
@@ -17,11 +17,50 @@ import json
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from textwrap import indent
-from typing import Any
+from typing import TypedDict
 
 from dblect.audit.walker import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
 
 JSON_SCHEMA_VERSION = "1"
+
+
+class JsonSummary(TypedDict):
+    models_scanned: int
+    findings: int
+    suppressed: int
+    skipped: int
+
+
+class JsonFinding(TypedDict):
+    model_unique_id: str
+    file_path: str | None
+    kind: str
+    line_start: int
+    line_end: int
+    message: str
+    sql_snippet: str
+
+
+class JsonSuppression(TypedDict):
+    reason: str
+    directive_line: int
+
+
+class JsonSuppressedFinding(JsonFinding):
+    suppression: JsonSuppression
+
+
+class JsonSkipped(TypedDict):
+    unique_id: str
+    reason: str
+
+
+class JsonReport(TypedDict):
+    schema_version: str
+    summary: JsonSummary
+    findings: list[JsonFinding]
+    suppressed: list[JsonSuppressedFinding]
+    skipped: list[JsonSkipped]
 
 
 def render_text(report: AuditReport) -> str:
@@ -111,11 +150,11 @@ def _skipped_block(skipped: Iterable[SkippedModel]) -> str:
 def render_json(report: AuditReport, *, indent_spaces: int = 2) -> str:
     """Render `report` as a stable JSON document.
 
-    The schema is documented at the module level via ``JSON_SCHEMA_VERSION``.
-    Consumers should branch on that field; we'll bump it on any incompatible
-    change to the shape.
+    The schema is documented at the module level via ``JSON_SCHEMA_VERSION``
+    and reflected in `JsonReport`. Consumers should branch on the version
+    field; we'll bump it on any incompatible change to the shape.
     """
-    payload: dict[str, Any] = {
+    payload: JsonReport = {
         "schema_version": JSON_SCHEMA_VERSION,
         "summary": {
             "models_scanned": report.models_scanned,
@@ -126,13 +165,13 @@ def render_json(report: AuditReport, *, indent_spaces: int = 2) -> str:
         "findings": [_finding_payload(lf) for lf in report.findings],
         "suppressed": [_suppressed_payload(s) for s in report.suppressed],
         "skipped": [
-            {"unique_id": s.unique_id, "reason": s.reason} for s in report.skipped
+            JsonSkipped(unique_id=s.unique_id, reason=s.reason) for s in report.skipped
         ],
     }
     return json.dumps(payload, indent=indent_spaces, sort_keys=True)
 
 
-def _finding_payload(lf: LocatedFinding) -> dict[str, Any]:
+def _finding_payload(lf: LocatedFinding) -> JsonFinding:
     return {
         "model_unique_id": lf.model_unique_id,
         "file_path": lf.file_path,
@@ -144,10 +183,12 @@ def _finding_payload(lf: LocatedFinding) -> dict[str, Any]:
     }
 
 
-def _suppressed_payload(s: SuppressedFinding) -> dict[str, Any]:
-    payload = _finding_payload(s.located)
-    payload["suppression"] = {
-        "reason": s.reason,
-        "directive_line": s.directive_line,
+def _suppressed_payload(s: SuppressedFinding) -> JsonSuppressedFinding:
+    base = _finding_payload(s.located)
+    return {
+        **base,
+        "suppression": {
+            "reason": s.reason,
+            "directive_line": s.directive_line,
+        },
     }
-    return payload

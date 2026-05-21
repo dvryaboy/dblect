@@ -28,7 +28,7 @@ def jaffle_report(jaffle: Manifest) -> AuditReport:
 
 
 def test_audit_scans_every_model_with_raw_code(jaffle: Manifest, jaffle_report: AuditReport) -> None:
-    # jaffle's five models all carry raw_code from `dbt parse`, so none are skipped.
+    # Every jaffle model carries raw_code from `dbt parse`, so none are skipped.
     assert jaffle_report.models_scanned == len(jaffle.models)
     assert jaffle_report.skipped == ()
 
@@ -87,9 +87,21 @@ def test_counts_by_kind_matches_findings(jaffle_report: AuditReport) -> None:
     assert actual == expected
 
 
-def test_default_detectors_covers_the_full_set() -> None:
-    # Sanity: no detector silently dropped between the SQL layer and the audit layer.
-    assert len(DEFAULT_DETECTORS) == 6
+def test_default_detectors_includes_every_sql_detector_exactly_once() -> None:
+    # The audit layer must wire in every `detect_*` the SQL layer exports.
+    # If a new detector lands in dblect.sql but the walker forgets to add it
+    # to DEFAULT_DETECTORS, audits would silently skip it; this test catches
+    # that without pinning the count.
+    import dblect.sql as sql_module
+
+    sql_detectors = {
+        getattr(sql_module, name)
+        for name in dir(sql_module)
+        if name.startswith("detect_") and callable(getattr(sql_module, name))
+    }
+    default_set = set(DEFAULT_DETECTORS)
+    assert sql_detectors == default_set
+    assert len(DEFAULT_DETECTORS) == len(default_set), "DEFAULT_DETECTORS contains duplicates"
 
 
 def test_located_finding_carries_file_path_for_every_scanned_model(
