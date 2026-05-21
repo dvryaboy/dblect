@@ -9,11 +9,15 @@ SQL) and stay silent where we can't ground a claim.
 from dblect.uniqueness.facts import (
     UniquenessFact,
     UniquenessSource,
+    facts_from_declarations,
     facts_from_manifest,
+    facts_from_sql,
 )
 
 __all__ = [
     "UniquenessFact",
     "UniquenessSource",
+    "facts_from_declarations",
     "facts_from_manifest",
+    "facts_from_sql",
 ]

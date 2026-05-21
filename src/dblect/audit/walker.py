@@ -31,6 +31,8 @@ from dblect.sql import (
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
 )
+from dblect.uniqueness import facts_from_manifest
+from dblect.uniqueness.detector import make_detector as _make_uniqueness_detector
 
 Detector = Callable[[ParsedSQL], tuple[Finding, ...]]
 
@@ -100,13 +102,21 @@ def run_audit(
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
     Models whose ``raw_code`` is missing or unparseable are listed in the
     report's ``skipped`` field with a reason rather than raising.
+
+    A uniqueness-aware detector (window order-keys grounded against declared
+    keys on the source model) runs alongside the configured `detectors` list.
+    It's silent on projects without declared uniqueness facts, so it doesn't
+    need an opt-in flag.
     """
+    facts = facts_from_manifest(manifest, dialect=dialect)
+    uniqueness_detector = _make_uniqueness_detector(manifest, facts)
+    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), uniqueness_detector)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []
     scanned = 0
     for _, node in sorted(manifest.models.items()):
-        outcome = _scan_one(node, detectors=detectors, dialect=dialect)
+        outcome = _scan_one(node, detectors=effective_detectors, dialect=dialect)
         if isinstance(outcome, _Scanned):
             scanned += 1
             active.extend(outcome.findings)
