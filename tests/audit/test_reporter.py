@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding, run_audit
-from dblect.audit.reporter import render_text
+from dblect.audit.reporter import JSON_SCHEMA_VERSION, render_json, render_text
 from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind
 
@@ -127,3 +128,94 @@ def test_line_range_formatting(start: int, end: int, expected: str) -> None:
     lf = _lf(finding=_finding(line_start=start, line_end=end))
     report = AuditReport(findings=(lf,), suppressed=(), skipped=(), models_scanned=1)
     assert expected in render_text(report)
+
+
+# --- JSON reporter ---
+
+
+def test_json_empty_report_has_well_formed_summary() -> None:
+    report = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=3)
+    payload = json.loads(render_json(report))
+    assert payload["schema_version"] == JSON_SCHEMA_VERSION
+    assert payload["summary"] == {
+        "models_scanned": 3,
+        "findings": 0,
+        "suppressed": 0,
+        "skipped": 0,
+    }
+    assert payload["findings"] == []
+    assert payload["suppressed"] == []
+    assert payload["skipped"] == []
+
+
+def test_json_finding_has_documented_shape() -> None:
+    lf = _lf(
+        "model.pkg.a",
+        "models/a.sql",
+        _finding(
+            line_start=10,
+            line_end=12,
+            kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+            message="m",
+            snippet="s",
+        ),
+    )
+    report = AuditReport(findings=(lf,), suppressed=(), skipped=(), models_scanned=1)
+    payload = json.loads(render_json(report))
+    [f] = payload["findings"]
+    assert f == {
+        "model_unique_id": "model.pkg.a",
+        "file_path": "models/a.sql",
+        "kind": "null_group_after_outer_join",
+        "line_start": 10,
+        "line_end": 12,
+        "message": "m",
+        "sql_snippet": "s",
+    }
+
+
+def test_json_suppressed_finding_includes_directive() -> None:
+    s = SuppressedFinding(
+        located=_lf(finding=_finding(line_start=7)),
+        reason="orphan handling",
+        directive_line=7,
+    )
+    report = AuditReport(findings=(), suppressed=(s,), skipped=(), models_scanned=1)
+    payload = json.loads(render_json(report))
+    [entry] = payload["suppressed"]
+    assert entry["suppression"] == {"reason": "orphan handling", "directive_line": 7}
+    # The finding fields are still present alongside the suppression block.
+    assert entry["kind"] == "null_group_after_outer_join"
+
+
+def test_json_skipped_models_round_trip() -> None:
+    report = AuditReport(
+        findings=(),
+        suppressed=(),
+        skipped=(SkippedModel(unique_id="model.pkg.bad", reason="parse error: ..."),),
+        models_scanned=0,
+    )
+    payload = json.loads(render_json(report))
+    assert payload["skipped"] == [
+        {"unique_id": "model.pkg.bad", "reason": "parse error: ..."}
+    ]
+
+
+def test_json_is_stable_under_unsorted_input() -> None:
+    a = _lf("model.pkg.a", "models/a.sql", _finding(line_start=10))
+    b = _lf("model.pkg.b", "models/b.sql", _finding(line_start=5))
+    r1 = AuditReport(findings=(a, b), suppressed=(), skipped=(), models_scanned=2)
+    r2 = AuditReport(findings=(b, a), suppressed=(), skipped=(), models_scanned=2)
+    # JSON ordering follows the input findings order, NOT a sort — so the two
+    # reports are different documents. This test pins that contract so we
+    # don't accidentally reorder later.
+    assert render_json(r1) != render_json(r2)
+
+
+def test_json_against_real_jaffle(jaffle_manifest_path: Path) -> None:
+    manifest = Manifest.from_file(jaffle_manifest_path)
+    report = run_audit(manifest)
+    payload = json.loads(render_json(report))
+    assert payload["summary"]["models_scanned"] == 5
+    kinds = {f["kind"] for f in payload["findings"]}
+    assert "null_group_after_outer_join" in kinds

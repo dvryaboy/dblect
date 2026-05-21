@@ -1,21 +1,27 @@
-"""Render an ``AuditReport`` for human consumption.
+"""Render an ``AuditReport`` for human or machine consumption.
 
 The text format groups findings by their originating model so a developer
 scanning the output can click through to a file:line and see every issue
 the file accumulated in one place. Suppressed findings show up in a compact
 trailing block so PR reviewers can audit what was muted and why.
 
-Machine-readable formats (JSON, eventually SARIF) live elsewhere; this module
-is for what gets printed on a terminal.
+The JSON format is a stable, documented schema for CI and editor
+integrations. It includes a ``schema_version`` field so consumers can
+detect breaking changes; we'll bump it any time the shape changes
+incompatibly.
 """
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from textwrap import indent
+from typing import Any
 
 from dblect.audit.walker import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
+
+JSON_SCHEMA_VERSION = "1"
 
 
 def render_text(report: AuditReport) -> str:
@@ -100,3 +106,48 @@ def _skipped_block(skipped: Iterable[SkippedModel]) -> str:
         for s in sorted(skipped, key=lambda x: x.unique_id)
     )
     return "\n".join(lines)
+
+
+def render_json(report: AuditReport, *, indent_spaces: int = 2) -> str:
+    """Render `report` as a stable JSON document.
+
+    The schema is documented at the module level via ``JSON_SCHEMA_VERSION``.
+    Consumers should branch on that field; we'll bump it on any incompatible
+    change to the shape.
+    """
+    payload: dict[str, Any] = {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "summary": {
+            "models_scanned": report.models_scanned,
+            "findings": len(report.findings),
+            "suppressed": len(report.suppressed),
+            "skipped": len(report.skipped),
+        },
+        "findings": [_finding_payload(lf) for lf in report.findings],
+        "suppressed": [_suppressed_payload(s) for s in report.suppressed],
+        "skipped": [
+            {"unique_id": s.unique_id, "reason": s.reason} for s in report.skipped
+        ],
+    }
+    return json.dumps(payload, indent=indent_spaces, sort_keys=True)
+
+
+def _finding_payload(lf: LocatedFinding) -> dict[str, Any]:
+    return {
+        "model_unique_id": lf.model_unique_id,
+        "file_path": lf.file_path,
+        "kind": lf.finding.kind.value,
+        "line_start": lf.finding.line_start,
+        "line_end": lf.finding.line_end,
+        "message": lf.finding.message,
+        "sql_snippet": lf.finding.sql_snippet,
+    }
+
+
+def _suppressed_payload(s: SuppressedFinding) -> dict[str, Any]:
+    payload = _finding_payload(s.located)
+    payload["suppression"] = {
+        "reason": s.reason,
+        "directive_line": s.directive_line,
+    }
+    return payload
