@@ -70,14 +70,17 @@ def test_unparseable_redacted_sql_raises_typed_error() -> None:
     assert "select from where" in excinfo.value.redacted_sql
 
 
+_RESERVED = frozenset(
+    {"select", "from", "where", "on", "as", "and", "or", "not", "in", "is", "null"}
+)
+_IDENT = st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True).filter(
+    lambda s: s not in _RESERVED
+)
+
+
 @given(
-    cols=st.lists(
-        st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True),
-        min_size=1,
-        max_size=5,
-        unique=True,
-    ),
-    table=st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True),
+    cols=st.lists(_IDENT, min_size=1, max_size=5, unique=True),
+    table=_IDENT,
 )
 @settings(max_examples=50, deadline=None)
 def test_simple_select_round_trips_through_parse(cols: list[str], table: str) -> None:

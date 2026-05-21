@@ -36,6 +36,7 @@ class FindingKind(StrEnum):
     COALESCE_ON_JOIN_KEY = "coalesce_on_join_key"
     UNORDERED_RANKING_WINDOW = "unordered_ranking_window"
     UNORDERED_AGGREGATE = "unordered_aggregate"
+    MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
 class JoinSide(StrEnum):

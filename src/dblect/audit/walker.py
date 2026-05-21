@@ -17,6 +17,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node
 from dblect.sql import (
     Finding,
@@ -49,6 +50,15 @@ class LocatedFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class SuppressedFinding:
+    """A finding that a ``-- noqa-fixture:`` directive silenced, with its reason."""
+
+    located: LocatedFinding
+    reason: str
+    directive_line: int
+
+
+@dataclass(frozen=True, slots=True)
 class SkippedModel:
     """A model the walker couldn't scan, with the reason."""
 
@@ -61,6 +71,7 @@ class AuditReport:
     """The output of one ``run_audit`` invocation."""
 
     findings: tuple[LocatedFinding, ...]
+    suppressed: tuple[SuppressedFinding, ...]
     skipped: tuple[SkippedModel, ...]
     models_scanned: int
 
@@ -86,18 +97,21 @@ def run_audit(
     Models whose ``raw_code`` is missing or unparseable are listed in the
     report's ``skipped`` field with a reason rather than raising.
     """
-    findings: list[LocatedFinding] = []
+    active: list[LocatedFinding] = []
+    suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []
     scanned = 0
     for _, node in sorted(manifest.models.items()):
         outcome = _scan_one(node, detectors=detectors, dialect=dialect)
         if isinstance(outcome, _Scanned):
             scanned += 1
-            findings.extend(outcome.findings)
+            active.extend(outcome.findings)
+            suppressed.extend(outcome.suppressed)
         else:
             skipped.append(outcome)
     return AuditReport(
-        findings=tuple(findings),
+        findings=tuple(active),
+        suppressed=tuple(suppressed),
         skipped=tuple(skipped),
         models_scanned=scanned,
     )
@@ -106,6 +120,7 @@ def run_audit(
 @dataclass(frozen=True, slots=True)
 class _Scanned:
     findings: tuple[LocatedFinding, ...]
+    suppressed: tuple[SuppressedFinding, ...]
 
 
 def _scan_one(
@@ -120,14 +135,33 @@ def _scan_one(
         parsed = ParsedSQL.parse(node.raw_code, dialect=dialect)
     except SQLParseError as e:
         return SkippedModel(unique_id=node.unique_id, reason=f"parse error: {e}")
-    located: list[LocatedFinding] = []
+
+    raw_findings: list[Finding] = []
     for detector in detectors:
-        located.extend(
-            LocatedFinding(
-                model_unique_id=node.unique_id,
-                file_path=node.original_file_path,
-                finding=f,
-            )
-            for f in detector(parsed)
+        raw_findings.extend(detector(parsed))
+    directives, malformed = parse_directives(node.raw_code)
+    # Malformed-suppression findings ride the regular pipeline; we never
+    # suppress them with another directive (it would be silly), so apply()
+    # only runs over the detector findings.
+    active_raw, suppressed_raw = apply(raw_findings, directives)
+    located_active = [_locate(node, f) for f in (*active_raw, *malformed)]
+    located_suppressed = [
+        SuppressedFinding(
+            located=_locate(node, f),
+            reason=d.reason,
+            directive_line=d.line,
         )
-    return _Scanned(findings=tuple(located))
+        for f, d in suppressed_raw
+    ]
+    return _Scanned(
+        findings=tuple(located_active),
+        suppressed=tuple(located_suppressed),
+    )
+
+
+def _locate(node: Node, finding: Finding) -> LocatedFinding:
+    return LocatedFinding(
+        model_unique_id=node.unique_id,
+        file_path=node.original_file_path,
+        finding=finding,
+    )
