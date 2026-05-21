@@ -34,7 +34,7 @@ Inside any dbt project:
 dblect init
 ```
 
-This scaffolds `dblect/`, adds dblect to your project dependencies, parses your dbt project, generates editor stubs, and runs the Tier 0 audit end-to-end. First findings typically land in under a minute.
+This scaffolds `dblect/`, adds dblect to your project dependencies, parses your dbt project, generates editor stubs, and runs the static-analysis audit end-to-end. First findings typically land in under a minute.
 
 See the [demo walkthrough](docs/demo_walkthrough.md) for an end-to-end tour against `jaffle_shop_duckdb`.
 

@@ -1,1 +1,1 @@
-"""Tier 0 audit: static detectors, replay-determinism, heuristic invariants."""
+"""Audit pipeline: static detectors, replay-determinism, heuristic invariants."""

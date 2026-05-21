@@ -19,7 +19,6 @@ def test_loads_schema_version(jaffle: Manifest) -> None:
 
 
 def test_partitions_nodes_by_resource_type(jaffle: Manifest) -> None:
-    # jaffle_shop_duckdb has 5 models + 3 seeds + 20 tests + 0 sources.
     assert len(jaffle.models) == 5
     assert len(jaffle.seeds) == 3
     assert len(jaffle.sources) == 0

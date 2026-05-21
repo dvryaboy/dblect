@@ -95,14 +95,10 @@ def test_simple_select_round_trips_through_parse(cols: list[str], table: str) ->
 @settings(max_examples=30, deadline=None)
 def test_ref_count_matches_jinja_ref_occurrences(n: int) -> None:
     refs = [f"m{i}" for i in range(n)]
-    if not refs:
-        sql = "select 1"
-    else:
-        joined = ", ".join(f"select * from {{{{ ref('{r}') }}}}" for r in refs)
-        sql = f"with cte as ({joined}) select 1"
-    # Construct a parseable statement that places each ref in a FROM
     if refs:
         clauses = " union all ".join(f"select 1 as x from {{{{ ref('{r}') }}}}" for r in refs)
         sql = f"with cte as ({clauses}) select * from cte"
+    else:
+        sql = "select 1"
     p = ParsedSQL.parse(sql, dialect="duckdb")
     assert p.refs == tuple(refs)

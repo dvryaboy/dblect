@@ -1,4 +1,4 @@
-"""Tests for SQL pattern queries and Tier 0 detectors."""
+"""Tests for SQL pattern queries and structural hazard detectors."""
 
 from __future__ import annotations
 
@@ -44,7 +44,13 @@ def test_list_windows_partitions_ranking_vs_non_ranking() -> None:
     assert {w.function for w in ws} == {"RowNumber", "Sum"}
     ranking = next(w for w in ws if w.function == "RowNumber")
     assert ranking.is_ranking is True
-    assert ranking.order_by == ("x NULLS LAST",) or ranking.order_by == ("x",)
+    # The rendered form may carry NULLS positioning depending on sqlglot version;
+    # we only care that the order key is present and non-empty.
+    assert len(ranking.order_by) == 1
+    assert ranking.order_by[0].startswith("x")
+    non_ranking = next(w for w in ws if w.function == "Sum")
+    assert non_ranking.is_ranking is False
+    assert non_ranking.order_by == ()
 
 
 def test_list_group_bys_one_per_select() -> None:

@@ -1,4 +1,4 @@
-"""Pattern queries and Tier 0 hazard detectors over a parsed SQL AST.
+"""Pattern queries and structural hazard detectors over a parsed SQL AST.
 
 Two layers, both pure functions over a `ParsedSQL`:
 
@@ -12,10 +12,10 @@ Two layers, both pure functions over a `ParsedSQL`:
 
 `scan_all` runs every detector and returns the combined findings.
 
-The static analyser doesn't have type information, lineage, or runtime data.
-Detectors prefer false positives over false negatives at this tier: each
-finding is a "look at this" that a Tier 1+ contract can suppress with a
-typed statement (or the user can dismiss with the per-finding ignore syntax).
+The static analyser doesn't have type information, lineage, or runtime data,
+so detectors prefer false positives over false negatives: each finding is a
+"look at this" that a typed contract can suppress (or the user can dismiss
+with the per-finding ignore syntax).
 """
 
 from __future__ import annotations

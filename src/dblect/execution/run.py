@@ -1,8 +1,8 @@
 """Run dbt models end-to-end in DuckDB and capture the output.
 
-This is the substrate the Tier 0 invariant checks and the runtime PBT loop
-sit on. The HANDOFF discussion settles on subprocess as the v1 approach for
-fidelity: in-process Jinja rendering is a follow-up when perf bites.
+This is the substrate the static-analysis invariant checks and the runtime
+PBT loop sit on. We use a subprocess as the v1 approach for fidelity:
+in-process Jinja rendering is a follow-up when perf bites.
 
 The contract:
 

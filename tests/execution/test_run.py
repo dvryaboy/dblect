@@ -34,8 +34,11 @@ def test_runs_customers_against_real_seeds(jaffle_project_dir: Path) -> None:
     result = run_model(jaffle_project_dir, "customers")
     assert result.model_name == "customers"
     assert result.row_count == 100
-    assert "customer_id" in result.columns
-    assert "customer_lifetime_value" in result.columns
+    expected_cols = {"customer_id", "number_of_orders", "customer_lifetime_value"}
+    assert expected_cols <= set(result.columns)
+    rows = result.as_dicts()
+    assert all(r["customer_id"] is not None for r in rows)
+    assert len({r["customer_id"] for r in rows}) == result.row_count
 
 
 def test_empty_seeds_produce_empty_output(jaffle_project_dir: Path) -> None:
@@ -84,7 +87,10 @@ def test_run_error_surfaces_dbt_compile_failure(jaffle_project_dir: Path, tmp_pa
 
     with pytest.raises(RunError) as excinfo:
         run_model(broken, "customers")
-    assert excinfo.value.phase in {"run", "seed"}
+    # dbt parses the full project at the start of every subcommand, so a
+    # broken `ref` surfaces during `dbt seed` (the first thing we run)
+    # rather than waiting for `dbt run`.
+    assert excinfo.value.phase == "seed"
     assert excinfo.value.returncode != 0
 
 
@@ -96,8 +102,16 @@ def test_missing_project_dir_raises_file_not_found(tmp_path: Path) -> None:
 
 
 def test_keep_artifacts_in_persists_warehouse(jaffle_project_dir: Path, tmp_path: Path) -> None:
+    import duckdb
+
     from dblect.execution import run_model
 
     keep = tmp_path / "kept"
-    run_model(jaffle_project_dir, "stg_customers", keep_artifacts_in=keep)
-    assert any(p.suffix == ".duckdb" for p in keep.iterdir())
+    result = run_model(jaffle_project_dir, "stg_customers", keep_artifacts_in=keep)
+    [duckdb_file] = [p for p in keep.iterdir() if p.suffix == ".duckdb"]
+    con = duckdb.connect(str(duckdb_file), read_only=True)
+    try:
+        (n,) = con.execute("select count(*) from stg_customers").fetchone()
+    finally:
+        con.close()
+    assert n == result.row_count
