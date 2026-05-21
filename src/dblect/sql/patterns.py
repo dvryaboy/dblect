@@ -36,6 +36,8 @@ class FindingKind(StrEnum):
     COALESCE_ON_JOIN_KEY = "coalesce_on_join_key"
     UNORDERED_RANKING_WINDOW = "unordered_ranking_window"
     UNORDERED_AGGREGATE = "unordered_aggregate"
+    WHERE_ON_OUTER_JOINED_NULLABLE = "where_on_outer_joined_nullable"
+    NON_DETERMINISTIC_FUNCTION = "non_deterministic_function"
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
@@ -124,6 +126,38 @@ _RANKING_FUNCTIONS: frozenset[type[Expr]] = frozenset(
 )
 
 _ORDERED_AGGREGATE_FUNCTIONS: frozenset[type[Expr]] = frozenset({exp.ArrayAgg, exp.GroupConcat})
+
+_NULL_INTOLERANT_COMPARISONS: frozenset[type[Expr]] = frozenset(
+    {
+        exp.EQ,
+        exp.NEQ,
+        exp.GT,
+        exp.LT,
+        exp.GTE,
+        exp.LTE,
+        exp.In,
+        exp.Like,
+        exp.ILike,
+        exp.Between,
+    }
+)
+
+_NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
+    {
+        exp.CurrentTimestamp,
+        exp.CurrentDate,
+        exp.CurrentTime,
+        exp.CurrentUser,
+        exp.Rand,
+        exp.Uuid,
+    }
+)
+
+# Names that arrive as `exp.Anonymous` (or similar) rather than a dedicated
+# sqlglot type, e.g. `now()`. Match is case-insensitive.
+_NON_DETERMINISTIC_NAMES: frozenset[str] = frozenset(
+    {"now", "current_database", "current_schema", "gen_random_uuid", "sysdate"}
+)
 
 
 def _finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
@@ -332,11 +366,105 @@ def detect_unordered_aggregate(parsed: ParsedSQL) -> tuple[Finding, ...]:
     return tuple(out)
 
 
+def detect_where_on_outer_joined_nullable(parsed: ParsedSQL) -> tuple[Finding, ...]:
+    """Flag WHERE predicates that silently invert an OUTER JOIN into an INNER one.
+
+    ``select * from a left join b on a.k = b.k where b.col = X`` rejects every
+    unmatched row from ``a`` because ``b.col`` is NULL there and ``NULL = X``
+    is NULL. The LEFT JOIN reads like it preserves left rows, but the WHERE
+    quietly takes them back. The fix is to move the predicate into the JOIN's
+    ON clause or to wrap the column in ``coalesce``.
+
+    A predicate is "protected" if the column reference is wrapped in
+    ``COALESCE`` or sits inside an ``IS [NOT] NULL`` check between itself and
+    the comparison node. Protected predicates are silent.
+    """
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(parsed.tree):
+        nullable = _nullable_tables(sel)
+        if not nullable:
+            continue
+        where = sel.args.get("where")
+        if where is None:
+            continue
+        for cmp in where.find_all(*_NULL_INTOLERANT_COMPARISONS):
+            risky_tables: set[str] = set()
+            for c in sg.find_columns(cmp):
+                if _is_null_protected(c, until=cmp):
+                    continue
+                table = sg.column_table(c)
+                if table is not None and table in nullable:
+                    risky_tables.add(table)
+            if risky_tables:
+                tables = ", ".join(sorted(risky_tables))
+                out.append(
+                    _finding_at(
+                        FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
+                        message=(
+                            f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
+                            f"nullable join side ({tables}); rows where the join didn't match "
+                            "are filtered out, silently inverting the OUTER JOIN to INNER. "
+                            "Move the predicate into the ON clause, or guard the column "
+                            "with COALESCE / IS [NOT] NULL."
+                        ),
+                        node=cmp,
+                    )
+                )
+    return tuple(out)
+
+
+def detect_non_deterministic_function(parsed: ParsedSQL) -> tuple[Finding, ...]:
+    """Flag non-deterministic function calls in load-bearing positions.
+
+    "Load-bearing" means the function's value affects which rows go where,
+    not just what gets projected. JOIN ON conditions, GROUP BY targets,
+    PARTITION BY and ORDER BY inside window specs all qualify; ``WHERE`` and
+    ``HAVING`` do not (incremental models that filter on
+    ``now() - interval`` are a known and legitimate idiom). Projected
+    non-determinism (``select current_timestamp() as loaded_at``) is also
+    silent.
+
+    Functions: ``current_timestamp``, ``current_date``, ``current_time``,
+    ``current_user``, ``random()``, ``uuid()``/``gen_random_uuid()``,
+    ``now()``, plus dialect-specific aliases. Matched by sqlglot expression
+    type for the typed forms and by name (case-insensitive) for
+    ``exp.Anonymous`` nodes.
+
+    TODO: once we read ``Node.config.materialized``, narrow the detector to
+    table/incremental models (the cases where stored aggregates drift over
+    time). Views are recomputed every read, so the hazard mostly evaporates.
+    """
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(parsed.tree):
+        scopes = _load_bearing_scopes(sel)
+        for label, scope in scopes:
+            calls = _find_non_deterministic(scope)
+            for call in calls:
+                func_name = _non_deterministic_name(call)
+                out.append(
+                    _finding_at(
+                        FindingKind.NON_DETERMINISTIC_FUNCTION,
+                        message=(
+                            f"{func_name} appears in {label}; this position is "
+                            "load-bearing — the value affects which rows go where "
+                            "(filtering, grouping, ranking). Output buckets drift "
+                            "with wall-clock time. If intentional, suppress with "
+                            "`-- noqa-fixture:`; if not, bucket by the absolute "
+                            "timestamp and derive the relative measure at query time."
+                        ),
+                        node=scope,
+                    )
+                )
+    return tuple(out)
+
+
 _ALL_DETECTORS = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
+    detect_where_on_outer_joined_nullable,
+    detect_non_deterministic_function,
 )
 
 
@@ -390,3 +518,70 @@ def _nullable_tables(sel: exp.Select) -> set[str]:
             nullable.update(accumulated_left)
         accumulated_left.add(right_name)
     return nullable
+
+
+def _is_null_protected(col: exp.Column, *, until: Expr) -> bool:
+    """True if `col` is wrapped in a NULL-tolerant context before reaching `until`.
+
+    Walks from `col` up the AST. ``COALESCE(col, ...)`` returns the fallback
+    when ``col`` is NULL, so the comparison sees a non-NULL value. ``IS NULL``
+    and ``IS NOT NULL`` are themselves null checks, so the analyst is
+    explicitly handling the nullable case.
+    """
+    node: Expr | None = col
+    while node is not None and node is not until:
+        if isinstance(node, exp.Coalesce | exp.Is):
+            return True
+        node = node.parent
+    return False
+
+
+def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
+    """Locations in `sel` where non-determinism changes which rows go where.
+
+    Returns ``(label, scope)`` pairs:
+
+    * Each JOIN's ON clause.
+    * Each GROUP BY target expression.
+    * Each window function's PARTITION BY expression list (rolled up as the
+      window node itself for snippet purposes) and ORDER BY expression list.
+
+    WHERE and HAVING are intentionally absent: a 7-day lookback like
+    ``where ts >= now() - interval`` is a legitimate incremental idiom that
+    we don't want to flag.
+    """
+    scopes: list[tuple[str, Expr]] = []
+    for j in sg.joins_of(sel):
+        on = sg.on_of(j)
+        if on is not None:
+            scopes.append(("a JOIN ON clause", on))
+    group = sg.group_of(sel)
+    if group is not None:
+        scopes.extend(("a GROUP BY target", g) for g in group.expressions)
+    for w in sg.find_all_windows(sel):
+        scopes.extend(("a window PARTITION BY", part) for part in sg.partition_of(w))
+        order = sg.order_of(w)
+        if order is not None:
+            scopes.extend(("a window ORDER BY", e) for e in order.expressions)
+    return scopes
+
+
+def _find_non_deterministic(e: Expr) -> list[Expr]:
+    """Every non-deterministic function call reachable from `e` (transitive)."""
+    return [node for node in e.walk() if _is_non_deterministic(node)]
+
+
+def _is_non_deterministic(node: Expr) -> bool:
+    if type(node) in _NON_DETERMINISTIC_TYPED:
+        return True
+    return (
+        isinstance(node, exp.Anonymous)
+        and isinstance(node.this, str)
+        and node.this.lower() in _NON_DETERMINISTIC_NAMES
+    )
+
+
+def _non_deterministic_name(call: Expr) -> str:
+    if isinstance(call, exp.Anonymous) and isinstance(call.this, str):
+        return f"{call.this}()"
+    return type(call).__name__

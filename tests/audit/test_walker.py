@@ -89,7 +89,7 @@ def test_counts_by_kind_matches_findings(jaffle_report: AuditReport) -> None:
 
 def test_default_detectors_covers_the_full_set() -> None:
     # Sanity: no detector silently dropped between the SQL layer and the audit layer.
-    assert len(DEFAULT_DETECTORS) == 4
+    assert len(DEFAULT_DETECTORS) == 6
 
 
 def test_located_finding_carries_file_path_for_every_scanned_model(

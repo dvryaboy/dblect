@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -11,9 +12,11 @@ from dblect.sql import (
     JoinSide,
     ParsedSQL,
     detect_coalesce_on_join_key,
+    detect_non_deterministic_function,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
+    detect_where_on_outer_joined_nullable,
     list_aggregations,
     list_group_bys,
     list_joins,
@@ -139,6 +142,26 @@ def test_ordered_row_number_not_flagged() -> None:
     assert detect_unordered_window(p) == ()
 
 
+@pytest.mark.parametrize(
+    "func",
+    ["lag(x)", "lead(x)", "first_value(x)", "last_value(x)", "nth_value(x, 2)"],
+)
+def test_unordered_lookup_window_functions_are_detected(func: str) -> None:
+    p = _parse(f"select {func} over (partition by g) from t")
+    findings = detect_unordered_window(p)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
+
+
+@pytest.mark.parametrize(
+    "func",
+    ["lag(x)", "lead(x)", "first_value(x)", "last_value(x)"],
+)
+def test_ordered_lookup_window_functions_not_flagged(func: str) -> None:
+    p = _parse(f"select {func} over (partition by g order by ts) from t")
+    assert detect_unordered_window(p) == ()
+
+
 def test_unordered_array_agg_detected() -> None:
     p = _parse("select array_agg(x) as arr from t")
     findings = detect_unordered_aggregate(p)
@@ -154,6 +177,27 @@ def test_ordered_array_agg_not_flagged() -> None:
 def test_within_group_array_agg_not_flagged() -> None:
     p = _parse("select array_agg(x) within group (order by y) as arr from t")
     assert detect_unordered_aggregate(p) == ()
+
+
+def test_unordered_string_agg_detected() -> None:
+    # sqlglot parses both STRING_AGG and GROUP_CONCAT into exp.GroupConcat,
+    # so the existing aggregate detector covers them.
+    p = _parse("select string_agg(name, ',') as names from t")
+    findings = detect_unordered_aggregate(p)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
+
+
+def test_ordered_string_agg_not_flagged() -> None:
+    p = _parse("select string_agg(name, ',' order by ts) as names from t")
+    assert detect_unordered_aggregate(p) == ()
+
+
+def test_unordered_group_concat_detected() -> None:
+    p = _parse("select group_concat(name) as names from t")
+    findings = detect_unordered_aggregate(p)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
 
 
 def test_finding_carries_line_range_of_offending_expression() -> None:
@@ -189,6 +233,124 @@ def test_finding_line_range_survives_multiline_jinja() -> None:
     assert len(findings) == 1
     assert findings[0].line_start == 9
     assert findings[0].line_end == 9
+
+
+# --- WHERE on outer-joined nullable ---
+
+
+def test_where_on_left_joined_nullable_detected() -> None:
+    sql = "select * from a left join b on a.k = b.k where b.status = 'active'"
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
+
+
+def test_where_on_left_joined_left_side_not_detected() -> None:
+    # a is the left side; predicates on a.* don't invert the join.
+    sql = "select * from a left join b on a.k = b.k where a.status = 'active'"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_on_inner_joined_not_detected() -> None:
+    sql = "select * from a inner join b on a.k = b.k where b.status = 'active'"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_is_null_on_nullable_not_detected() -> None:
+    # IS NULL on the nullable side is the explicit "find unmatched rows" idiom.
+    sql = "select * from a left join b on a.k = b.k where b.k is null"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_coalesced_nullable_not_detected() -> None:
+    sql = (
+        "select * from a left join b on a.k = b.k "
+        "where coalesce(b.status, 'unknown') = 'active'"
+    )
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_in_predicate_on_nullable_detected() -> None:
+    sql = "select * from a left join b on a.k = b.k where b.status in ('x', 'y')"
+    assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
+
+
+def test_where_between_on_nullable_detected() -> None:
+    sql = "select * from a left join b on a.k = b.k where b.amount between 1 and 10"
+    assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
+
+
+def test_where_on_right_joined_left_side_detected() -> None:
+    sql = "select * from a right join b on a.k = b.k where a.status = 'x'"
+    assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
+
+
+# --- Non-deterministic function in load-bearing positions ---
+
+
+def test_now_in_join_on_detected() -> None:
+    sql = "select * from a join b on a.k = b.k and b.created_at < now()"
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
+
+
+def test_now_in_group_by_detected() -> None:
+    sql = "select date_diff('day', ts, now()) as days_ago, count(*) from t group by 1"
+    # `group by 1` is a positional reference; the GROUP BY *target* in the AST
+    # is the literal 1, not the expression. So this won't fire. The pattern
+    # we care about is `group by <expression containing now()>` directly.
+    # (Documented because someone will inevitably wonder why it didn't trigger.)
+    assert detect_non_deterministic_function(_parse(sql)) == ()
+
+
+def test_now_in_explicit_group_by_expression_detected() -> None:
+    sql = (
+        "select date_diff('day', ts, now()) as days_ago, count(*) "
+        "from t group by date_diff('day', ts, now())"
+    )
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_current_timestamp_in_window_order_by_detected() -> None:
+    sql = (
+        "select row_number() over (order by ts - current_timestamp) as rn from t"
+    )
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_random_in_window_partition_by_detected() -> None:
+    sql = "select rank() over (partition by random() order by ts) from t"
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_now_in_where_not_detected() -> None:
+    # The lookback idiom we explicitly want to leave alone.
+    sql = "select * from t where ts >= now() - interval '7 days'"
+    assert detect_non_deterministic_function(_parse(sql)) == ()
+
+
+def test_now_in_projection_not_detected() -> None:
+    # Audit columns are common and benign.
+    sql = "select x, current_timestamp as loaded_at from t"
+    assert detect_non_deterministic_function(_parse(sql)) == ()
+
+
+def test_uuid_in_join_on_detected() -> None:
+    sql = "select * from a join b on a.k = gen_random_uuid()"
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_now_function_call_alias_detected() -> None:
+    # now() arrives as exp.Anonymous; current_timestamp is a typed node.
+    sql = "select * from t group by now()"
+    findings = detect_non_deterministic_function(_parse(sql))
+    assert len(findings) == 1
+    assert "now" in findings[0].message.lower()
 
 
 def test_scan_all_runs_every_detector() -> None:

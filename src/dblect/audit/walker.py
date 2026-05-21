@@ -25,9 +25,11 @@ from dblect.sql import (
     ParsedSQL,
     SQLParseError,
     detect_coalesce_on_join_key,
+    detect_non_deterministic_function,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
+    detect_where_on_outer_joined_nullable,
 )
 
 Detector = Callable[[ParsedSQL], tuple[Finding, ...]]
@@ -37,6 +39,8 @@ DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
+    detect_where_on_outer_joined_nullable,
+    detect_non_deterministic_function,
 )
 
 
