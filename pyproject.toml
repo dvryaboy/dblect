@@ -49,6 +49,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "pyright>=1.1.380",
+    "dbt-core>=1.8",
+    "dbt-duckdb>=1.8",
 ]
 
 [tool.hatch.version]
