@@ -429,3 +429,21 @@ this seems straightforward to solve once we get to this point
   into a demo.
 
 figure out later
+
+  16. SQL static-analysis AST: sqlglot directly, or an internal AST? The tech intro's open-questions section flags this. The Tier 0 static
+  analyzer walks SQL pulled out of dbt models. The Tier 1+ contract-method DSL builds its own proxy-expression AST that has to compile to
+  SQL anyway. Either we share representations across both layers (one AST), or we keep them separate.
+
+DECISION: The `dblect.sql` static-analysis layer walks sqlglot's AST directly. No internal wrapper AST at this tier. Rationale:
+  - sqlglot's AST is the substrate the field uses (SQLMesh, dbt-core internals, Ibis backends). Reintroducing a parallel AST is cost
+    without payoff at the static-analysis layer, where every operation we want to express ("find joins," "find window functions and their
+    ORDER BY," "find COALESCE on a join key") is naturally phrased over sqlglot expression nodes.
+  - sqlglot ships first-party type stubs and a stable enough public API that we can type-check the boundary without leaking `Any`. Pattern
+    detectors return our own dblect-shaped value types (frozen dataclasses), so downstream consumers do not have to import sqlglot to read
+    findings.
+  - The Tier 1+ proxy-expression DSL (`contract.conservation`, column proxies) is a separate AST concern. Whether that DSL produces
+    sqlglot expressions directly or a thin proxy AST that lowers to sqlglot is independent of this decision and stays open. If the proxy
+    DSL ends up wanting a richer shape (refinement-axis carrying, branch-typed nodes for flag worlds, etc.), it can be its own AST that
+    lowers to sqlglot for execution. The static analyzer does not read proxy expressions; it reads SQL pulled from dbt model files.
+  - The value types `dblect.sql` exposes (findings, pattern matches, structural summaries) are stable across any future decision about the
+    proxy DSL. Swapping sqlglot for another parser later would be local to the `dblect.sql.parse` boundary.
