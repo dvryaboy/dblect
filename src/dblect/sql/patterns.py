@@ -8,7 +8,7 @@ Two layers, both pure functions over a `ParsedSQL`:
   import sqlglot.
 * **Detectors** (`detect_*`) emit `Finding`s for structural hazards: NULL
   groups after outer joins, COALESCE on a join key, undefined-ordering window
-  functions, integer division on cents-named columns.
+  functions and aggregates.
 
 `scan_all` runs every detector and returns the combined findings.
 
@@ -36,7 +36,6 @@ class FindingKind(StrEnum):
     COALESCE_ON_JOIN_KEY = "coalesce_on_join_key"
     UNORDERED_RANKING_WINDOW = "unordered_ranking_window"
     UNORDERED_AGGREGATE = "unordered_aggregate"
-    CENTS_LIKE_INTEGER_DIVISION = "cents_like_integer_division"
 
 
 class JoinSide(StrEnum):
@@ -111,12 +110,6 @@ _RANKING_FUNCTIONS: frozenset[type[Expr]] = frozenset(
 )
 
 _ORDERED_AGGREGATE_FUNCTIONS: frozenset[type[Expr]] = frozenset({exp.ArrayAgg, exp.GroupConcat})
-
-_CENTS_LIKE_NAMES: frozenset[str] = frozenset(
-    {"amount", "price", "cost", "revenue", "total", "subtotal", "fee", "tax", "value", "balance"}
-)
-_CENTS_DIVISORS: frozenset[int] = frozenset({100, 1000, 10000, 100000, 1000000})
-
 
 def list_joins(parsed: ParsedSQL) -> tuple[JoinSummary, ...]:
     """Return every JOIN in the statement, including those nested in CTEs/subqueries."""
@@ -311,47 +304,11 @@ def detect_unordered_aggregate(parsed: ParsedSQL) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_cents_like_integer_division(parsed: ParsedSQL) -> tuple[Finding, ...]:
-    """Flag ``<money_named_column> / <power_of_ten>`` patterns.
-
-    Heuristic for the cents-to-dollars footgun: integer-typed columns whose
-    name reads like a monetary amount, divided by 10, 100, 1000, etc., truncate
-    rather than producing the dollars expected. We can't see the column's type
-    statically; the name match plus literal divisor is the signal.
-    """
-    out: list[Finding] = []
-    for d in sg.find_all_div(parsed.tree):
-        lhs = d.this
-        rhs = d.expression
-        if not isinstance(lhs, exp.Column):
-            continue
-        if not isinstance(rhs, exp.Literal):
-            continue
-        divisor = sg.literal_int(rhs)
-        if divisor is None or divisor not in _CENTS_DIVISORS:
-            continue
-        col_name = sg.column_name(lhs).lower()
-        if not any(token in col_name for token in _CENTS_LIKE_NAMES):
-            continue
-        out.append(
-            Finding(
-                kind=FindingKind.CENTS_LIKE_INTEGER_DIVISION,
-                message=(
-                    f"{sg.render_sql(lhs)} / {divisor} on a money-named column may truncate; "
-                    "cast to NUMERIC or DECIMAL before dividing"
-                ),
-                sql_snippet=sg.render_sql(d),
-            )
-        )
-    return tuple(out)
-
-
 _ALL_DETECTORS = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
-    detect_cents_like_integer_division,
 )
 
 

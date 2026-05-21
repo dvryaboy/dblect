@@ -111,7 +111,8 @@ def test_keep_artifacts_in_persists_warehouse(jaffle_project_dir: Path, tmp_path
     [duckdb_file] = [p for p in keep.iterdir() if p.suffix == ".duckdb"]
     con = duckdb.connect(str(duckdb_file), read_only=True)
     try:
-        (n,) = con.execute("select count(*) from stg_customers").fetchone()
+        row = con.execute("select count(*) from stg_customers").fetchone()
     finally:
         con.close()
-    assert n == result.row_count
+    assert row is not None
+    assert row[0] == result.row_count

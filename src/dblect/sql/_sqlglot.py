@@ -86,10 +86,6 @@ def find_all_coalesce(e: Expr) -> list[exp.Coalesce]:
     return list(e.find_all(exp.Coalesce))
 
 
-def find_all_div(e: Expr) -> list[exp.Div]:
-    return list(e.find_all(exp.Div))
-
-
 def find_all_windows(e: Expr) -> list[exp.Window]:
     return list(e.find_all(exp.Window))
 
@@ -100,13 +96,3 @@ def find_all_aggfunc(e: Expr) -> list[Expr]:
 
 def render_sql(e: Expr) -> str:
     return e.sql()
-
-
-def literal_int(lit: exp.Literal) -> int | None:
-    """Return an integer literal's value, or ``None`` if it's not parseable as int."""
-    if lit.is_string:
-        return None
-    try:
-        return int(cast("str", lit.this))
-    except (TypeError, ValueError):
-        return None

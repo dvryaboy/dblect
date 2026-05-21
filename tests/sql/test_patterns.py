@@ -10,7 +10,6 @@ from dblect.sql import (
     FindingKind,
     JoinSide,
     ParsedSQL,
-    detect_cents_like_integer_division,
     detect_coalesce_on_join_key,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
@@ -157,35 +156,11 @@ def test_within_group_array_agg_not_flagged() -> None:
     assert detect_unordered_aggregate(p) == ()
 
 
-def test_cents_like_integer_division_detected() -> None:
-    p = _parse("select amount / 100 as dollars from t")
-    findings = detect_cents_like_integer_division(p)
-    assert len(findings) == 1
-    assert findings[0].kind is FindingKind.CENTS_LIKE_INTEGER_DIVISION
-
-
-def test_non_money_division_not_detected() -> None:
-    p = _parse("select count_a / count_b as ratio from t")
-    assert detect_cents_like_integer_division(p) == ()
-
-
-def test_money_divided_by_arbitrary_literal_not_detected() -> None:
-    # Divisor must look like a cents-conversion power-of-ten.
-    p = _parse("select amount / 7 as weekly from t")
-    assert detect_cents_like_integer_division(p) == ()
-
-
-def test_money_divided_by_column_not_detected() -> None:
-    # Division by another column is a ratio, not a cents conversion.
-    p = _parse("select amount / total_amount as share from t")
-    assert detect_cents_like_integer_division(p) == ()
-
-
 def test_scan_all_runs_every_detector() -> None:
     sql = """
     select coalesce(a.k, 0) as k_safe,
            row_number() over (partition by b.k) as rn,
-           amount / 100 as dollars
+           array_agg(amount) as amounts
     from a left join b on a.k = b.k
     group by b.k
     """
@@ -194,7 +169,7 @@ def test_scan_all_runs_every_detector() -> None:
     assert FindingKind.NULL_GROUP_AFTER_OUTER_JOIN in kinds
     assert FindingKind.COALESCE_ON_JOIN_KEY in kinds
     assert FindingKind.UNORDERED_RANKING_WINDOW in kinds
-    assert FindingKind.CENTS_LIKE_INTEGER_DIVISION in kinds
+    assert FindingKind.UNORDERED_AGGREGATE in kinds
 
 
 # Property-based invariants:
