@@ -36,7 +36,7 @@ dblect init
 
 This scaffolds `dblect/`, adds dblect to your project dependencies, parses your dbt project, generates editor stubs, and runs the static-analysis audit end-to-end. First findings typically land in under a minute.
 
-See the [demo walkthrough](docs/demo_walkthrough.md) for an end-to-end tour against `jaffle_shop_duckdb`.
+See the [demo walkthrough](docs/design/demo_walkthrough.md) for the forward-looking end-to-end tour against `jaffle_shop_duckdb`, or [docs/current_state/architecture.md](docs/current_state/architecture.md) for what's actually built today.
 
 ## Development
 
