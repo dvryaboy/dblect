@@ -24,7 +24,10 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
+# /MANIFEST is the setuptools sdist artifact at repo root.
+# Anchored to root so our src/dblect/manifest/ package is not matched
+# case-insensitively on macOS/Windows filesystems.
+/MANIFEST
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
