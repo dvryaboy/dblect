@@ -45,12 +45,44 @@ class ResourceType(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ConstraintSpec:
+    """A constraint declared on a model or column in schema.yml (dbt 1.5+).
+
+    ``type`` is the constraint kind (``"primary_key"``, ``"unique"``,
+    ``"not_null"``, ``"check"``, ``"foreign_key"``). ``columns`` carries the
+    column set for model-level constraints; column-level constraints leave it
+    empty (the column they're attached to is implicit). ``expression`` carries
+    a CHECK constraint's predicate text, if any.
+    """
+
+    type: str
+    columns: tuple[str, ...] = ()
+    expression: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DbtTestMetadata:
+    """The ``test_metadata`` block on a dbt test node.
+
+    ``name`` is the generic-test name (``"unique"``, ``"not_null"``,
+    ``"dbt_utils.unique_combination_of_columns"``, etc.). ``kwargs`` is the
+    arguments the test was instantiated with, heterogeneously shaped per test
+    type (``column_name`` for ``unique``, ``combination_of_columns`` for
+    ``unique_combination_of_columns``, and so on).
+    """
+
+    name: str
+    kwargs: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class Column:
     """A column on a dbt model/source as declared in schema.yml."""
 
     name: str
     data_type: str | None
     description: str | None
+    constraints: tuple[ConstraintSpec, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +105,9 @@ class Node:
     original_file_path: str | None
     columns: Mapping[str, Column]
     depends_on: frozenset[str] = field(default_factory=cast("type[frozenset[str]]", frozenset))
+    constraints: tuple[ConstraintSpec, ...] = ()
+    test_metadata: DbtTestMetadata | None = None
+    attached_node: str | None = None
 
     @property
     def is_data_flow(self) -> bool:
@@ -174,6 +209,9 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         original_file_path=getattr(n, "original_file_path", None),
         columns=_columns_from_parsed(getattr(n, "columns", {}) or {}),
         depends_on=frozenset(depends_on_nodes),
+        constraints=_constraints_from_parsed(getattr(n, "constraints", None) or ()),
+        test_metadata=_test_metadata_from_parsed(getattr(n, "test_metadata", None)),
+        attached_node=getattr(n, "attached_node", None),
     )
 
 
@@ -200,6 +238,32 @@ def _columns_from_parsed(raw: Mapping[str, Any]) -> Mapping[str, Column]:
             name=col.name,
             data_type=getattr(col, "data_type", None),
             description=getattr(col, "description", None),
+            constraints=_constraints_from_parsed(getattr(col, "constraints", None) or ()),
         )
         for name, col in raw.items()
     }
+
+
+def _constraints_from_parsed(raw: Any) -> tuple[ConstraintSpec, ...]:
+    return tuple(
+        ConstraintSpec(
+            type=str(getattr(c, "type", "")),
+            columns=tuple(getattr(c, "columns", None) or ()),
+            expression=getattr(c, "expression", None),
+        )
+        for c in raw
+    )
+
+
+def _test_metadata_from_parsed(raw: Any) -> DbtTestMetadata | None:
+    if raw is None:
+        return None
+    name = getattr(raw, "name", None)
+    if not isinstance(name, str):
+        return None
+    raw_kwargs: Any = getattr(raw, "kwargs", None) or {}
+    kwargs: dict[str, Any] = {}
+    if isinstance(raw_kwargs, Mapping):
+        raw_mapping = cast("Mapping[Any, Any]", raw_kwargs)
+        kwargs = {str(k): v for k, v in raw_mapping.items()}
+    return DbtTestMetadata(name=name, kwargs=kwargs)
