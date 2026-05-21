@@ -23,8 +23,9 @@ Exit code is `1` when unsuppressed findings exist (or `0` with `--no-fail`). `--
 
 ```
 src/dblect/
-├── manifest/          # parse manifest.json into typed Node + DAG
+├── manifest/          # parse manifest.json into typed Node + DAG, surface dbt tests + constraints
 ├── sql/               # parse SQL (with Jinja), walk the AST, detect hazards
+├── uniqueness/        # collect uniqueness facts from declarations + SQL, ground a uniqueness-aware detector
 ├── audit/             # orchestrate detectors over a manifest, render output
 ├── cli/               # the `dblect` typer app
 └── execution/         # run dbt models in DuckDB (used for execution tests; not on the audit path)
@@ -34,7 +35,7 @@ Each package has a focused job and clean exports through its `__init__.py`. Inte
 
 ## Data flow
 
-The audit pipeline is a straight line through three layers:
+The audit pipeline:
 
 ```
 dbt project
@@ -46,16 +47,25 @@ manifest.json (on disk)
     │  (b) dblect.manifest.Manifest.from_file()
     ▼
 Manifest (typed)
-    │   - Nodes keyed by unique_id
-    │   - raw_code for each model
-    │   - original_file_path threaded through
+    │   - Nodes keyed by unique_id (models, sources, seeds, snapshots, tests)
+    │   - raw_code, original_file_path, depends_on
+    │   - Test nodes carry DbtTestMetadata + attached_node
+    │   - Models + Columns carry ConstraintSpec lists
     │   - DAG built from depends_on edges
     │
-    │  (c) dblect.audit.run_audit()
+    ▼
+    │  (c.1) dblect.uniqueness.facts_from_manifest()
+    │       Pre-pass over the whole manifest, BEFORE per-model detection:
+    │       - declarations: dbt unique tests, composite-key tests, native constraints
+    │       - structural proof from each model's SQL: SELECT DISTINCT, GROUP BY
+    │       → Mapping[model_uid, tuple[UniquenessFact, ...]]
+    │
+    │  (c.2) dblect.audit.run_audit()
     ▼
 For each model:
     │   - ParsedSQL.parse(raw_code)  ────► sqlglot AST + Jinja placeholder record
     │   - DEFAULT_DETECTORS run over the AST
+    │   - Uniqueness-aware detector runs with the precomputed facts
     │   - parse_directives() reads -- noqa-fixture: comments
     │   - apply() partitions into active / suppressed
     │
@@ -79,9 +89,11 @@ Status messages (manifest path, dbt parse invocation) go to stderr so JSON consu
 Key types in [`manifest/parse.py`](../../src/dblect/manifest/parse.py):
 
 - **`Manifest`** — `schema_version`, `nodes: Mapping[str, Node]`, plus `models` / `sources` / `seeds` / `snapshots` properties that filter by resource type.
-- **`Node`** — `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`.
+- **`Node`** — `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`, `constraints`, `test_metadata`, `attached_node`. The last three carry dbt-specific information that the uniqueness layer consumes: `constraints` for native dbt 1.5+ constraints on models, `test_metadata` (a `DbtTestMetadata`) for the `name`+`kwargs` of generic tests, and `attached_node` for the model a test is attached to.
 - **`ResourceType`** — `MODEL`, `SOURCE`, `SEED`, `SNAPSHOT`, `OTHER` (catches tests, analyses, operations).
-- **`Column`** — `name`, `data_type`, `description`.
+- **`Column`** — `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
+- **`ConstraintSpec`** — `type` (e.g. `"primary_key"`, `"unique"`, `"not_null"`, `"check"`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
+- **`DbtTestMetadata`** — `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type).
 
 The DAG lives in [`manifest/dag.py`](../../src/dblect/manifest/dag.py). `Dag.build(nodes, edges)` validates that every edge references a known node, detects cycles (raises `CycleError` with the witness cycle), and exposes `upstream(uid)`, `downstream(uid)`, `transitive_upstream(uid)`, `transitive_downstream(uid)`, and `topological_order()`. `Manifest.dag` materializes one from the project's `depends_on` graph, silently dropping edges to nodes the manifest didn't expose (e.g. upstream models from packages the project doesn't include).
 
@@ -139,7 +151,50 @@ Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier
 
 The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_group_bys`, `list_aggregations`) that return dblect-shaped summary value types. Consumers don't need to import sqlglot to read structural facts about a statement.
 
-`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. There's a seventh kind, `MALFORMED_SUPPRESSION`, emitted by the suppression layer rather than a detector — see below.
+`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. Two additional kinds live outside `patterns.py`: `MALFORMED_SUPPRESSION`, emitted by the suppression layer when a `-- noqa-fixture:` comment lacks a reason; and `NON_UNIQUE_WINDOW_ORDER_KEYS`, emitted by the uniqueness-aware detector described below.
+
+## The uniqueness layer (`src/dblect/uniqueness/`)
+
+This package collects **uniqueness facts** — claims that a particular set of columns is jointly unique on a model — and uses them to ground a detector that fires only when it can prove a hazard. Two layers:
+
+- [**`facts.py`**](../../src/dblect/uniqueness/facts.py) — collects facts from declarations and SQL.
+- [**`detector.py`**](../../src/dblect/uniqueness/detector.py) — the window order-keys detector that consumes those facts.
+
+### Where facts come from
+
+```python
+@dataclass(frozen=True, slots=True)
+class UniquenessFact:
+    model_unique_id: str
+    columns: frozenset[str]
+    source: UniquenessSource     # DBT_UNIQUE_TEST | DBT_UNIQUE_COMBINATION_TEST | NATIVE_CONSTRAINT | STRUCTURAL_PROOF
+    detail: str | None           # provenance pointer (test name, SQL phrase, ...)
+```
+
+Three public entry points:
+
+- **`facts_from_declarations(manifest)`** reads dbt test nodes (single-column `unique` and dbt-utils `unique_combination_of_columns`) and native dbt 1.5+ `ConstraintSpec` lists (model-level and column-level). Each fact carries a `detail` field naming the test or constraint so reviewers can trace the claim back.
+- **`facts_from_sql(model_unique_id, parsed)`** infers facts from a model's own SQL. Two rules today:
+  - Top-level `SELECT DISTINCT a, b` proves the output is unique on `(a, b)`.
+  - Top-level `SELECT a, b, ... FROM ... GROUP BY a, b` proves the output is unique on `(a, b)` — but only when every GROUP BY target is a bare column that's also in the projection (positional, expression, and unprojected keys are skipped conservatively).
+  - CTEs are unwrapped to find the body SELECT. Set operations (`UNION` etc.) are out of scope.
+- **`facts_from_manifest(manifest)`** is the combined entry the walker uses. Returns `Mapping[model_uid, tuple[UniquenessFact, ...]]` with every known fact for every model. Models with no known facts are absent from the mapping; callers should treat missing as "we don't know."
+
+The whole layer is **opportunistic by design**: it uses what the project gives it and stays silent everywhere else. There's no warning when a model has no declared keys — that would be noise on every project that doesn't aggressively declare.
+
+### The window order-keys detector
+
+`detect_non_unique_window_order_keys` flags window functions where the combined `(PARTITION BY + ORDER BY)` columns aren't grounded as unique on the source model. The check is intentionally narrow:
+
+- Only the **top-level SELECT** is inspected.
+- The model's top-level FROM must resolve to a **single ref'd model** (no joins at the top level; multi-source needs column-level lineage we don't have yet).
+- The source model must have **at least one uniqueness fact**. With no grounding, we stay silent.
+- A fact whose columns are a **subset** of the window's key set counts as coverage — any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
+- Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
+
+`make_detector(manifest, facts)` curries the function against the audit-scoped context (the manifest's model name→unique_id index plus the precomputed facts) and returns a plain `Detector` callable the walker drops into its detector pipeline.
+
+The detector is enabled by default. Because it's opportunistic, no opt-in flag is needed — projects without declared uniqueness simply see no findings from it. Findings of kind `NON_UNIQUE_WINDOW_ORDER_KEYS` are suppressible via the standard `-- noqa-fixture:` syntax.
 
 ## The audit layer (`src/dblect/audit/`)
 
@@ -153,14 +208,15 @@ Three modules:
 
 `run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`:
 
-1. Iterates `manifest.models` in unique_id sort order for stable output.
-2. For each model:
+1. Computes `facts_from_manifest(manifest)` once up front, then curries the uniqueness-aware detector against it. The curried detector joins the configured `detectors` list so the per-model loop runs everything in one pass.
+2. Iterates `manifest.models` in unique_id sort order for stable output.
+3. For each model:
    - Skips if `raw_code is None` (sources, seeds, packages that don't ship SQL) — recorded as `SkippedModel(reason="no raw_code")`.
    - Calls `ParsedSQL.parse(raw_code, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure** — one bad model shouldn't blind the audit to the rest.
    - Runs each detector, collecting `Finding`s.
    - Calls `parse_directives(raw_code)` to extract `-- noqa-fixture:` comments. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
    - Calls `apply(findings, directives)` to partition into active vs. suppressed.
-3. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`.
+4. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`.
 
 Each active finding is wrapped in a `LocatedFinding(model_unique_id, file_path, finding)` so reporters can show file:line locations. Suppressed findings are wrapped in `SuppressedFinding(located, reason, directive_line)` which preserves both the original finding context and the directive that silenced it.
 
@@ -235,20 +291,21 @@ Each failure mode raises `typer.BadParameter` with an actionable message. The "n
 
 ## Tests
 
-162 tests across the layers, organized by package:
+~195 tests across the layers, organized by package:
 
 ```
-tests/manifest/  - 25 tests, manifest parsing + DAG topology (incl. PBT)
-tests/sql/       - 71 tests, parsing, Jinja redaction, detectors (incl. PBT)
-tests/audit/     - 50 tests, walker, suppression, reporters
-tests/cli/       -  9 tests, end-to-end CLI via typer.testing.CliRunner
-tests/execution/ -  6 tests, real-dbt run against jaffle
-tests/test_smoke.py - 2 tests, package import + CLI module load
+tests/manifest/    - manifest parsing + DAG topology (incl. PBT over generated acyclic DAGs)
+tests/sql/         - parsing, Jinja redaction, structural detectors (incl. PBT on line-preservation and parse round-trips)
+tests/uniqueness/  - declaration ingestion, structural-proof rules, ordering-key detector
+tests/audit/       - walker, suppression directives, text + JSON reporters
+tests/cli/         - end-to-end CLI via typer.testing.CliRunner
+tests/execution/   - real-dbt run against the vendored jaffle project
+tests/test_smoke.py - package import + CLI module load
 ```
 
-Hypothesis property-based tests cover DAG topology, Jinja line-preservation, and round-trip parsing. The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
+Hypothesis property-based tests cover DAG topology, Jinja line-preservation, parse round-trips, and the uniqueness-fact kind round-trip. The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
 
-Strict pyright and ruff in CI. The detectors and suppression module are pure functions, which makes the testing rigorous: the same inputs always give the same outputs, no mocking needed.
+Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression module are pure functions, which makes testing rigorous: same inputs always give the same outputs, no mocking needed.
 
 ## What's deliberately not here yet
 

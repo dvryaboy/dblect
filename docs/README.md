@@ -8,7 +8,7 @@ Three buckets, each answering a different question.
 
 ## What's *built* today — current state
 
-- [**current_state/architecture.md**](current_state/architecture.md) — a walkthrough of the code as it stands: manifest ingestion → SQL parsing → structural detectors → audit walker → CLI + reporters. Reads bottom-up from a fresh checkout. Start here if you want to navigate the source or extend a detector.
+- [**current_state/architecture.md**](current_state/architecture.md) — a walkthrough of the code as it stands: manifest ingestion (including dbt tests + constraints) → SQL parsing → structural detectors → uniqueness facts (declarations + structural proof) and the uniqueness-aware detector → audit walker → CLI + reporters. Reads bottom-up from a fresh checkout. Start here if you want to navigate the source or extend a detector.
 
 ## What's *designed but not built* — forward-looking
 
