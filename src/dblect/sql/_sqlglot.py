@@ -96,3 +96,25 @@ def find_all_aggfunc(e: Expr) -> list[Expr]:
 
 def render_sql(e: Expr) -> str:
     return e.sql()
+
+
+def line_range(e: Expr) -> tuple[int, int] | None:
+    """The 1-indexed (start, end) source-line span covered by `e`.
+
+    sqlglot only stamps token-position metadata onto ``Identifier`` nodes, so
+    we walk descendants and take min/max over their `meta["line"]`. Returns
+    `None` if no identifier carries a usable line number (rare; some literal-
+    only expressions like ``select 1`` have no identifier children).
+
+    Line numbers refer to the redacted SQL the parser saw. Redaction in
+    ``dblect.sql.parse`` is line-preserving, so they also correspond to lines
+    in the user's source file.
+    """
+    lines: list[int] = []
+    for ident in e.find_all(exp.Identifier):
+        line = ident.meta.get("line") if ident.meta else None
+        if isinstance(line, int):
+            lines.append(line)
+    if not lines:
+        return None
+    return min(lines), max(lines)

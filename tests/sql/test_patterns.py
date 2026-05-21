@@ -156,6 +156,41 @@ def test_within_group_array_agg_not_flagged() -> None:
     assert detect_unordered_aggregate(p) == ()
 
 
+def test_finding_carries_line_range_of_offending_expression() -> None:
+    sql = (
+        "select b.k,\n"  # line 1
+        "       sum(amount) as total\n"  # line 2
+        "from a\n"  # line 3
+        "left join b on a.k = b.k\n"  # line 4
+        "group by b.k\n"  # line 5
+    )
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    # The flagged GROUP BY expression is on line 5.
+    assert findings[0].line_start == 5
+    assert findings[0].line_end == 5
+
+
+def test_finding_line_range_survives_multiline_jinja() -> None:
+    sql = (
+        "{# preamble\n"  # 1
+        "   spans two lines #}\n"  # 2
+        "{% set greeting = 'hello'\n"  # 3
+        "%}\n"  # 4
+        "select b.k,\n"  # 5
+        "       sum(amount) as total\n"  # 6
+        "from {{ ref('a') }}\n"  # 7
+        "left join {{ ref('b') }} on a.k = b.k\n"  # 8
+        "group by b.k\n"  # 9
+    )
+    # If redaction were not line-preserving, the GROUP BY would slide up the
+    # file and the line numbers on the finding would be wrong.
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].line_start == 9
+    assert findings[0].line_end == 9
+
+
 def test_scan_all_runs_every_detector() -> None:
     sql = """
     select coalesce(a.k, 0) as k_safe,

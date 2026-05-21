@@ -12,6 +12,11 @@ in the parsed tree:
   comments are stripped entirely; the body of a ``{% for %}`` block stays in
   place, exercised once.
 
+Redaction preserves line counts: every consumed newline is re-emitted, so
+that sqlglot's per-identifier line numbers correspond to lines in the
+original SQL. Detectors rely on this to attach source-location info to
+findings.
+
 A `JinjaPlaceholder` captures the original text and the substitution, so a
 detector that flags a sentinel can recover the source span.
 """
@@ -19,7 +24,7 @@ detector that flags a sentinel can recover the source span.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import count
@@ -115,26 +120,27 @@ _SOURCE_CALL = re.compile(r"^source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)
 
 
 def _redact_jinja(sql: str) -> tuple[str, list[JinjaPlaceholder]]:
-    out = _JINJA_COMMENT.sub("", sql)
-    out = _JINJA_STATEMENT.sub("", out)
+    out = _JINJA_COMMENT.sub(_pad_to_match_newlines(""), sql)
+    out = _JINJA_STATEMENT.sub(_pad_to_match_newlines(""), out)
 
     placeholders: list[JinjaPlaceholder] = []
     counter = count(1)
 
     def sub_expr(match: re.Match[str]) -> str:
         body = match.group(1).strip()
+        original = match.group(0)
         ref_m = _REF_CALL.match(body)
         if ref_m is not None:
             target = ref_m.group(1)
             placeholders.append(
                 JinjaPlaceholder(
                     sentinel=target,
-                    original=match.group(0),
+                    original=original,
                     kind=PlaceholderKind.REF,
                     target=target,
                 )
             )
-            return target
+            return _preserve_newlines(target, original)
         src_m = _SOURCE_CALL.match(body)
         if src_m is not None:
             source_name, table_name = src_m.group(1), src_m.group(2)
@@ -142,25 +148,44 @@ def _redact_jinja(sql: str) -> tuple[str, list[JinjaPlaceholder]]:
             placeholders.append(
                 JinjaPlaceholder(
                     sentinel=sentinel,
-                    original=match.group(0),
+                    original=original,
                     kind=PlaceholderKind.SOURCE,
                     target=f"{source_name}.{table_name}",
                 )
             )
-            return sentinel
+            return _preserve_newlines(sentinel, original)
         sentinel = f"__jinja_{next(counter):03d}"
         placeholders.append(
             JinjaPlaceholder(
                 sentinel=sentinel,
-                original=match.group(0),
+                original=original,
                 kind=PlaceholderKind.EXPR,
                 target=None,
             )
         )
-        return sentinel
+        return _preserve_newlines(sentinel, original)
 
     out = _JINJA_EXPR.sub(sub_expr, out)
     return out, placeholders
+
+
+def _pad_to_match_newlines(replacement: str) -> Callable[[re.Match[str]], str]:
+    """Build an `re.sub` callback that appends `\\n`s to match the consumed text.
+
+    Used so the redacted SQL has the same line count as the source. sqlglot's
+    per-identifier line numbers (which we surface on findings) only line up
+    with the user's source file when redaction is line-preserving.
+    """
+
+    def sub(match: re.Match[str]) -> str:
+        return _preserve_newlines(replacement, match.group(0))
+
+    return sub
+
+
+def _preserve_newlines(replacement: str, original: str) -> str:
+    n = original.count("\n")
+    return replacement + ("\n" * n) if n else replacement
 
 
 def is_jinja_sentinel(name: str, placeholders: Iterable[JinjaPlaceholder]) -> bool:

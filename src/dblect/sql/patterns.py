@@ -48,11 +48,24 @@ class JoinSide(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Finding:
-    """A single static-analysis observation about a SQL statement."""
+    """A single static-analysis observation about a SQL statement.
+
+    ``line_start`` and ``line_end`` are 1-indexed line numbers in the SQL
+    the detector was given. When that SQL came from a dbt model's
+    ``raw_code``, they also correspond to lines in the user's ``.sql`` file
+    (the Jinja-redacting parser preserves line counts).
+
+    A value of ``0`` means we couldn't pin the finding to a line, which
+    happens when the offending AST node has no ``Identifier`` descendants
+    sqlglot stamped with position info. Callers can treat ``0`` as "model
+    scope, line unknown" and report it without a line number.
+    """
 
     kind: FindingKind
     message: str
     sql_snippet: str
+    line_start: int
+    line_end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +123,20 @@ _RANKING_FUNCTIONS: frozenset[type[Expr]] = frozenset(
 )
 
 _ORDERED_AGGREGATE_FUNCTIONS: frozenset[type[Expr]] = frozenset({exp.ArrayAgg, exp.GroupConcat})
+
+
+def _finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
+    """Build a Finding whose snippet and source span both come from `node`."""
+    span = sg.line_range(node)
+    line_start, line_end = span if span is not None else (0, 0)
+    return Finding(
+        kind=kind,
+        message=message,
+        sql_snippet=sg.render_sql(node),
+        line_start=line_start,
+        line_end=line_end,
+    )
+
 
 def list_joins(parsed: ParsedSQL) -> tuple[JoinSummary, ...]:
     """Return every JOIN in the statement, including those nested in CTEs/subqueries."""
@@ -208,13 +235,13 @@ def detect_null_group_after_outer_join(parsed: ParsedSQL) -> tuple[Finding, ...]
             if risky:
                 tables = ", ".join(sorted(risky))
                 out.append(
-                    Finding(
-                        kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+                    _finding_at(
+                        FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
                         message=(
                             f"GROUP BY {sg.render_sql(grp_expr)} references column(s) from "
                             f"nullable join side ({tables}); unmatched rows collapse into a NULL group"
                         ),
-                        sql_snippet=sg.render_sql(grp_expr),
+                        node=grp_expr,
                     )
                 )
     return tuple(out)
@@ -243,13 +270,13 @@ def detect_coalesce_on_join_key(parsed: ParsedSQL) -> tuple[Finding, ...]:
                 continue
             if (sg.column_table(first), sg.column_name(first)) in keys:
                 out.append(
-                    Finding(
-                        kind=FindingKind.COALESCE_ON_JOIN_KEY,
+                    _finding_at(
+                        FindingKind.COALESCE_ON_JOIN_KEY,
                         message=(
                             f"COALESCE on join key {sg.render_sql(first)} masks NULLs that "
                             "the JOIN's semantics distinguish"
                         ),
-                        sql_snippet=sg.render_sql(coalesce),
+                        node=coalesce,
                     )
                 )
     return tuple(out)
@@ -270,13 +297,13 @@ def detect_unordered_window(parsed: ParsedSQL) -> tuple[Finding, ...]:
         order = sg.order_of(w)
         if order is None or not order.expressions:
             out.append(
-                Finding(
-                    kind=FindingKind.UNORDERED_RANKING_WINDOW,
+                _finding_at(
+                    FindingKind.UNORDERED_RANKING_WINDOW,
                     message=(
                         f"{type(fn).__name__.upper()} window function has no ORDER BY; "
                         "result is non-deterministic"
                     ),
-                    sql_snippet=sg.render_sql(w),
+                    node=w,
                 )
             )
     return tuple(out)
@@ -292,13 +319,13 @@ def detect_unordered_aggregate(parsed: ParsedSQL) -> tuple[Finding, ...]:
         if isinstance(inner, exp.Order):
             continue
         out.append(
-            Finding(
-                kind=FindingKind.UNORDERED_AGGREGATE,
+            _finding_at(
+                FindingKind.UNORDERED_AGGREGATE,
                 message=(
                     f"{type(node).__name__.upper()} has no ORDER BY; "
                     "element order across rows is undefined"
                 ),
-                sql_snippet=sg.render_sql(node),
+                node=node,
             )
         )
     return tuple(out)
