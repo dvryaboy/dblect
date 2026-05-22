@@ -34,12 +34,15 @@ def test_models_have_expected_names(jaffle: Manifest) -> None:
     assert names == {"customers", "orders", "stg_customers", "stg_orders", "stg_payments"}
 
 
-def test_models_carry_raw_code(jaffle: Manifest) -> None:
-    # `dbt parse` populates raw_code but not compiled_code.
+def test_models_carry_raw_and_compiled_code(jaffle: Manifest) -> None:
+    # `dbt compile` populates both raw_code (the on-disk template) and
+    # compiled_code (the rendered SQL the analysis layer consumes).
     customers = jaffle.nodes["model.jaffle_shop.customers"]
     assert customers.raw_code is not None
     assert "stg_customers" in customers.raw_code
-    assert customers.compiled_code is None
+    assert customers.compiled_code is not None
+    # Rendered ref('stg_customers') resolves to the relation name.
+    assert "stg_customers" in customers.compiled_code
 
 
 def test_models_have_column_metadata(jaffle: Manifest) -> None:

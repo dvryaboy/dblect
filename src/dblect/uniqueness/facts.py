@@ -11,9 +11,9 @@ specific model. Facts come from multiple sources:
 * **Native dbt constraints** (dbt 1.5+): model-level ``primary_key`` /
   ``unique`` constraints carry a column list; column-level constraints carry
   the implicit single-column key.
-* **Structural proof** from the model's SQL (separate layer, future): e.g.
-  ``select distinct cols`` or ``select cols, ... group by cols`` proves the
-  output is unique on ``cols``.
+* **Structural proof** from the model's SQL: e.g. ``select distinct cols`` or
+  ``select cols, ... group by cols`` proves the output is unique on ``cols``.
+  The analysis reads ``compiled_code`` so it sees SQL after macro expansion.
 
 Each fact carries provenance so reviewers can see *why* dblect believes a key
 is unique. Reasoning over uniqueness is opportunistic: when we have a fact,
@@ -32,7 +32,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.manifest import ConstraintSpec, ConstraintType, Manifest, Node, ResourceType
-from dblect.sql import ParsedSQL, SQLParseError
+from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
 
 
@@ -63,7 +63,7 @@ def facts_from_manifest(
     * **Declaration ingestion**: dbt unique tests, dbt-utils composite-key
       tests, dbt 1.5+ native constraints (model-level and column-level).
     * **Structural proof from SQL**: ``SELECT DISTINCT`` and ``GROUP BY``
-      shapes in each model's ``raw_code``.
+      shapes in each model's compiled SQL.
 
     Models with no known facts are absent from the mapping; callers should
     treat missing keys as "no facts known" rather than assuming uniqueness
@@ -82,7 +82,7 @@ def facts_from_declarations(manifest: Manifest) -> tuple[UniquenessFact, ...]:
     return tuple(_all_declaration_facts(manifest))
 
 
-def facts_from_sql(model_unique_id: str, parsed: ParsedSQL) -> tuple[UniquenessFact, ...]:
+def facts_from_sql(model_unique_id: str, tree: Expr) -> tuple[UniquenessFact, ...]:
     """Uniqueness facts provable from a model's SQL alone (DISTINCT, GROUP BY).
 
     Only the top-level ``SELECT`` (the one that produces the model's output
@@ -90,7 +90,7 @@ def facts_from_sql(model_unique_id: str, parsed: ParsedSQL) -> tuple[UniquenessF
     don't prove anything about the outer model's output. Set operations
     (``UNION`` and friends) are out of scope for this first cut.
     """
-    sel = _top_level_select(parsed.tree)
+    sel = _top_level_select(tree)
     if sel is None:
         return ()
     out: list[UniquenessFact] = []
@@ -108,13 +108,14 @@ def _all_structural_facts(
     manifest: Manifest, *, dialect: str | None
 ) -> Iterable[UniquenessFact]:
     for model in manifest.models.values():
-        if model.raw_code is None:
+        sql = model.analysis_sql
+        if sql is None:
             continue
         try:
-            parsed = ParsedSQL.parse(model.raw_code, dialect=dialect)
+            tree = parse_sql(sql, dialect=dialect)
         except SQLParseError:
             continue
-        yield from facts_from_sql(model.unique_id, parsed)
+        yield from facts_from_sql(model.unique_id, tree)
 
 
 def _facts_from_tests(nodes: Iterable[Node]) -> Iterable[UniquenessFact]:

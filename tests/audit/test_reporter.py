@@ -100,7 +100,7 @@ def test_suppressed_block_shows_reason() -> None:
 def test_skipped_block_shows_reasons() -> None:
     skipped = (
         SkippedModel(unique_id="model.pkg.bad", reason="parse error: ..."),
-        SkippedModel(unique_id="source.pkg.s", reason="no raw_code"),
+        SkippedModel(unique_id="source.pkg.s", reason="no compiled SQL"),
     )
     report = AuditReport(findings=(), suppressed=(), skipped=skipped, models_scanned=0)
     text = render_text(report)

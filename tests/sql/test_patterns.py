@@ -5,12 +5,12 @@ from __future__ import annotations
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from sqlglot import Expr
 
 from dblect.sql import (
     Finding,
     FindingKind,
     JoinSide,
-    ParsedSQL,
     detect_coalesce_on_join_key,
     detect_non_deterministic_function,
     detect_null_group_after_outer_join,
@@ -21,12 +21,13 @@ from dblect.sql import (
     list_group_bys,
     list_joins,
     list_windows,
+    parse_sql,
     scan_all,
 )
 
 
-def _parse(sql: str) -> ParsedSQL:
-    return ParsedSQL.parse(sql, dialect="duckdb")
+def _parse(sql: str) -> Expr:
+    return parse_sql(sql, dialect="duckdb")
 
 
 def _kinds(findings: tuple[Finding, ...]) -> set[FindingKind]:
@@ -213,26 +214,6 @@ def test_finding_carries_line_range_of_offending_expression() -> None:
     # The flagged GROUP BY expression is on line 5.
     assert findings[0].line_start == 5
     assert findings[0].line_end == 5
-
-
-def test_finding_line_range_survives_multiline_jinja() -> None:
-    sql = (
-        "{# preamble\n"  # 1
-        "   spans two lines #}\n"  # 2
-        "{% set greeting = 'hello'\n"  # 3
-        "%}\n"  # 4
-        "select b.k,\n"  # 5
-        "       sum(amount) as total\n"  # 6
-        "from {{ ref('a') }}\n"  # 7
-        "left join {{ ref('b') }} on a.k = b.k\n"  # 8
-        "group by b.k\n"  # 9
-    )
-    # If redaction were not line-preserving, the GROUP BY would slide up the
-    # file and the line numbers on the finding would be wrong.
-    findings = detect_null_group_after_outer_join(_parse(sql))
-    assert len(findings) == 1
-    assert findings[0].line_start == 9
-    assert findings[0].line_end == 9
 
 
 # --- WHERE on outer-joined nullable ---

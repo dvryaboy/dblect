@@ -20,7 +20,10 @@ Or with pip:
 pip install dblect
 ```
 
-For projects that want dblect to invoke `dbt parse` for them (instead of requiring an existing `target/manifest.json`):
+dblect reads the SQL your models produce after dbt's Jinja runtime has rendered them ("compiled SQL"), so it sees macros, conditionals, and refs the way the warehouse will. The two ways to feed it that SQL:
+
+- Pre-run `dbt compile` yourself and let dblect read `target/manifest.json`.
+- Let dblect invoke `dbt compile` for you, in which case it needs `dbt-core` installed and a working dbt profile (the same setup `dbt run` needs):
 
 ```bash
 uv add --dev "dblect[dbt-core]"

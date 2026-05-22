@@ -10,10 +10,9 @@ import pytest
 from dblect.audit import (
     DEFAULT_DETECTORS,
     AuditReport,
-    SkippedModel,
     run_audit,
 )
-from dblect.manifest import Manifest, Node
+from dblect.manifest import Manifest, Node, ResourceType
 from dblect.sql import FindingKind
 
 
@@ -27,8 +26,11 @@ def jaffle_report(jaffle: Manifest) -> AuditReport:
     return run_audit(jaffle)
 
 
-def test_audit_scans_every_model_with_raw_code(jaffle: Manifest, jaffle_report: AuditReport) -> None:
-    # Every jaffle model carries raw_code from `dbt parse`, so none are skipped.
+def test_audit_scans_every_model_with_compiled_code(
+    jaffle: Manifest, jaffle_report: AuditReport
+) -> None:
+    # Every jaffle model carries compiled_code from `dbt compile`, so none are
+    # skipped.
     assert jaffle_report.models_scanned == len(jaffle.models)
     assert jaffle_report.skipped == ()
 
@@ -47,18 +49,22 @@ def test_audit_locates_customers_null_group(jaffle_report: AuditReport) -> None:
     assert hit.finding.line_start <= hit.finding.line_end
 
 
-def test_audit_skips_models_without_raw_code(jaffle: Manifest) -> None:
-    # Drop raw_code on one model to simulate the source/seed shape.
+def test_audit_skips_models_without_sql(jaffle: Manifest) -> None:
+    # Drop both raw_code and compiled_code on one model to simulate the
+    # source/seed shape.
     [a_model_uid] = list(jaffle.models)[:1]
     drained = dict(jaffle.nodes)
-    drained[a_model_uid] = _without_raw_code(drained[a_model_uid])
+    drained[a_model_uid] = _without_sql(drained[a_model_uid])
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,
         nodes=drained,
     )
     report = run_audit(altered)
-    assert SkippedModel(unique_id=a_model_uid, reason="no raw_code") in report.skipped
+    assert any(
+        s.unique_id == a_model_uid and s.reason.startswith("no compiled SQL")
+        for s in report.skipped
+    )
     assert report.models_scanned == len(jaffle.models) - 1
 
 
@@ -66,7 +72,7 @@ def test_audit_records_parse_errors_without_blowing_up(jaffle: Manifest) -> None
     # Replace one model's SQL with something sqlglot can't parse.
     [a_model_uid] = list(jaffle.models)[:1]
     drained = dict(jaffle.nodes)
-    drained[a_model_uid] = _with_raw_code(drained[a_model_uid], "select from where")
+    drained[a_model_uid] = _with_compiled_code(drained[a_model_uid], "select from where")
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,
@@ -209,9 +215,48 @@ def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> N
     ), "Line-1 directive matched nothing, so suppressed should be empty for customers"
 
 
-def _without_raw_code(node: Node) -> Node:
-    return replace(node, raw_code=None)
+def test_macro_emitted_join_visible_in_compiled_code() -> None:
+    # Regression guard for "we analyze compiled_code". A model whose LEFT
+    # JOIN comes from a macro call: in the on-disk template the join is
+    # invisible (`{{ join_country(u) }}`), but the compiled SQL has the
+    # join expanded inline, so the null-group-after-outer-join detector
+    # sees it.
+    compiled_sql = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "left join dim_country d on u.country_code = d.code\n"
+        "group by u.user_id, d.country"
+    )
+    node = Node(
+        unique_id="model.pkg.user_country",
+        name="user_country",
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", "user_country"),
+        package_name="pkg",
+        schema=None,
+        raw_code=(
+            "select u.user_id, d.country, count(*) as n\n"
+            "from users u\n"
+            "{{ join_country(u) }}\n"
+            "group by u.user_id, d.country"
+        ),
+        compiled_code=compiled_sql,
+        original_file_path="models/user_country.sql",
+        columns={},
+    )
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node}
+    )
+    report = run_audit(manifest)
+    assert any(
+        lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+        for lf in report.findings
+    ), "compiled path should see the macro-emitted LEFT JOIN and flag the GROUP BY"
 
 
-def _with_raw_code(node: Node, sql: str) -> Node:
-    return replace(node, raw_code=sql)
+def _without_sql(node: Node) -> Node:
+    return replace(node, raw_code=None, compiled_code=None)
+
+
+def _with_compiled_code(node: Node, sql: str) -> Node:
+    return replace(node, compiled_code=sql)

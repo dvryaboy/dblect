@@ -9,12 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlglot import Expr
 
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.sql import (
     FindingKind,
-    ParsedSQL,
     detect_null_group_after_outer_join,
+    parse_sql,
     scan_all,
 )
 
@@ -28,13 +29,13 @@ def _models_with_code(manifest: Manifest) -> dict[str, Node]:
     return {
         uid: n
         for uid, n in manifest.nodes.items()
-        if n.resource_type is ResourceType.MODEL and n.raw_code is not None
+        if n.resource_type is ResourceType.MODEL and n.compiled_code is not None
     }
 
 
-def _parsed(node: Node) -> ParsedSQL:
-    assert node.raw_code is not None
-    return ParsedSQL.parse(node.raw_code, dialect="duckdb")
+def _parsed(node: Node) -> Expr:
+    assert node.compiled_code is not None
+    return parse_sql(node.compiled_code, dialect="duckdb")
 
 
 def test_every_jaffle_model_parses(jaffle: Manifest) -> None:

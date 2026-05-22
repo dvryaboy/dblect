@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlglot import Expr
 
 from dblect.manifest import (
     Column,
@@ -15,7 +16,7 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
-from dblect.sql import ParsedSQL
+from dblect.sql import parse_sql
 from dblect.uniqueness import (
     UniquenessSource,
     facts_from_declarations,
@@ -254,8 +255,8 @@ def test_fact_carries_provenance_detail(jaffle: Manifest) -> None:
 # --- Structural proof from SQL ---
 
 
-def _parsed(sql: str) -> ParsedSQL:
-    return ParsedSQL.parse(sql, dialect="duckdb")
+def _parsed(sql: str) -> Expr:
+    return parse_sql(sql, dialect="duckdb")
 
 
 def test_distinct_proves_uniqueness() -> None:
@@ -348,7 +349,7 @@ def test_facts_from_declarations_excludes_structural() -> None:
         unique_id="model.pkg.x",
         name="x",
         resource_type=ResourceType.MODEL,
-        raw_code="select distinct a from t",
+        compiled_code="select distinct a from t",
     )
     manifest = Manifest(
         schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
@@ -373,7 +374,12 @@ def _node(
     test_metadata: DbtTestMetadata | None = None,
     attached_node: str | None = None,
     raw_code: str | None = None,
+    compiled_code: str | None = None,
 ) -> Node:
+    # The structural-proof layer reads compiled_code by default; tests that
+    # care about SQL-derived facts should set compiled_code. raw_code is
+    # accepted for callers that want to model the on-disk template (and is
+    # what suppression directives read from in the walker).
     return Node(
         unique_id=unique_id,
         name=name,
@@ -382,7 +388,7 @@ def _node(
         package_name="pkg",
         schema=None,
         raw_code=raw_code,
-        compiled_code=None,
+        compiled_code=compiled_code,
         original_file_path=None,
         columns=columns or {},
         depends_on=frozenset(),

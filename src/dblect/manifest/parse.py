@@ -153,6 +153,18 @@ class Node:
         """True for nodes that participate in lineage (models, sources, seeds, snapshots)."""
         return self.resource_type is not ResourceType.OTHER
 
+    @property
+    def analysis_sql(self) -> str | None:
+        """The SQL the analysis layer should parse for this node, or `None`.
+
+        Always the dbt-rendered ``compiled_code``: the analysis layer needs
+        macros expanded and refs resolved for its detectors to see the real
+        structure. The raw template is not a usable fallback (macro calls
+        come out as opaque sentinels and the detectors miss anything the
+        macros emit).
+        """
+        return self.compiled_code
+
 
 @dataclass(frozen=True, slots=True)
 class Manifest:

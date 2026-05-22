@@ -24,7 +24,7 @@ Exit code is `1` when unsuppressed findings exist (or `0` with `--no-fail`). `--
 ```
 src/dblect/
 ├── manifest/          # parse manifest.json into typed Node + DAG, surface dbt tests + constraints
-├── sql/               # parse SQL (with Jinja), walk the AST, detect hazards
+├── sql/               # parse compiled SQL, walk the AST, detect hazards
 ├── uniqueness/        # collect uniqueness facts from declarations + SQL, ground a uniqueness-aware detector
 ├── audit/             # orchestrate detectors over a manifest, render output
 ├── cli/               # the `dblect` typer app
@@ -40,7 +40,7 @@ The audit pipeline:
 ```
 dbt project
     │
-    │  (a) dbt parse / pre-built target/manifest.json
+    │  (a) dbt compile / pre-built target/manifest.json
     ▼
 manifest.json (on disk)
     │
@@ -48,7 +48,8 @@ manifest.json (on disk)
     ▼
 Manifest (typed)
     │   - Nodes keyed by unique_id (models, sources, seeds, snapshots, tests)
-    │   - raw_code, original_file_path, depends_on
+    │   - raw_code (on-disk template), compiled_code (rendered by dbt)
+    │   - original_file_path, depends_on
     │   - Test nodes carry DbtTestMetadata + attached_node
     │   - Models + Columns carry ConstraintSpec lists
     │   - DAG built from depends_on edges
@@ -57,16 +58,17 @@ Manifest (typed)
     │  (c.1) dblect.uniqueness.facts_from_manifest()
     │       Pre-pass over the whole manifest, BEFORE per-model detection:
     │       - declarations: dbt unique tests, composite-key tests, native constraints
-    │       - structural proof from each model's SQL: SELECT DISTINCT, GROUP BY
+    │       - structural proof from each model's compiled SQL: SELECT DISTINCT, GROUP BY
     │       → Mapping[model_uid, tuple[UniquenessFact, ...]]
     │
     │  (c.2) dblect.audit.run_audit()
     ▼
 For each model:
-    │   - ParsedSQL.parse(raw_code)  ────► sqlglot AST + Jinja placeholder record
+    │   - Read compiled_code (skip the model if absent)
+    │   - parse_sql(compiled_code) ────► sqlglot AST
     │   - DEFAULT_DETECTORS run over the AST
     │   - Uniqueness-aware detector runs with the precomputed facts
-    │   - parse_directives() reads -- noqa-fixture: comments
+    │   - parse_directives() reads -- noqa-fixture: comments from raw_code
     │   - apply() partitions into active / suppressed
     │
     ▼
@@ -80,7 +82,7 @@ AuditReport
 stdout
 ```
 
-Status messages (manifest path, `dbt parse` invocation) go to stderr in both text and JSON modes, so stdout stays a clean report that consumers can pipe into `jq` or capture to a file.
+Status messages (manifest path, `dbt compile` invocation, fallback notices) go to stderr in both text and JSON modes, so stdout stays a clean report that consumers can pipe into `jq` or capture to a file.
 
 ## The manifest layer (`src/dblect/manifest/`)
 
@@ -104,7 +106,7 @@ Topological order is deterministic (ties are broken by node-id sort) so the audi
 
 Four modules:
 
-- [**`parse.py`**](../../src/dblect/sql/parse.py): Jinja redaction + sqlglot parsing.
+- [**`parse.py`**](../../src/dblect/sql/parse.py): a thin wrapper that runs `sqlglot.parse_one` over the model's compiled SQL.
 - [**`patterns.py`**](../../src/dblect/sql/patterns.py): list queries and detectors over the AST.
 - [**`dialects.py`**](../../src/dblect/sql/dialects.py): adapter -> sqlglot dialect mapping and the validated-set gate.
 - [**`_sqlglot.py`**](../../src/dblect/sql/_sqlglot.py): typed accessors over sqlglot's `Any`-heavy attribute surface.
@@ -115,24 +117,15 @@ Four modules:
 
 `resolve_dialect(adapter_type, explicit_dialect)` is what the CLI calls after loading the manifest. An explicit `--dialect` always wins (the flag itself is the operator's acknowledgment that detector behavior is best-effort). Without it, the adapter must be in the validated mapping; otherwise `UnvalidatedAdapterError` fires and the CLI bails with a message that names the adapter, the validated set, and the `--dialect` escape. When the resolved dialect is outside `VALIDATED_DIALECTS`, the CLI prints a one-line stderr warning so the run is never silently best-effort.
 
-Programmatic callers of `run_audit(manifest, dialect=...)` are unaffected: they pass whatever dialect they want and the walker forwards it to `ParsedSQL.parse`. The gate lives at the CLI boundary, not in the walker.
+Programmatic callers of `run_audit(manifest, dialect=...)` are unaffected: they pass whatever dialect they want and the walker forwards it to `parse_sql`. The gate lives at the CLI boundary, not in the walker.
 
-### `ParsedSQL.parse(sql, dialect)`
+### `parse_sql(sql, dialect)`
 
-dbt SQL is Jinja-laced, and sqlglot can't parse Jinja directly. The parser redacts Jinja in a way that keeps the surrounding SQL parseable:
-
-- `{{ ref('x') }}` → bare identifier `x`. This makes joins and lineage read naturally to the AST walker.
-- `{{ source('s', 't') }}` → `s__t` (compound sentinel).
-- Other `{{ expr }}` → `__jinja_NNN` sentinel.
-- `{# comment #}` and `{% statement %}` tags → stripped entirely.
-
-**Redaction is line-preserving.** Every consumed newline is re-emitted so the redacted SQL has the same line count as the source. This invariant is what makes sqlglot's per-identifier line numbers (which we surface on findings) correspond to lines in the user's `.sql` file. A property-based test in `tests/sql/test_parse.py` exercises the invariant across composed Jinja inputs; targeted tests cover the multi-line-comment, multi-line-statement, and multi-line-expression shapes.
-
-`ParsedSQL` is a frozen dataclass carrying `raw`, `redacted`, `dialect`, `tree` (sqlglot expression), and `placeholders: tuple[JinjaPlaceholder, ...]`. The `refs` property pulls model names from placeholder `ref(...)` calls in declaration order. `SQLParseError` is raised when the redacted SQL still won't parse (with the redacted text attached so users can see what sqlglot saw).
+The analysis layer's input is compiled SQL — dbt has already rendered Jinja, so sqlglot sees real SQL with refs expanded and macros applied. `parse_sql` is a thin wrapper around `sqlglot.parse_one` that returns a sqlglot `Expr` and translates `sqlglot.errors.ParseError` into `SQLParseError`. `SQLParseError` carries the offending SQL on its `sql` attribute so the walker can record it on the skipped-model report.
 
 ### Detectors and findings
 
-`patterns.py` exposes the static detectors, all pure functions over `ParsedSQL` returning `tuple[Finding, ...]`:
+`patterns.py` exposes the static detectors, all pure functions over a sqlglot `Expr` returning `tuple[Finding, ...]`:
 
 | Detector | What it flags |
 | --- | --- |
@@ -216,15 +209,15 @@ Three modules:
 
 ### Walker
 
-`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`. A `Detector` is the type alias `Callable[[ParsedSQL], tuple[Finding, ...]]`; passing a custom list overrides the defaults (the uniqueness-aware detector still runs).
+`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`. A `Detector` is the type alias `Callable[[Expr], tuple[Finding, ...]]`; passing a custom list overrides the defaults (the uniqueness-aware detector still runs).
 
 1. Computes `facts_from_manifest(manifest)` once up front, then curries the uniqueness-aware detector against it. The curried detector joins the configured `detectors` list so the per-model loop runs everything in one pass.
 2. Iterates `manifest.models` in unique_id sort order for stable output.
 3. For each model:
-   - Skips if `raw_code is None` (sources, seeds, packages that don't ship SQL), recorded as `SkippedModel(reason="no raw_code")`.
-   - Calls `ParsedSQL.parse(raw_code, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure**: one bad model shouldn't blind the audit to the rest.
+   - Reads `Node.analysis_sql` (the model's `compiled_code`). Models with no compiled SQL are recorded as `SkippedModel(reason="no compiled SQL (run \`dbt compile\`)")`.
+   - Calls `parse_sql(sql, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure**: one bad model shouldn't blind the audit to the rest.
    - Runs each detector, collecting `Finding`s.
-   - Calls `parse_directives(raw_code)` to extract `-- noqa-fixture:` comments. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
+   - Calls `parse_directives(node.raw_code)` to extract `-- noqa-fixture:` comments — directives live in the source the developer wrote, not in the compiled output, so they always come from `raw_code`. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
    - Calls `apply(findings, directives)` to partition into active vs. suppressed.
 4. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`. Convenience properties `counts_by_kind` (a `Counter`-backed `Mapping[FindingKind, int]`) and `has_findings` are available for consumers that want the rolled-up view without re-iterating.
 
@@ -279,7 +272,7 @@ Audit options:
 | --- | --- | --- |
 | `PROJECT_DIR` positional | `.` | Where `dbt_project.yml` lives. |
 | `--manifest PATH` | _(unset)_ | Skip resolution and load this file directly. |
-| `--dbt-executable NAME` | `dbt` | Used only by the fallback `dbt parse`. |
+| `--dbt-executable NAME` | `dbt` | Used only by the fallback `dbt compile`. |
 | `--format text\|json -f` | `text` | Reporter selection. Status messages always go to stderr; stdout is the report. |
 | `--dialect NAME` | _(unset)_ | Force a sqlglot dialect, overriding the manifest's `adapter_type`. Required when the adapter is not in dblect's validated set; passing the flag is the operator's acknowledgment that detector behavior is best-effort. |
 | `--no-fail` | _(off)_ | Force exit 0 even when findings exist. Default is exit 1 on any unsuppressed finding. |
@@ -288,7 +281,7 @@ Audit options:
 
 1. `--manifest PATH` if provided.
 2. `<project_dir>/target/manifest.json` if it exists.
-3. Shell out to `dbt parse --project-dir <project_dir>` to produce one. Requires `dbt` on `PATH`; the error message tells the user when it isn't.
+3. Shell out to `dbt compile --project-dir <project_dir>` to produce one. Requires `dbt` on `PATH` and a working profile (the same setup `dbt run` needs); the error message tells the user when it isn't.
 
 Each failure mode raises `typer.BadParameter` with an actionable message. The "no `dbt_project.yml` and no `--manifest`" case is caught explicitly so users don't get confusing dbt errors when they're just in the wrong directory.
 
@@ -306,7 +299,7 @@ The test suite is organized by package:
 
 ```
 tests/manifest/    - manifest parsing + DAG topology (incl. PBT over generated acyclic DAGs)
-tests/sql/         - parsing, Jinja redaction, structural detectors (incl. PBT on line-preservation and parse round-trips)
+tests/sql/         - sqlglot parsing wrapper, structural detectors (incl. PBT on parse round-trips)
 tests/uniqueness/  - declaration ingestion, structural-proof rules, ordering-key detector
 tests/audit/       - walker, suppression directives, text + JSON reporters
 tests/cli/         - end-to-end CLI via typer.testing.CliRunner
@@ -314,7 +307,7 @@ tests/execution/   - real-dbt run against the vendored jaffle project
 tests/test_smoke.py - package import + CLI module load
 ```
 
-Hypothesis property-based tests cover DAG topology, Jinja line-preservation, parse round-trips, and the uniqueness-fact kind round-trip. The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
+Hypothesis property-based tests cover DAG topology, parse round-trips, and the uniqueness-fact kind round-trip. The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
 
 Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression module are pure functions, which makes testing rigorous: same inputs always give the same outputs, no mocking needed.
 

@@ -129,9 +129,8 @@ def line_range(e: Expr) -> tuple[int, int] | None:
     `None` if no identifier carries a usable line number (rare; some literal-
     only expressions like ``select 1`` have no identifier children).
 
-    Line numbers refer to the redacted SQL the parser saw. Redaction in
-    ``dblect.sql.parse`` is line-preserving, so they also correspond to lines
-    in the user's source file.
+    Line numbers refer to the SQL the parser saw (the model's
+    ``compiled_code``).
     """
     lines: list[int] = []
     for ident in e.find_all(exp.Identifier):

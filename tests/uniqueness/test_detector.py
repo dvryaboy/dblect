@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from dblect.sql import FindingKind, ParsedSQL
+from sqlglot import Expr
+
+from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness import UniquenessFact, UniquenessSource
 from dblect.uniqueness.detector import detect_non_unique_window_order_keys
 
@@ -23,8 +25,8 @@ def _facts(model_uid: str, *keys: tuple[str, ...]) -> Mapping[str, tuple[Uniquen
     }
 
 
-def _parse(sql: str) -> ParsedSQL:
-    return ParsedSQL.parse(sql, dialect="duckdb")
+def _parse(sql: str) -> Expr:
+    return parse_sql(sql, dialect="duckdb")
 
 
 def test_window_order_keys_not_unique_is_flagged() -> None:

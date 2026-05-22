@@ -20,13 +20,15 @@ fi
 
 # Invoke dbt via jaffle's own dependency environment so we don't pollute dblect's.
 # Prefer `uv run` (matches jaffle's pyproject.toml setup); fall back to a system dbt.
-echo "Running 'dbt parse' in ${JAFFLE}..."
+# `dbt compile` (rather than `dbt parse`) is what populates `compiled_code` on
+# every model, which is what dblect's analysis layer consumes.
+echo "Running 'dbt compile' in ${JAFFLE}..."
 (
   cd "${JAFFLE}"
   if command -v uv >/dev/null 2>&1 && [[ -f pyproject.toml ]]; then
-    uv run dbt parse
+    uv run dbt compile
   elif command -v dbt >/dev/null 2>&1; then
-    dbt parse
+    dbt compile
   else
     echo "error: neither 'uv' nor 'dbt' is available." >&2
     echo "       Install uv (https://docs.astral.sh/uv) or dbt-duckdb." >&2

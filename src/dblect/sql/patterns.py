@@ -1,6 +1,6 @@
 """Pattern queries and structural hazard detectors over a parsed SQL AST.
 
-Two layers, both pure functions over a `ParsedSQL`:
+Two layers, both pure functions over a sqlglot ``Expr``:
 
 * **List queries** (`list_joins`, `list_windows`, `list_group_bys`,
   `list_aggregations`) summarise structural features of the statement. They
@@ -29,7 +29,6 @@ from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
-from dblect.sql.parse import ParsedSQL
 
 
 class FindingKind(StrEnum):
@@ -48,9 +47,10 @@ class Finding:
     """A single static-analysis observation about a SQL statement.
 
     ``line_start`` and ``line_end`` are 1-indexed line numbers in the SQL
-    the detector was given. When that SQL came from a dbt model's
-    ``raw_code``, they also correspond to lines in the user's ``.sql`` file
-    (the Jinja-redacting parser preserves line counts).
+    the detector was given — the model's ``compiled_code``, which dbt
+    renders with refs and macro calls expanded inline. Line numbers
+    correspond to the compiled output; the reporter still surfaces the
+    model's source file path so navigation works as expected.
 
     A value of ``0`` means we couldn't pin the finding to a line, which
     happens when the offending AST node has no ``Identifier`` descendants
@@ -167,10 +167,10 @@ def _finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
     )
 
 
-def list_joins(parsed: ParsedSQL) -> tuple[JoinSummary, ...]:
+def list_joins(tree: Expr) -> tuple[JoinSummary, ...]:
     """Return every JOIN in the statement, including those nested in CTEs/subqueries."""
     out: list[JoinSummary] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         from_ = sg.from_of(sel)
         left: str | None = (
             sg.name_of(from_.this) if from_ is not None and from_.this is not None else None
@@ -189,10 +189,10 @@ def list_joins(parsed: ParsedSQL) -> tuple[JoinSummary, ...]:
     return tuple(out)
 
 
-def list_windows(parsed: ParsedSQL) -> tuple[WindowSummary, ...]:
+def list_windows(tree: Expr) -> tuple[WindowSummary, ...]:
     """Return every windowed function invocation in the statement."""
     out: list[WindowSummary] = []
-    for w in sg.find_all_windows(parsed.tree):
+    for w in sg.find_all_windows(tree):
         fn = sg.fn_of(w)
         partition = sg.partition_of(w)
         out.append(
@@ -207,10 +207,10 @@ def list_windows(parsed: ParsedSQL) -> tuple[WindowSummary, ...]:
     return tuple(out)
 
 
-def list_group_bys(parsed: ParsedSQL) -> tuple[GroupBySummary, ...]:
+def list_group_bys(tree: Expr) -> tuple[GroupBySummary, ...]:
     """Return every GROUP BY clause's targets, one summary per containing SELECT."""
     out: list[GroupBySummary] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         g = sg.group_of(sel)
         if g is None:
             continue
@@ -222,10 +222,10 @@ def list_group_bys(parsed: ParsedSQL) -> tuple[GroupBySummary, ...]:
     return tuple(out)
 
 
-def list_aggregations(parsed: ParsedSQL) -> tuple[AggregateSummary, ...]:
+def list_aggregations(tree: Expr) -> tuple[AggregateSummary, ...]:
     """Return every non-windowed aggregate-function call in the statement."""
     out: list[AggregateSummary] = []
-    for node in sg.find_all_aggfunc(parsed.tree):
+    for node in sg.find_all_aggfunc(tree):
         if isinstance(node.parent, exp.Window):
             continue
         arg = node.this
@@ -239,7 +239,7 @@ def list_aggregations(parsed: ParsedSQL) -> tuple[AggregateSummary, ...]:
     return tuple(out)
 
 
-def detect_null_group_after_outer_join(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
     """Flag GROUP BY targets that reference the nullable side of an outer join.
 
     LEFT JOIN makes the right side's columns NULL for unmatched left rows;
@@ -248,7 +248,7 @@ def detect_null_group_after_outer_join(parsed: ParsedSQL) -> tuple[Finding, ...]
     are flagged symmetrically.
     """
     out: list[Finding] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         nullable = _nullable_tables(sel)
         if not nullable:
             continue
@@ -276,14 +276,14 @@ def detect_null_group_after_outer_join(parsed: ParsedSQL) -> tuple[Finding, ...]
     return tuple(out)
 
 
-def detect_coalesce_on_join_key(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
     """Flag COALESCE applied to a column that also appears in a JOIN ON clause.
 
     Patching a join-key column with COALESCE typically defeats the NULL
     semantics that distinguish "no match" from "match with NULL". Worth a look.
     """
     out: list[Finding] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         keys: set[tuple[str | None, str]] = set()
         for j in sg.joins_of(sel):
             on = sg.on_of(j)
@@ -311,7 +311,7 @@ def detect_coalesce_on_join_key(parsed: ParsedSQL) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_unordered_window(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
     """Flag ranking window functions with no deterministic ORDER BY.
 
     ``ROW_NUMBER()``, ``RANK()``, and friends produce different results across
@@ -319,7 +319,7 @@ def detect_unordered_window(parsed: ParsedSQL) -> tuple[Finding, ...]:
     ``LAST_VALUE`` are similarly meaningless without an ordering.
     """
     out: list[Finding] = []
-    for w in sg.find_all_windows(parsed.tree):
+    for w in sg.find_all_windows(tree):
         fn = sg.fn_of(w)
         if fn is None or type(fn) not in _RANKING_FUNCTIONS:
             continue
@@ -338,10 +338,10 @@ def detect_unordered_window(parsed: ParsedSQL) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_unordered_aggregate(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
     """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY."""
     out: list[Finding] = []
-    for node in parsed.tree.find_all(*_ORDERED_AGGREGATE_FUNCTIONS):
+    for node in tree.find_all(*_ORDERED_AGGREGATE_FUNCTIONS):
         if isinstance(node.parent, exp.WithinGroup):
             continue
         inner = node.this
@@ -360,7 +360,7 @@ def detect_unordered_aggregate(parsed: ParsedSQL) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_where_on_outer_joined_nullable(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
     """Flag WHERE predicates that silently invert an OUTER JOIN into an INNER one.
 
     ``select * from a left join b on a.k = b.k where b.col = X`` rejects every
@@ -374,7 +374,7 @@ def detect_where_on_outer_joined_nullable(parsed: ParsedSQL) -> tuple[Finding, .
     the comparison node. Protected predicates are silent.
     """
     out: list[Finding] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         nullable = _nullable_tables(sel)
         if not nullable:
             continue
@@ -407,7 +407,7 @@ def detect_where_on_outer_joined_nullable(parsed: ParsedSQL) -> tuple[Finding, .
     return tuple(out)
 
 
-def detect_non_deterministic_function(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def detect_non_deterministic_function(tree: Expr) -> tuple[Finding, ...]:
     """Flag non-deterministic function calls in load-bearing positions.
 
     "Load-bearing" means the function's value affects which rows go where,
@@ -429,7 +429,7 @@ def detect_non_deterministic_function(parsed: ParsedSQL) -> tuple[Finding, ...]:
     time). Views are recomputed every read, so the hazard mostly evaporates.
     """
     out: list[Finding] = []
-    for sel in sg.find_all_selects(parsed.tree):
+    for sel in sg.find_all_selects(tree):
         scopes = _load_bearing_scopes(sel)
         for label, scope in scopes:
             calls = _find_non_deterministic(scope)
@@ -462,14 +462,14 @@ _ALL_DETECTORS = (
 )
 
 
-def scan_all(parsed: ParsedSQL) -> tuple[Finding, ...]:
+def scan_all(tree: Expr) -> tuple[Finding, ...]:
     """Run every detector and return findings in detector-declaration order."""
-    return tuple(f for detector in _ALL_DETECTORS for f in detector(parsed))
+    return tuple(f for detector in _ALL_DETECTORS for f in detector(tree))
 
 
-def all_findings(parseds: Iterable[ParsedSQL]) -> tuple[Finding, ...]:
+def all_findings(trees: Iterable[Expr]) -> tuple[Finding, ...]:
     """Convenience: scan a batch of parsed statements."""
-    return tuple(f for p in parseds for f in scan_all(p))
+    return tuple(f for t in trees for f in scan_all(t))
 
 
 def _order_targets(order: exp.Order | None) -> tuple[str, ...]:

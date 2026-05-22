@@ -1,14 +1,18 @@
 """Run SQL detectors over every model in a manifest, return a typed report.
 
 The walker is the substrate the CLI sits on. It iterates ``manifest.models``,
-parses each model's ``raw_code`` through the Jinja-redacting SQL parser, runs
-the configured detectors, and attaches each finding to its originating model
-and source file path.
+feeds each model's compiled SQL (rendered by ``dbt compile``) into the SQL
+parser, runs the configured detectors, and attaches each finding to its
+originating model and source file path.
 
-Models whose ``raw_code`` is absent (sources, seeds, packages that didn't
-expose SQL) and models whose SQL fails to parse are recorded on the report as
-skipped, with a reason. The walker never raises on per-model failure: one bad
-model shouldn't blind the audit to the rest of the project.
+Models whose analysis SQL is absent and models whose SQL fails to parse are
+recorded on the report as skipped, with a reason. The walker never raises on
+per-model failure: one bad model shouldn't blind the audit to the rest of the
+project.
+
+Suppression directives (``-- noqa-fixture:`` comments) are always read from
+``raw_code``: they live in the source the developer wrote, not in the
+compiled output.
 """
 
 from __future__ import annotations
@@ -17,12 +21,13 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from sqlglot import Expr
+
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node
 from dblect.sql import (
     Finding,
     FindingKind,
-    ParsedSQL,
     SQLParseError,
     detect_coalesce_on_join_key,
     detect_non_deterministic_function,
@@ -30,11 +35,12 @@ from dblect.sql import (
     detect_unordered_aggregate,
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
+    parse_sql,
 )
 from dblect.uniqueness import facts_from_manifest
 from dblect.uniqueness.detector import make_detector as _make_uniqueness_detector
 
-Detector = Callable[[ParsedSQL], tuple[Finding, ...]]
+Detector = Callable[[Expr], tuple[Finding, ...]]
 
 DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_null_group_after_outer_join,
@@ -100,8 +106,8 @@ def run_audit(
     """Run `detectors` over every model in `manifest`.
 
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
-    Models whose ``raw_code`` is missing or unparseable are listed in the
-    report's ``skipped`` field with a reason rather than raising.
+    Models whose ``compiled_code`` is missing or unparseable are listed in
+    the report's ``skipped`` field with a reason rather than raising.
 
     A uniqueness-aware detector (window order-keys grounded against declared
     keys on the source model) runs alongside the configured `detectors` list.
@@ -143,17 +149,23 @@ def _scan_one(
     detectors: Sequence[Detector],
     dialect: str | None,
 ) -> _Scanned | SkippedModel:
-    if node.raw_code is None:
-        return SkippedModel(unique_id=node.unique_id, reason="no raw_code")
+    sql = node.analysis_sql
+    if sql is None:
+        return SkippedModel(
+            unique_id=node.unique_id,
+            reason="no compiled SQL (run `dbt compile`)",
+        )
     try:
-        parsed = ParsedSQL.parse(node.raw_code, dialect=dialect)
+        tree = parse_sql(sql, dialect=dialect)
     except SQLParseError as e:
         return SkippedModel(unique_id=node.unique_id, reason=f"parse error: {e}")
 
     raw_findings: list[Finding] = []
     for detector in detectors:
-        raw_findings.extend(detector(parsed))
-    directives, malformed = parse_directives(node.raw_code)
+        raw_findings.extend(detector(tree))
+    # Directives live in the source the developer wrote, not the compiled
+    # output. Fall back to the parsed SQL only if `raw_code` is missing.
+    directives, malformed = parse_directives(node.raw_code or sql)
     # Malformed-suppression findings ride the regular pipeline; we never
     # suppress them with another directive (it would be silly), so apply()
     # only runs over the detector findings.

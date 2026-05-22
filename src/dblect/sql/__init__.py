@@ -1,11 +1,6 @@
 """SQL static-analysis layer over sqlglot."""
 
-from dblect.sql.parse import (
-    JinjaPlaceholder,
-    ParsedSQL,
-    PlaceholderKind,
-    SQLParseError,
-)
+from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.sql.patterns import (
     AggregateSummary,
     Finding,
@@ -33,11 +28,8 @@ __all__ = [
     "Finding",
     "FindingKind",
     "GroupBySummary",
-    "JinjaPlaceholder",
     "JoinSide",
     "JoinSummary",
-    "ParsedSQL",
-    "PlaceholderKind",
     "SQLParseError",
     "WindowSummary",
     "all_findings",
@@ -51,5 +43,6 @@ __all__ = [
     "list_group_bys",
     "list_joins",
     "list_windows",
+    "parse_sql",
     "scan_all",
 ]

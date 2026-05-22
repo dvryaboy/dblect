@@ -45,7 +45,7 @@ def audit(
             help=(
                 "Path to a manifest.json. If omitted, dblect looks for "
                 "<project_dir>/target/manifest.json and falls back to running "
-                "`dbt parse` to produce one."
+                "`dbt compile` to produce one."
             ),
         ),
     ] = None,
@@ -53,7 +53,7 @@ def audit(
         str,
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
             "--dbt-executable",
-            help="Name or path of the dbt CLI used by the fallback `dbt parse`.",
+            help="Name or path of the dbt CLI used by the fallback `dbt compile`.",
         ),
     ] = "dbt",
     output_format: Annotated[
@@ -152,11 +152,11 @@ def _resolve_manifest_path(
     if shutil.which(dbt_executable) is None:
         raise typer.BadParameter(
             f"`{dbt_executable}` not on PATH and no manifest at {default}; "
-            "install dbt or pass --manifest"
+            "install dbt (e.g. `uv add 'dblect[dbt-core]'`) or pass --manifest"
         )
-    typer.echo(f"audit: running `{dbt_executable} parse` in {project_dir}", err=True)
+    typer.echo(f"audit: running `{dbt_executable} compile` in {project_dir}", err=True)
     completed = subprocess.run(
-        [dbt_executable, "parse", "--project-dir", str(project_dir)],
+        [dbt_executable, "compile", "--project-dir", str(project_dir)],
         capture_output=True,
         text=True,
         check=False,
@@ -167,7 +167,7 @@ def _resolve_manifest_path(
         raise typer.Exit(code=completed.returncode)
     if not default.exists():
         raise typer.BadParameter(
-            f"`dbt parse` succeeded but {default} is missing; check dbt's target-path config"
+            f"`dbt compile` succeeded but {default} is missing; check dbt's target-path config"
         )
     return default
 

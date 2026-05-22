@@ -27,13 +27,13 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.manifest import Manifest
-from dblect.sql import Finding, FindingKind, ParsedSQL
+from dblect.sql import Finding, FindingKind
 from dblect.sql import _sqlglot as sg
 from dblect.uniqueness.facts import UniquenessFact
 
 
 def detect_non_unique_window_order_keys(
-    parsed: ParsedSQL,
+    tree: Expr,
     *,
     facts: Mapping[str, tuple[UniquenessFact, ...]],
     model_name_to_uid: Mapping[str, str],
@@ -45,7 +45,7 @@ def detect_non_unique_window_order_keys(
     queries, queries reading from CTEs that we can't trace, queries where the
     source has no declared uniqueness facts.
     """
-    sel = _top_level_select(parsed.tree)
+    sel = _top_level_select(tree)
     if sel is None:
         return ()
     source_uid = _single_source_model_uid(sel, model_name_to_uid)
@@ -93,14 +93,14 @@ def make_detector(
 ):
     """Curry the detector against an audit-scoped context.
 
-    Returns a plain ``Detector`` (``Callable[[ParsedSQL], tuple[Finding, ...]]``)
+    Returns a plain ``Detector`` (``Callable[[Expr], tuple[Finding, ...]]``)
     so the walker can drop it into the existing detector pipeline.
     """
     name_to_uid: dict[str, str] = {m.name: uid for uid, m in manifest.models.items()}
 
-    def detector(parsed: ParsedSQL) -> tuple[Finding, ...]:
+    def detector(tree: Expr) -> tuple[Finding, ...]:
         return detect_non_unique_window_order_keys(
-            parsed,
+            tree,
             facts=facts,
             model_name_to_uid=name_to_uid,
         )
