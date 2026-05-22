@@ -52,7 +52,11 @@ def test_audit_skips_models_without_raw_code(jaffle: Manifest) -> None:
     [a_model_uid] = list(jaffle.models)[:1]
     drained = dict(jaffle.nodes)
     drained[a_model_uid] = _without_raw_code(drained[a_model_uid])
-    altered = Manifest(schema_version=jaffle.schema_version, nodes=drained)
+    altered = Manifest(
+        schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
+        nodes=drained,
+    )
     report = run_audit(altered)
     assert SkippedModel(unique_id=a_model_uid, reason="no raw_code") in report.skipped
     assert report.models_scanned == len(jaffle.models) - 1
@@ -63,7 +67,11 @@ def test_audit_records_parse_errors_without_blowing_up(jaffle: Manifest) -> None
     [a_model_uid] = list(jaffle.models)[:1]
     drained = dict(jaffle.nodes)
     drained[a_model_uid] = _with_raw_code(drained[a_model_uid], "select from where")
-    altered = Manifest(schema_version=jaffle.schema_version, nodes=drained)
+    altered = Manifest(
+        schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
+        nodes=drained,
+    )
     report = run_audit(altered)
     assert any(
         s.unique_id == a_model_uid and s.reason.startswith("parse error") for s in report.skipped
@@ -128,6 +136,7 @@ def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> N
     assert suppressed_sql != customers.raw_code, "test setup failed to find target line"
     altered = Manifest(
         schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
             customers.unique_id: replace(customers, raw_code=suppressed_sql),
@@ -155,6 +164,7 @@ def test_bare_noqa_fixture_surfaces_as_malformed_suppression(jaffle: Manifest) -
     assert node.raw_code is not None
     altered = Manifest(
         schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
             a_model_uid: replace(node, raw_code="-- noqa-fixture\n" + node.raw_code),
@@ -177,6 +187,7 @@ def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> N
     blanket = "-- noqa-fixture: silence everything in this file\n" + customers.raw_code
     altered = Manifest(
         schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
             customers.unique_id: replace(customers, raw_code=blanket),

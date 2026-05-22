@@ -54,7 +54,9 @@ def test_models_without_facts_are_absent_from_mapping() -> None:
         name="alone",
         resource_type=ResourceType.MODEL,
     )
-    manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
+    )
     facts = facts_from_manifest(manifest)
     assert facts == {}
 
@@ -78,6 +80,7 @@ def test_unique_combination_of_columns_test_produces_composite_fact() -> None:
     )
     manifest = Manifest(
         schema_version="x",
+        adapter_type="duckdb",
         nodes={model.unique_id: model, test_node.unique_id: test_node},
     )
     facts = facts_from_manifest(manifest)
@@ -93,7 +96,9 @@ def test_native_model_level_primary_key_constraint() -> None:
         resource_type=ResourceType.MODEL,
         constraints=(ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("id",)),),
     )
-    manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
+    )
     facts = facts_from_manifest(manifest)
     [fact] = facts["model.pkg.x"]
     assert fact.columns == frozenset({"id"})
@@ -112,7 +117,9 @@ def test_native_column_level_unique_constraint() -> None:
             constraints=(ConstraintSpec(type=ConstraintType.UNIQUE),),
         )},
     )
-    manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
+    )
     facts = facts_from_manifest(manifest)
     [fact] = facts["model.pkg.x"]
     assert fact.columns == frozenset({"slug"})
@@ -131,7 +138,9 @@ def test_not_null_constraint_is_not_a_uniqueness_fact() -> None:
             constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL),),
         )},
     )
-    manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
+    )
     facts = facts_from_manifest(manifest)
     assert facts == {}
 
@@ -146,7 +155,11 @@ def test_unique_test_on_source_is_skipped() -> None:
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": "id"}),
         attached_node="source.pkg.raw.raw",
     )
-    manifest = Manifest(schema_version="x", nodes={test_node.unique_id: test_node})
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={test_node.unique_id: test_node},
+    )
     assert facts_from_manifest(manifest) == {}
 
 
@@ -258,7 +271,9 @@ def test_facts_from_declarations_excludes_structural() -> None:
         resource_type=ResourceType.MODEL,
         raw_code="select distinct a from t",
     )
-    manifest = Manifest(schema_version="x", nodes={model.unique_id: model})
+    manifest = Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
+    )
     # Declarations alone: no facts (no tests, no constraints).
     assert facts_from_declarations(manifest) == ()
     # Combined: the structural-proof DISTINCT fact appears.

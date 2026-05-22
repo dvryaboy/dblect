@@ -118,3 +118,61 @@ def test_version_command_still_works(runner: CliRunner) -> None:
     result = runner.invoke(app, ["version"])
     assert result.exit_code == 0
     assert result.output.strip()
+
+
+def test_audit_bails_on_unvalidated_adapter(
+    jaffle_snowflake_meta_manifest_path: Path, runner: CliRunner
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "audit",
+            "--manifest",
+            str(jaffle_snowflake_meta_manifest_path),
+            "--no-fail",
+            ".",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "snowflake" in result.output
+    assert "--dialect" in result.output
+
+
+def test_audit_dialect_override_unlocks_unvalidated_adapter(
+    jaffle_snowflake_meta_manifest_path: Path, runner: CliRunner
+) -> None:
+    # Force-interpret the jaffle SQL as duckdb; the override is the operator
+    # opt-in, so the run proceeds and lands the usual jaffle finding.
+    result = runner.invoke(
+        app,
+        [
+            "audit",
+            "--manifest",
+            str(jaffle_snowflake_meta_manifest_path),
+            "--dialect",
+            "duckdb",
+            "--no-fail",
+            ".",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "null_group_after_outer_join" in result.output
+
+
+def test_audit_warns_when_using_unvalidated_dialect(
+    jaffle_manifest_path: Path, runner: CliRunner
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "audit",
+            "--manifest",
+            str(jaffle_manifest_path),
+            "--dialect",
+            "snowflake",
+            "--no-fail",
+            ".",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "unvalidated dialect" in result.output

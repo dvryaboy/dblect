@@ -18,6 +18,11 @@ def test_loads_schema_version(jaffle: Manifest) -> None:
     assert jaffle.schema_version.startswith("https://schemas.getdbt.com/dbt/manifest/")
 
 
+def test_loads_adapter_type(jaffle: Manifest) -> None:
+    # The jaffle fixture is generated with the duckdb adapter.
+    assert jaffle.adapter_type == "duckdb"
+
+
 def test_partitions_nodes_by_resource_type(jaffle: Manifest) -> None:
     assert len(jaffle.models) == 5
     assert len(jaffle.seeds) == 3

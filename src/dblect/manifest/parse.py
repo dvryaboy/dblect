@@ -142,6 +142,7 @@ class Manifest:
     """A dblect-shaped view of a parsed dbt ``manifest.json``."""
 
     schema_version: str
+    adapter_type: str
     nodes: Mapping[str, Node]
 
     @classmethod
@@ -168,8 +169,12 @@ class Manifest:
         schema_version = parsed.metadata.dbt_schema_version
         if schema_version is None:
             raise ValueError("manifest is missing metadata.dbt_schema_version")
+        adapter_type = getattr(parsed.metadata, "adapter_type", None)
+        if not isinstance(adapter_type, str) or not adapter_type:
+            raise ValueError("manifest is missing metadata.adapter_type")
         return cls(
             schema_version=schema_version,
+            adapter_type=adapter_type,
             nodes=nodes,
         )
 

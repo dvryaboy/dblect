@@ -88,7 +88,7 @@ Status messages (manifest path, `dbt parse` invocation) go to stderr in both tex
 
 Key types in [`manifest/parse.py`](../../src/dblect/manifest/parse.py):
 
-- **`Manifest`**: `schema_version`, `nodes: Mapping[str, Node]`, plus `models` / `sources` / `seeds` / `snapshots` properties that filter by resource type.
+- **`Manifest`**: `schema_version`, `adapter_type` (e.g. `"duckdb"`, `"snowflake"` — sourced from `metadata.adapter_type`), `nodes: Mapping[str, Node]`, plus `models` / `sources` / `seeds` / `snapshots` properties that filter by resource type.
 - **`Node`**: `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`, `constraints`, `test_metadata`, `attached_node`. The last three carry dbt-specific information that the uniqueness layer consumes: `constraints` for native dbt 1.5+ constraints on models, `test_metadata` (a `DbtTestMetadata`) for the `name`+`kwargs` of generic tests, and `attached_node` for the model a test is attached to.
 - **`ResourceType`**: `MODEL`, `SOURCE`, `SEED`, `SNAPSHOT`, `OTHER` (catches tests, analyses, operations).
 - **`Column`**: `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
@@ -102,11 +102,20 @@ Topological order is deterministic (ties are broken by node-id sort) so the audi
 
 ## The SQL layer (`src/dblect/sql/`)
 
-Three modules:
+Four modules:
 
 - [**`parse.py`**](../../src/dblect/sql/parse.py): Jinja redaction + sqlglot parsing.
 - [**`patterns.py`**](../../src/dblect/sql/patterns.py): list queries and detectors over the AST.
+- [**`dialects.py`**](../../src/dblect/sql/dialects.py): adapter -> sqlglot dialect mapping and the validated-set gate.
 - [**`_sqlglot.py`**](../../src/dblect/sql/_sqlglot.py): typed accessors over sqlglot's `Any`-heavy attribute surface.
+
+### Dialect resolution
+
+`ADAPTER_TO_SQLGLOT_DIALECT` in `dialects.py` is the explicit set of dbt adapters whose detector behavior dblect has validated end-to-end. Today that's `{"duckdb": "duckdb"}`. `VALIDATED_DIALECTS` is derived from the mapping's values.
+
+`resolve_dialect(adapter_type, explicit_dialect)` is what the CLI calls after loading the manifest. An explicit `--dialect` always wins (the flag itself is the operator's acknowledgment that detector behavior is best-effort). Without it, the adapter must be in the validated mapping; otherwise `UnvalidatedAdapterError` fires and the CLI bails with a message that names the adapter, the validated set, and the `--dialect` escape. When the resolved dialect is outside `VALIDATED_DIALECTS`, the CLI prints a one-line stderr warning so the run is never silently best-effort.
+
+Programmatic callers of `run_audit(manifest, dialect=...)` are unaffected: they pass whatever dialect they want and the walker forwards it to `ParsedSQL.parse`. The gate lives at the CLI boundary, not in the walker.
 
 ### `ParsedSQL.parse(sql, dialect)`
 
@@ -272,6 +281,7 @@ Audit options:
 | `--manifest PATH` | _(unset)_ | Skip resolution and load this file directly. |
 | `--dbt-executable NAME` | `dbt` | Used only by the fallback `dbt parse`. |
 | `--format text\|json -f` | `text` | Reporter selection. Status messages always go to stderr; stdout is the report. |
+| `--dialect NAME` | _(unset)_ | Force a sqlglot dialect, overriding the manifest's `adapter_type`. Required when the adapter is not in dblect's validated set; passing the flag is the operator's acknowledgment that detector behavior is best-effort. |
 | `--no-fail` | _(off)_ | Force exit 0 even when findings exist. Default is exit 1 on any unsuppressed finding. |
 
 **Manifest resolution** (first wins):

@@ -64,6 +64,18 @@ def audit(
             help="Output format. `text` is for terminals; `json` is for CI / editors.",
         ),
     ] = OutputFormat.TEXT,
+    dialect_override: Annotated[
+        str | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--dialect",
+            help=(
+                "Force a sqlglot dialect for SQL parsing, overriding the "
+                "manifest's adapter_type. Required when running against an "
+                "adapter dblect has not validated; passing the flag is the "
+                "operator's acknowledgment that detector behavior is best-effort."
+            ),
+        ),
+    ] = None,
     no_fail: Annotated[
         bool,
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
@@ -79,6 +91,11 @@ def audit(
     from dblect.audit import run_audit
     from dblect.audit.reporter import render_json, render_text
     from dblect.manifest import Manifest
+    from dblect.sql.dialects import (
+        VALIDATED_DIALECTS,
+        UnvalidatedAdapterError,
+        resolve_dialect,
+    )
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir,
@@ -87,7 +104,26 @@ def audit(
     )
     typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
-    report = run_audit(loaded)
+    try:
+        dialect = resolve_dialect(
+            adapter_type=loaded.adapter_type,
+            explicit_dialect=dialect_override,
+        )
+    except UnvalidatedAdapterError as e:
+        raise typer.BadParameter(
+            f"manifest adapter is `{e.adapter_type}`, which is not in "
+            f"dblect's validated set ({sorted(VALIDATED_DIALECTS)}). "
+            f"Pass --dialect <name> to force a sqlglot dialect "
+            f"(interpretation will be best-effort)."
+        ) from e
+    if dialect not in VALIDATED_DIALECTS:
+        typer.echo(
+            f"audit: using unvalidated dialect `{dialect}` "
+            f"(validated: {sorted(VALIDATED_DIALECTS)}); "
+            f"detector behavior is best-effort.",
+            err=True,
+        )
+    report = run_audit(loaded, dialect=dialect)
     rendered = (
         render_json(report) if output_format is OutputFormat.JSON else render_text(report)
     )
