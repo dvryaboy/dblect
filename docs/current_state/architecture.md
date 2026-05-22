@@ -80,7 +80,7 @@ AuditReport
 stdout
 ```
 
-Status messages (manifest path, dbt parse invocation) go to stderr so JSON consumers can pipe stdout into `jq` without interleaved noise.
+Status messages (manifest path, `dbt parse` invocation) go to stderr in both text and JSON modes, so stdout stays a clean report that consumers can pipe into `jq` or capture to a file.
 
 ## The manifest layer (`src/dblect/manifest/`)
 
@@ -92,7 +92,8 @@ Key types in [`manifest/parse.py`](../../src/dblect/manifest/parse.py):
 - **`Node`**: `unique_id`, `name`, `resource_type`, `fqn`, `package_name`, `schema`, `raw_code`, `compiled_code`, `original_file_path`, `columns`, `depends_on: frozenset[str]`, `constraints`, `test_metadata`, `attached_node`. The last three carry dbt-specific information that the uniqueness layer consumes: `constraints` for native dbt 1.5+ constraints on models, `test_metadata` (a `DbtTestMetadata`) for the `name`+`kwargs` of generic tests, and `attached_node` for the model a test is attached to.
 - **`ResourceType`**: `MODEL`, `SOURCE`, `SEED`, `SNAPSHOT`, `OTHER` (catches tests, analyses, operations).
 - **`Column`**: `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
-- **`ConstraintSpec`**: `type` (e.g. `"primary_key"`, `"unique"`, `"not_null"`, `"check"`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
+- **`ConstraintSpec`**: `type` (a `ConstraintType`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
+- **`ConstraintType`**: `PRIMARY_KEY`, `UNIQUE`, `NOT_NULL`, `CHECK`, `FOREIGN_KEY`, `OTHER`. `from_raw` is total: unrecognized vendor- or dialect-specific types fall into `OTHER` so the parse stays total.
 - **`DbtTestMetadata`**: `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type).
 
 The DAG lives in [`manifest/dag.py`](../../src/dblect/manifest/dag.py). `Dag.build(nodes, edges)` validates that every edge references a known node, detects cycles (raises `CycleError` with the witness cycle), and exposes `upstream(uid)`, `downstream(uid)`, `transitive_upstream(uid)`, `transitive_downstream(uid)`, and `topological_order()`. `Manifest.dag` materializes one from the project's `depends_on` graph, silently dropping edges to nodes the manifest didn't expose (e.g. upstream models from packages the project doesn't include).
@@ -151,7 +152,7 @@ Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier
 
 The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_group_bys`, `list_aggregations`) that return dblect-shaped summary value types. Consumers don't need to import sqlglot to read structural facts about a statement.
 
-`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. Two additional kinds live outside `patterns.py`: `MALFORMED_SUPPRESSION`, emitted by the suppression layer when a `-- noqa-fixture:` comment lacks a reason; and `NON_UNIQUE_WINDOW_ORDER_KEYS`, emitted by the uniqueness-aware detector described below.
+`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. Two of its members are emitted from outside `patterns.py`: `MALFORMED_SUPPRESSION` is raised by the suppression layer when a `-- noqa-fixture:` comment lacks a reason, and `NON_UNIQUE_WINDOW_ORDER_KEYS` is raised by the uniqueness-aware detector described below. The enum itself stays here so suppression syntax and JSON consumers have one canonical list of kind strings.
 
 ## The uniqueness layer (`src/dblect/uniqueness/`)
 
@@ -178,7 +179,7 @@ Three public entry points:
   - Top-level `SELECT DISTINCT a, b` proves the output is unique on `(a, b)`.
   - Top-level `SELECT a, b, ... FROM ... GROUP BY a, b` proves the output is unique on `(a, b)`, but only when every GROUP BY target is a bare column that's also in the projection (positional, expression, and unprojected keys are skipped conservatively).
   - CTEs are unwrapped to find the body SELECT. Set operations (`UNION` etc.) are out of scope.
-- **`facts_from_manifest(manifest)`** is the combined entry the walker uses. Returns `Mapping[model_uid, tuple[UniquenessFact, ...]]` with every known fact for every model. Models with no known facts are absent from the mapping; callers should treat missing as "we don't know."
+- **`facts_from_manifest(manifest, *, dialect="duckdb")`** is the combined entry the walker uses. Returns `Mapping[model_uid, tuple[UniquenessFact, ...]]` with every known fact for every model. The `dialect` kwarg is threaded into the per-model SQL parse for the structural-proof pass; the walker forwards its own configured dialect. Models with no known facts are absent from the mapping; callers should treat missing as "we don't know."
 
 The whole layer is **opportunistic by design**: it uses what the project gives it and stays silent everywhere else. There's no warning when a model has no declared keys, because that would be noise on every project that doesn't aggressively declare.
 
@@ -206,7 +207,7 @@ Three modules:
 
 ### Walker
 
-`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`:
+`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`. A `Detector` is the type alias `Callable[[ParsedSQL], tuple[Finding, ...]]`; passing a custom list overrides the defaults (the uniqueness-aware detector still runs).
 
 1. Computes `facts_from_manifest(manifest)` once up front, then curries the uniqueness-aware detector against it. The curried detector joins the configured `detectors` list so the per-model loop runs everything in one pass.
 2. Iterates `manifest.models` in unique_id sort order for stable output.
@@ -216,7 +217,7 @@ Three modules:
    - Runs each detector, collecting `Finding`s.
    - Calls `parse_directives(raw_code)` to extract `-- noqa-fixture:` comments. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
    - Calls `apply(findings, directives)` to partition into active vs. suppressed.
-4. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`.
+4. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`. Convenience properties `counts_by_kind` (a `Counter`-backed `Mapping[FindingKind, int]`) and `has_findings` are available for consumers that want the rolled-up view without re-iterating.
 
 Each active finding is wrapped in a `LocatedFinding(model_unique_id, file_path, finding)` so reporters can show file:line locations. Suppressed findings are wrapped in `SuppressedFinding(located, reason, directive_line)` which preserves both the original finding context and the directive that silenced it.
 
@@ -226,7 +227,7 @@ Syntax in SQL files:
 
 - `-- noqa-fixture: <reason>` silences all kinds on the comment's line.
 - `-- noqa-fixture: <FindingKind>: <reason>` silences only that kind. The leading token must be a known `FindingKind` value or it falls back to all-kinds (so typos and free-text reasons like `TODO: revisit Q3` don't silently fail to suppress).
-- A directive applies on the same line as the offending SQL or the line immediately above it.
+- A directive applies on the line immediately above the finding's span, or anywhere within the span itself (`finding.line_start - 1 <= directive.line <= finding.line_end`). For single-line findings that collapses to "same line or one line above"; for multi-line findings (windows or joins that span several lines) the directive can sit on any line of the span.
 - A reason is required. A bare `-- noqa-fixture` produces a `MALFORMED_SUPPRESSION` finding so dangling directives are visible in PR review.
 - Findings without line provenance (`line_start == 0`) are never suppressed.
 
@@ -270,7 +271,7 @@ Audit options:
 | `PROJECT_DIR` positional | `.` | Where `dbt_project.yml` lives. |
 | `--manifest PATH` | _(unset)_ | Skip resolution and load this file directly. |
 | `--dbt-executable NAME` | `dbt` | Used only by the fallback `dbt parse`. |
-| `--format text\|json -f` | `text` | Reporter selection. Status messages stay on stderr only in text mode. |
+| `--format text\|json -f` | `text` | Reporter selection. Status messages always go to stderr; stdout is the report. |
 | `--no-fail` | _(off)_ | Force exit 0 even when findings exist. Default is exit 1 on any unsuppressed finding. |
 
 **Manifest resolution** (first wins):

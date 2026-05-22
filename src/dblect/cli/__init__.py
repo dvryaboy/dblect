@@ -85,8 +85,7 @@ def audit(
         explicit=manifest,
         dbt_executable=dbt_executable,
     )
-    if output_format is OutputFormat.TEXT:
-        typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
+    typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
     report = run_audit(loaded)
     rendered = (
