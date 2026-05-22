@@ -215,6 +215,35 @@ def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> N
     ), "Line-1 directive matched nothing, so suppressed should be empty for customers"
 
 
+def test_run_audit_parses_each_model_once(
+    jaffle: Manifest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The facts pre-pass and the per-model detector loop used to each parse
+    # every model's compiled SQL, which was twice the work. The walker now
+    # parses once and shares the trees. Lock that in by counting calls to
+    # sqlglot.parse_one against each model's compiled SQL.
+    from typing import Any
+
+    import sqlglot
+
+    model_sqls = {
+        m.compiled_code for m in jaffle.models.values() if m.compiled_code is not None
+    }
+    counts: dict[str, int] = {}
+    real_parse_one = sqlglot.parse_one
+
+    def counting_parse_one(sql: str, *args: Any, **kwargs: Any) -> Any:
+        if sql in model_sqls:
+            counts[sql] = counts.get(sql, 0) + 1
+        return real_parse_one(sql, *args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
+
+    monkeypatch.setattr(sqlglot, "parse_one", counting_parse_one)
+    run_audit(jaffle)
+    assert set(counts) == model_sqls, "every model's compiled SQL should be parsed"
+    repeated = {n for n in counts.values() if n > 1}
+    assert not repeated, f"each model's SQL should parse exactly once; counts: {counts.values()}"
+
+
 def test_macro_emitted_join_visible_in_compiled_code() -> None:
     # Regression guard for "we analyze compiled_code". A model whose LEFT
     # JOIN comes from a macro call: in the on-disk template the join is

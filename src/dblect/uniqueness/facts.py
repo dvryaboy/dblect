@@ -54,7 +54,10 @@ class UniquenessFact:
 
 
 def facts_from_manifest(
-    manifest: Manifest, *, dialect: str | None = "duckdb"
+    manifest: Manifest,
+    *,
+    dialect: str | None = "duckdb",
+    parsed: Mapping[str, Expr] | None = None,
 ) -> Mapping[str, tuple[UniquenessFact, ...]]:
     """All known uniqueness facts for `manifest`, grouped by model unique_id.
 
@@ -65,6 +68,10 @@ def facts_from_manifest(
     * **Structural proof from SQL**: ``SELECT DISTINCT`` and ``GROUP BY``
       shapes in each model's compiled SQL.
 
+    `parsed` lets callers that already have a per-model `Expr` (e.g. the
+    audit walker) skip a redundant parse pass. When omitted, this function
+    parses each model's `analysis_sql` itself, swallowing parse errors.
+
     Models with no known facts are absent from the mapping; callers should
     treat missing keys as "no facts known" rather than assuming uniqueness
     one way or the other.
@@ -72,8 +79,10 @@ def facts_from_manifest(
     by_model: defaultdict[str, list[UniquenessFact]] = defaultdict(list)
     for fact in _all_declaration_facts(manifest):
         by_model[fact.model_unique_id].append(fact)
-    for fact in _all_structural_facts(manifest, dialect=dialect):
-        by_model[fact.model_unique_id].append(fact)
+    trees = parsed if parsed is not None else _parse_models(manifest, dialect=dialect)
+    for uid, tree in trees.items():
+        for fact in facts_from_sql(uid, tree):
+            by_model[fact.model_unique_id].append(fact)
     return {uid: tuple(facts) for uid, facts in by_model.items()}
 
 
@@ -104,18 +113,18 @@ def _all_declaration_facts(manifest: Manifest) -> Iterable[UniquenessFact]:
     yield from _facts_from_native_constraints(manifest.nodes.values())
 
 
-def _all_structural_facts(
-    manifest: Manifest, *, dialect: str | None
-) -> Iterable[UniquenessFact]:
+def _parse_models(manifest: Manifest, *, dialect: str | None) -> Mapping[str, Expr]:
+    """Parse each model's analysis SQL; skip models with no SQL or parse errors."""
+    out: dict[str, Expr] = {}
     for model in manifest.models.values():
         sql = model.analysis_sql
         if sql is None:
             continue
         try:
-            tree = parse_sql(sql, dialect=dialect)
+            out[model.unique_id] = parse_sql(sql, dialect=dialect)
         except SQLParseError:
             continue
-        yield from facts_from_sql(model.unique_id, tree)
+    return out
 
 
 def _facts_from_tests(nodes: Iterable[Node]) -> Iterable[UniquenessFact]:

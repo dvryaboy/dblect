@@ -114,15 +114,17 @@ def run_audit(
     It's silent on projects without declared uniqueness facts, so it doesn't
     need an opt-in flag.
     """
-    facts = facts_from_manifest(manifest, dialect=dialect)
+    parsed = _parse_models_for_audit(manifest, dialect=dialect)
+    trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
+    facts = facts_from_manifest(manifest, parsed=trees)
     uniqueness_detector = _make_uniqueness_detector(manifest, facts)
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), uniqueness_detector)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []
     scanned = 0
-    for _, node in sorted(manifest.models.items()):
-        outcome = _scan_one(node, detectors=effective_detectors, dialect=dialect)
+    for uid, node in sorted(manifest.models.items()):
+        outcome = _scan_one(node, parsed.get(uid), detectors=effective_detectors)
         if isinstance(outcome, _Scanned):
             scanned += 1
             active.extend(outcome.findings)
@@ -137,6 +139,28 @@ def run_audit(
     )
 
 
+def _parse_models_for_audit(
+    manifest: Manifest, *, dialect: str | None
+) -> Mapping[str, Expr | SQLParseError]:
+    """Parse each model's analysis SQL exactly once.
+
+    Returns a mapping from model unique_id to either the parsed tree or the
+    `SQLParseError` that prevented parsing. Models with no analysis SQL are
+    absent from the mapping; the walker treats absence as "no compiled SQL"
+    when it iterates.
+    """
+    out: dict[str, Expr | SQLParseError] = {}
+    for uid, model in manifest.models.items():
+        sql = model.analysis_sql
+        if sql is None:
+            continue
+        try:
+            out[uid] = parse_sql(sql, dialect=dialect)
+        except SQLParseError as e:
+            out[uid] = e
+    return out
+
+
 @dataclass(frozen=True, slots=True)
 class _Scanned:
     findings: tuple[LocatedFinding, ...]
@@ -145,27 +169,25 @@ class _Scanned:
 
 def _scan_one(
     node: Node,
+    parse_outcome: Expr | SQLParseError | None,
     *,
     detectors: Sequence[Detector],
-    dialect: str | None,
 ) -> _Scanned | SkippedModel:
-    sql = node.analysis_sql
-    if sql is None:
+    if parse_outcome is None:
         return SkippedModel(
             unique_id=node.unique_id,
             reason="no compiled SQL (run `dbt compile`)",
         )
-    try:
-        tree = parse_sql(sql, dialect=dialect)
-    except SQLParseError as e:
-        return SkippedModel(unique_id=node.unique_id, reason=f"parse error: {e}")
+    if isinstance(parse_outcome, SQLParseError):
+        return SkippedModel(unique_id=node.unique_id, reason=f"parse error: {parse_outcome}")
+    tree = parse_outcome
 
     raw_findings: list[Finding] = []
     for detector in detectors:
         raw_findings.extend(detector(tree))
     # Directives live in the source the developer wrote, not the compiled
-    # output. Fall back to the parsed SQL only if `raw_code` is missing.
-    directives, malformed = parse_directives(node.raw_code or sql)
+    # output. Fall back to the compiled SQL only if `raw_code` is missing.
+    directives, malformed = parse_directives(node.raw_code or node.analysis_sql or "")
     # Malformed-suppression findings ride the regular pipeline; we never
     # suppress them with another directive (it would be silly), so apply()
     # only runs over the detector findings.
