@@ -84,17 +84,34 @@ class ConstraintSpec:
 
 @dataclass(frozen=True, slots=True)
 class DbtTestMetadata:
-    """The ``test_metadata`` block on a dbt test node.
+    """What dblect knows about a dbt test node.
 
-    ``name`` is the generic-test name (``"unique"``, ``"not_null"``,
-    ``"dbt_utils.unique_combination_of_columns"``, etc.). ``kwargs`` is the
-    arguments the test was instantiated with, heterogeneously shaped per test
-    type (``column_name`` for ``unique``, ``combination_of_columns`` for
-    ``unique_combination_of_columns``, and so on).
+    Mostly mirrors dbt's ``test_metadata`` block on the node (``name``,
+    ``kwargs``, ``namespace``), enriched with the test-relevant slice of
+    node-level config (``enabled``, ``where``) so consumers can reason
+    about test semantics from one place.
+
+    * ``name``: generic-test name (``"unique"``, ``"not_null"``,
+      ``"dbt_utils.unique_combination_of_columns"``, etc.).
+    * ``kwargs``: the arguments the test was instantiated with,
+      heterogeneously shaped per test type (``column_name`` for
+      ``unique``, ``combination_of_columns`` for
+      ``unique_combination_of_columns``, and so on).
+    * ``namespace``: the package the test comes from (``"dbt_utils"``,
+      etc.). ``None`` for dbt-built-in tests.
+    * ``enabled``: from ``node.config.enabled``. Defaults to ``True`` when
+      unset.
+    * ``where``: from ``node.config.where``. The filter the test runs
+      under; a non-``None`` value means the test only asserts its
+      property over rows matching ``where``, so any fact derived from it
+      is conditional.
     """
 
     name: str
     kwargs: Mapping[str, Any]
+    namespace: str | None = None
+    enabled: bool = True
+    where: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,7 +254,7 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         columns=_columns_from_parsed(getattr(n, "columns", {}) or {}),
         depends_on=frozenset(depends_on_nodes),
         constraints=_constraints_from_parsed(getattr(n, "constraints", None) or ()),
-        test_metadata=_test_metadata_from_parsed(getattr(n, "test_metadata", None)),
+        test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
     )
 
@@ -282,7 +299,15 @@ def _constraints_from_parsed(raw: Any) -> tuple[ConstraintSpec, ...]:
     )
 
 
-def _test_metadata_from_parsed(raw: Any) -> DbtTestMetadata | None:
+def _test_metadata_from_parsed(node: Any) -> DbtTestMetadata | None:
+    """Build `DbtTestMetadata` from a parsed dbt test node, or `None`.
+
+    Reads the test_metadata block (``name``, ``kwargs``, ``namespace``) and
+    the test-relevant slice of node config (``enabled``, ``where``). Returns
+    `None` when the node has no test_metadata block or its name is missing,
+    which is the case for every non-test node.
+    """
+    raw = getattr(node, "test_metadata", None)
     if raw is None:
         return None
     name = getattr(raw, "name", None)
@@ -293,4 +318,17 @@ def _test_metadata_from_parsed(raw: Any) -> DbtTestMetadata | None:
     if isinstance(raw_kwargs, Mapping):
         raw_mapping = cast("Mapping[Any, Any]", raw_kwargs)
         kwargs = {str(k): v for k, v in raw_mapping.items()}
-    return DbtTestMetadata(name=name, kwargs=kwargs)
+    raw_namespace = getattr(raw, "namespace", None)
+    namespace = raw_namespace if isinstance(raw_namespace, str) and raw_namespace else None
+    config = getattr(node, "config", None)
+    raw_enabled = getattr(config, "enabled", True)
+    enabled = bool(raw_enabled) if raw_enabled is not None else True
+    raw_where = getattr(config, "where", None)
+    where = raw_where if isinstance(raw_where, str) and raw_where else None
+    return DbtTestMetadata(
+        name=name,
+        kwargs=kwargs,
+        namespace=namespace,
+        enabled=enabled,
+        where=where,
+    )

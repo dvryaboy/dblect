@@ -104,3 +104,17 @@ def test_seeds_have_no_dependencies(jaffle: Manifest) -> None:
     for n in jaffle.seeds.values():
         # Seeds are root nodes in the data-flow DAG.
         assert n.depends_on == frozenset()
+
+
+def test_jaffle_tests_round_trip_with_default_test_config(jaffle: Manifest) -> None:
+    # jaffle's generic tests are all built-in, enabled, and unfiltered: the
+    # parser should surface those as the defaults on DbtTestMetadata.
+    tests = [n for n in jaffle.nodes.values() if n.test_metadata is not None]
+    assert tests, "jaffle fixture should expose at least one test node"
+    for n in tests:
+        tm = n.test_metadata
+        assert tm is not None  # for the type checker
+        assert tm.enabled is True
+        assert tm.where is None
+        # All of jaffle's tests are built-in (no third-party namespace).
+        assert tm.namespace is None

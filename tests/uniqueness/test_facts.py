@@ -145,6 +145,85 @@ def test_not_null_constraint_is_not_a_uniqueness_fact() -> None:
     assert facts == {}
 
 
+def test_unique_test_with_where_filter_does_not_ground_fact() -> None:
+    # A `where`-filtered test only proves uniqueness within the filtered
+    # subset; downstream detectors assume facts are unconditional, so we
+    # skip rather than over-claim.
+    model = _node(
+        unique_id="model.pkg.orders",
+        name="orders",
+        resource_type=ResourceType.MODEL,
+    )
+    test_node = _node(
+        unique_id="test.pkg.unique_us_orders",
+        name="unique_us_orders_id",
+        resource_type=ResourceType.OTHER,
+        test_metadata=DbtTestMetadata(
+            name="unique",
+            kwargs={"column_name": "order_id"},
+            where="country = 'US'",
+        ),
+        attached_node="model.pkg.orders",
+    )
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={model.unique_id: model, test_node.unique_id: test_node},
+    )
+    assert facts_from_declarations(manifest) == ()
+
+
+def test_disabled_unique_test_does_not_ground_fact() -> None:
+    model = _node(
+        unique_id="model.pkg.orders",
+        name="orders",
+        resource_type=ResourceType.MODEL,
+    )
+    test_node = _node(
+        unique_id="test.pkg.unique_orders_disabled",
+        name="unique_orders_id",
+        resource_type=ResourceType.OTHER,
+        test_metadata=DbtTestMetadata(
+            name="unique",
+            kwargs={"column_name": "order_id"},
+            enabled=False,
+        ),
+        attached_node="model.pkg.orders",
+    )
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={model.unique_id: model, test_node.unique_id: test_node},
+    )
+    assert facts_from_declarations(manifest) == ()
+
+
+def test_unique_combination_test_with_where_is_also_skipped() -> None:
+    # Same conditional-uniqueness concern applies to composite-key tests.
+    model = _node(
+        unique_id="model.pkg.orders",
+        name="orders",
+        resource_type=ResourceType.MODEL,
+    )
+    test_node = _node(
+        unique_id="test.pkg.combo_us",
+        name="unique_combo_us",
+        resource_type=ResourceType.OTHER,
+        test_metadata=DbtTestMetadata(
+            name="dbt_utils.unique_combination_of_columns",
+            kwargs={"combination_of_columns": ["customer_id", "order_date"]},
+            where="country = 'US'",
+        ),
+        attached_node="model.pkg.orders",
+    )
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={model.unique_id: model, test_node.unique_id: test_node},
+    )
+    assert facts_from_declarations(manifest) == ()
+
+
 def test_unique_test_on_source_is_skipped() -> None:
     # Sources can carry tests, but uniqueness reasoning on sources is a
     # different problem; we restrict to models.

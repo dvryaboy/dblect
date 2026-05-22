@@ -94,7 +94,7 @@ Key types in [`manifest/parse.py`](../../src/dblect/manifest/parse.py):
 - **`Column`**: `name`, `data_type`, `description`, `constraints`. Column-level native constraints surface here.
 - **`ConstraintSpec`**: `type` (a `ConstraintType`), `columns` (model-level; empty for column-level constraints), `expression` (CHECK predicate text).
 - **`ConstraintType`**: `PRIMARY_KEY`, `UNIQUE`, `NOT_NULL`, `CHECK`, `FOREIGN_KEY`, `OTHER`. `from_raw` is total: unrecognized vendor- or dialect-specific types fall into `OTHER` so the parse stays total.
-- **`DbtTestMetadata`**: `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type).
+- **`DbtTestMetadata`**: `name` (the generic-test name like `"unique"` or `"dbt_utils.unique_combination_of_columns"`), `kwargs` (heterogeneously shaped per test type), `namespace` (the package the test comes from, e.g. `"dbt_utils"`, or `None` for built-ins), plus the test-relevant slice of node config: `enabled` (defaults to `True`) and `where` (the row filter the test runs under, or `None`). The last two are pulled from the node's `config` block so downstream consumers can reason about test semantics from one place; the uniqueness layer in particular skips disabled and `where`-filtered tests because their assertions don't ground unconditional facts.
 
 The DAG lives in [`manifest/dag.py`](../../src/dblect/manifest/dag.py). `Dag.build(nodes, edges)` validates that every edge references a known node, detects cycles (raises `CycleError` with the witness cycle), and exposes `upstream(uid)`, `downstream(uid)`, `transitive_upstream(uid)`, `transitive_downstream(uid)`, and `topological_order()`. `Manifest.dag` materializes one from the project's `depends_on` graph, silently dropping edges to nodes the manifest didn't expose (e.g. upstream models from packages the project doesn't include).
 
@@ -183,7 +183,7 @@ class UniquenessFact:
 
 Three public entry points:
 
-- **`facts_from_declarations(manifest)`** reads dbt test nodes (single-column `unique` and dbt-utils `unique_combination_of_columns`) and native dbt 1.5+ `ConstraintSpec` lists (model-level and column-level). Each fact carries a `detail` field naming the test or constraint so reviewers can trace the claim back.
+- **`facts_from_declarations(manifest)`** reads dbt test nodes (single-column `unique` and dbt-utils `unique_combination_of_columns`) and native dbt 1.5+ `ConstraintSpec` lists (model-level and column-level). Tests with `enabled: false` or a `where:` row filter don't ground facts: disabled tests don't run, and a `where`-filtered test only asserts its property over the filtered subset, which doesn't match the unconditional shape downstream detectors assume. Each fact carries a `detail` field naming the test or constraint so reviewers can trace the claim back.
 - **`facts_from_sql(model_unique_id, parsed)`** infers facts from a model's own SQL. Two rules today:
   - Top-level `SELECT DISTINCT a, b` proves the output is unique on `(a, b)`.
   - Top-level `SELECT a, b, ... FROM ... GROUP BY a, b` proves the output is unique on `(a, b)`, but only when every GROUP BY target is a bare column that's also in the projection (positional, expression, and unprojected keys are skipped conservatively).

@@ -122,6 +122,12 @@ def _facts_from_tests(nodes: Iterable[Node]) -> Iterable[UniquenessFact]:
         tm = node.test_metadata
         if tm is None:
             continue
+        # Disabled tests don't run, so they prove nothing. A `where` filter
+        # makes the assertion conditional ("unique within rows matching X"),
+        # which doesn't translate to the unconditional UniquenessFact shape
+        # downstream detectors assume; skip rather than over-claim.
+        if not tm.enabled or tm.where is not None:
+            continue
         target = _test_target_model(node)
         if target is None:
             continue
