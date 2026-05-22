@@ -1,27 +1,25 @@
-"""Detector: window-function ordering keys that aren't grounded as unique.
+"""Fact-grounded detectors that consume uniqueness facts about source models.
 
-A window function like ``row_number() over (partition by p order by k)`` is
-deterministic only when ``(p, k)`` is unique within the input row scope.
-Otherwise the ranking has ties and the result is non-deterministic: the same
-input can produce different outputs across runs.
+Two detectors live here, both opportunistic (they fire only when the project
+gives us enough information to make a claim; they stay silent everywhere
+else):
 
-This detector is **opportunistic**: it fires only when the project gives us
-enough information to make the claim. Specifically:
+* `detect_non_unique_window_order_keys`: window functions whose combined
+  (partition, order) columns aren't covered by any declared uniqueness fact
+  on the source model. Ties in the ordering produce non-deterministic
+  rankings.
+* `detect_join_fanout`: JOINs to a ref'd model where the model has declared
+  uniqueness facts but none of them covers the join's equality predicate
+  columns. The join can multiply rows.
 
-* The model's top-level FROM resolves to a single ref'd model (no joins at
-  the top level). Multi-source joins need column-level lineage, which is a
-  separate body of work.
-* We have at least one uniqueness fact for the source model.
-* The combined (partition, order) column set is *not* covered by any of
-  those facts.
-
-When any of those conditions fails, the detector stays silent. That's the
-right posture: we're claiming a hazard, not policing every window function.
+Both share the same context (the manifest's model-name-to-uid index plus the
+precomputed uniqueness facts) and are curried by `make_fact_grounded_detectors`
+into plain `Detector` callables the walker drops into its detector pipeline.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -29,7 +27,10 @@ from sqlglot import Expr
 from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import JoinSide
 from dblect.uniqueness.facts import UniquenessFact
+
+Detector = Callable[[Expr], tuple[Finding, ...]]
 
 
 def detect_non_unique_window_order_keys(
@@ -88,24 +89,101 @@ def detect_non_unique_window_order_keys(
     return tuple(out)
 
 
-def make_detector(
-    manifest: Manifest, facts: Mapping[str, tuple[UniquenessFact, ...]]
-):
-    """Curry the detector against an audit-scoped context.
+def detect_join_fanout(
+    tree: Expr,
+    *,
+    facts: Mapping[str, tuple[UniquenessFact, ...]],
+    model_name_to_uid: Mapping[str, str],
+) -> tuple[Finding, ...]:
+    """Flag JOINs to a ref'd model whose declared keys don't cover the join.
 
-    Returns a plain ``Detector`` (``Callable[[Expr], tuple[Finding, ...]]``)
-    so the walker can drop it into the existing detector pipeline.
+    For each JOIN whose joined-in side resolves to a known model, we look up
+    the model's uniqueness facts. If the facts exist and at least one is
+    covered by the join's right-side equality predicate columns, the join
+    can't multiply rows (the joined-in side is unique on those keys, so each
+    left row matches at most one right row). Otherwise, we flag.
+
+    The detector stays silent when:
+
+    * The joined-in side isn't a known model (subqueries, CTEs, anything
+      we can't resolve to a manifest node).
+    * The model has no uniqueness facts at all (opportunistic posture: we
+      don't claim a hazard without grounding).
+    * The ON predicate isn't a conjunction of equalities between bare
+      columns where one side belongs to the joined-in alias and the other
+      doesn't. Anything fancier (function calls, range comparisons, OR)
+      gets skipped to keep the rule conservative.
+    * The join is `CROSS`: that's an explicit cartesian product, not a
+      fanout-by-accident.
+    """
+    out: list[Finding] = []
+    cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+    for sel in sg.find_all_selects(tree):
+        for j in sg.joins_of(sel):
+            if sg.join_side_of(j) is JoinSide.CROSS:
+                continue
+            target = j.this
+            if not isinstance(target, exp.Table):
+                continue
+            if target.name in cte_names:
+                # A local CTE shadows the model name; we can't assume the
+                # model's declared keys apply to this join.
+                continue
+            target_uid = model_name_to_uid.get(target.name)
+            if target_uid is None:
+                continue
+            target_facts = facts.get(target_uid)
+            if not target_facts:
+                continue
+            on = sg.on_of(j)
+            if on is None:
+                continue
+            joined_cols = _equality_cols_on_alias(on, target.alias_or_name)
+            if joined_cols is None or not joined_cols:
+                continue
+            if any(fact.columns <= joined_cols for fact in target_facts):
+                continue
+            sample_keys = ", ".join(sorted(joined_cols))
+            known_keys = "; ".join(
+                "(" + ", ".join(sorted(f.columns)) + ")" for f in target_facts
+            )
+            out.append(
+                Finding(
+                    kind=FindingKind.JOIN_FANOUT,
+                    message=(
+                        f"JOIN to {target.name} on ({sample_keys}) isn't covered by any "
+                        f"declared uniqueness key on {target.name} (known: {known_keys}); "
+                        f"the join can multiply rows. Either pin the join to a unique key "
+                        f"or aggregate the joined-in side first."
+                    ),
+                    sql_snippet=sg.render_sql(j),
+                    line_start=_line_start(j),
+                    line_end=_line_end(j),
+                )
+            )
+    return tuple(out)
+
+
+def make_fact_grounded_detectors(
+    manifest: Manifest, facts: Mapping[str, tuple[UniquenessFact, ...]]
+) -> tuple[Detector, ...]:
+    """Curry the fact-grounded detectors against an audit-scoped context.
+
+    Returns a tuple of plain `Detector` callables
+    (`Callable[[Expr], tuple[Finding, ...]]`) the walker drops into its
+    detector pipeline.
     """
     name_to_uid: dict[str, str] = {m.name: uid for uid, m in manifest.models.items()}
 
-    def detector(tree: Expr) -> tuple[Finding, ...]:
+    def window_keys(tree: Expr) -> tuple[Finding, ...]:
         return detect_non_unique_window_order_keys(
-            tree,
-            facts=facts,
-            model_name_to_uid=name_to_uid,
+            tree, facts=facts, model_name_to_uid=name_to_uid
         )
 
-    return detector
+    def fanout(tree: Expr) -> tuple[Finding, ...]:
+        return detect_join_fanout(tree, facts=facts, model_name_to_uid=name_to_uid)
+
+    return (window_keys, fanout)
 
 
 def _top_level_select(tree: Expr) -> exp.Select | None:
@@ -140,6 +218,41 @@ def _single_source_model_uid(
         pass
     name = target.name
     return model_name_to_uid.get(name)
+
+
+def _equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None:
+    """Columns on `alias` appearing in conjunctive equalities in `predicate`.
+
+    Walks the AND-conjunction of `predicate`; for each leaf, accepts only
+    `exp.EQ` between two bare columns where exactly one column's qualifier
+    equals `alias`. Returns the set of column names on the `alias` side.
+    Returns ``None`` if `predicate` contains anything other than a
+    conjunction of such equalities (a disjunction, a function call,
+    a range comparison, or an equality whose alias mix is ambiguous).
+    """
+    cols: set[str] = set()
+    for leaf in _conjunctive_leaves(predicate):
+        if not isinstance(leaf, exp.EQ):
+            return None
+        left = leaf.this
+        right = leaf.expression
+        if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+            return None
+        left_alias = sg.column_table(left)
+        right_alias = sg.column_table(right)
+        on_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t == alias]
+        off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
+        if len(on_alias) != 1 or len(off_alias) != 1:
+            return None
+        cols.add(sg.column_name(on_alias[0]))
+    return frozenset(cols)
+
+
+def _conjunctive_leaves(predicate: Expr) -> list[Expr]:
+    """Flatten an `AND`-only conjunction into its leaves; non-AND nodes are leaves."""
+    if isinstance(predicate, exp.And):
+        return [*_conjunctive_leaves(predicate.this), *_conjunctive_leaves(predicate.expression)]
+    return [predicate]
 
 
 def _bare_column_names(expressions: list[Expr]) -> list[str] | None:

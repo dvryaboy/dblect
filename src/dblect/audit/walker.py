@@ -38,7 +38,7 @@ from dblect.sql import (
     parse_sql,
 )
 from dblect.uniqueness import facts_from_manifest
-from dblect.uniqueness.detector import make_detector as _make_uniqueness_detector
+from dblect.uniqueness.detector import make_fact_grounded_detectors
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
@@ -109,16 +109,16 @@ def run_audit(
     Models whose ``compiled_code`` is missing or unparseable are listed in
     the report's ``skipped`` field with a reason rather than raising.
 
-    A uniqueness-aware detector (window order-keys grounded against declared
-    keys on the source model) runs alongside the configured `detectors` list.
-    It's silent on projects without declared uniqueness facts, so it doesn't
-    need an opt-in flag.
+    Fact-grounded detectors (window order-keys, join fanout, both grounded
+    against declared uniqueness keys on the source model) run alongside the
+    configured `detectors` list. They're silent on projects without declared
+    uniqueness facts, so they don't need an opt-in flag.
     """
     parsed = _parse_models_for_audit(manifest, dialect=dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
     facts = facts_from_manifest(manifest, parsed=trees)
-    uniqueness_detector = _make_uniqueness_detector(manifest, facts)
-    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), uniqueness_detector)
+    fact_grounded = make_fact_grounded_detectors(manifest, facts)
+    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []

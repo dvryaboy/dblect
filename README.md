@@ -29,6 +29,8 @@ dblect reads the SQL your models produce after dbt's Jinja runtime has rendered 
 uv add --dev "dblect[dbt-core]"
 ```
 
+Finding line numbers refer to the compiled SQL the analyzer parsed, not to the on-disk `.sql` template. Findings always carry the model's source file path, so you can open the source file from the report and locate the construct from there.
+
 ## Quick start
 
 Inside any dbt project:

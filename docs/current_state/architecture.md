@@ -25,7 +25,7 @@ Exit code is `1` when unsuppressed findings exist (or `0` with `--no-fail`). `--
 src/dblect/
 ├── manifest/          # parse manifest.json into typed Node + DAG, surface dbt tests + constraints
 ├── sql/               # parse compiled SQL, walk the AST, detect hazards
-├── uniqueness/        # collect uniqueness facts from declarations + SQL, ground a uniqueness-aware detector
+├── uniqueness/        # collect uniqueness facts from declarations + SQL, ground fact-aware detectors
 ├── audit/             # orchestrate detectors over a manifest, render output
 ├── cli/               # the `dblect` typer app
 └── execution/         # run dbt models in DuckDB (used for execution tests; not on the audit path)
@@ -152,16 +152,18 @@ class Finding:
 
 Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier` descendants and takes min/max over each one's `meta["line"]`. sqlglot only stamps positions on identifiers, not on every expression, so nodes with no identifier descendants (rare; literal-only expressions) report `(0, 0)`.
 
+**Line numbers refer to the compiled SQL the parser saw**, not to the on-disk `.sql` file the developer wrote. For models that don't use macros (refs only), compiled and source line up; for macro-heavy models, the compiled output may differ. Findings always carry the model's `original_file_path`, so the user can open the source file from the report and locate the construct from there. A future work item is to back-map compiled line numbers to source positions using the manifest's `raw_code`.
+
 The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_group_bys`, `list_aggregations`) that return dblect-shaped summary value types. Consumers don't need to import sqlglot to read structural facts about a statement.
 
-`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. Two of its members are emitted from outside `patterns.py`: `MALFORMED_SUPPRESSION` is raised by the suppression layer when a `-- noqa-fixture:` comment lacks a reason, and `NON_UNIQUE_WINDOW_ORDER_KEYS` is raised by the uniqueness-aware detector described below. The enum itself stays here so suppression syntax and JSON consumers have one canonical list of kind strings.
+`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. A few of its members are emitted from outside `patterns.py`: `MALFORMED_SUPPRESSION` is raised by the suppression layer when a `-- noqa-fixture:` comment lacks a reason, and `NON_UNIQUE_WINDOW_ORDER_KEYS` + `JOIN_FANOUT` come from the fact-grounded detectors described below. The enum itself stays here so suppression syntax and JSON consumers have one canonical list of kind strings.
 
 ## The uniqueness layer (`src/dblect/uniqueness/`)
 
-This package collects **uniqueness facts** (claims that a particular set of columns is jointly unique on a model) and uses them to ground a detector that fires only when it can prove a hazard. Two layers:
+This package collects **uniqueness facts** (claims that a particular set of columns is jointly unique on a model) and uses them to ground detectors that fire only when they can prove a hazard. Two layers:
 
 - [**`facts.py`**](../../src/dblect/uniqueness/facts.py): collects facts from declarations and SQL.
-- [**`detector.py`**](../../src/dblect/uniqueness/detector.py): the window order-keys detector that consumes those facts.
+- [**`detector.py`**](../../src/dblect/uniqueness/detector.py): the window order-keys and join-fanout detectors that consume those facts.
 
 ### Where facts come from
 
@@ -185,9 +187,11 @@ Three public entry points:
 
 The whole layer is **opportunistic by design**: it uses what the project gives it and stays silent everywhere else. There's no warning when a model has no declared keys, because that would be noise on every project that doesn't aggressively declare.
 
-### The window order-keys detector
+### Fact-grounded detectors
 
-`detect_non_unique_window_order_keys` flags window functions where the combined `(PARTITION BY + ORDER BY)` columns aren't grounded as unique on the source model. The check is intentionally narrow:
+Two detectors live in [`uniqueness/detector.py`](../../src/dblect/uniqueness/detector.py). Both share an audit-scoped context (the manifest's model-name → unique_id index plus the precomputed uniqueness facts) and are curried by `make_fact_grounded_detectors(manifest, facts)` into plain `Detector` callables the walker drops into its detector pipeline.
+
+**`detect_non_unique_window_order_keys`** flags window functions where the combined `(PARTITION BY + ORDER BY)` columns aren't grounded as unique on the source model. The check is intentionally narrow:
 
 - Only the **top-level SELECT** is inspected.
 - The model's top-level FROM must resolve to a **single ref'd model** (no joins at the top level; multi-source needs column-level lineage we don't have yet).
@@ -195,9 +199,16 @@ The whole layer is **opportunistic by design**: it uses what the project gives i
 - A fact whose columns are a **subset** of the window's key set counts as coverage. Any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
 - Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
 
-`make_detector(manifest, facts)` curries the function against the audit-scoped context (the manifest's model name→unique_id index plus the precomputed facts) and returns a plain `Detector` callable the walker drops into its detector pipeline.
+**`detect_join_fanout`** flags JOINs to a ref'd model whose declared uniqueness keys don't cover the join's equality predicate. A JOIN multiplies rows when the joined-in side has duplicates on the join key; declaring the joined-in side unique on the JOIN's columns rules that out.
 
-The detector is enabled by default. Because it's opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from it. Findings of kind `NON_UNIQUE_WINDOW_ORDER_KEYS` are suppressible via the standard `-- noqa-fixture:` syntax.
+- Every SELECT is inspected (including JOINs inside CTEs).
+- The joined-in side must resolve to a known model and have **at least one uniqueness fact**. No grounding → silent.
+- The ON predicate must be a **conjunction of equalities between bare columns**, exactly one of which is qualified by the joined-in side's alias. Disjunctions, function calls, and range comparisons are skipped conservatively.
+- A fact whose columns are a **subset** of the join's right-side equality columns counts as coverage (superkey logic, same as window-keys).
+- `CROSS JOIN` is skipped (it's an explicit cartesian, not a fanout-by-accident).
+- A JOIN target whose name is shadowed by a local CTE is skipped: the CTE's output is not the model's.
+
+Both detectors are enabled by default. Because they're opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from them. Findings of kinds `NON_UNIQUE_WINDOW_ORDER_KEYS` and `JOIN_FANOUT` are suppressible via the standard `-- noqa-fixture:` syntax.
 
 ## The audit layer (`src/dblect/audit/`)
 
@@ -209,9 +220,9 @@ Three modules:
 
 ### Walker
 
-`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`. A `Detector` is the type alias `Callable[[Expr], tuple[Finding, ...]]`; passing a custom list overrides the defaults (the uniqueness-aware detector still runs).
+`run_audit(manifest, *, detectors=DEFAULT_DETECTORS, dialect="duckdb") -> AuditReport`. A `Detector` is the type alias `Callable[[Expr], tuple[Finding, ...]]`; passing a custom list overrides the defaults (the fact-grounded detectors still run).
 
-1. Computes `facts_from_manifest(manifest)` once up front, then curries the uniqueness-aware detector against it. The curried detector joins the configured `detectors` list so the per-model loop runs everything in one pass.
+1. Pre-parses every model's `compiled_code` once (so the facts pre-pass and the detector loop share the same `Expr` per model), computes `facts_from_manifest(manifest, parsed=...)`, then curries the fact-grounded detectors against it via `make_fact_grounded_detectors`. The curried detectors join the configured `detectors` list so the per-model loop runs everything in one pass.
 2. Iterates `manifest.models` in unique_id sort order for stable output.
 3. For each model:
    - Reads `Node.analysis_sql` (the model's `compiled_code`). Models with no compiled SQL are recorded as `SkippedModel(reason="no compiled SQL (run \`dbt compile\`)")`.

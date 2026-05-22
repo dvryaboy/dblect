@@ -39,6 +39,7 @@ class FindingKind(StrEnum):
     WHERE_ON_OUTER_JOINED_NULLABLE = "where_on_outer_joined_nullable"
     NON_DETERMINISTIC_FUNCTION = "non_deterministic_function"
     NON_UNIQUE_WINDOW_ORDER_KEYS = "non_unique_window_order_keys"
+    JOIN_FANOUT = "join_fanout"
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 

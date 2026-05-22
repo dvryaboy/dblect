@@ -1,4 +1,4 @@
-"""Tests for the window order-keys uniqueness detector."""
+"""Tests for the fact-grounded detectors (window order-keys, join fanout)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,10 @@ from sqlglot import Expr
 
 from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness import UniquenessFact, UniquenessSource
-from dblect.uniqueness.detector import detect_non_unique_window_order_keys
+from dblect.uniqueness.detector import (
+    detect_join_fanout,
+    detect_non_unique_window_order_keys,
+)
 
 
 def _facts(model_uid: str, *keys: tuple[str, ...]) -> Mapping[str, tuple[UniquenessFact, ...]]:
@@ -185,3 +188,180 @@ def test_finding_carries_line_number() -> None:
     assert len(findings) == 1
     # The window lives on line 2.
     assert findings[0].line_start == 2
+
+
+# --- join fanout ---
+
+
+def test_fanout_flagged_when_facts_dont_cover_join_key() -> None:
+    # `dim` has a fact on (id), but we join on (segment), which isn't unique.
+    parsed = _parse(
+        "select * from facts f left join dim d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.JOIN_FANOUT
+    assert "segment" in findings[0].message
+
+
+def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
+    parsed = _parse(
+        "select * from facts f left join dim d on f.id = d.id"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_when_join_key_is_a_superkey_of_declared_key() -> None:
+    # Source unique on (id); join uses both id AND segment — still safe.
+    parsed = _parse(
+        "select * from facts f left join dim d on f.id = d.id and f.segment = d.segment"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_composite_key_silent_when_join_covers_all_columns() -> None:
+    parsed = _parse(
+        "select * from facts f join dim d on f.a = d.a and f.b = d.b"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("a", "b")),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_composite_key_flagged_when_join_covers_only_one_column() -> None:
+    parsed = _parse(
+        "select * from facts f join dim d on f.a = d.a"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("a", "b")),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert len(findings) == 1
+
+
+def test_fanout_silent_when_source_has_no_facts() -> None:
+    # Opportunistic: with no facts on the joined-in model, we can't tell.
+    parsed = _parse(
+        "select * from facts f left join dim d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts={},
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_when_join_target_is_unknown_model() -> None:
+    parsed = _parse(
+        "select * from facts f left join unknown u on f.id = u.id"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_on_cross_join() -> None:
+    # CROSS is an explicit cartesian; that's not what this detector is for.
+    parsed = _parse(
+        "select * from facts f cross join dim d"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_when_join_target_shadowed_by_cte() -> None:
+    # A local CTE named `dim` shadows the dbt model. We can't assume the
+    # model's declared keys apply to the CTE's output.
+    parsed = _parse(
+        "with dim as (select segment from raw) "
+        "select * from facts f left join dim d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_when_predicate_is_disjunctive() -> None:
+    # OR-disjunctions don't simplify to "join is on key X"; skip conservatively.
+    parsed = _parse(
+        "select * from facts f left join dim d on f.id = d.id or f.alt = d.alt"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_silent_when_predicate_has_function_call() -> None:
+    parsed = _parse(
+        "select * from facts f left join dim d on lower(f.id) = lower(d.id)"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_flagged_inside_cte_body() -> None:
+    # Joins inside CTEs are equally susceptible to fanout, and the joined-in
+    # side is still a ref'd model whose facts apply.
+    parsed = _parse(
+        "with widened as ("
+        "  select * from facts f left join dim d on f.segment = d.segment"
+        ") "
+        "select * from widened"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert len(findings) == 1
+
+
+def test_fanout_finding_carries_join_line() -> None:
+    sql = (
+        "select *\n"
+        "from facts f\n"
+        "left join dim d on f.segment = d.segment\n"
+    )
+    findings = detect_join_fanout(
+        _parse(sql),
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert len(findings) == 1
+    assert findings[0].line_start == 3
