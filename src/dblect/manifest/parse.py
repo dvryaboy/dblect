@@ -147,6 +147,14 @@ class Node:
     constraints: tuple[ConstraintSpec, ...] = ()
     test_metadata: DbtTestMetadata | None = None
     attached_node: str | None = None
+    identifier: str | None = None
+    """The relation name as it appears in compiled SQL.
+
+    Populated for sources (where it can diverge from ``name`` via the
+    ``identifier`` setting in ``schema.yml``). ``None`` for nodes that
+    don't have a separate identifier concept; callers that need a
+    SQL-level lookup name should prefer ``identifier or name``.
+    """
 
     @property
     def is_data_flow(self) -> bool:
@@ -272,7 +280,14 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
 
 
 def _source_from_parsed(uid: str, s: Any) -> Node:
-    """Sources have no `raw_code`/`compiled_code` and no `depends_on`."""
+    """Sources have no `raw_code`/`compiled_code` and no `depends_on`.
+
+    ``identifier`` is the relation name dbt resolves ``{{ source(...) }}``
+    to in compiled SQL; it defaults to ``name`` in the v12 schema but may
+    differ when the schema.yml sets it explicitly.
+    """
+    raw_identifier = getattr(s, "identifier", None)
+    identifier = raw_identifier if isinstance(raw_identifier, str) and raw_identifier else None
     return Node(
         unique_id=uid,
         name=s.name,
@@ -285,6 +300,7 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
         original_file_path=getattr(s, "original_file_path", None),
         columns=_columns_from_parsed(getattr(s, "columns", {}) or {}),
         depends_on=frozenset(),
+        identifier=identifier,
     )
 
 

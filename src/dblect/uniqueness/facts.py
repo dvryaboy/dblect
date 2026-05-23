@@ -122,15 +122,14 @@ def facts_from_manifest(
 def _build_name_to_uid(manifest: Manifest) -> Mapping[str, str]:
     """Map of relation name → unique_id covering models and sources.
 
-    Models win on collisions: a developer writing ``{{ ref('x') }}`` expects
-    the model named ``x``, not a source that happens to share the name.
-    Sources lack an exposed identifier today; if a source is referenced
-    under a name different from its logical ``name``, propagation won't
-    find its facts. Limitation we can revisit when a project surfaces it.
+    Sources are keyed by ``identifier or name`` since that's the rightmost
+    name in compiled SQL when dbt resolves ``{{ source(...) }}``. Models win
+    on collisions: a developer writing ``{{ ref('x') }}`` expects the model
+    named ``x``, not a source that happens to share the name.
     """
     name_to_uid: dict[str, str] = {}
     for uid, src in manifest.sources.items():
-        name_to_uid.setdefault(src.name, uid)
+        name_to_uid.setdefault(src.identifier or src.name, uid)
     for uid, model in manifest.models.items():
         name_to_uid[model.name] = uid
     return name_to_uid

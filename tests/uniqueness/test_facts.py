@@ -461,6 +461,38 @@ def test_facts_from_source_flow_into_downstream_model() -> None:
     assert stg_fact.source is UniquenessSource.PROPAGATED
 
 
+def test_source_with_divergent_identifier_is_matched_by_identifier() -> None:
+    # The source's logical name is `raw_orders` but the warehouse table is
+    # `orders_raw` (set via `identifier:` in schema.yml). Compiled SQL refs
+    # the identifier, not the logical name, so propagation must key by it.
+    src = Node(
+        unique_id="source.pkg.raw.raw_orders",
+        name="raw_orders",
+        resource_type=ResourceType.SOURCE,
+        fqn=("pkg", "raw_orders"),
+        package_name="pkg",
+        schema=None,
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+        identifier="orders_raw",
+    )
+    test = _unique_test(
+        uid="test.pkg.unique_src", attached="source.pkg.raw.raw_orders", column="order_id"
+    )
+    consumer = _model(
+        uid="model.pkg.stg_orders",
+        name="stg_orders",
+        compiled_code="select * from orders_raw",
+        depends_on=frozenset({"source.pkg.raw.raw_orders"}),
+    )
+    facts = facts_from_manifest(_manifest(src, test, consumer))
+    [stg_fact] = facts["model.pkg.stg_orders"]
+    assert stg_fact.columns == frozenset({"order_id"})
+    assert stg_fact.source is UniquenessSource.PROPAGATED
+
+
 def test_order_invariant_across_manifest_node_order() -> None:
     # Whatever order the manifest's `nodes` dict happens to deliver, the
     # toposort drives propagation, so downstream facts come out the same.
