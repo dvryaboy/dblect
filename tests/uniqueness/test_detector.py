@@ -140,16 +140,30 @@ def test_order_by_expression_is_skipped() -> None:
     assert findings == ()
 
 
-def test_window_inside_with_clause_body_is_inspected() -> None:
+def test_window_against_cte_inherits_model_keys_via_propagation() -> None:
+    # The CTE `src` pass-throughs `raw` so its keys propagate. The window's
+    # (customer_id, ts) tuple isn't covered by `raw`'s key (id), so flag.
     parsed = _parse(
         "with src as (select * from raw) "
         "select row_number() over (partition by customer_id order by ts) from src"
     )
     findings = detect_non_unique_window_order_keys(
         parsed,
-        # Note: the FROM references the CTE `src`, not the ref'd model. We
-        # have a model `raw`; the CTE shadows it. Conservatively this stays
-        # silent because `src` resolves to the CTE, not the model.
+        facts=_facts("model.pkg.raw", ("id",)),
+        model_name_to_uid={"raw": "model.pkg.raw"},
+    )
+    assert len(findings) == 1
+
+
+def test_window_against_cte_covered_via_propagation_is_silent() -> None:
+    # The CTE pass-throughs `raw.id`, and the window partitions by id. The
+    # propagated key covers the window key, so no finding.
+    parsed = _parse(
+        "with src as (select * from raw) "
+        "select row_number() over (partition by id order by ts) from src"
+    )
+    findings = detect_non_unique_window_order_keys(
+        parsed,
         facts=_facts("model.pkg.raw", ("id",)),
         model_name_to_uid={"raw": "model.pkg.raw"},
     )
@@ -296,8 +310,10 @@ def test_fanout_silent_on_cross_join() -> None:
 
 
 def test_fanout_silent_when_join_target_shadowed_by_cte() -> None:
-    # A local CTE named `dim` shadows the dbt model. We can't assume the
-    # model's declared keys apply to the CTE's output.
+    # A local CTE named `dim` shadows the dbt model: resolution lands on the
+    # CTE, and the CTE body has no known keys (no upstream fact on `raw`,
+    # no DISTINCT/GROUP BY), so the detector stays silent rather than
+    # claiming a hazard.
     parsed = _parse(
         "with dim as (select segment from raw) "
         "select * from facts f left join dim d on f.segment = d.segment"
@@ -350,6 +366,38 @@ def test_fanout_flagged_inside_cte_body() -> None:
         model_name_to_uid={"dim": "model.pkg.dim"},
     )
     assert len(findings) == 1
+
+
+def test_fanout_silent_when_cte_inherits_uniqueness_via_propagation() -> None:
+    # The CTE `dim_local` pass-throughs `dim`, so its propagated key is `id`.
+    # The join binds on `id`, so the join can't fan out — silent.
+    parsed = _parse(
+        "with dim_local as (select * from dim) "
+        "select * from facts f join dim_local d on f.id = d.id"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert findings == ()
+
+
+def test_fanout_flagged_when_join_to_propagated_cte_misses_inherited_key() -> None:
+    # Same propagated key as above, but the join binds on `segment` rather
+    # than the inherited `id` key. The detector now sees the CTE's facts
+    # (no carve-out) and flags.
+    parsed = _parse(
+        "with dim_local as (select * from dim) "
+        "select * from facts f join dim_local d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(
+        parsed,
+        facts=_facts("model.pkg.dim", ("id",)),
+        model_name_to_uid={"dim": "model.pkg.dim"},
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.JOIN_FANOUT
 
 
 def test_fanout_finding_carries_join_line() -> None:

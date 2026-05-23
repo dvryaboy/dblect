@@ -1,11 +1,16 @@
-"""Tests for declaration-derived and structural-proof uniqueness facts."""
+"""Tests for declaration-derived uniqueness facts and manifest aggregation.
+
+SQL-level propagation (the structural-proof and CTE-pass-through cases the
+old `facts_from_sql` covered) lives in `test_propagation.py`; this module
+focuses on the declaration ingestion layer and the cross-cutting
+`facts_from_manifest` aggregation.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from sqlglot import Expr
 
 from dblect.manifest import (
     Column,
@@ -16,12 +21,10 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
-from dblect.sql import parse_sql
 from dblect.uniqueness import (
     UniquenessSource,
     facts_from_declarations,
     facts_from_manifest,
-    facts_from_sql,
 )
 
 
@@ -243,108 +246,28 @@ def test_unique_test_on_source_is_skipped() -> None:
     assert facts_from_manifest(manifest) == {}
 
 
-def test_fact_carries_provenance_detail(jaffle: Manifest) -> None:
+def test_declaration_fact_carries_provenance_detail(jaffle: Manifest) -> None:
+    # The declared unique test on `customers.customer_id` carries a detail
+    # naming the test node so reviewers can navigate to it. Propagation may
+    # also surface a fact on the same column set; this assertion targets the
+    # declaration-sourced one specifically.
     facts = facts_from_manifest(jaffle)
     customers = facts["model.jaffle_shop.customers"]
-    [fact] = [f for f in customers if f.columns == frozenset({"customer_id"})]
-    # detail should reference the test node's name so reviewers can navigate.
-    assert fact.detail is not None
-    assert "customer_id" in fact.detail
+    declared = [
+        f
+        for f in customers
+        if f.columns == frozenset({"customer_id"})
+        and f.source is UniquenessSource.DBT_UNIQUE_TEST
+    ]
+    assert len(declared) == 1
+    assert declared[0].detail is not None
+    assert "customer_id" in declared[0].detail
 
 
-# --- Structural proof from SQL ---
+# --- facts_from_manifest combines declarations + propagation ---
 
 
-def _parsed(sql: str) -> Expr:
-    return parse_sql(sql, dialect="duckdb")
-
-
-def test_distinct_proves_uniqueness() -> None:
-    [fact] = facts_from_sql("model.pkg.x", _parsed("select distinct a, b from t"))
-    assert fact.columns == frozenset({"a", "b"})
-    assert fact.source is UniquenessSource.STRUCTURAL_PROOF
-    assert "DISTINCT" in (fact.detail or "")
-
-
-def test_group_by_bare_columns_proves_uniqueness() -> None:
-    [fact] = facts_from_sql(
-        "model.pkg.x", _parsed("select a, b, sum(x) from t group by a, b")
-    )
-    assert fact.columns == frozenset({"a", "b"})
-    assert fact.source is UniquenessSource.STRUCTURAL_PROOF
-
-
-def test_group_by_unprojected_keys_does_not_prove_named_uniqueness() -> None:
-    # `select sum(x) from t group by a, b`: a, b aren't output columns so we
-    # can't make a named-column uniqueness claim.
-    assert facts_from_sql("model.pkg.x", _parsed("select sum(x) from t group by a, b")) == ()
-
-
-def test_group_by_positional_does_not_prove_uniqueness() -> None:
-    # `GROUP BY 1, 2` is a positional reference; we conservatively don't infer.
-    assert facts_from_sql("model.pkg.x", _parsed("select a, b from t group by 1, 2")) == ()
-
-
-def test_group_by_expression_does_not_prove_uniqueness() -> None:
-    # The key is an expression, not a bare column, so we don't reason about it.
-    sql = "select date_trunc('day', ts) as d, sum(x) from t group by date_trunc('day', ts)"
-    assert facts_from_sql("model.pkg.x", _parsed(sql)) == ()
-
-
-def test_top_level_select_with_cte_is_unwrapped() -> None:
-    sql = (
-        "with src as (select * from raw) "
-        "select distinct a, b from src"
-    )
-    [fact] = facts_from_sql("model.pkg.x", _parsed(sql))
-    assert fact.columns == frozenset({"a", "b"})
-
-
-def test_inner_distinct_does_not_prove_outer_uniqueness() -> None:
-    # The DISTINCT is inside a CTE; the outer SELECT just selects from it
-    # without a DISTINCT or GROUP BY, so output uniqueness isn't proven.
-    sql = "with src as (select distinct a from raw) select a, b from src join other on src.a = other.a"
-    assert facts_from_sql("model.pkg.x", _parsed(sql)) == ()
-
-
-def test_aliased_group_by_column_uses_alias_name() -> None:
-    # If the projection aliases the group key, the output column is the alias.
-    # `select a as id, sum(x) from t group by a`: we'd want to claim
-    # uniqueness on "id", not "a". For first cut this is conservatively
-    # skipped (the GROUP BY references "a" but the projection produces "id").
-    sql = "select a as id, sum(x) from t group by a"
-    # Conservative: skip rather than emit a fact under the wrong name.
-    facts = facts_from_sql("model.pkg.x", _parsed(sql))
-    # Acceptable for either result: no fact (current behaviour) or a fact on
-    # "a" (if a future iteration learns alias resolution). Don't lock in.
-    assert all("id" not in f.columns and "a" in f.columns for f in facts) or facts == ()
-
-
-def test_union_set_op_is_out_of_scope() -> None:
-    sql = "select a from t1 union select a from t2"
-    assert facts_from_sql("model.pkg.x", _parsed(sql)) == ()
-
-
-def test_no_distinct_no_group_by_produces_no_fact() -> None:
-    assert facts_from_sql("model.pkg.x", _parsed("select a, b from t")) == ()
-
-
-# --- facts_from_manifest combines declarations + structural proof ---
-
-
-def test_facts_from_manifest_includes_structural_for_jaffle(jaffle: Manifest) -> None:
-    facts = facts_from_manifest(jaffle)
-    # stg_customers.sql is `select ... from raw_customers` with no DISTINCT or
-    # GROUP BY. customers.sql has a top-level GROUP BY (final select), but
-    # let's be lenient and just assert both kinds appear *somewhere* across
-    # the jaffle models. Declarations are guaranteed; structural is nice to
-    # have if any jaffle model qualifies.
-    all_facts = [f for fs in facts.values() for f in fs]
-    by_source = {f.source for f in all_facts}
-    assert UniquenessSource.DBT_UNIQUE_TEST in by_source
-
-
-def test_facts_from_declarations_excludes_structural() -> None:
+def test_facts_from_declarations_excludes_propagation() -> None:
     model = _node(
         unique_id="model.pkg.x",
         name="x",
@@ -356,7 +279,7 @@ def test_facts_from_declarations_excludes_structural() -> None:
     )
     # Declarations alone: no facts (no tests, no constraints).
     assert facts_from_declarations(manifest) == ()
-    # Combined: the structural-proof DISTINCT fact appears.
+    # Combined: the propagation-derived DISTINCT fact appears.
     combined = facts_from_manifest(manifest)
     assert "model.pkg.x" in combined
     assert any(

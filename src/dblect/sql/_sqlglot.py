@@ -121,6 +121,43 @@ def render_sql(e: Expr) -> str:
     return e.sql()
 
 
+def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None:
+    """Columns on `alias` appearing in conjunctive equalities in `predicate`.
+
+    Walks the AND-conjunction of `predicate`; for each leaf, accepts only
+    ``exp.EQ`` between two bare columns where exactly one column's qualifier
+    equals `alias`. Returns the set of column names on the `alias` side.
+
+    Returns ``None`` if `predicate` contains anything other than a conjunction
+    of such equalities (a disjunction, a function call, a range comparison,
+    or an equality whose alias mix is ambiguous). Callers treat ``None`` as
+    "can't simplify to a clean join-key" and conservatively skip.
+    """
+    cols: set[str] = set()
+    for leaf in _conjunctive_leaves(predicate):
+        if not isinstance(leaf, exp.EQ):
+            return None
+        left = leaf.this
+        right = leaf.expression
+        if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+            return None
+        left_alias = column_table(left)
+        right_alias = column_table(right)
+        on_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t == alias]
+        off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
+        if len(on_alias) != 1 or len(off_alias) != 1:
+            return None
+        cols.add(column_name(on_alias[0]))
+    return frozenset(cols)
+
+
+def _conjunctive_leaves(predicate: Expr) -> list[Expr]:
+    """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
+    if isinstance(predicate, exp.And):
+        return [*_conjunctive_leaves(predicate.this), *_conjunctive_leaves(predicate.expression)]
+    return [predicate]
+
+
 def line_range(e: Expr) -> tuple[int, int] | None:
     """The 1-indexed (start, end) source-line span covered by `e`.
 

@@ -1,4 +1,4 @@
-"""Uniqueness facts derived from a dbt manifest and (later) model SQL.
+"""Uniqueness facts derived from a dbt manifest and model SQL.
 
 A **uniqueness fact** is a claim that a set of columns is jointly unique on a
 specific model. Facts come from multiple sources:
@@ -11,13 +11,17 @@ specific model. Facts come from multiple sources:
 * **Native dbt constraints** (dbt 1.5+): model-level ``primary_key`` /
   ``unique`` constraints carry a column list; column-level constraints carry
   the implicit single-column key.
-* **Structural proof** from the model's SQL: e.g. ``select distinct cols`` or
-  ``select cols, ... group by cols`` proves the output is unique on ``cols``.
-  The analysis reads ``compiled_code`` so it sees SQL after macro expansion.
+* **Structural proof / propagation** from the model's SQL: ``select distinct``,
+  top-level ``GROUP BY``, ``UNION`` (distinct), and pass-throughs of ref'd
+  model keys via projection, JOIN, and CTE all surface as
+  ``UniquenessSource.STRUCTURAL_PROOF`` or ``PROPAGATED`` facts. The analysis
+  reads ``compiled_code`` so it sees SQL after macro expansion.
 
 Each fact carries provenance so reviewers can see *why* dblect believes a key
-is unique. Reasoning over uniqueness is opportunistic: when we have a fact,
-downstream detectors can use it; when we don't, they stay silent.
+is unique. Propagated facts also carry ``derived_from``, a chain of parent
+facts the key inherits from. Reasoning over uniqueness is opportunistic: when
+we have a fact, downstream detectors can use it; when we don't, they stay
+silent.
 """
 
 from __future__ import annotations
@@ -28,12 +32,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, cast
 
-import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.manifest import ConstraintSpec, ConstraintType, Manifest, Node, ResourceType
 from dblect.sql import SQLParseError, parse_sql
-from dblect.sql import _sqlglot as sg
 
 
 class UniquenessSource(StrEnum):
@@ -41,16 +43,26 @@ class UniquenessSource(StrEnum):
     DBT_UNIQUE_COMBINATION_TEST = "dbt_unique_combination_test"
     NATIVE_CONSTRAINT = "native_constraint"
     STRUCTURAL_PROOF = "structural_proof"
+    PROPAGATED = "propagated"
 
 
 @dataclass(frozen=True, slots=True)
 class UniquenessFact:
-    """A single uniqueness claim about a set of columns on one model."""
+    """A single uniqueness claim about a set of columns on one model.
+
+    Most facts originate at a single declaration or structural shape and have
+    an empty ``derived_from``. Facts produced by SQL-level propagation (a CTE
+    that pass-throughs a ref'd model's keys, a JOIN that preserves the left
+    side's keys) carry the parent fact(s) they inherit from in
+    ``derived_from``; chains let reviewers trace why the audit believes a
+    derived key is unique.
+    """
 
     model_unique_id: str
     columns: frozenset[str]
     source: UniquenessSource
     detail: str | None = None
+    derived_from: tuple[UniquenessFact, ...] = ()
 
 
 def facts_from_manifest(
@@ -65,8 +77,9 @@ def facts_from_manifest(
 
     * **Declaration ingestion**: dbt unique tests, dbt-utils composite-key
       tests, dbt 1.5+ native constraints (model-level and column-level).
-    * **Structural proof from SQL**: ``SELECT DISTINCT`` and ``GROUP BY``
-      shapes in each model's compiled SQL.
+    * **Propagation through SQL**: top-level ``DISTINCT`` and ``GROUP BY``
+      shapes, ``UNION`` (distinct), and pass-throughs of ref'd model keys via
+      projection, JOIN, and CTE inside each model's compiled SQL.
 
     `parsed` lets callers that already have a per-model `Expr` (e.g. the
     audit walker) skip a redundant parse pass. When omitted, this function
@@ -80,8 +93,19 @@ def facts_from_manifest(
     for fact in _all_declaration_facts(manifest):
         by_model[fact.model_unique_id].append(fact)
     trees = parsed if parsed is not None else _parse_models(manifest, dialect=dialect)
+    name_to_uid: Mapping[str, str] = {m.name: uid for uid, m in manifest.models.items()}
+    declaration_input: Mapping[str, tuple[UniquenessFact, ...]] = {
+        uid: tuple(facts) for uid, facts in by_model.items()
+    }
+    from dblect.uniqueness.propagation import facts_from_tree
+
     for uid, tree in trees.items():
-        for fact in facts_from_sql(uid, tree):
+        for fact in facts_from_tree(
+            uid,
+            tree,
+            model_facts=declaration_input,
+            model_name_to_uid=name_to_uid,
+        ):
             by_model[fact.model_unique_id].append(fact)
     return {uid: tuple(facts) for uid, facts in by_model.items()}
 
@@ -89,23 +113,6 @@ def facts_from_manifest(
 def facts_from_declarations(manifest: Manifest) -> tuple[UniquenessFact, ...]:
     """Just the declaration-derived facts (tests + native constraints)."""
     return tuple(_all_declaration_facts(manifest))
-
-
-def facts_from_sql(model_unique_id: str, tree: Expr) -> tuple[UniquenessFact, ...]:
-    """Uniqueness facts provable from a model's SQL alone (DISTINCT, GROUP BY).
-
-    Only the top-level ``SELECT`` (the one that produces the model's output
-    rows) is considered. Inner ``SELECT`` shapes inside CTEs or subqueries
-    don't prove anything about the outer model's output. Set operations
-    (``UNION`` and friends) are out of scope for this first cut.
-    """
-    sel = _top_level_select(tree)
-    if sel is None:
-        return ()
-    out: list[UniquenessFact] = []
-    out.extend(_facts_from_distinct(model_unique_id, sel))
-    out.extend(_facts_from_group_by(model_unique_id, sel))
-    return tuple(out)
 
 
 def _all_declaration_facts(manifest: Manifest) -> Iterable[UniquenessFact]:
@@ -202,86 +209,6 @@ def _uniqueness_columns(c: ConstraintSpec) -> frozenset[str] | None:
     if not c.columns:
         return None
     return frozenset(c.columns)
-
-
-def _top_level_select(tree: Expr) -> exp.Select | None:
-    """The ``SELECT`` whose output is the model's output, or ``None``.
-
-    A bare ``Select`` is returned as-is. A ``WITH`` clause's body
-    (``tree.this``) is unwrapped. Set operations (``UNION`` and friends) are
-    out of scope: their output uniqueness is shape-dependent and we don't
-    reason about them yet.
-    """
-    if isinstance(tree, exp.Select):
-        return tree
-    if isinstance(tree, exp.With):
-        body = tree.this
-        if isinstance(body, exp.Select):
-            return body
-    return None
-
-
-def _facts_from_distinct(model_unique_id: str, sel: exp.Select) -> Iterable[UniquenessFact]:
-    """``SELECT DISTINCT a, b FROM ...`` proves the output is unique on ``(a, b)``."""
-    if sel.args.get("distinct") is None:
-        return
-    columns = _project_output_columns(sel)
-    if not columns:
-        return
-    yield UniquenessFact(
-        model_unique_id=model_unique_id,
-        columns=frozenset(columns),
-        source=UniquenessSource.STRUCTURAL_PROOF,
-        detail="top-level SELECT DISTINCT",
-    )
-
-
-def _facts_from_group_by(model_unique_id: str, sel: exp.Select) -> Iterable[UniquenessFact]:
-    """``SELECT cols, ... FROM ... GROUP BY cols`` proves the output is unique on those cols.
-
-    Only emits a fact when every GROUP BY target resolves to a bare column
-    that's also in the SELECT projection. That is, the uniqueness claim can be
-    expressed in terms of named output columns. ``GROUP BY 1, 2`` (positional)
-    and GROUP BY over computed expressions are skipped to keep the rule
-    conservative.
-    """
-    group = sg.group_of(sel)
-    if group is None or not group.expressions:
-        return
-    group_cols: list[str] = []
-    for g in group.expressions:
-        if not isinstance(g, exp.Column):
-            return
-        group_cols.append(sg.column_name(g))
-    projected = _project_output_columns(sel)
-    if not projected:
-        return
-    projected_set = set(projected)
-    if not all(name in projected_set for name in group_cols):
-        return
-    yield UniquenessFact(
-        model_unique_id=model_unique_id,
-        columns=frozenset(group_cols),
-        source=UniquenessSource.STRUCTURAL_PROOF,
-        detail="top-level GROUP BY",
-    )
-
-
-def _project_output_columns(sel: exp.Select) -> list[str]:
-    """Output column names from `sel`'s projection list.
-
-    Only counts projections that resolve to a named output column: bare
-    ``exp.Column`` references and ``exp.Alias`` wrappers. Computed expressions
-    without an alias get no name and are skipped, since they can't participate in
-    a column-name uniqueness claim.
-    """
-    names: list[str] = []
-    for proj in sel.expressions:
-        if isinstance(proj, exp.Alias):
-            names.append(proj.alias_or_name)
-        elif isinstance(proj, exp.Column):
-            names.append(sg.column_name(proj))
-    return names
 
 
 def _test_target_model(node: Node) -> str | None:
