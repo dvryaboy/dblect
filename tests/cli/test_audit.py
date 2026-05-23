@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -10,6 +11,16 @@ import pytest
 from typer.testing import CliRunner
 
 from dblect.cli import app
+
+# Typer/Rich renders BadParameter inside a Panel and highlights CLI flags like
+# ``--dialect`` with colour escapes when a colour-capable terminal is detected
+# (which CI runners report). That highlighting splits the literal substring
+# ``--dialect`` across ANSI sequences, so substring checks must strip first.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 @pytest.fixture
@@ -132,8 +143,9 @@ def test_audit_bails_on_unvalidated_adapter(
         ],
     )
     assert result.exit_code != 0
-    assert "snowflake" in result.output
-    assert "--dialect" in result.output
+    plain = _plain(result.output)
+    assert "snowflake" in plain
+    assert "--dialect" in plain
 
 
 def test_audit_dialect_override_unlocks_unvalidated_adapter(

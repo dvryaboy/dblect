@@ -22,7 +22,7 @@ guessing.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 import sqlglot.expressions as exp
@@ -58,7 +58,11 @@ class ScopeFacts:
     """
 
     keys: frozenset[frozenset[str]]
-    lineage: Mapping[frozenset[str], tuple[UniquenessFact, ...]] = _EMPTY_BARE_LINEAGE
+    # Python 3.11's dataclass rejects MappingProxyType as a literal default
+    # ("mutable default not allowed"); the factory threads the same singleton.
+    lineage: Mapping[frozenset[str], tuple[UniquenessFact, ...]] = field(
+        default_factory=lambda: _EMPTY_BARE_LINEAGE
+    )
 
     @staticmethod
     def empty() -> ScopeFacts:
