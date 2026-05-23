@@ -125,9 +125,7 @@ def detect_join_fanout(
     """
     prop = _propagation_for(tree, facts, model_name_to_uid, propagation)
     cte_bodies: Mapping[str, Expr] = {
-        cte.alias_or_name: cte.this
-        for cte in tree.find_all(exp.CTE)
-        if isinstance(cte.this, Expr)
+        cte.alias_or_name: cte.this for cte in tree.find_all(exp.CTE) if isinstance(cte.this, Expr)
     }
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -155,9 +153,7 @@ def detect_join_fanout(
             if any(k <= joined_cols for k in target_keys):
                 continue
             sample_keys = ", ".join(sorted(joined_cols))
-            known_keys = "; ".join(
-                "(" + ", ".join(sorted(k)) + ")" for k in target_keys
-            )
+            known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in target_keys)
             out.append(
                 Finding(
                     kind=FindingKind.JOIN_FANOUT,
@@ -218,9 +214,7 @@ def make_fact_grounded_detectors(
         k = id(tree)
         hit = cache.get(k)
         if hit is None:
-            hit = propagate_facts(
-                tree, model_facts=facts, model_name_to_uid=name_to_uid
-            )
+            hit = propagate_facts(tree, model_facts=facts, model_name_to_uid=name_to_uid)
             cache[k] = hit
         return hit
 

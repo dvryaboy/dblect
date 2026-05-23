@@ -112,9 +112,7 @@ def facts_from_manifest(
         current: Mapping[str, tuple[UniquenessFact, ...]] = {
             k: tuple(v) for k, v in by_node.items()
         }
-        for fact in facts_from_tree(
-            uid, tree, model_facts=current, model_name_to_uid=name_to_uid
-        ):
+        for fact in facts_from_tree(uid, tree, model_facts=current, model_name_to_uid=name_to_uid):
             by_node[fact.model_unique_id].append(fact)
     return {uid: _dedupe(facts) for uid, facts in by_node.items()}
 

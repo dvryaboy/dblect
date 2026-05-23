@@ -196,9 +196,7 @@ def test_json_skipped_models_round_trip() -> None:
         models_scanned=0,
     )
     payload = json.loads(render_json(report))
-    assert payload["skipped"] == [
-        {"unique_id": "model.pkg.bad", "reason": "parse error: ..."}
-    ]
+    assert payload["skipped"] == [{"unique_id": "model.pkg.bad", "reason": "parse error: ..."}]
 
 
 def test_json_is_stable_under_unsorted_input() -> None:

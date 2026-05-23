@@ -39,14 +39,12 @@ def test_picks_up_unique_tests_from_jaffle(jaffle: Manifest) -> None:
     # and stg_customers.customer_id (at minimum).
     customers = facts.get("model.jaffle_shop.customers", ())
     assert any(
-        f.columns == frozenset({"customer_id"})
-        and f.source is UniquenessSource.DBT_UNIQUE_TEST
+        f.columns == frozenset({"customer_id"}) and f.source is UniquenessSource.DBT_UNIQUE_TEST
         for f in customers
     )
     orders = facts.get("model.jaffle_shop.orders", ())
     assert any(
-        f.columns == frozenset({"order_id"})
-        and f.source is UniquenessSource.DBT_UNIQUE_TEST
+        f.columns == frozenset({"order_id"}) and f.source is UniquenessSource.DBT_UNIQUE_TEST
         for f in orders
     )
 
@@ -58,9 +56,7 @@ def test_models_without_facts_are_absent_from_mapping() -> None:
         name="alone",
         resource_type=ResourceType.MODEL,
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model})
     facts = facts_from_manifest(manifest)
     assert facts == {}
 
@@ -100,9 +96,7 @@ def test_native_model_level_primary_key_constraint() -> None:
         resource_type=ResourceType.MODEL,
         constraints=(ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("id",)),),
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model})
     facts = facts_from_manifest(manifest)
     [fact] = facts["model.pkg.x"]
     assert fact.columns == frozenset({"id"})
@@ -114,16 +108,16 @@ def test_native_column_level_unique_constraint() -> None:
         unique_id="model.pkg.x",
         name="x",
         resource_type=ResourceType.MODEL,
-        columns={"slug": Column(
-            name="slug",
-            data_type=None,
-            description=None,
-            constraints=(ConstraintSpec(type=ConstraintType.UNIQUE),),
-        )},
+        columns={
+            "slug": Column(
+                name="slug",
+                data_type=None,
+                description=None,
+                constraints=(ConstraintSpec(type=ConstraintType.UNIQUE),),
+            )
+        },
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model})
     facts = facts_from_manifest(manifest)
     [fact] = facts["model.pkg.x"]
     assert fact.columns == frozenset({"slug"})
@@ -135,16 +129,16 @@ def test_not_null_constraint_is_not_a_uniqueness_fact() -> None:
         unique_id="model.pkg.x",
         name="x",
         resource_type=ResourceType.MODEL,
-        columns={"slug": Column(
-            name="slug",
-            data_type=None,
-            description=None,
-            constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL),),
-        )},
+        columns={
+            "slug": Column(
+                name="slug",
+                data_type=None,
+                description=None,
+                constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL),),
+            )
+        },
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model})
     facts = facts_from_manifest(manifest)
     assert facts == {}
 
@@ -260,8 +254,7 @@ def test_declaration_fact_carries_provenance_detail(jaffle: Manifest) -> None:
     declared = [
         f
         for f in customers
-        if f.columns == frozenset({"customer_id"})
-        and f.source is UniquenessSource.DBT_UNIQUE_TEST
+        if f.columns == frozenset({"customer_id"}) and f.source is UniquenessSource.DBT_UNIQUE_TEST
     ]
     assert len(declared) == 1
     assert declared[0].detail is not None
@@ -278,17 +271,13 @@ def test_facts_from_declarations_excludes_propagation() -> None:
         resource_type=ResourceType.MODEL,
         compiled_code="select distinct a from t",
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={model.unique_id: model})
     # Declarations alone: no facts (no tests, no constraints).
     assert facts_from_declarations(manifest) == ()
     # Combined: the propagation-derived DISTINCT fact appears.
     combined = facts_from_manifest(manifest)
     assert "model.pkg.x" in combined
-    assert any(
-        f.source is UniquenessSource.STRUCTURAL_PROOF for f in combined["model.pkg.x"]
-    )
+    assert any(f.source is UniquenessSource.STRUCTURAL_PROOF for f in combined["model.pkg.x"])
 
 
 def _node(

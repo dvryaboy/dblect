@@ -33,9 +33,9 @@ from dblect.sql._sqlglot import JoinSide
 from dblect.uniqueness.facts import UniquenessFact, UniquenessSource
 
 _EMPTY_BARE_LINEAGE: Mapping[frozenset[str], tuple[UniquenessFact, ...]] = MappingProxyType({})
-_EMPTY_QUAL_LINEAGE: Mapping[
-    frozenset[tuple[str, str]], tuple[UniquenessFact, ...]
-] = MappingProxyType({})
+_EMPTY_QUAL_LINEAGE: Mapping[frozenset[tuple[str, str]], tuple[UniquenessFact, ...]] = (
+    MappingProxyType({})
+)
 
 # Internal column representation: an alias qualifier plus a column name. The
 # alias comes from the FROM/JOIN source the column belongs to. We never carry
@@ -83,9 +83,7 @@ def propagate_facts(
     return walker.out
 
 
-def top_scope_facts(
-    tree: Expr, propagation: Mapping[int, ScopeFacts]
-) -> ScopeFacts | None:
+def top_scope_facts(tree: Expr, propagation: Mapping[int, ScopeFacts]) -> ScopeFacts | None:
     """The ``ScopeFacts`` attached to the top-level ``Select``/``Union`` of `tree`.
 
     Returns ``None`` when the tree's root isn't a shape the propagation pass
@@ -155,9 +153,7 @@ class _Walker:
             return self._visit_union(node, cte_scope=cte_scope)
         return ScopeFacts.empty()
 
-    def _visit_select(
-        self, sel: exp.Select, *, cte_scope: Mapping[str, ScopeFacts]
-    ) -> ScopeFacts:
+    def _visit_select(self, sel: exp.Select, *, cte_scope: Mapping[str, ScopeFacts]) -> ScopeFacts:
         local = dict(cte_scope)
         w = sel.args.get("with_")
         if isinstance(w, exp.With):
@@ -172,9 +168,7 @@ class _Walker:
         self.out[id(sel)] = facts
         return facts
 
-    def _visit_union(
-        self, u: exp.Union, *, cte_scope: Mapping[str, ScopeFacts]
-    ) -> ScopeFacts:
+    def _visit_union(self, u: exp.Union, *, cte_scope: Mapping[str, ScopeFacts]) -> ScopeFacts:
         left = u.this
         right = u.args.get("expression")
         if isinstance(left, Expr):
@@ -292,9 +286,7 @@ class _Walker:
             return _QualifiedFacts.empty()
         return combined
 
-    def _apply_group_by(
-        self, group: exp.Group, *, from_alias: str
-    ) -> _QualifiedFacts | None:
+    def _apply_group_by(self, group: exp.Group, *, from_alias: str) -> _QualifiedFacts | None:
         cols: list[_QCol] = []
         for g in group.expressions:
             if not isinstance(g, exp.Column):

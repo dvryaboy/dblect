@@ -244,10 +244,7 @@ def test_where_is_null_on_nullable_not_detected() -> None:
 
 
 def test_where_coalesced_nullable_not_detected() -> None:
-    sql = (
-        "select * from a left join b on a.k = b.k "
-        "where coalesce(b.status, 'unknown') = 'active'"
-    )
+    sql = "select * from a left join b on a.k = b.k where coalesce(b.status, 'unknown') = 'active'"
     assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
 
 
@@ -295,9 +292,7 @@ def test_now_in_explicit_group_by_expression_detected() -> None:
 
 
 def test_current_timestamp_in_window_order_by_detected() -> None:
-    sql = (
-        "select row_number() over (order by ts - current_timestamp) as rn from t"
-    )
+    sql = "select row_number() over (order by ts - current_timestamp) as rn from t"
     findings = detect_non_deterministic_function(_parse(sql))
     assert len(findings) == 1
 

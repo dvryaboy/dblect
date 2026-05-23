@@ -15,9 +15,7 @@ def test_validated_adapter_resolves_to_mapped_dialect() -> None:
 def test_explicit_dialect_wins_regardless_of_adapter(adapter: str) -> None:
     # The flag itself is the operator's acknowledgment; we don't second-guess
     # it whether the adapter is validated, unvalidated, or unknown.
-    assert (
-        resolve_dialect(adapter_type=adapter, explicit_dialect="redshift") == "redshift"
-    )
+    assert resolve_dialect(adapter_type=adapter, explicit_dialect="redshift") == "redshift"
 
 
 def test_unvalidated_adapter_without_override_raises() -> None:

@@ -129,20 +129,15 @@ def _suppressed_block(suppressed: Sequence[SuppressedFinding]) -> str:
     for uid in sorted(by_model):
         for s in sorted(by_model[uid], key=lambda x: x.located.finding.line_start):
             path = s.located.file_path or uid
-            loc = _format_line_range(
-                s.located.finding.line_start, s.located.finding.line_end
-            )
-            lines.append(
-                f"  {path}:{loc}  {s.located.finding.kind.value}  -- {s.reason}"
-            )
+            loc = _format_line_range(s.located.finding.line_start, s.located.finding.line_end)
+            lines.append(f"  {path}:{loc}  {s.located.finding.kind.value}  -- {s.reason}")
     return "\n".join(lines)
 
 
 def _skipped_block(skipped: Iterable[SkippedModel]) -> str:
     lines = ["skipped:"]
     lines.extend(
-        f"  {s.unique_id}  ({s.reason})"
-        for s in sorted(skipped, key=lambda x: x.unique_id)
+        f"  {s.unique_id}  ({s.reason})" for s in sorted(skipped, key=lambda x: x.unique_id)
     )
     return "\n".join(lines)
 
@@ -164,9 +159,7 @@ def render_json(report: AuditReport, *, indent_spaces: int = 2) -> str:
         },
         "findings": [_finding_payload(lf) for lf in report.findings],
         "suppressed": [_suppressed_payload(s) for s in report.suppressed],
-        "skipped": [
-            JsonSkipped(unique_id=s.unique_id, reason=s.reason) for s in report.skipped
-        ],
+        "skipped": [JsonSkipped(unique_id=s.unique_id, reason=s.reason) for s in report.skipped],
     }
     return json.dumps(payload, indent=indent_spaces, sort_keys=True)
 
