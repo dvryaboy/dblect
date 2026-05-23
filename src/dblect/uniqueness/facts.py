@@ -71,43 +71,95 @@ def facts_from_manifest(
     dialect: str | None = "duckdb",
     parsed: Mapping[str, Expr] | None = None,
 ) -> Mapping[str, tuple[UniquenessFact, ...]]:
-    """All known uniqueness facts for `manifest`, grouped by model unique_id.
+    """All known uniqueness facts for `manifest`, grouped by node unique_id.
 
     Combines two layers:
 
     * **Declaration ingestion**: dbt unique tests, dbt-utils composite-key
       tests, dbt 1.5+ native constraints (model-level and column-level).
+      Tests on sources ground facts on the source uid; downstream models
+      that ``ref`` the source pick them up by name.
     * **Propagation through SQL**: top-level ``DISTINCT`` and ``GROUP BY``
-      shapes, ``UNION`` (distinct), and pass-throughs of ref'd model keys via
-      projection, JOIN, and CTE inside each model's compiled SQL.
+      shapes, ``UNION`` (distinct), and pass-throughs of ref'd model/source
+      keys via projection, JOIN, and CTE. Models are processed in
+      topological order, so a downstream model's propagation sees every
+      upstream's combined declared + propagated facts.
 
     `parsed` lets callers that already have a per-model `Expr` (e.g. the
     audit walker) skip a redundant parse pass. When omitted, this function
     parses each model's `analysis_sql` itself, swallowing parse errors.
 
-    Models with no known facts are absent from the mapping; callers should
-    treat missing keys as "no facts known" rather than assuming uniqueness
-    one way or the other.
+    Facts for a given node are de-duplicated on column set; when the same
+    set is grounded by multiple sources the strongest one wins (native
+    constraint > unique test > combination test > structural proof >
+    propagated). Nodes with no known facts are absent from the mapping.
     """
-    by_model: defaultdict[str, list[UniquenessFact]] = defaultdict(list)
+    by_node: defaultdict[str, list[UniquenessFact]] = defaultdict(list)
     for fact in _all_declaration_facts(manifest):
-        by_model[fact.model_unique_id].append(fact)
+        by_node[fact.model_unique_id].append(fact)
     trees = parsed if parsed is not None else _parse_models(manifest, dialect=dialect)
-    name_to_uid: Mapping[str, str] = {m.name: uid for uid, m in manifest.models.items()}
-    declaration_input: Mapping[str, tuple[UniquenessFact, ...]] = {
-        uid: tuple(facts) for uid, facts in by_model.items()
-    }
+    name_to_uid = _build_name_to_uid(manifest)
+
     from dblect.uniqueness.propagation import facts_from_tree
 
-    for uid, tree in trees.items():
+    model_uids = set(manifest.models)
+    for uid in manifest.dag.topological_order():
+        if uid not in model_uids:
+            continue
+        tree = trees.get(uid)
+        if tree is None:
+            continue
+        current: Mapping[str, tuple[UniquenessFact, ...]] = {
+            k: tuple(v) for k, v in by_node.items()
+        }
         for fact in facts_from_tree(
-            uid,
-            tree,
-            model_facts=declaration_input,
-            model_name_to_uid=name_to_uid,
+            uid, tree, model_facts=current, model_name_to_uid=name_to_uid
         ):
-            by_model[fact.model_unique_id].append(fact)
-    return {uid: tuple(facts) for uid, facts in by_model.items()}
+            by_node[fact.model_unique_id].append(fact)
+    return {uid: _dedupe(facts) for uid, facts in by_node.items()}
+
+
+def _build_name_to_uid(manifest: Manifest) -> Mapping[str, str]:
+    """Map of relation name → unique_id covering models and sources.
+
+    Models win on collisions: a developer writing ``{{ ref('x') }}`` expects
+    the model named ``x``, not a source that happens to share the name.
+    Sources lack an exposed identifier today; if a source is referenced
+    under a name different from its logical ``name``, propagation won't
+    find its facts. Limitation we can revisit when a project surfaces it.
+    """
+    name_to_uid: dict[str, str] = {}
+    for uid, src in manifest.sources.items():
+        name_to_uid.setdefault(src.name, uid)
+    for uid, model in manifest.models.items():
+        name_to_uid[model.name] = uid
+    return name_to_uid
+
+
+_SOURCE_RANK: Mapping[UniquenessSource, int] = {
+    UniquenessSource.NATIVE_CONSTRAINT: 0,
+    UniquenessSource.DBT_UNIQUE_TEST: 1,
+    UniquenessSource.DBT_UNIQUE_COMBINATION_TEST: 2,
+    UniquenessSource.STRUCTURAL_PROOF: 3,
+    UniquenessSource.PROPAGATED: 4,
+}
+
+
+def _dedupe(facts: Iterable[UniquenessFact]) -> tuple[UniquenessFact, ...]:
+    """Collapse facts on the same column set, keeping the strongest source.
+
+    A model whose ``customer_id`` is both a declared unique test and a
+    propagated key (from a CTE pass-through of an upstream model) yields a
+    single fact, sourced as ``DBT_UNIQUE_TEST``. Tie order between same-rank
+    sources follows insertion order: first-seen wins, which keeps the
+    declaration ahead of the structural shape inferred from the same SQL.
+    """
+    keep: dict[frozenset[str], UniquenessFact] = {}
+    for f in facts:
+        existing = keep.get(f.columns)
+        if existing is None or _SOURCE_RANK[f.source] < _SOURCE_RANK[existing.source]:
+            keep[f.columns] = f
+    return tuple(keep.values())
 
 
 def facts_from_declarations(manifest: Manifest) -> tuple[UniquenessFact, ...]:
@@ -145,7 +197,7 @@ def _facts_from_tests(nodes: Iterable[Node]) -> Iterable[UniquenessFact]:
         # downstream detectors assume; skip rather than over-claim.
         if not tm.enabled or tm.where is not None:
             continue
-        target = _test_target_model(node)
+        target = _test_target_node(node)
         if target is None:
             continue
         if tm.name == "unique":
@@ -211,18 +263,21 @@ def _uniqueness_columns(c: ConstraintSpec) -> frozenset[str] | None:
     return frozenset(c.columns)
 
 
-def _test_target_model(node: Node) -> str | None:
-    """The model unique_id a generic test is attached to, or None if undeterminable.
+_TARGET_PREFIXES: tuple[str, ...] = ("model.", "source.")
 
-    Prefer ``attached_node`` (the modern shape); fall back to the first model
-    in ``depends_on`` for older manifest versions where ``attached_node``
-    isn't populated. Sources, seeds, and snapshots also accept generic tests
-    but uniqueness reasoning on those is a different story; we restrict to
-    models here.
+
+def _test_target_node(node: Node) -> str | None:
+    """The unique_id a generic test is attached to, or None if undeterminable.
+
+    Prefer ``attached_node`` (the modern shape); fall back to the first
+    eligible entry in ``depends_on`` for older manifest versions where
+    ``attached_node`` isn't populated. Models and sources both accept generic
+    tests and both feed downstream model SQL, so both ground facts; seeds and
+    snapshots are out of scope for now.
     """
-    if node.attached_node and node.attached_node.startswith("model."):
+    if node.attached_node and node.attached_node.startswith(_TARGET_PREFIXES):
         return node.attached_node
     for dep in sorted(node.depends_on):
-        if dep.startswith("model."):
+        if dep.startswith(_TARGET_PREFIXES):
             return dep
     return None

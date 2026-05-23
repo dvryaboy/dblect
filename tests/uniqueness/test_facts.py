@@ -228,9 +228,10 @@ def test_unique_combination_test_with_where_is_also_skipped() -> None:
     assert facts_from_declarations(manifest) == ()
 
 
-def test_unique_test_on_source_is_skipped() -> None:
-    # Sources can carry tests, but uniqueness reasoning on sources is a
-    # different problem; we restrict to models.
+def test_unique_test_on_source_grounds_fact_on_source_uid() -> None:
+    # Sources participate: a unique test on a source column produces a fact
+    # keyed by the source uid. Downstream models that `ref` the source pick
+    # it up by name during propagation.
     test_node = _node(
         unique_id="test.pkg.unique_raw",
         name="unique_raw_id",
@@ -243,7 +244,10 @@ def test_unique_test_on_source_is_skipped() -> None:
         adapter_type="duckdb",
         nodes={test_node.unique_id: test_node},
     )
-    assert facts_from_manifest(manifest) == {}
+    facts = facts_from_manifest(manifest)
+    [fact] = facts["source.pkg.raw.raw"]
+    assert fact.columns == frozenset({"id"})
+    assert fact.source is UniquenessSource.DBT_UNIQUE_TEST
 
 
 def test_declaration_fact_carries_provenance_detail(jaffle: Manifest) -> None:
@@ -298,6 +302,7 @@ def _node(
     attached_node: str | None = None,
     raw_code: str | None = None,
     compiled_code: str | None = None,
+    depends_on: frozenset[str] = frozenset(),
 ) -> Node:
     # The structural-proof layer reads compiled_code by default; tests that
     # care about SQL-derived facts should set compiled_code. raw_code is
@@ -314,8 +319,160 @@ def _node(
         compiled_code=compiled_code,
         original_file_path=None,
         columns=columns or {},
-        depends_on=frozenset(),
+        depends_on=depends_on,
         constraints=constraints,
         test_metadata=test_metadata,
         attached_node=attached_node,
     )
+
+
+# --- Cross-model propagation ---
+
+
+def _model(
+    *,
+    uid: str,
+    name: str,
+    compiled_code: str | None = None,
+    depends_on: frozenset[str] = frozenset(),
+) -> Node:
+    return _node(
+        unique_id=uid,
+        name=name,
+        resource_type=ResourceType.MODEL,
+        compiled_code=compiled_code,
+        depends_on=depends_on,
+    )
+
+
+def _unique_test(*, uid: str, attached: str, column: str, name: str | None = None) -> Node:
+    return _node(
+        unique_id=uid,
+        name=name or f"unique_{column}",
+        resource_type=ResourceType.OTHER,
+        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
+        attached_node=attached,
+    )
+
+
+def _manifest(*nodes: Node) -> Manifest:
+    return Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in nodes},
+    )
+
+
+def test_downstream_inherits_upstream_structural_proof() -> None:
+    # A: select distinct id from raw  → structural-proof {id}
+    # B: select * from a              → inherits A's key via propagation
+    a = _model(uid="model.pkg.a", name="a", compiled_code="select distinct id from raw")
+    b = _model(
+        uid="model.pkg.b",
+        name="b",
+        compiled_code="select * from a",
+        depends_on=frozenset({"model.pkg.a"}),
+    )
+    facts = facts_from_manifest(_manifest(a, b))
+    [b_fact] = facts["model.pkg.b"]
+    assert b_fact.columns == frozenset({"id"})
+    assert b_fact.source is UniquenessSource.PROPAGATED
+
+
+def test_chain_propagation_through_three_models() -> None:
+    # raw_a (declared) → b (pass-through) → c (pass-through)
+    a = _model(uid="model.pkg.a", name="a", compiled_code="select id from raw")
+    ta = _unique_test(uid="test.pkg.unique_a", attached="model.pkg.a", column="id")
+    b = _model(
+        uid="model.pkg.b",
+        name="b",
+        compiled_code="select * from a",
+        depends_on=frozenset({"model.pkg.a"}),
+    )
+    c = _model(
+        uid="model.pkg.c",
+        name="c",
+        compiled_code="select * from b",
+        depends_on=frozenset({"model.pkg.b"}),
+    )
+    facts = facts_from_manifest(_manifest(a, ta, b, c))
+    assert any(f.columns == frozenset({"id"}) for f in facts["model.pkg.c"])
+
+
+def test_diamond_propagation() -> None:
+    # a → b, a → c, then d refs both b and c
+    a = _model(uid="model.pkg.a", name="a", compiled_code="select distinct id from raw")
+    b = _model(
+        uid="model.pkg.b",
+        name="b",
+        compiled_code="select * from a",
+        depends_on=frozenset({"model.pkg.a"}),
+    )
+    c = _model(
+        uid="model.pkg.c",
+        name="c",
+        compiled_code="select * from a",
+        depends_on=frozenset({"model.pkg.a"}),
+    )
+    d = _model(
+        uid="model.pkg.d",
+        name="d",
+        compiled_code="select b.id as id from b join c on b.id = c.id",
+        depends_on=frozenset({"model.pkg.b", "model.pkg.c"}),
+    )
+    facts = facts_from_manifest(_manifest(a, b, c, d))
+    assert any(f.columns == frozenset({"id"}) for f in facts["model.pkg.d"])
+
+
+def test_dedupe_collapses_redundant_facts_strongest_wins() -> None:
+    # Customer table has both a declared unique test on id and a structural
+    # DISTINCT proof from its SQL. Expect one merged fact, source = declared.
+    x = _model(
+        uid="model.pkg.x",
+        name="x",
+        compiled_code="select distinct id from raw",
+    )
+    t = _unique_test(uid="test.pkg.unique_x", attached="model.pkg.x", column="id")
+    facts = facts_from_manifest(_manifest(x, t))
+    [fact] = facts["model.pkg.x"]
+    assert fact.source is UniquenessSource.DBT_UNIQUE_TEST
+
+
+def test_facts_from_source_flow_into_downstream_model() -> None:
+    # Source `raw_orders` has a unique test on order_id; model that refs the
+    # source pass-throughs it.
+    src = _node(
+        unique_id="source.pkg.raw.raw_orders",
+        name="raw_orders",
+        resource_type=ResourceType.SOURCE,
+    )
+    test = _unique_test(
+        uid="test.pkg.unique_src", attached="source.pkg.raw.raw_orders", column="order_id"
+    )
+    consumer = _model(
+        uid="model.pkg.stg_orders",
+        name="stg_orders",
+        compiled_code="select * from raw_orders",
+        depends_on=frozenset({"source.pkg.raw.raw_orders"}),
+    )
+    facts = facts_from_manifest(_manifest(src, test, consumer))
+    [stg_fact] = facts["model.pkg.stg_orders"]
+    assert stg_fact.columns == frozenset({"order_id"})
+    assert stg_fact.source is UniquenessSource.PROPAGATED
+
+
+def test_order_invariant_across_manifest_node_order() -> None:
+    # Whatever order the manifest's `nodes` dict happens to deliver, the
+    # toposort drives propagation, so downstream facts come out the same.
+    a = _model(uid="model.pkg.a", name="a", compiled_code="select distinct id from raw")
+    b = _model(
+        uid="model.pkg.b",
+        name="b",
+        compiled_code="select * from a",
+        depends_on=frozenset({"model.pkg.a"}),
+    )
+    forward = facts_from_manifest(_manifest(a, b))
+    reverse = facts_from_manifest(_manifest(b, a))
+    assert {f.columns for f in forward["model.pkg.b"]} == {
+        f.columns for f in reverse["model.pkg.b"]
+    }
