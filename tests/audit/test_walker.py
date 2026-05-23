@@ -180,8 +180,7 @@ def test_bare_noqa_fixture_surfaces_as_malformed_suppression(jaffle: Manifest) -
     [bad] = [
         lf
         for lf in report.findings
-        if lf.model_unique_id == a_model_uid
-        and lf.finding.kind.value == "malformed_suppression"
+        if lf.model_unique_id == a_model_uid and lf.finding.kind.value == "malformed_suppression"
     ]
     assert bad.finding.line_start == 1
 
@@ -202,17 +201,13 @@ def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> N
     report = run_audit(altered)
     # The blanket suppression at line 1 only covers line 1-2, not the GROUP BY.
     # So the customers null-group finding still surfaces.
-    still_there = [
-        lf for lf in report.findings if lf.model_unique_id == customers.unique_id
-    ]
-    assert still_there, (
-        "A line-1 directive should not blanket-suppress findings on far-down lines"
-    )
+    still_there = [lf for lf in report.findings if lf.model_unique_id == customers.unique_id]
+    assert still_there, "A line-1 directive should not blanket-suppress findings on far-down lines"
     # No SuppressedFinding objects were produced from customers (the directive
     # didn't actually match anything).
-    assert not any(
-        s.located.model_unique_id == customers.unique_id for s in report.suppressed
-    ), "Line-1 directive matched nothing, so suppressed should be empty for customers"
+    assert not any(s.located.model_unique_id == customers.unique_id for s in report.suppressed), (
+        "Line-1 directive matched nothing, so suppressed should be empty for customers"
+    )
 
 
 def test_run_audit_parses_each_model_once(
@@ -226,9 +221,7 @@ def test_run_audit_parses_each_model_once(
 
     import sqlglot
 
-    model_sqls = {
-        m.compiled_code for m in jaffle.models.values() if m.compiled_code is not None
-    }
+    model_sqls = {m.compiled_code for m in jaffle.models.values() if m.compiled_code is not None}
     counts: dict[str, int] = {}
     real_parse_one = sqlglot.parse_one
 
@@ -273,13 +266,10 @@ def test_macro_emitted_join_visible_in_compiled_code() -> None:
         original_file_path="models/user_country.sql",
         columns={},
     )
-    manifest = Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node}
-    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
     report = run_audit(manifest)
     assert any(
-        lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
-        for lf in report.findings
+        lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
     ), "compiled path should see the macro-emitted LEFT JOIN and flag the GROUP BY"
 
 

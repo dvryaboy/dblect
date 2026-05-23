@@ -24,9 +24,7 @@ def test_unparseable_sql_raises_typed_error() -> None:
 _RESERVED = frozenset(
     {"select", "from", "where", "on", "as", "and", "or", "not", "in", "is", "null"}
 )
-_IDENT = st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True).filter(
-    lambda s: s not in _RESERVED
-)
+_IDENT = st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True).filter(lambda s: s not in _RESERVED)
 
 
 @given(

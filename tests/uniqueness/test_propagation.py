@@ -85,9 +85,7 @@ def test_select_without_distinct_or_group_proves_nothing_on_unknown_source() -> 
 
 
 def test_union_distinct_proves_full_tuple_uniqueness() -> None:
-    assert _top_keys("select a from t1 union select a from t2") == frozenset(
-        {frozenset({"a"})}
-    )
+    assert _top_keys("select a from t1 union select a from t2") == frozenset({frozenset({"a"})})
 
 
 def test_union_all_proves_nothing() -> None:
@@ -98,10 +96,7 @@ def test_union_all_proves_nothing() -> None:
 
 
 def test_cte_passthrough_carries_model_keys() -> None:
-    sql = (
-        "with x as (select * from realx) "
-        "select * from x"
-    )
+    sql = "with x as (select * from realx) select * from x"
     keys = _top_keys(
         sql,
         model_facts=_model_facts("model.realx", ("id",)),
@@ -241,9 +236,7 @@ def test_propagated_fact_carries_derivation_chain() -> None:
 
 def test_structural_proof_facts_have_empty_chain() -> None:
     tree = _parse("select distinct a from t")
-    out = facts_from_tree(
-        "model.pkg.x", tree, model_facts={}, model_name_to_uid={}
-    )
+    out = facts_from_tree("model.pkg.x", tree, model_facts={}, model_name_to_uid={})
     assert len(out) == 1
     assert out[0].source is UniquenessSource.STRUCTURAL_PROOF
     assert out[0].derived_from == ()

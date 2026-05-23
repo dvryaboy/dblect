@@ -50,9 +50,7 @@ def test_window_order_keys_not_unique_is_flagged() -> None:
 def test_window_keys_covered_by_declared_unique_key_is_silent() -> None:
     # Source is unique on (customer_id, ts); the window's (customer_id, ts) key is
     # therefore guaranteed unique. No finding.
-    parsed = _parse(
-        "select row_number() over (partition by customer_id order by ts) from src"
-    )
+    parsed = _parse("select row_number() over (partition by customer_id order by ts) from src")
     findings = detect_non_unique_window_order_keys(
         parsed,
         facts=_facts("model.pkg.src", ("customer_id", "ts")),
@@ -63,9 +61,7 @@ def test_window_keys_covered_by_declared_unique_key_is_silent() -> None:
 
 def test_superkey_covered_by_subset_fact_is_silent() -> None:
     # `id` alone is unique on the source; (id, ts) is a superkey and still unique.
-    parsed = _parse(
-        "select row_number() over (partition by id order by ts) from src"
-    )
+    parsed = _parse("select row_number() over (partition by id order by ts) from src")
     findings = detect_non_unique_window_order_keys(
         parsed,
         facts=_facts("model.pkg.src", ("id",)),
@@ -76,9 +72,7 @@ def test_superkey_covered_by_subset_fact_is_silent() -> None:
 
 def test_no_order_by_window_is_not_flagged() -> None:
     # detect_unordered_window covers this case; we don't double-flag.
-    parsed = _parse(
-        "select row_number() over (partition by customer_id) from src"
-    )
+    parsed = _parse("select row_number() over (partition by customer_id) from src")
     findings = detect_non_unique_window_order_keys(
         parsed,
         facts=_facts("model.pkg.src", ("id",)),
@@ -89,9 +83,7 @@ def test_no_order_by_window_is_not_flagged() -> None:
 
 def test_no_facts_for_source_stays_silent() -> None:
     # We don't know if the source has unique keys, so we can't claim a hazard.
-    parsed = _parse(
-        "select row_number() over (partition by customer_id order by ts) from src"
-    )
+    parsed = _parse("select row_number() over (partition by customer_id order by ts) from src")
     findings = detect_non_unique_window_order_keys(
         parsed,
         facts={},
@@ -189,11 +181,7 @@ def test_multiple_windows_each_evaluated_independently() -> None:
 
 
 def test_finding_carries_line_number() -> None:
-    sql = (
-        "select\n"
-        "  row_number() over (partition by customer_id order by ts) as rn\n"
-        "from src\n"
-    )
+    sql = "select\n  row_number() over (partition by customer_id order by ts) as rn\nfrom src\n"
     findings = detect_non_unique_window_order_keys(
         _parse(sql),
         facts=_facts("model.pkg.src", ("id",)),
@@ -209,9 +197,7 @@ def test_finding_carries_line_number() -> None:
 
 def test_fanout_flagged_when_facts_dont_cover_join_key() -> None:
     # `dim` has a fact on (id), but we join on (segment), which isn't unique.
-    parsed = _parse(
-        "select * from facts f left join dim d on f.segment = d.segment"
-    )
+    parsed = _parse("select * from facts f left join dim d on f.segment = d.segment")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -223,9 +209,7 @@ def test_fanout_flagged_when_facts_dont_cover_join_key() -> None:
 
 
 def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
-    parsed = _parse(
-        "select * from facts f left join dim d on f.id = d.id"
-    )
+    parsed = _parse("select * from facts f left join dim d on f.id = d.id")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -248,9 +232,7 @@ def test_fanout_silent_when_join_key_is_a_superkey_of_declared_key() -> None:
 
 
 def test_fanout_composite_key_silent_when_join_covers_all_columns() -> None:
-    parsed = _parse(
-        "select * from facts f join dim d on f.a = d.a and f.b = d.b"
-    )
+    parsed = _parse("select * from facts f join dim d on f.a = d.a and f.b = d.b")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("a", "b")),
@@ -260,9 +242,7 @@ def test_fanout_composite_key_silent_when_join_covers_all_columns() -> None:
 
 
 def test_fanout_composite_key_flagged_when_join_covers_only_one_column() -> None:
-    parsed = _parse(
-        "select * from facts f join dim d on f.a = d.a"
-    )
+    parsed = _parse("select * from facts f join dim d on f.a = d.a")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("a", "b")),
@@ -273,9 +253,7 @@ def test_fanout_composite_key_flagged_when_join_covers_only_one_column() -> None
 
 def test_fanout_silent_when_source_has_no_facts() -> None:
     # Opportunistic: with no facts on the joined-in model, we can't tell.
-    parsed = _parse(
-        "select * from facts f left join dim d on f.segment = d.segment"
-    )
+    parsed = _parse("select * from facts f left join dim d on f.segment = d.segment")
     findings = detect_join_fanout(
         parsed,
         facts={},
@@ -285,9 +263,7 @@ def test_fanout_silent_when_source_has_no_facts() -> None:
 
 
 def test_fanout_silent_when_join_target_is_unknown_model() -> None:
-    parsed = _parse(
-        "select * from facts f left join unknown u on f.id = u.id"
-    )
+    parsed = _parse("select * from facts f left join unknown u on f.id = u.id")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -298,9 +274,7 @@ def test_fanout_silent_when_join_target_is_unknown_model() -> None:
 
 def test_fanout_silent_on_cross_join() -> None:
     # CROSS is an explicit cartesian; that's not what this detector is for.
-    parsed = _parse(
-        "select * from facts f cross join dim d"
-    )
+    parsed = _parse("select * from facts f cross join dim d")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -328,9 +302,7 @@ def test_fanout_silent_when_join_target_shadowed_by_cte() -> None:
 
 def test_fanout_silent_when_predicate_is_disjunctive() -> None:
     # OR-disjunctions don't simplify to "join is on key X"; skip conservatively.
-    parsed = _parse(
-        "select * from facts f left join dim d on f.id = d.id or f.alt = d.alt"
-    )
+    parsed = _parse("select * from facts f left join dim d on f.id = d.id or f.alt = d.alt")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -340,9 +312,7 @@ def test_fanout_silent_when_predicate_is_disjunctive() -> None:
 
 
 def test_fanout_silent_when_predicate_has_function_call() -> None:
-    parsed = _parse(
-        "select * from facts f left join dim d on lower(f.id) = lower(d.id)"
-    )
+    parsed = _parse("select * from facts f left join dim d on lower(f.id) = lower(d.id)")
     findings = detect_join_fanout(
         parsed,
         facts=_facts("model.pkg.dim", ("id",)),
@@ -401,11 +371,7 @@ def test_fanout_flagged_when_join_to_propagated_cte_misses_inherited_key() -> No
 
 
 def test_fanout_finding_carries_join_line() -> None:
-    sql = (
-        "select *\n"
-        "from facts f\n"
-        "left join dim d on f.segment = d.segment\n"
-    )
+    sql = "select *\nfrom facts f\nleft join dim d on f.segment = d.segment\n"
     findings = detect_join_fanout(
         _parse(sql),
         facts=_facts("model.pkg.dim", ("id",)),

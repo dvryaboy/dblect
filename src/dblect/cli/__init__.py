@@ -124,9 +124,7 @@ def audit(
             err=True,
         )
     report = run_audit(loaded, dialect=dialect)
-    rendered = (
-        render_json(report) if output_format is OutputFormat.JSON else render_text(report)
-    )
+    rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
     typer.echo(rendered)
     if report.findings and not no_fail:
         raise typer.Exit(code=1)

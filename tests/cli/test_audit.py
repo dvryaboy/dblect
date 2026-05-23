@@ -97,9 +97,7 @@ def test_audit_finds_manifest_in_target_dir(
     assert "null_group_after_outer_join" in result.output
 
 
-def test_audit_missing_manifest_and_no_dbt_project_fails(
-    tmp_path: Path, runner: CliRunner
-) -> None:
+def test_audit_missing_manifest_and_no_dbt_project_fails(tmp_path: Path, runner: CliRunner) -> None:
     result = runner.invoke(app, ["audit", str(tmp_path)])
     assert result.exit_code != 0
     assert "dbt_project.yml" in result.output
