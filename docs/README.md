@@ -20,7 +20,7 @@ Working design notes for the layers above the current static analyzer. These des
 - [**design/contract-directed-generation.md**](design/contract-directed-generation.md): the generator architecture: intent catalog, multi-table coordinated generation, shrinking.
 - [**design/flags_and_configs_as_types.md**](design/flags_and_configs_as_types.md): how dbt vars and env_vars become typed configuration, the `SemanticFlag` shape, world enumeration, PR-time flag-flip analysis.
 - [**design/var-inference-spec.md**](design/var-inference-spec.md): implementation spec for the var-discovery and inference pass that populates `SemanticFlag` scaffolding.
-- [**design/column-level-lineage.md**](design/column-level-lineage.md): per-column lineage substrate built on `sqlglot.lineage`. Closes the multi-source uniqueness gap, enables a handful of cross-model detectors, and prefigures tag tracking for the semantic-types layer.
+- [**design/column-level-lineage.md**](design/column-level-lineage.md): column-level lineage and property propagation built on K-relations (Green-Karvounarakis-Tannen 2007) marrying with `sqlglot.lineage`. One propagation engine; properties (uniqueness, fanout, nullability, semantic tags) instantiate it by choosing a semiring and per-operator transfer functions. Closes the multi-source uniqueness gap and is the substrate the semantic-types layer will tag-propagate over.
 - [**design/demo_walkthrough.md**](design/demo_walkthrough.md): the canonical end-to-end demo against `jaffle_shop_duckdb`. Output and commands are illustrative; the demo presupposes the typed-contract layer.
 
 ## Other docs at the repo root
