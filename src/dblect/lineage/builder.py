@@ -91,8 +91,18 @@ def build_manifest_graph(
                 schema=schema,
                 dialect=dialect,
             )
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except SqlglotError as e:
             issues.append(BuildIssue(model_unique_id=uid, message=f"sqlglot: {e}"))
+            continue
+        except Exception as e:
+            # sqlglot.lineage runs parse + qualifier + optimizer + walker; not
+            # every failure on that path subclasses SqlglotError (KeyError on a
+            # missing schema entry, AttributeError on an unexpected Expression
+            # shape, RecursionError on pathological nesting). One bad model
+            # shouldn't blank lineage for every downstream model.
+            issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
         graph = graph.merge(per_model)
     return BuildResult(graph=graph, issues=tuple(issues))
@@ -201,6 +211,15 @@ def _resolve_to_leaves(qual_name: str, by_name: Mapping[str, Node]) -> frozenset
     referencing that intermediate, so resolving has to fan out across every
     downstream branch rather than picking one arbitrarily.
 
+    Only chain branches that terminate at an ``exp.Table`` contribute. A
+    branch sqlglot couldn't trace to a real table (CTE alias the walker
+    didn't expand, unqualified column reference, subquery whose lineage
+    wasn't extracted) contributes nothing: the function returns absence
+    rather than a guess shaped like a leaf. Where-provenance's empty
+    annotation is the correct answer for "unresolved"; properties that need
+    to track unresolved-ness explicitly should model it with their own
+    sentinel rather than rely on a stand-in here.
+
     Returns the empty frozenset if no Table-sourced leaf is reachable.
     Cycles are tolerated by tracking visited names.
     """
@@ -214,23 +233,12 @@ def _resolve_to_leaves(qual_name: str, by_name: Mapping[str, Node]) -> frozenset
         seen.add(name)
         node = by_name.get(name)
         if node is None:
-            # Not in the downstream chain: probably a column reference that
-            # sqlglot couldn't qualify. Best effort: treat the qualified name
-            # itself as the leaf identity.
-            split = _split_qualified(name)
-            if split is not None:
-                out.add(split)
             continue
         if isinstance(node.source, exp.Table):
             split = _split_qualified(node.name)
             if split is not None:
                 _, column = split
                 out.add((node.source.name, column))
-            continue
-        if not node.downstream:
-            split = _split_qualified(node.name)
-            if split is not None:
-                out.add(split)
             continue
         stack.extend(nxt.name for nxt in node.downstream if nxt.name)
     return frozenset(out)
