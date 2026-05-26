@@ -163,15 +163,24 @@ def jaffle_manifest(tmp_path_factory: pytest.TempPathFactory) -> Manifest:
     return Manifest.from_file(fixture)
 
 
-def test_jaffle_cross_model_propagator_matches_builder_edges(jaffle_manifest: Manifest) -> None:
-    """End-to-end: across the jaffle DAG, propagated annotations equal recorded edges.
+def test_jaffle_build_succeeds_and_annotations_match_edges(jaffle_manifest: Manifest) -> None:
+    """Regression guard on the jaffle fixture: builder must produce a non-empty graph
+    and the propagator's annotation must equal the builder-recorded edges per column.
 
-    Walks every model output column in the cross-model graph and confirms the
-    propagator's union-semiring annotation matches the builder's edge set.
-    Any divergence here would mean either the builder's edge computation or
-    the propagator's walk is wrong; both paths must agree by construction.
+    The jaffle manifest exposes the rough edges of the V0 substrate (seeds with
+    no documented columns; stg_* models with partial column metadata that
+    causes sqlglot to refuse to qualify downstream models). The contract this
+    test pins is narrow but useful: ``_build_schema`` must not collapse to an
+    empty schema on real manifests, and per-column annotations must agree with
+    per-column edges. Rigorous semantic verification of where-provenance
+    lives in the property-based test ``test_pbt_synthetic_dag_*`` below.
     """
     result = build_manifest_graph(jaffle_manifest)
+    # Sanity floor: a regression in _build_schema (e.g., empty-column tables
+    # leaking into the sqlglot schema) would zero out the graph. Catch it here.
+    assert len(result.graph.edges) > 0, (
+        "graph collapsed to empty; check _build_schema and BuildIssue messages"
+    )
     anns = propagate(result.graph, where_provenance)
     mismatches: list[str] = []
     for col, leaves in result.graph.edges.items():

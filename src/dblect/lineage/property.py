@@ -117,8 +117,14 @@ def _walk(
     Dispatch order:
 
     1. ``exp.Alias`` is a no-op, recurse into the wrapped expression.
-    2. ``exp.Column`` resolves to the upstream annotation via the ``ColumnRef``
-       the builder recorded in ``expr.meta``.
+    2. ``exp.Column`` resolves to the upstream annotation via the set of
+       ``ColumnRef``s the builder recorded in ``expr.meta``. When the set has
+       more than one entry (the column was an intermediate inside a CTE or
+       inline subquery whose own expression collapsed into a single ``Column``
+       at the outer projection), the upstream annotations fold via
+       ``semiring.times``. That matches the "no specific transfer registered"
+       fallback for an operator: the multiple leaves stand in for the
+       structural children the substrate no longer has direct access to.
     3. ``exp.AggFunc`` subclass goes through ``prop.aggregates`` (with MRO
        lookup, so a transfer on ``AggFunc`` catches every subclass that has
        no more specific entry).
@@ -133,10 +139,10 @@ def _walk(
             return _walk(inner, prop, annotate)
         return prop.default()
     if isinstance(expr, exp.Column):
-        ref = _column_ref_meta(expr)
-        if ref is None:
+        refs = _column_refs_meta(expr)
+        if not refs:
             return prop.default()
-        return annotate(ref)
+        return reduce(prop.semiring.times, (annotate(r) for r in refs))
     if isinstance(expr, exp.AggFunc):
         agg_transfer = _lookup_subclass(prop.aggregates, type(expr))
         if agg_transfer is not None:
@@ -196,18 +202,27 @@ def _lookup_subclass(table: Mapping[type[Any], _T_TRANSFER], cls: type) -> _T_TR
     return None
 
 
-def _column_ref_meta(col: exp.Column) -> ColumnRef | None:
-    """Read the ``ColumnRef`` the builder attached to this ``exp.Column``."""
-    meta = col.meta.get(COLUMNREF_META_KEY)
-    if isinstance(meta, ColumnRef):
-        return meta
-    return None
+def _column_refs_meta(col: exp.Column) -> frozenset[ColumnRef]:
+    """Read the set of ``ColumnRef``s the builder attached to this ``exp.Column``.
 
-
-def attach_column_ref(col: exp.Column, ref: ColumnRef) -> None:
-    """Builder-side hook: stamp ``col`` with its resolved ``ColumnRef``.
-
-    The propagator reads back via ``Expr.meta``; this function exists so the
-    meta-key string lives in one place.
+    Returns the empty frozenset for an unstamped Column (either the builder
+    couldn't resolve the reference or it never visited the node). The
+    propagator treats that as "unknown" and falls back to ``Property.default()``.
     """
-    col.meta[COLUMNREF_META_KEY] = ref
+    meta = col.meta.get(COLUMNREF_META_KEY)
+    if isinstance(meta, frozenset):
+        return cast("frozenset[ColumnRef]", meta)
+    return frozenset()
+
+
+def attach_column_refs(col: exp.Column, refs: frozenset[ColumnRef]) -> None:
+    """Builder-side hook: stamp ``col`` with the set of leaf ``ColumnRef``s it resolves to.
+
+    A column expression like ``a.x + a.y`` inside a CTE collapses, at the
+    outer projection, into a single ``exp.Column`` referring to the CTE
+    intermediate. To preserve every leaf the original expression touched, the
+    builder records all of them here as a frozenset. Single-leaf cases pass a
+    singleton; the propagator treats the multi-leaf case as a structural
+    times-fold (see ``_walk`` for the rationale).
+    """
+    col.meta[COLUMNREF_META_KEY] = refs

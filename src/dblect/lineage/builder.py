@@ -6,11 +6,15 @@ trees into our graph shape. The translation stamps each ``exp.Column`` in the
 captured projection expression with the resolved ``ColumnRef`` of its
 ultimate leaf source, so the propagator can walk the expression directly.
 
-V0 scope: CTE intermediate columns are collapsed (the leaf reference is
-attached straight to the top-level Column). Properties that need per-CTE
-intermediate annotations (nullability across multi-step transforms in CTEs)
-will want a follow-up that materialises CTE columns as their own graph
-entries. Where-provenance, which only unions leaves, does not need that.
+V0 scope: CTE intermediate columns are collapsed at translation time. Each
+top-level ``exp.Column`` is stamped with the *set* of leaf ``ColumnRef``s
+that the CTE intermediate's expression touched, walked across every
+downstream branch in the lineage chain. Where-provenance recovers the full
+leaf union by folding that set with the semiring's ``times`` at propagation
+time. Properties that need per-CTE intermediate annotations (e.g.,
+nullability across multi-step transforms in CTEs, where the operator
+structure matters) still want a follow-up that materialises CTE columns as
+their own graph entries.
 
 Cross-model composition is a topological walk over the manifest DAG that
 calls the per-model builder for each model and merges results. We deliberately
@@ -30,7 +34,7 @@ from sqlglot.errors import SqlglotError
 from sqlglot.lineage import Node, lineage
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
-from dblect.lineage.property import attach_column_ref
+from dblect.lineage.property import attach_column_refs
 from dblect.manifest import Manifest, ResourceType
 from dblect.manifest import Node as ManifestNode
 
@@ -134,15 +138,16 @@ def _stamp_and_collect(
     *,
     name_to_source: Mapping[str, SourceRef],
 ) -> frozenset[ColumnRef]:
-    """Stamp every ``exp.Column`` in ``expression`` with its leaf ``ColumnRef`` and return the leaves.
+    """Stamp every ``exp.Column`` in ``expression`` with the set of leaf ``ColumnRef``s
+    it resolves to, and return the union of those leaves.
 
-    For each Column inside the expression, look up the matching downstream
-    ``Node`` in ``root`` (matched by qualified name), walk to a leaf source,
-    read the leaf's column name and source-table identifier directly off the
-    leaf ``Node`` (its ``name`` carries the column, its ``source`` is the
-    ``exp.Table`` whose ``.name`` is the real table identifier, distinct from
-    any FROM alias). Columns that don't resolve are left unstamped; the
-    propagator treats them as "unknown" and falls back to its default.
+    For each Column inside the expression, walk the lineage chain from the
+    matching downstream ``Node`` to every Table-sourced leaf reachable from
+    it. A Column that came from a CTE intermediate like ``a.x + a.y``
+    resolves to both ``leaf.x`` and ``leaf.y``; the stamp records the full
+    set so the propagator can fold them at walk time. Columns that don't
+    resolve are left unstamped; the propagator treats them as "unknown" and
+    falls back to its default.
     """
     downstream_by_name = _index_downstream(root)
     leaves: set[ColumnRef] = set()
@@ -150,16 +155,17 @@ def _stamp_and_collect(
         qual_name = _qualified_name(col)
         if qual_name is None:
             continue
-        leaf = _resolve_to_leaf(qual_name, downstream_by_name)
-        if leaf is None:
+        resolved = _resolve_to_leaves(qual_name, downstream_by_name)
+        refs: set[ColumnRef] = set()
+        for source_name, leaf_column in resolved:
+            source_ref = name_to_source.get(source_name)
+            if source_ref is None:
+                continue
+            refs.add(ColumnRef(source=source_ref, column=leaf_column.lower()))
+        if not refs:
             continue
-        source_name, leaf_column = leaf
-        source_ref = name_to_source.get(source_name)
-        if source_ref is None:
-            continue
-        leaf_ref = ColumnRef(source=source_ref, column=leaf_column.lower())
-        attach_column_ref(col, leaf_ref)
-        leaves.add(leaf_ref)
+        attach_column_refs(col, frozenset(refs))
+        leaves |= refs
     return frozenset(leaves)
 
 
@@ -180,46 +186,54 @@ def _index_downstream(root: Node) -> dict[str, Node]:
     return out
 
 
-def _resolve_to_leaf(qual_name: str, by_name: Mapping[str, Node]) -> tuple[str, str] | None:
-    """Walk from ``qual_name`` down the chain until reaching a Table-sourced leaf.
+def _resolve_to_leaves(qual_name: str, by_name: Mapping[str, Node]) -> frozenset[tuple[str, str]]:
+    """Walk every branch from ``qual_name`` to its Table-sourced leaves.
 
-    Returns ``(source_table_name, column_name)`` taken from the leaf ``Node``:
-    the source table's real identifier (off the ``exp.Table``'s ``.name``,
-    which is distinct from any FROM alias the lineage chain carried) and the
-    column name parsed off the leaf's qualified ``.name``. Returns ``None``
-    if the name isn't in the chain, or if the chain doesn't terminate at a
-    Table source within a reasonable bound.
+    Each result is a ``(source_table_name, column_name)`` pair: the source
+    table's real identifier off the leaf ``Node``'s ``exp.Table`` source
+    (distinct from any FROM alias the lineage chain carried) and the column
+    name parsed off the leaf's qualified ``.name``.
+
+    A single qualified name can expand into multiple leaves when an
+    intermediate column in the lineage chain (most commonly a CTE column or
+    inline-subquery projection) was built from several upstream columns
+    (``a.x + a.y AS combined``). The outer projection only sees one Column
+    referencing that intermediate, so resolving has to fan out across every
+    downstream branch rather than picking one arbitrarily.
+
+    Returns the empty frozenset if no Table-sourced leaf is reachable.
+    Cycles are tolerated by tracking visited names.
     """
+    out: set[tuple[str, str]] = set()
     seen: set[str] = set()
-    name = qual_name
-    while True:
+    stack: list[str] = [qual_name]
+    while stack:
+        name = stack.pop()
         if name in seen:
-            return None
+            continue
         seen.add(name)
         node = by_name.get(name)
         if node is None:
             # Not in the downstream chain: probably a column reference that
-            # sqlglot couldn't qualify. Try splitting the name as a best effort.
-            return _split_qualified(name)
+            # sqlglot couldn't qualify. Best effort: treat the qualified name
+            # itself as the leaf identity.
+            split = _split_qualified(name)
+            if split is not None:
+                out.add(split)
+            continue
         if isinstance(node.source, exp.Table):
-            # Leaf: real source identifier off the Table node, column off the
-            # qualified Node.name.
             split = _split_qualified(node.name)
-            if split is None:
-                return None
-            _, column = split
-            return node.source.name, column
+            if split is not None:
+                _, column = split
+                out.add((node.source.name, column))
+            continue
         if not node.downstream:
-            return _split_qualified(node.name)
-        # Otherwise, descend. Each intermediate has typically one downstream
-        # pointer per upstream column; for a column with a single upstream we
-        # follow that. For multiple, we can't pick one uniquely (the column
-        # expression involved multiple sources); the caller's `find_all` walk
-        # will visit each one separately, so we just follow the first here.
-        nxt = node.downstream[0]
-        name = nxt.name
-        if not name:
-            return None
+            split = _split_qualified(node.name)
+            if split is not None:
+                out.add(split)
+            continue
+        stack.extend(nxt.name for nxt in node.downstream if nxt.name)
+    return frozenset(out)
 
 
 def _qualified_name(col: exp.Column) -> str | None:
@@ -268,17 +282,22 @@ def _build_schema(manifest: Manifest) -> Mapping[str, Mapping[str, str]]:
     Lets sqlglot qualify columns and walk lineage cleanly. Type strings come
     from manifest column metadata; missing types default to ``UNKNOWN`` (a
     sqlglot-accepted placeholder).
+
+    Tables with no documented columns are omitted from the result rather than
+    emitted as ``{}``. sqlglot.lineage rejects an empty column dict with
+    ``Table must have at least one column``, which would kill the build for
+    any model that transitively touches an undocumented seed or source. When
+    the table is simply absent from the schema dict, sqlglot trusts the
+    qualifiers already present in the SQL and lineage proceeds.
     """
     out: dict[str, dict[str, str]] = {}
     for src in manifest.sources.values():
         name = src.identifier or src.name
-        out.setdefault(name, {})
         for col_name, col in src.columns.items():
-            out[name][col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(name, {})[col_name] = col.data_type or "UNKNOWN"
     for node in _models_seeds_snapshots(manifest):
-        out.setdefault(node.name, {})
         for col_name, col in node.columns.items():
-            out[node.name][col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(node.name, {})[col_name] = col.data_type or "UNKNOWN"
     return out
 
 
