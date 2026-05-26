@@ -1,21 +1,28 @@
-"""Property[K] and the single-pass propagator.
+"""``Property[K]`` and the single-pass propagator that walks lineage graphs.
 
-A ``Property[K]`` bundles a ``Semiring[K]`` with three dispatch tables:
+A property has three pieces:
 
-* ``operators``: per sqlglot ``Expr`` subclass, how the operator's input
-  K-annotations combine into the output K-annotation.
-* ``aggregates``: per sqlglot ``AggFunc`` subclass, the semimodule transfer
-  (Amsterdamer, Deutch, Tannen 2011) from the aggregated input to the
-  aggregate's output.
-* ``source``: how a leaf ``ColumnRef`` (a dbt source or seed column) gets its
-  initial K.
+* ``source``: how a leaf column (a dbt source or seed) gets its starting
+  value. For where-provenance it's "the singleton set containing this
+  column"; for nullability it might be "True if the column is declared
+  nullable in the manifest."
+* ``operators``: per sqlglot expression type, how the input values combine
+  into the output value. Empty by default: the walker then folds inputs via
+  ``semiring.times`` (which is union for where-provenance, ``and`` for the
+  Boolean semiring, etc.).
+* ``aggregates``: per sqlglot aggregate function, the rule for going from
+  the aggregated input's value to the aggregate's output. This is the
+  semimodule layer on top of the semiring (Amsterdamer, Deutch, Tannen
+  "Provenance for Aggregate Queries", PODS 2011); for many properties the
+  default ``times``-fold is correct, others (uniqueness through GROUP BY,
+  fanout through COUNT) install a specific rule here.
 
-``propagate`` walks each output column's projection expression top-down. At
-leaf ``exp.Column`` references it recursively resolves the upstream column
-identified by metadata the builder attached. At internal nodes it dispatches
-on the expression subclass. Unknown subclasses fold children via
-``semiring.times`` and, lacking children, return ``Property.default()``;
-detectors that consume the annotation stay silent rather than guess.
+``propagate(graph, prop)`` walks each output column's projection expression
+top-down. At a leaf column reference it recursively annotates the upstream
+column the builder stamped on the node. At an internal expression it
+dispatches on the type. Anything without a registered rule folds its
+children with ``semiring.times``; an expression with no children at all
+returns ``Property.default()`` so detectors stay silent rather than guess.
 """
 
 from __future__ import annotations
@@ -45,17 +52,18 @@ COLUMNREF_META_KEY = "dblect_columnref"
 
 @dataclass(frozen=True, slots=True)
 class Property(Generic[K]):
-    """A propagated property: semiring, dispatch tables, and source rule.
+    """A propagated property: how to start, how to combine, and what to do
+    when we don't know.
 
-    ``unknown_value`` is what the propagator returns when an expression has no
-    transfer and no children to fold over (e.g., a literal like ``42``). For
-    most properties this is ``semiring.zero``; lattice-shaped properties may
-    prefer lattice-top to encode "we know nothing here". Left as ``None`` it
-    falls back to ``semiring.zero`` at call time.
+    ``unknown_value`` is what the propagator returns when an expression has
+    no registered rule and no children to fold over (e.g., a literal like
+    ``42``). For most properties this is ``semiring.zero``; lattice-shaped
+    properties may want lattice-top to mean "we know nothing here." Left as
+    ``None`` it defaults to ``semiring.zero``.
 
-    The dispatch tables (``operators``, ``aggregates``) are required arguments
-    even when empty, so each property declares its surface explicitly rather
-    than relying on a default that hides what is or isn't covered.
+    ``operators`` and ``aggregates`` are required arguments even when empty,
+    so each property declares its surface explicitly: a reader can tell at
+    a glance which expression types this property treats specially.
     """
 
     name: str
@@ -72,16 +80,17 @@ class Property(Generic[K]):
 
 
 def propagate(graph: ColumnLineageGraph, prop: Property[K]) -> Mapping[ColumnRef, K]:
-    """Compute ``prop``'s K-annotation for every column referenced by ``graph``.
+    """Compute ``prop``'s value for every column in ``graph``.
 
-    Walks each column's projection expression top-down, recursing into upstream
-    column annotations at ``exp.Column`` leaves. Results are memoised: a column
-    is annotated once per call regardless of how many downstream paths visit it.
+    Walks each output column's projection expression top-down and recurses
+    into upstream columns at ``exp.Column`` leaves. Memoised per column, so
+    each column is annotated once regardless of how many downstream paths
+    touch it.
 
-    Cycles cannot occur in a manifest-derived lineage graph (the DAG is
-    acyclic), but a defensive guard treats any in-progress recursion as the
-    property's default value, so a malformed input degrades rather than recurses
-    forever.
+    Cycles can't occur in a manifest-derived lineage graph (the DAG is
+    acyclic), but a defensive guard returns the property's default if
+    recursion ever revisits a column mid-walk, so a malformed input degrades
+    instead of looping forever.
     """
     annotations: dict[ColumnRef, K] = {}
     in_progress: set[ColumnRef] = set()
@@ -112,25 +121,24 @@ def _walk(
     prop: Property[K],
     annotate: Callable[[ColumnRef], K],
 ) -> K:
-    """Recursively reduce ``expr`` to a K via ``prop``'s dispatch tables.
+    """Reduce ``expr`` to a single value by walking it and combining children.
 
-    Dispatch order:
+    Dispatch order, from most-specific to least:
 
-    1. ``exp.Alias`` is a no-op, recurse into the wrapped expression.
-    2. ``exp.Column`` resolves to the upstream annotation via the set of
-       ``ColumnRef``s the builder recorded in ``expr.meta``. When the set has
-       more than one entry (the column was an intermediate inside a CTE or
-       inline subquery whose own expression collapsed into a single ``Column``
-       at the outer projection), the upstream annotations fold via
-       ``semiring.times``. That matches the "no specific transfer registered"
-       fallback for an operator: the multiple leaves stand in for the
-       structural children the substrate no longer has direct access to.
-    3. ``exp.AggFunc`` subclass goes through ``prop.aggregates`` (with MRO
-       lookup, so a transfer on ``AggFunc`` catches every subclass that has
-       no more specific entry).
-    4. Any other ``Expr`` subclass goes through ``prop.operators``.
-    5. If no transfer is registered, fall back to folding ``Expr`` children
-       via ``semiring.times``; with no expression children, return
+    1. ``Alias`` is a wrapper; look through it to the wrapped expression.
+    2. ``Column`` resolves to the upstream column the builder stamped onto
+       it. If a single Column references several upstream leaves (because a
+       CTE intermediate like ``a.x + a.y`` collapsed into one outer
+       reference), their values fold via ``semiring.times``, the same fold
+       the walker would use for an operator without a registered rule. The
+       multiple leaves stand in for the structural inputs the collapse
+       erased.
+    3. Aggregates (``AggFunc`` subclasses) check ``prop.aggregates`` with
+       MRO lookup, so a rule registered on ``AggFunc`` itself catches every
+       aggregate subclass that has no more specific entry.
+    4. Any other expression type checks ``prop.operators`` (also MRO).
+    5. With no registered rule, fold the expression's children via
+       ``semiring.times``. With no expression children at all, return
        ``prop.default()``.
     """
     if isinstance(expr, exp.Alias):
@@ -151,7 +159,7 @@ def _walk(
                 return prop.default()
             child_k = _walk(child, prop, annotate)
             return agg_transfer(expr, child_k)
-        # An aggregate without a registered transfer falls through to operator
+        # An aggregate without a registered rule falls through to operator
         # dispatch (which itself defaults to folding children via times).
     op_transfer = _lookup_subclass(prop.operators, type(expr))
     children = _expression_children(expr)
@@ -183,10 +191,10 @@ _T_TRANSFER = TypeVar("_T_TRANSFER")
 
 
 def _lookup_subclass(table: Mapping[type[Any], _T_TRANSFER], cls: type) -> _T_TRANSFER | None:
-    """Find a transfer registered for ``cls`` or any of its base classes.
+    """Find a rule registered for ``cls`` or any of its base classes.
 
     sqlglot's ``Sum``/``Min``/``Max`` share an ``AggFunc`` ancestor; a property
-    that registers a transfer on ``AggFunc`` itself can therefore catch all
+    that registers a rule on ``AggFunc`` itself can therefore catch all
     aggregates with one entry, while still permitting per-aggregate overrides.
 
     Typed as ``Mapping[type[Any], _T_TRANSFER]`` rather than narrowing to ``Expr``

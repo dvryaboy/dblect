@@ -1,26 +1,31 @@
-"""Semiring abstraction for property propagation.
+"""The small algebraic interface every property gets to assume.
 
-A commutative semiring ``(K, +, x, 0, 1)`` is the algebraic backbone for a
-propagated property. Specific properties (where-provenance, uniqueness as
-candidate keys, nullability, fanout, semantic tags) instantiate ``Semiring``
-with the K most natural for that property.
+A property propagates values of some type ``K`` over the lineage graph. At
+two points in the walk those values need to combine:
 
-Core laws every instance satisfies (checked in
-``tests/lineage/test_semiring_laws.py``):
+* ``times``: when SQL builds something from several inputs (an expression
+  like ``a + b``, a JOIN).
+* ``plus``: when several branches feed the same output (UNION ALL, multiple
+  paths through a CTE).
 
-* ``(K, +, 0)`` is a commutative monoid: ``+`` is associative and commutative;
-  ``0 + x = x`` for all ``x``.
-* ``(K, x, 1)`` is a commutative monoid: ``x`` is associative and commutative;
-  ``1 x x = x`` for all ``x``.
-* ``x`` distributes over ``+``: ``a x (b + c) = (a x b) + (a x c)``.
+Both are associative and commutative, both have identities (``one`` and
+``zero``), and ``times`` distributes over ``plus``. That structure is a
+*commutative semiring*, which the K-relations framework (Green, Karvounarakis,
+Tannen "Provenance Semirings", PODS 2007) identifies as exactly what's needed
+for any order-independent combine-rule. Strict semirings additionally satisfy
+``0 x x = 0`` ("times an absent value annihilates"); the looser flavour used
+by ``UnionSemiring`` doesn't.
 
-Strict semirings additionally satisfy ``0 x x = 0`` (zero absorbs times).
-The Boolean semiring is strict; the set-union near-semiring used by
-where-provenance is not (in that instance, ``zero == one == empty set``).
-Properties whose propagation relies on absorption (a property reasoning
-about "join with nothing produces nothing") should pick a strict semiring;
-those that only need confluence and cross combinators (where-provenance,
-many security-label flows) can use the looser structure.
+Concrete implementations:
+
+* ``BooleanSemiring``: strict; ``plus`` is ``or``, ``times`` is ``and``.
+  Encodes plain set semantics over tuples and is the reference any property
+  can be checked against.
+* ``UnionSemiring``: non-strict; ``zero == one == empty set``, both
+  operations are set union. Natural for where-provenance, where every
+  operator unions the inputs' source-column sets.
+
+Laws are checked in ``tests/lineage/test_semiring_laws.py``.
 """
 
 from __future__ import annotations
@@ -34,11 +39,7 @@ E = TypeVar("E")
 
 @runtime_checkable
 class Semiring(Protocol[K]):
-    """Commutative semiring with the operations needed for K-relations propagation.
-
-    ``plus`` reconciles values at confluence points (UNION ALL across branches).
-    ``times`` combines values at cross points (the implicit cross product
-    underlying every JOIN).
+    """The minimal algebra a property's combine-rules satisfy.
 
     ``zero`` and ``one`` are declared as read-only properties so that frozen
     dataclass implementations (the natural way to build a concrete semiring)
@@ -52,20 +53,26 @@ class Semiring(Protocol[K]):
     def one(self) -> K: ...
 
     def plus(self, a: K, b: K) -> K:
-        """Confluence combinator. Associative, commutative, identity ``zero``."""
+        """Combine values from branches that flow to the same output (UNION ALL,
+        multiple paths through a CTE). Associative, commutative; ``zero`` is the
+        identity."""
         ...
 
     def times(self, a: K, b: K) -> K:
-        """Cross combinator. Associative, commutative, identity ``one``, annihilated by ``zero``."""
+        """Combine values from inputs to the same expression or JOIN.
+        Associative, commutative; ``one`` is the identity. Strict semirings
+        also satisfy ``zero x x = zero`` (annihilation)."""
         ...
 
 
 @dataclass(frozen=True, slots=True)
 class BooleanSemiring:
-    """The Boolean semiring ``({F, T}, or, and, F, T)``.
+    """The Boolean semiring: values are ``True``/``False``, ``plus`` is ``or``,
+    ``times`` is ``and``.
 
-    Useful for laws-testing the propagator and as a sanity reference. Set
-    semantics over tuples is what this semiring encodes in K-relations.
+    This is the smallest strict semiring and the reference any property can
+    be sanity-checked against. In K-relations terms it encodes plain set
+    semantics: "is this tuple present in the output?"
     """
 
     zero: bool = False
@@ -80,17 +87,17 @@ class BooleanSemiring:
 
 @dataclass(frozen=True, slots=True)
 class UnionSemiring(Generic[E]):
-    """The set-union semiring ``(frozenset[E], union, union, empty, empty)``.
+    """The set-union semiring: values are frozen sets, both ``plus`` and
+    ``times`` are union, both identities are the empty set.
 
-    An idempotent semiring where ``plus`` and ``times`` are both set union and
-    both identities are the empty set. Used for where-provenance: each output
-    column's annotation is the set of source ``ColumnRef``s that ultimately
-    contributed to it.
-
-    The zero-equals-one degeneracy is a feature here, not a bug: union is
-    self-distributive and the semiring captures "merge contributors at every
-    operator" cleanly. The semimodule extension (aggregate transfers) is what
-    distinguishes per-property behaviour, not the multiplicative structure.
+    The natural shape for where-provenance: every operator and JOIN unions
+    the sets of contributing source columns. The ``zero == one == empty
+    set`` collapse is deliberate: it's what makes "merge contributors at
+    every step" fall out of the algebra. The price is that this isn't a
+    strict semiring (``0 x x = 0`` fails because ``empty | x == x``);
+    properties that rely on absorption should use a strict semiring instead.
+    Per-property behaviour for aggregates lives in the semimodule on top,
+    not in the multiplicative structure here.
     """
 
     zero: frozenset[E] = frozenset()

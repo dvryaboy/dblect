@@ -1,22 +1,23 @@
-"""Column-level lineage and property propagation.
+"""Column-level lineage for dbt projects, plus a generic engine for
+propagating *properties* (where-provenance, nullability, uniqueness,
+fanout, ...) over that lineage.
 
-This package builds on the provenance-semiring framework (Green, Karvounarakis,
-Tannen 2007 "Provenance Semirings", PODS) and the semimodule extension for
-aggregates (Amsterdamer, Deutch, Tannen 2011 "Provenance for Aggregate
-Queries", PODS), applied to dbt model graphs via sqlglot's parse + ``lineage``
-primitives.
+Two pieces:
 
-The substrate is two pieces:
+* A ``ColumnLineageGraph`` built from each model's compiled SQL. Per output
+  column it records which upstream columns fed it (edges) and the sqlglot
+  expression that built it (so a property can walk it).
+* A ``Property[K]`` API plus a single ``propagate`` walker. A property says
+  what value a leaf column starts with and how values combine across
+  operators and aggregates. Adding a new propagated property is adding a
+  ``Property[K]`` value; the walker does not change.
 
-* A ``ColumnLineageGraph`` (where- and how-provenance per output column) built
-  from each model's compiled SQL.
-* A ``Property[K]`` API plus a single ``propagate`` walker. A property is a
-  commutative semiring ``(K, +, x, 0, 1)`` paired with per-operator and
-  per-aggregate transfer functions, dispatched on sqlglot expression types.
-  Adding a new propagated property (uniqueness, nullability, fanout, semantic
-  tag) is adding a ``Property[K]`` value; the walker does not change.
-
-See ``docs/design/column-level-lineage.md`` for the design.
+The combine-rules satisfy the laws of a commutative semiring; aggregates use
+a semimodule on top. The framework is from Green, Karvounarakis, and Tannen
+("Provenance Semirings", PODS 2007); the aggregate extension is from
+Amsterdamer, Deutch, and Tannen ("Provenance for Aggregate Queries", PODS
+2011). You don't need either paper to write a property; see
+``docs/design/column-level-lineage.md`` for the practical guide.
 """
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef

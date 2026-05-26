@@ -1,17 +1,20 @@
 """Data model for the column-level lineage graph.
 
-A ``ColumnLineageGraph`` carries two things per output column:
+Per output column the graph stores two things:
 
-* **where-provenance**: the set of upstream ``ColumnRef``s the output
-  ultimately draws from. Edges in the graph.
-* **how-provenance**: the sqlglot ``Expression`` that produced this column at
-  the projection level (e.g. ``Alias(Sum(Column))``). The propagator walks
-  this expression top-down applying per-operator and per-aggregate transfers.
+* ``edges``: *where* the column's values came from, the set of upstream
+  columns it ultimately draws from. (In the K-relations literature this is
+  called "where-provenance.")
+* ``expressions``: *how* the column was built, the sqlglot expression for
+  this column at the projection level, like ``Alias(Sum(Column))``. The
+  propagator walks this expression top-down when computing any property.
+  (In the K-relations literature this is "how-provenance.")
 
-The graph is built by ``builder.py`` from each model's compiled SQL and then
-merged across the manifest DAG. Source columns (dbt sources, seeds) appear as
-``ColumnRef`` keys with no entry in ``expressions``: they are the leaves where
-``Property.source`` is consulted.
+The graph is built by ``builder.py`` from each model's compiled SQL and
+then merged across the manifest DAG. Leaf source columns (dbt sources and
+seeds) appear as ``ColumnRef`` keys with no entry in ``expressions``:
+those are the points where ``Property.source`` is consulted to seed the
+value before propagation.
 """
 
 from __future__ import annotations
@@ -65,20 +68,21 @@ class ColumnRef:
 class ColumnLineageGraph:
     """Per-audit column lineage assembled across the manifest DAG.
 
-    ``edges`` is the flattened where-provenance: every output column points to
-    the source-level ``ColumnRef``s it ultimately depends on. Useful for cheap
-    queries like "did this output come from X" without invoking the full
+    ``edges`` is the flattened where-provenance: every output column points
+    to the source-level columns it ultimately depends on. Useful for cheap
+    queries like "did this output come from X?" without invoking the full
     propagator.
 
-    ``expressions`` is the per-column projection ``Expression`` as sqlglot
-    parsed it. The propagator walks this expression top-down at each output
-    column, dispatching on the expression's subclass to ``Property.operators``
-    or ``Property.aggregates``. At leaf ``exp.Column`` nodes the propagator
-    recurses into the referenced upstream ``ColumnRef``.
+    ``expressions`` is the per-column projection expression as sqlglot
+    parsed it. The propagator walks this expression top-down for each
+    output column, dispatching on the expression type to
+    ``Property.operators`` or ``Property.aggregates`` and recursing into
+    upstream columns at ``exp.Column`` leaves.
 
-    A ``ColumnRef`` appearing in ``edges`` keys but not in ``expressions`` is a
-    leaf source (a dbt source or seed column, or an unresolved reference).
-    ``Property.source`` supplies its initial K-annotation.
+    A column that appears in ``edges`` keys but not in ``expressions`` is
+    a leaf source (a dbt source or seed column, or an unresolved
+    reference). ``Property.source`` supplies its starting value before
+    propagation.
     """
 
     edges: Mapping[ColumnRef, frozenset[ColumnRef]]
