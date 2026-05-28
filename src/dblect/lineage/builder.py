@@ -32,8 +32,8 @@ import sqlglot
 from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
-from sqlglot.optimizer import Scope, build_scope, qualify
-from sqlglot.optimizer.scope import ScopeType
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
 from dblect.lineage.property import UnionConfluence, attach_column_ref
@@ -118,7 +118,7 @@ def build_model_graph(
     """
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
     expression = sqlglot.maybe_parse(sql, dialect=dialect, copy=True)
-    expression = qualify.qualify(
+    expression = qualify(
         expression,
         dialect=dialect,
         schema=schema,
@@ -156,12 +156,25 @@ class _Walker:
         self._scope_source_ref: dict[int, SourceRef] = {}
         self._union_output_ref: dict[tuple[int, str], SourceRef] = {}
 
-    def walk(self, scope: Scope, *, scope_path: tuple[str, ...]) -> None:
+    def walk(
+        self,
+        scope: Scope,
+        *,
+        scope_path: tuple[str, ...],
+        register_projections: bool = True,
+    ) -> None:
         """Recursively walk ``scope``, registering each interesting projection.
 
         Child scopes (CTEs, derived tables, UNION arms) are assigned and
         registered before the parent's selects are stamped, so qualifiers
         like ``r.combined`` resolve to the right child SourceRef.
+
+        ``register_projections=False`` descends into child scopes without
+        registering this scope's own projections. ``_emit_union_nodes``
+        uses this for UNION arms: the arm's projections are registered
+        positionally under arm 0's output names rather than under the
+        arm's own per-position aliases, so a single arm projection ends
+        up in ``expressions`` once.
         """
         for cte_scope in scope.cte_scopes:
             cte_name = self._alias_for_child_scope(cte_scope, scope)
@@ -198,7 +211,7 @@ class _Walker:
         if isinstance(scope_expr, exp.Union):
             self._register_top_level_union(scope, scope_path=scope_path)
             return
-        if not hasattr(scope_expr, "selects"):
+        if not register_projections or not hasattr(scope_expr, "selects"):
             return
         scope_source = self._source_ref_for_scope(scope)
         for select in scope_expr.selects:
@@ -332,7 +345,7 @@ class _Walker:
                 unique_id=self._synthetic_id_union_arm(scope_path, arm_idx),
             )
             self._scope_source_ref[id(arm_scope)] = arm_ref
-            self.walk(arm_scope, scope_path=arm_path)
+            self.walk(arm_scope, scope_path=arm_path, register_projections=False)
             arm_selects = per_arm_selects[arm_idx]
             for col_idx, out_name in enumerate(output_names):
                 if not out_name or col_idx >= len(arm_selects):
@@ -340,10 +353,9 @@ class _Walker:
                 arm_select = arm_selects[col_idx]
                 arm_col_ref = ColumnRef(source=arm_ref, column=out_name.lower())
                 arm_refs_per_col[col_idx].append(arm_col_ref)
-                if arm_col_ref not in self.expressions:
-                    immediate = self._stamp_columns(arm_select, scope=arm_scope)
-                    self.expressions[arm_col_ref] = arm_select
-                    self.edges[arm_col_ref] = immediate
+                immediate = self._stamp_columns(arm_select, scope=arm_scope)
+                self.expressions[arm_col_ref] = arm_select
+                self.edges[arm_col_ref] = immediate
 
         for col_idx, out_name in enumerate(output_names):
             if not out_name or not arm_refs_per_col[col_idx]:
