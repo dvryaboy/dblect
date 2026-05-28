@@ -365,25 +365,35 @@ class CTEScenario:
     """A single-leaf scenario whose only model uses a CTE.
 
     The CTE has its own projection list (``intermediates``) and the outer
-    SELECT draws from those intermediates. Splitting CTE scenarios out from
-    the general generator keeps the substrate's CTE-collapse behaviour pinned
-    by its own pair of tests: one for the case the V0 builder claims works
-    (single-source intermediates) and one for the case it does not yet handle
-    (multi-source intermediates).
+    SELECT draws from those intermediates. ``wrap`` decides whether each
+    intermediate expression is bare or wrapped in a structural operator
+    (``coalesce``, ``case``, or ``SUM``). The wrappings preserve
+    set-of-leaves semantics for where-provenance, so they don't change the
+    ground truth; they exist to put the substrate's CTE materialisation
+    under load on the shape of expressions where downstream properties
+    (nullability, aggregate detection) will care about the structure.
     """
 
     leaf: LeafSpec
     intermediates: tuple[Projection, ...]
     outer: tuple[Projection, ...]
+    wrap: str  # "none" | "coalesce" | "case" | "aggregate"
 
 
 @st.composite
-def _cte_scenario(draw: st.DrawFn, *, multi_source: bool) -> CTEScenario:
+def _cte_scenario(
+    draw: st.DrawFn, *, multi_source: bool, wrap_choices: tuple[str, ...]
+) -> CTEScenario:
     """Generator for CTE scenarios.
 
     ``multi_source=False`` restricts CTE intermediates to single-column
     references. ``multi_source=True`` forces at least one intermediate to
     combine two or more upstream columns.
+
+    ``wrap_choices`` is the set of structural wrappings the generator
+    samples from for the CTE's intermediate expressions. Pass
+    ``("none",)`` to keep intermediates bare; pass the full set to stress
+    the substrate on coalesce / case / aggregate-wrapped intermediates.
     """
     n_cols = draw(st.integers(min_value=2, max_value=3))
     leaf = LeafSpec(
@@ -414,19 +424,47 @@ def _cte_scenario(draw: st.DrawFn, *, multi_source: bool) -> CTEScenario:
         col = draw(st.sampled_from(inter_names))
         outer.append(Projection(out=f"o{k}", sources=(("__cte__", col),), aggregate=False))
 
-    return CTEScenario(leaf=leaf, intermediates=tuple(intermediates), outer=tuple(outer))
+    wrap = draw(st.sampled_from(wrap_choices))
+    return CTEScenario(leaf=leaf, intermediates=tuple(intermediates), outer=tuple(outer), wrap=wrap)
+
+
+def _wrap_inner_expr(terms: list[str], wrap: str) -> str:
+    """Apply the chosen structural wrapping to a CTE intermediate's expression.
+
+    ``case`` falls back to the bare expression when only one source term
+    is present (a CASE needs at least one WHEN plus an ELSE). All
+    wrappings preserve set-of-leaves: every original source term still
+    appears as a Column reference inside the wrapped expression, so
+    where-provenance stays unchanged regardless of duplicates in ``terms``.
+    """
+    bare = " + ".join(terms) if len(terms) > 1 else terms[0]
+    if wrap == "coalesce":
+        return f"COALESCE({', '.join(terms)})"
+    if wrap == "case" and len(terms) >= 2:
+        # Chain a WHEN per term-except-last and put the last in the ELSE.
+        # Every term appears at least once in the produced expression, so
+        # the leaf-union ground truth holds even when ``terms`` repeats
+        # the same column (the generator does this on purpose).
+        when_clauses = " ".join(f"WHEN {t} > 0 THEN {t}" for t in terms[:-1])
+        return f"CASE {when_clauses} ELSE {terms[-1]} END"
+    if wrap == "aggregate":
+        return f"SUM({bare})"
+    return bare
 
 
 def _build_cte_sql(s: CTEScenario) -> str:
     inner_parts: list[str] = []
     for p in s.intermediates:
         terms = [f"a.{col}" for _, col in p.sources]
-        expr = " + ".join(terms) if len(terms) > 1 else terms[0]
+        expr = _wrap_inner_expr(terms, s.wrap)
         inner_parts.append(f"{expr} AS {p.out}")
     inner = f"SELECT {', '.join(inner_parts)} FROM {s.leaf.name} AS a"
+    # When intermediates are aggregated, SQL requires a GROUP BY for any
+    # non-aggregated columns. Aggregating every intermediate avoids the
+    # mixed-aggregation-without-grouping error: the CTE becomes a fully
+    # aggregated query that returns one row, which is well-formed.
     outer_parts: list[str] = []
     for p in s.outer:
-        # outer projection sources are (__cte__, intermediate_name)
         col = p.sources[0][1]
         outer_parts.append(f"r.{col} AS {p.out}")
     outer = f"SELECT {', '.join(outer_parts)} FROM r"
@@ -461,15 +499,21 @@ def _run_cte(s: CTEScenario) -> dict[str, frozenset[ColumnRef]]:
     return {p.out: anns[ColumnRef(source=model_src, column=p.out.lower())] for p in s.outer}
 
 
-@given(_cte_scenario(multi_source=False))
+_WRAP_BARE = ("none",)
+_WRAP_ALL = ("none", "coalesce", "case", "aggregate")
+
+
+@given(_cte_scenario(multi_source=False, wrap_choices=_WRAP_ALL))
 @settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_pbt_cte_single_source_intermediates_match_ground_truth(s: CTEScenario) -> None:
-    """V0 claim: pass-through CTEs work. Pin it.
+    """Single-column-reference CTE intermediates, with structural wrappings.
 
-    When every CTE intermediate references exactly one upstream column, the
-    outer column's propagated where-provenance must equal the singleton leaf
-    set named by that intermediate. This is the contract the V0 builder
-    docstring explicitly commits to.
+    Whether the intermediate is bare, coalesce-wrapped, case-wrapped, or
+    aggregate-wrapped, the outer column's where-provenance must equal the
+    singleton leaf set the intermediate names. The wrapping changes the
+    expression structure (which downstream properties care about) but not
+    the set of source columns reachable from it (which where-provenance
+    pins).
     """
     got = _run_cte(s)
     gt = _cte_ground_truth(s)
@@ -481,19 +525,17 @@ def test_pbt_cte_single_source_intermediates_match_ground_truth(s: CTEScenario) 
         )
 
 
-@given(_cte_scenario(multi_source=True))
+@given(_cte_scenario(multi_source=True, wrap_choices=_WRAP_ALL))
 @settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_pbt_cte_multi_source_intermediates_match_ground_truth(s: CTEScenario) -> None:
-    """A CTE intermediate that combines several upstream columns must
-    contribute every one of them to the outer column's where-provenance.
+    """Multi-column CTE intermediates, with structural wrappings.
 
-    The outer projection only sees one ``exp.Column`` referring to the CTE
-    intermediate. The substrate handles that by stamping the Column with the
-    full set of leaves the intermediate's expression touched (walked across
-    every downstream branch in the lineage chain) and folding them via the
-    semiring's ``times`` at propagation time. For where-provenance ``times``
-    is set union, so the outer annotation equals the leaf closure of the
-    intermediate's expression.
+    A CTE intermediate like ``COALESCE(a.x, a.y)`` or ``SUM(a.x + a.y)``
+    references several upstream columns; the outer projection still only
+    sees one ``exp.Column`` pointing at the intermediate. The V1 substrate
+    materialises that intermediate as its own graph entry whose
+    expression carries the wrapping; the propagator walks the wrapping
+    and recurses through the Column stamps, recovering every leaf.
     """
     got = _run_cte(s)
     gt = _cte_ground_truth(s)
@@ -502,4 +544,84 @@ def test_pbt_cte_multi_source_intermediates_match_ground_truth(s: CTEScenario) -
             f"{out_name}: sql={_build_cte_sql(s)!r} "
             f"expected={sorted(repr(c) for c in expected)} "
             f"got={sorted(repr(c) for c in got[out_name])}"
+        )
+
+
+# --- UNION ALL scenarios ---
+
+
+@dataclass(frozen=True)
+class UnionScenario:
+    """Two-arm UNION ALL between two single-leaf SELECTs, wrapped in a
+    subquery the outer model SELECTs from.
+
+    Both arms project the same column names off two different leaves.
+    Outer where-provenance for each output column is exactly the
+    union of the two arms' leaf columns.
+    """
+
+    n_columns: int
+
+
+@st.composite
+def _union_scenario(draw: st.DrawFn) -> UnionScenario:
+    return UnionScenario(n_columns=draw(st.integers(min_value=1, max_value=3)))
+
+
+_UNION_LEAVES = ("leaf_a", "leaf_b")
+_UNION_COLS = ("c0", "c1", "c2")
+
+
+def _build_union_sql(s: UnionScenario) -> str:
+    out_names = tuple(f"out{i}" for i in range(s.n_columns))
+    arm_a = ", ".join(f"a.{_UNION_COLS[i]} AS {out_names[i]}" for i in range(s.n_columns))
+    arm_b = ", ".join(f"b.{_UNION_COLS[i]} AS {out_names[i]}" for i in range(s.n_columns))
+    inner = f"SELECT {arm_a} FROM leaf_a a UNION ALL SELECT {arm_b} FROM leaf_b b"
+    outer = ", ".join(f"u.{c} AS {c}" for c in out_names)
+    return f"SELECT {outer} FROM ({inner}) u"
+
+
+def _union_ground_truth(s: UnionScenario) -> dict[str, frozenset[ColumnRef]]:
+    leaf_a = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_a")
+    leaf_b = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_b")
+    out: dict[str, frozenset[ColumnRef]] = {}
+    for i in range(s.n_columns):
+        out[f"out{i}"] = frozenset(
+            {ColumnRef(leaf_a, _UNION_COLS[i]), ColumnRef(leaf_b, _UNION_COLS[i])}
+        )
+    return out
+
+
+@given(_union_scenario())
+@settings(max_examples=50, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_pbt_union_all_arms_match_ground_truth(s: UnionScenario) -> None:
+    """A UNION ALL between two arms unions their leaves at the outer column.
+
+    The V1 substrate materialises the union as a synthetic graph node
+    whose expression is ``Union(arm0_col, arm1_col)``; the propagator
+    dispatches on ``exp.Union`` and folds via ``semiring.plus``. For
+    where-provenance ``plus`` is set union, so the outer column's
+    where-provenance equals the union of each arm's leaves.
+    """
+    sql = _build_union_sql(s)
+    leaf_a = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_a")
+    leaf_b = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_b")
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"leaf_a": leaf_a, "leaf_b": leaf_b},
+        schema={
+            "leaf_a": dict.fromkeys(_UNION_COLS[: s.n_columns], "INT"),
+            "leaf_b": dict.fromkeys(_UNION_COLS[: s.n_columns], "INT"),
+        },
+    )
+    anns = propagate(graph, where_provenance)
+    model_src = SourceRef(SourceKind.MODEL, "model.test.m")
+    gt = _union_ground_truth(s)
+    for out_name, expected in gt.items():
+        got = anns[ColumnRef(model_src, out_name)]
+        assert got == expected, (
+            f"{out_name}: sql={sql!r} "
+            f"expected={sorted(repr(c) for c in expected)} "
+            f"got={sorted(repr(c) for c in got)}"
         )

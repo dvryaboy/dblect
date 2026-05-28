@@ -46,10 +46,3 @@ where_provenance: Property[WhereProvenance] = Property(
     aggregates={},  # aggregates likewise union their inputs
     unknown_value=frozenset(),
 )
-"""The where-provenance property.
-
-Operators and aggregates both fall through to the walker's default
-child-fold, which under ``UnionSemiring`` is set union. A leaf column
-annotates itself with ``{self}``; downstream columns inherit the union of
-their inputs.
-"""
