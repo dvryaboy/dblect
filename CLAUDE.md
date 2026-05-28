@@ -9,6 +9,7 @@ We do not write tests for tests' sakes. We avoid test theater.
 We prefer to test at the boundaries instead of implementation specifics; tests should survive implementation
 changes that do not change contracts.
 Excessive use of mocking is a smell. Loads of boilerplate is a smell.
+Pin contracts, not coincidences. If fragile cooperation is observed (two functions work correctly together only because of implementation details, not contract guarantees), fix the contracts in code rather than pinning the accidental behavior in a test.
 
 ## Comments
 We avoid comment bloat. We write comments that explain the why of things, or help understand particularly

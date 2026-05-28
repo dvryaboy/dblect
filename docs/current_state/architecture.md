@@ -26,6 +26,7 @@ src/dblect/
 ├── manifest/          # parse manifest.json into typed Node + DAG, surface dbt tests + constraints
 ├── sql/               # parse compiled SQL, walk the AST, detect hazards
 ├── uniqueness/        # collect uniqueness facts from declarations + SQL, ground fact-aware detectors
+├── lineage/           # column-level lineage graph + generic property propagator
 ├── audit/             # orchestrate detectors over a manifest, render output
 ├── cli/               # the `dblect` typer app
 └── execution/         # run dbt models in DuckDB (used for execution tests; not on the audit path)
@@ -194,7 +195,7 @@ Two detectors live in [`uniqueness/detector.py`](../../src/dblect/uniqueness/det
 **`detect_non_unique_window_order_keys`** flags window functions where the combined `(PARTITION BY + ORDER BY)` columns aren't grounded as unique on the source model. The check is intentionally narrow:
 
 - Only the **top-level SELECT** is inspected.
-- The model's top-level FROM must resolve to a **single ref'd model** (no joins at the top level; multi-source needs column-level lineage we don't have yet).
+- The model's top-level FROM must resolve to a **single ref'd model** (no joins at the top level). Multi-source resolution will lean on the lineage substrate (see below); the detector hasn't been wired through it yet.
 - The source model must have **at least one uniqueness fact**. With no grounding, we stay silent.
 - A fact whose columns are a **subset** of the window's key set counts as coverage. Any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
 - Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
@@ -209,6 +210,28 @@ Two detectors live in [`uniqueness/detector.py`](../../src/dblect/uniqueness/det
 - A JOIN target whose name is shadowed by a local CTE is skipped: the CTE's output is not the model's.
 
 Both detectors are enabled by default. Because they're opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from them. Findings of kinds `NON_UNIQUE_WINDOW_ORDER_KEYS` and `JOIN_FANOUT` are suppressible via the standard `-- noqa-fixture:` syntax.
+
+## The lineage substrate (`src/dblect/lineage/`)
+
+Most SQL footguns only become visible when you know where a column's *values* came from. Does this `LEFT JOIN ... WHERE upstream NOT IN (...)` silently drop rows because some upstream value is NULL? Is the column you're ranking on actually unique in the source, or did a CTE reshuffle it? Did an aggregate flatten away a key the next window function expects? Answering any of these means walking back from an output column, through the model graph, to the real source columns its values originated in, and reasoning about what happened along the way.
+
+The substrate is a column-level lineage graph plus a single walker that propagates *properties* over it. A property is a question like "which source columns did this trace back to?", "could this be NULL?", or "is this still a key?". Every property plugs into the same walker; adding a new one is writing a small dataclass, not a new traversal. The first one is **where-provenance**: for every output column, the set of source columns whose values feed it. It's the simplest property to compute, and gives downstream detectors a cheap "did this come from X?" primitive without re-walking SQL. The uniqueness detector's multi-source bail, a cross-model fanout detector, a NOT-IN-nullable-upstream detector, and an aggregate-over-aggregated detector each become a different property over the same engine.
+
+The way values combine at expression crosses (JOIN) and confluence (UNION ALL) has the same algebraic shape no matter what's being propagated: a commutative semiring. That's why one `propagate` function handles where-provenance today and will handle nullability, uniqueness, and fanout tomorrow. The framework is from Green, Karvounarakis, and Tannen ("Provenance Semirings", PODS 2007); the aggregate extension is from Amsterdamer, Deutch, and Tannen ("Provenance for Aggregate Queries", PODS 2011). You don't need either paper to write a property: say what the value is at a leaf, how two values combine, and which operators or aggregates do something special.
+
+### Pieces
+
+- [**`graph.py`**](../../src/dblect/lineage/graph.py): the lineage graph. Per output column we store its *edges* (the upstream columns it directly draws from) and its *expression* (the sqlglot AST that built it). Column names are case-folded so cross-model lookups don't trip over `id` vs `ID`.
+- [**`builder.py`**](../../src/dblect/lineage/builder.py): turns compiled SQL into the graph. Per model it calls sqlglot's lineage walker and stamps each `Column` in the projection expression with the real source columns it resolves to. CTE intermediates collapse here: a CTE column built from `a.x + a.y` stamps the outer reference with both leaves. The cross-model variant walks the manifest DAG and merges per-model graphs; per-model failures land as `BuildIssue` entries instead of blanking the whole build.
+- [**`semiring.py`**](../../src/dblect/lineage/semiring.py): the small algebraic interface a property gets to assume. Two implementations ship: a Boolean reference (`or` for branch-confluence, `and` for cross) and a set-union one for where-provenance. The set-union variant has a quirk worth knowing: the empty set is both `zero` and `one`, so it doesn't satisfy `0 × x = 0` the way a strict semiring would. A docstring and a Hypothesis test pin this explicitly so a future cleanup doesn't quietly break it.
+- [**`property.py`**](../../src/dblect/lineage/property.py): the property type and the walker. A property declares what value a leaf starts with, how values combine, and per-expression-type overrides for operators and aggregates (MRO lookup lets one rule on `AggFunc` catch every aggregate subclass). `propagate(graph, prop)` computes the value for every column by walking each output column's expression top-down, memoising as it goes.
+- [**`properties/where_provenance.py`**](../../src/dblect/lineage/properties/where_provenance.py): the first property. Each leaf annotates itself with `{self}`; every operator and aggregate unions inputs. The annotation on each output column ends up being exactly the set of source columns whose values fed it.
+
+### What the substrate proves today
+
+`tests/lineage/test_pbt_lineage.py` generates dbt-shaped scenarios with sources, seeds, models, multi-upstream JOINs, repeated columns in projections (`a.x + a.x`), mixed-case identifiers, leaves with undocumented columns, and CTE-shaped models whose intermediates can combine multiple upstream columns. For every model output column the test compares the propagator's annotation to the leaf-level closure computed structurally from the scenario itself; the two must agree. A companion test pins that the recorded `edges` set lands on the immediate upstream relation (a leaf or the upstream model), with the propagator doing all transitive stitching. A pair of CTE-focused PBTs separately pin the single-source-intermediate and multi-source-intermediate cases so the CTE collapse path can't silently regress.
+
+The where-provenance scenario tests in `tests/lineage/test_where_provenance.py` exercise pass-through, transform, aggregate, `COUNT(*)`, JOIN, and CTE collapse on small explicit SQL. A jaffle-fixture regression guard asserts that `build_manifest_graph` produces a non-empty graph and that per-column annotations agree with per-column edges on the real manifest. The substrate is independently parsable and consumable from outside the audit walker; downstream code paths can drop it in once the detector wiring lands.
 
 ## The audit layer (`src/dblect/audit/`)
 
@@ -312,13 +335,14 @@ The test suite is organized by package:
 tests/manifest/    - manifest parsing + DAG topology (incl. PBT over generated acyclic DAGs)
 tests/sql/         - sqlglot parsing wrapper, structural detectors (incl. PBT on parse round-trips)
 tests/uniqueness/  - declaration ingestion, structural-proof rules, ordering-key detector
+tests/lineage/     - semiring laws (PBT), where-provenance scenarios, synthetic-DAG PBT incl. CTEs
 tests/audit/       - walker, suppression directives, text + JSON reporters
 tests/cli/         - end-to-end CLI via typer.testing.CliRunner
 tests/execution/   - real-dbt run against the vendored jaffle project
 tests/test_smoke.py - package import + CLI module load
 ```
 
-Hypothesis property-based tests cover DAG topology, parse round-trips, and the uniqueness-fact kind round-trip. The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
+Hypothesis property-based tests cover DAG topology, parse round-trips, the uniqueness-fact kind round-trip, the semiring laws, and end-to-end lineage propagation on synthetic dbt-shaped DAGs (including CTE-collapse cases that previously dropped multi-source intermediates). The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
 
 Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression module are pure functions, which makes testing rigorous: same inputs always give the same outputs, no mocking needed.
 
