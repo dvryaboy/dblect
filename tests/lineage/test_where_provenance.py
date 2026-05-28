@@ -1,8 +1,6 @@
 """Tests for the where-provenance property.
 
-Where-provenance is the simplest non-trivial property: every output column's
-annotation should be exactly the set of source columns whose values fed into
-it. ``graph.edges`` records each column's *immediate* upstream relation;
+``graph.edges`` records each column's immediate upstream relation;
 ``propagate(graph, where_provenance)`` walks each column's projection
 expression and folds via the union semiring to recover the transitive
 leaf closure. The two values mean different things, and these tests pin
@@ -124,22 +122,35 @@ def test_cte_collapses_to_source_leaf() -> None:
     assert anns[out] == frozenset({ColumnRef(_source("t"), "x")})
 
 
+def test_union_arms_bind_positionally_not_by_alias() -> None:
+    """Arms with different per-position aliases must contribute positionally:
+    the standard-SQL rule is "output names come from arm 0; later arms
+    contribute by position regardless of their own aliases." A name-based
+    lookup would silently drop arm 1's contribution.
+    """
+    sql = """
+        SELECT u.x AS out FROM (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS y FROM t2
+        ) u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _source("t1"), "t2": _source("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+    anns = propagate(graph, where_provenance)
+    out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "out")
+    assert anns[out] == frozenset({ColumnRef(_source("t1"), "a"), ColumnRef(_source("t2"), "b")})
+
+
 def test_edges_are_immediate_upstream_and_annotation_is_leaf_closure() -> None:
-    """Pin the post-V1 substrate contract on a CTE-rich query.
-
-    Two facts have to hold simultaneously:
-
-    * ``graph.edges`` is the *immediate* upstream relation. A model column
-      built off a CTE points at the CTE column, not at the underlying
-      source. CTE columns are themselves entries; their edges point at
-      sources.
-    * ``propagate(..., where_provenance)`` walks the chain transitively,
-      so a model column's annotation is the leaf closure regardless of
-      how many CTE hops sat between it and the source.
-
-    Where-provenance is the cleanest cross-check because both edges and
-    propagator output are sets of ``ColumnRef``; the two values mean
-    different things now and the test pins both meanings.
+    """On a CTE-rich query, ``graph.edges`` for a model column points at a
+    CTE column (one step up), the CTE column's edges point at sources, and
+    ``propagate(..., where_provenance)`` resolves the model column to the
+    transitive leaf closure regardless of how many CTE hops sat between.
     """
     sql = (
         "WITH a AS (SELECT id, value FROM src_a), "
@@ -194,16 +205,12 @@ def test_jaffle_build_succeeds_and_chains_resolve_to_real_leaves(
 ) -> None:
     """Regression guard on the jaffle fixture.
 
-    Two contracts the substrate has to honour on a real manifest:
-
-    * ``_build_schema`` does not collapse to an empty schema. A regression
-      that lets empty-column tables leak into the sqlglot schema would
-      blank the graph; catch it before any property test does.
-    * Every model column's where-provenance annotation terminates at
-      manifest-backed leaves (sources, seeds, snapshots, or upstream
-      models). Synthetic CTE / UNION_ARM refs may appear in ``edges`` but
-      must never appear in the *transitive* closure that the propagator
-      walks. If they do, the propagator stopped early.
+    * ``_build_schema`` must not collapse to an empty schema (an
+      empty-column-table leak would blank the graph).
+    * Every model column's where-provenance annotation must terminate at
+      manifest-backed leaves. Synthetic CTE / UNION refs may appear in
+      ``edges`` but never in the transitive closure — if they do, the
+      propagator stopped early.
     """
     result = build_manifest_graph(jaffle_manifest)
     assert len(result.graph.edges) > 0, (

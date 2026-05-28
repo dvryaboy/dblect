@@ -130,7 +130,7 @@ The table is the shape of dispatch. Each `Property[K]` fills in the specific beh
 The audit builds a single `ColumnLineageGraph` per run by walking the manifest DAG in topological order. For each model:
 
 1. Parse the compiled SQL and qualify it via sqlglot's optimiser passes, then build the scope tree.
-2. Walk the scope tree top-down. The root SELECT's projections become `ColumnRef`s on the model. Each CTE projection becomes a `ColumnRef` on a synthetic `cte.<model_uid>.<scope_path>` source; each UNION ALL output gets a synthetic `union.<model_uid>.<scope_path>.<col>` node whose expression is `Union(arm0, arm1, ...)`, with each arm projection itself a separate `ColumnRef`. Each `exp.Column` in any projection is stamped with the single `ColumnRef` of its immediate upstream graph node.
+2. Walk the scope tree top-down. The root SELECT's projections become `ColumnRef`s on the model. Each CTE projection becomes a `ColumnRef` on a synthetic `cte.<model_uid>.<scope_path>` source; each UNION ALL combined output column gets a synthetic `union.<model_uid>.<scope_path>.<col>` node whose expression is a `UnionConfluence` carrying the per-arm `ColumnRef`s, with each arm projection itself a separate `ColumnRef`. Each `exp.Column` in any projection is stamped with the single `ColumnRef` of its immediate upstream graph node.
 3. Merge into the audit-wide graph.
 
 Property propagation is then a separate pass per property: `propagate(graph, prop)` returns a `Mapping[ColumnRef, K]`. Properties are independent. Running uniqueness propagation does not depend on running fanout propagation; they share the graph, never the annotations.

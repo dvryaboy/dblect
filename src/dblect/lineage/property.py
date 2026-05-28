@@ -19,13 +19,12 @@ A property has three pieces:
 
 ``propagate(graph, prop)`` walks each column's projection expression
 top-down. At an ``exp.Column`` leaf it recurses into the single upstream
-``ColumnRef`` the builder stamped onto the node. At an internal expression
-it dispatches on the type. ``exp.Union`` is structurally a confluence
-point and always folds its arms via ``semiring.plus`` (the same role
-``UNION ALL`` plays in K-relations); other expressions consult
+``ColumnRef`` the builder stamped onto the node. At a ``UnionConfluence``
+it folds the carried arm refs via ``semiring.plus`` (the K-relations
+confluence rule for ``UNION ALL``). Other expressions consult
 ``Property.operators`` / ``Property.aggregates`` and fall through to a
 ``semiring.times`` fold of children. An expression with no children at all
-returns ``Property.default()`` so detectors stay silent rather than guess.
+returns ``Property.default()``.
 """
 
 from __future__ import annotations
@@ -33,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, ClassVar, Generic, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -51,6 +50,22 @@ SourceRule = Callable[[ColumnRef], K]
 # an ``exp.Column`` resolves to. Centralised so builder and propagator stay
 # in sync; tests pin the contract.
 COLUMNREF_META_KEY = "dblect_columnref"
+
+
+class UnionConfluence(exp.Expression):
+    """Synthetic confluence node for a ``UNION ALL`` combined output column.
+
+    Carries the per-arm ``ColumnRef``s on the instance so the propagator
+    can plus-fold them directly. Distinct from ``exp.Union`` (and not an
+    ``exp.Column``), so qualifier passes and column resolution can never
+    misread it as a real reference.
+    """
+
+    arg_types: ClassVar[dict[str, bool]] = {}
+
+    def __init__(self, arm_refs: tuple[ColumnRef, ...] = ()) -> None:
+        super().__init__()
+        self.arm_refs: tuple[ColumnRef, ...] = arm_refs
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,23 +143,18 @@ def _walk(
 
     Dispatch order, from most-specific to least:
 
-    1. ``Alias`` is a wrapper; look through it to the wrapped expression.
-    2. ``Column`` recurses into the single upstream ``ColumnRef`` the
-       builder stamped onto it. An unstamped Column returns
-       ``prop.default()`` (the builder couldn't resolve it).
-    3. ``Union`` is the K-relations confluence point. Its arm children
-       always fold via ``semiring.plus``, regardless of any operator rule
-       the property might have registered: the algebra requires
-       confluences to fold with ``plus``, and pretending otherwise would
-       silently violate property contracts. With no arm children at all
-       (a malformed Union), return ``prop.default()``.
+    1. ``Alias`` looks through to the wrapped expression.
+    2. ``Column`` recurses into its stamped upstream ``ColumnRef``.
+       Unstamped Column returns ``prop.default()``.
+    3. ``UnionConfluence`` plus-folds its arm refs (the K-relations
+       confluence rule). No registered rule can override this; the algebra
+       requires confluences to fold with ``plus``.
     4. Aggregates (``AggFunc`` subclasses) check ``prop.aggregates`` with
        MRO lookup, so a rule registered on ``AggFunc`` itself catches every
-       aggregate subclass that has no more specific entry.
+       subclass that has no more specific entry.
     5. Any other expression type checks ``prop.operators`` (also MRO).
-    6. With no registered rule, fold the expression's children via
-       ``semiring.times``. With no expression children at all, return
-       ``prop.default()``.
+    6. Fallback: fold the expression's Expr children via ``semiring.times``,
+       or ``prop.default()`` if there are none.
     """
     if isinstance(expr, exp.Alias):
         inner = expr.this
@@ -156,11 +166,10 @@ def _walk(
         if ref is None:
             return prop.default()
         return annotate(ref)
-    if isinstance(expr, exp.Union):
-        arm_ks = tuple(_walk(c, prop, annotate) for c in _expression_children(expr))
-        if not arm_ks:
+    if isinstance(expr, UnionConfluence):
+        if not expr.arm_refs:
             return prop.default()
-        return reduce(prop.semiring.plus, arm_ks)
+        return reduce(prop.semiring.plus, (annotate(r) for r in expr.arm_refs))
     if isinstance(expr, exp.AggFunc):
         agg_transfer = _lookup_subclass(prop.aggregates, type(expr))
         if agg_transfer is not None:
@@ -221,26 +230,15 @@ def _lookup_subclass(table: Mapping[type[Any], _T_TRANSFER], cls: type) -> _T_TR
 
 
 def _column_ref_meta(col: exp.Column) -> ColumnRef | None:
-    """Read the single ``ColumnRef`` the builder attached to this ``exp.Column``.
+    """Read the ``ColumnRef`` the builder stamped on ``col``.
 
-    Returns ``None`` for an unstamped Column (either the builder couldn't
-    resolve the reference or it never visited the node). The propagator
-    treats that as "unknown" and falls back to ``Property.default()``.
+    Returns ``None`` for an unstamped Column; the propagator falls back to
+    ``Property.default()``.
     """
     meta = col.meta.get(COLUMNREF_META_KEY)
-    if isinstance(meta, ColumnRef):
-        return cast("ColumnRef", meta)
-    return None
+    return meta if isinstance(meta, ColumnRef) else None
 
 
 def attach_column_ref(col: exp.Column, ref: ColumnRef) -> None:
-    """Builder-side hook: stamp ``col`` with the single ``ColumnRef`` it resolves to.
-
-    Each ``exp.Column`` in a projection expression points at exactly one
-    immediate upstream column in the lineage graph. That upstream may
-    itself be a CTE intermediate, a UNION arm, an upstream-model column,
-    or a leaf source; the propagator recurses through the chain.
-    Multi-leaf fan-out is handled by materialising CTE / union nodes in
-    the graph rather than by attaching multiple refs here.
-    """
+    """Stamp ``col`` with the single ``ColumnRef`` it resolves to."""
     col.meta[COLUMNREF_META_KEY] = ref

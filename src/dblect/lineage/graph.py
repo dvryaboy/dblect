@@ -1,31 +1,25 @@
 """Data model for the column-level lineage graph.
 
-Per output column the graph stores two things:
+Per column the graph stores two things:
 
-* ``edges``: the *immediate* upstream columns this column's projection
+* ``edges``: the immediate upstream columns this column's projection
   expression references. One step only; the propagator stitches longer
-  chains by recursing through the column refs stamped on ``exp.Column``s
-  in each projection expression.
-* ``expressions``: *how* the column was built, the sqlglot expression for
-  this column at the projection level, like ``Alias(Sum(Column))``. The
-  propagator walks this expression top-down when computing any property.
-  (In the K-relations literature this is "how-provenance.")
+  chains by recursing through the refs stamped on ``exp.Column``s.
+* ``expressions``: the sqlglot expression that produced this column at
+  the projection level, like ``Alias(Sum(Column))``. (In the K-relations
+  literature, "how-provenance.") The propagator walks it top-down.
 
-CTE intermediates, inline-subquery projections, and UNION ALL outputs are
-all first-class entries in the graph. A reference like ``r.combined`` from
-an outer SELECT into a CTE column stamps to a ``ColumnRef`` whose source
-is the synthetic ``cte.<model_uid>.<scope_path>`` shape; that CTE column
-in turn has its own projection expression in ``expressions``. UNION ALL
-outputs surface as a synthetic ``union.<model_uid>.<scope_path>.<col>``
-node whose expression is ``Union(arm0, arm1, ...)``, with each arm
-materialised as its own ``ColumnRef`` entry. Properties dispatch on
-``exp.Union`` to combine the arms via ``semiring.plus``.
+CTE intermediates, inline-subquery projections, and UNION ALL combined
+outputs are all first-class entries: a reference like ``r.combined`` from
+an outer SELECT stamps to a ``ColumnRef`` on a synthetic CTE source whose
+own projection expression then lives in ``expressions``. UNION ALL
+combined outputs carry a ``UnionConfluence`` synthetic node that
+plus-folds the per-arm ``ColumnRef``s.
 
-The graph is built by ``builder.py`` from each model's compiled SQL and
-then merged across the manifest DAG. Leaf source columns (dbt sources and
-seeds) appear as ``ColumnRef`` keys with no entry in ``expressions``:
-those are the points where ``Property.source`` is consulted to seed the
-value before propagation.
+The graph is built by ``builder.py`` per model and merged across the
+manifest DAG. Leaf source columns (sources, seeds) appear as ``ColumnRef``
+keys with no ``expressions`` entry; ``Property.source`` seeds their value
+before propagation.
 """
 
 from __future__ import annotations
@@ -41,11 +35,11 @@ class SourceKind(StrEnum):
     """What kind of dbt node a ``ColumnRef`` lives on.
 
     ``MODEL``, ``SOURCE``, ``SEED``, ``SNAPSHOT`` map to real manifest
-    entries. ``CTE`` and ``UNION_ARM`` are synthetic kinds the builder
-    invents to materialise CTE intermediates, inline-subquery projections,
-    and UNION ALL arms as first-class graph entries; detectors that walk
-    the graph should treat those kinds as opaque "internal scaffolding"
-    rather than user-facing nodes.
+    entries. ``CTE``, ``UNION``, ``UNION_ARM`` are synthetic kinds the
+    builder invents to materialise CTE intermediates, inline-subquery
+    projections, UNION ALL combined outputs, and the individual arms as
+    first-class graph entries. Detectors that walk the graph should treat
+    synthetic kinds as opaque internal scaffolding.
     """
 
     MODEL = "model"
@@ -53,6 +47,7 @@ class SourceKind(StrEnum):
     SEED = "seed"
     SNAPSHOT = "snapshot"
     CTE = "cte"
+    UNION = "union"
     UNION_ARM = "union_arm"
 
 
@@ -64,18 +59,15 @@ class SourceRef:
     (``model.<project>.<name>``, ``source.<project>.<source_name>.<table_name>``,
     etc.).
 
-    For the synthetic kinds the builder invents:
+    Synthetic-kind id shapes:
 
-    * ``CTE``: ``cte.<model_uid>.<scope_path>`` where ``scope_path`` is a
-      dot-joined chain of CTE aliases / subquery aliases from outermost to
-      innermost (e.g. ``cte.model.test.m.outer_cte.inner_cte``). This is
-      stable across builds for the same SQL and disambiguates CTEs with
-      the same alias in different lexical scopes.
-    * ``UNION_ARM``: ``union.<model_uid>.<scope_path>.<col>`` for a
-      UNION's combined output node, or
-      ``union.<model_uid>.<scope_path>.<col>#<arm_index>`` for an
-      individual arm projection. Arms are indexed in the order they appear
-      in the SQL.
+    * ``CTE``: ``cte.<model_uid>.<scope_path>``, where ``scope_path`` is a
+      dot-joined chain of CTE / derived-table aliases from outermost to
+      innermost. Disambiguates same-named CTEs in different scopes.
+    * ``UNION``: ``union.<model_uid>.<scope_path>.<col>`` — the combined
+      output node for a UNION ALL's column.
+    * ``UNION_ARM``: ``union.<model_uid>.<scope_path>#<arm_index>`` —
+      individual arm projection, indexed in source order.
     """
 
     kind: SourceKind
@@ -100,21 +92,12 @@ class ColumnRef:
 class ColumnLineageGraph:
     """Per-audit column lineage assembled across the manifest DAG.
 
-    ``edges`` is the immediate upstream relation: every column points to
-    the columns its projection expression directly references. One step
-    only. The propagator stitches longer chains by recursing through the
-    ``ColumnRef`` stamped on each ``exp.Column`` in the projection.
-
-    ``expressions`` is the per-column projection expression as sqlglot
-    parsed it. The propagator walks this expression top-down for each
-    column, dispatching on the expression type to ``Property.operators``
-    or ``Property.aggregates`` and recursing into the upstream column at
-    each ``exp.Column`` leaf via its stamped ``ColumnRef``.
-
-    A column that appears in ``edges`` keys but not in ``expressions`` is
-    a leaf source (a dbt source or seed column, an upstream-model column
-    at a per-model build boundary, or an unresolved reference).
-    ``Property.source`` supplies its starting value before propagation.
+    ``edges`` is the immediate upstream relation; the propagator stitches
+    longer chains by recursing through ``ColumnRef``s stamped on
+    ``exp.Column``s in each projection. ``expressions`` carries the
+    sqlglot projection expression the propagator walks. A column with no
+    ``expressions`` entry is a leaf (source, seed, upstream-model boundary,
+    or unresolved), and ``Property.source`` seeds it.
     """
 
     edges: Mapping[ColumnRef, frozenset[ColumnRef]]

@@ -1,15 +1,4 @@
-"""Demo tests for the aggregation-depth property over the immediate-upstream substrate.
-
-The SUM-of-SUM-through-a-CTE scenario in issue #25's acceptance criteria
-is what this file exists to pin. The CTE column is a graph entry whose
-expression is ``Sum(Column(t.x))``, so the outer reference inherits
-depth 1 through the Column stamp and the outer ``SUM(r.subtotal)`` ticks
-the depth to 2. A detector that flags double aggregation reads
-``aggregation_depth > 1`` per model column.
-
-``aggregation_depth`` is a demo property; see its module docstring for
-the gaps that keep it out of audit consumption.
-"""
+"""Tests for the demo aggregation-depth property."""
 
 from __future__ import annotations
 
@@ -28,7 +17,6 @@ def _model(uid: str) -> SourceRef:
 
 
 def test_single_aggregate_is_depth_one() -> None:
-    """Baseline: ``SUM(t.x)`` directly in the model SELECT is depth 1."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT SUM(t.x) AS total FROM t",
@@ -41,7 +29,6 @@ def test_single_aggregate_is_depth_one() -> None:
 
 
 def test_non_aggregate_passthrough_is_depth_zero() -> None:
-    """Baseline: a plain projection is depth 0."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT t.x AS y FROM t",
@@ -54,13 +41,9 @@ def test_non_aggregate_passthrough_is_depth_zero() -> None:
 
 
 def test_sum_of_sum_through_cte_is_depth_two() -> None:
-    """Aggregate over a CTE that already aggregated: depth 2.
-
-    A ``double_aggregation`` detector built on this property checks
-    ``depth > 1`` per model column. The CTE column carries its own
-    ``Sum(...)`` expression as a graph entry, so the outer reference
-    inherits depth 1 through a single Column stamp and the outer ``SUM``
-    ticks the depth to 2.
+    """Aggregate over a CTE that already aggregated must surface as depth 2 —
+    this is the substrate-level check that CTE projections carry their own
+    expression rather than being collapsed to a leaf stamp.
     """
     sql = """
         WITH r AS (SELECT SUM(t.x) AS subtotal FROM t GROUP BY t.bucket)
@@ -78,11 +61,8 @@ def test_sum_of_sum_through_cte_is_depth_two() -> None:
 
 
 def test_aggregate_in_expression_does_not_double_count() -> None:
-    """``SUM(t.x + t.y)`` is one aggregate over a binary expression: depth 1.
-
-    The default times-fold over the binary expression's children must
-    take the max (both 0) rather than summing, so the aggregate-rule's
-    ``child_k + 1`` returns 1 rather than 2.
+    """``SUM(t.x + t.y)`` is one aggregate: the default times-fold over the
+    binary expression's children must take the max rather than sum.
     """
     graph = build_model_graph(
         model_uid="model.test.m",
@@ -96,11 +76,8 @@ def test_aggregate_in_expression_does_not_double_count() -> None:
 
 
 def test_union_of_aggregated_arms_keeps_depth_one() -> None:
-    """``UNION ALL`` of two depth-1 arms: combined output is depth 1, not 2.
-
-    Plus-fold via ``MaxSemiring.plus`` is ``max``, so two arms at depth 1
-    combine to depth 1. A naive sum-style combine would have reported 2
-    and produced false positives on every UNION of aggregates.
+    """UNION ALL plus-fold under MaxSemiring is ``max``: two depth-1 arms
+    combine to 1, not 2. Pins that the confluence isn't a naive sum.
     """
     sql = """
         SELECT u.s AS out FROM (

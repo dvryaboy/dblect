@@ -1,27 +1,20 @@
-"""Property-based tests for the lineage substrate end-to-end.
+"""Property-based tests for lineage end-to-end.
 
-The generator builds small dbt-shaped scenarios: sources, seeds, and models
-with explicit projections, joined or chained in arbitrary ways. For each
-scenario the test builds a real ``Manifest``, runs ``build_manifest_graph``
-plus ``propagate`` for where-provenance, and asserts that every model
-column's annotation equals the leaf-level closure computed structurally from
-the scenario itself.
+The generator builds small dbt-shaped scenarios: sources, seeds, and
+models with explicit projections, joined or chained. For each scenario
+the test builds a real ``Manifest``, runs ``build_manifest_graph`` plus
+``propagate`` for where-provenance, and asserts that every model column's
+annotation equals the leaf-level closure computed structurally from the
+scenario.
 
-The generator deliberately stresses cases the substrate is most likely to
-get wrong:
+The generator deliberately stresses:
 
-* Leaves with empty ``columns`` metadata (the undocumented-seed shape that
-  used to collapse ``_build_schema`` to ``{table: {}}`` entries).
+* Leaves with empty ``columns`` metadata (undocumented seeds).
 * Multi-upstream JOINs whose projections mix columns from both sides.
-* Same-column-reused-in-an-expression (``a.x + a.x``), exercising the
-  per-Column walk's set semantics rather than list semantics.
-* Mixed-case identifiers, since the graph case-folds column names.
-* Column-name collisions across leaves (``leaf_0.c0`` vs ``leaf_1.c0``).
+* Same-column-reused-in-an-expression (``a.x + a.x``).
+* Mixed-case identifiers.
+* Column-name collisions across leaves.
 * Aggregates over arbitrary projections.
-
-If this PBT ever passes on the first run after a substrate change, the
-generator is probably not searching hard enough; widen the strategies before
-declaring victory.
 """
 
 from __future__ import annotations
@@ -364,14 +357,11 @@ def test_pbt_edges_are_immediate_upstream(scenario: Scenario) -> None:
 class CTEScenario:
     """A single-leaf scenario whose only model uses a CTE.
 
-    The CTE has its own projection list (``intermediates``) and the outer
-    SELECT draws from those intermediates. ``wrap`` decides whether each
-    intermediate expression is bare or wrapped in a structural operator
-    (``coalesce``, ``case``, or ``SUM``). The wrappings preserve
-    set-of-leaves semantics for where-provenance, so they don't change the
-    ground truth; they exist to put the substrate's CTE materialisation
-    under load on the shape of expressions where downstream properties
-    (nullability, aggregate detection) will care about the structure.
+    ``wrap`` decides whether each intermediate is bare or wrapped in a
+    structural operator (``coalesce``, ``case``, ``SUM``). All wrappings
+    preserve set-of-leaves for where-provenance — they stress the CTE
+    materialisation on expression shapes downstream properties (nullability,
+    aggregate detection) will care about.
     """
 
     leaf: LeafSpec
@@ -531,11 +521,11 @@ def test_pbt_cte_multi_source_intermediates_match_ground_truth(s: CTEScenario) -
     """Multi-column CTE intermediates, with structural wrappings.
 
     A CTE intermediate like ``COALESCE(a.x, a.y)`` or ``SUM(a.x + a.y)``
-    references several upstream columns; the outer projection still only
-    sees one ``exp.Column`` pointing at the intermediate. The V1 substrate
-    materialises that intermediate as its own graph entry whose
-    expression carries the wrapping; the propagator walks the wrapping
-    and recurses through the Column stamps, recovering every leaf.
+    references several upstream columns; the outer projection only sees
+    one ``exp.Column`` pointing at the intermediate. The intermediate is
+    its own graph entry whose expression carries the wrapping, so the
+    propagator walks the wrapping and recurses through the stamps,
+    recovering every leaf.
     """
     got = _run_cte(s)
     gt = _cte_ground_truth(s)
@@ -597,11 +587,9 @@ def _union_ground_truth(s: UnionScenario) -> dict[str, frozenset[ColumnRef]]:
 def test_pbt_union_all_arms_match_ground_truth(s: UnionScenario) -> None:
     """A UNION ALL between two arms unions their leaves at the outer column.
 
-    The V1 substrate materialises the union as a synthetic graph node
-    whose expression is ``Union(arm0_col, arm1_col)``; the propagator
-    dispatches on ``exp.Union`` and folds via ``semiring.plus``. For
-    where-provenance ``plus`` is set union, so the outer column's
-    where-provenance equals the union of each arm's leaves.
+    The union's combined output is a synthetic ``UnionConfluence`` node
+    plus-folded by the propagator. For where-provenance ``plus`` is set
+    union, so the outer column equals the union of each arm's leaves.
     """
     sql = _build_union_sql(s)
     leaf_a = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_a")
