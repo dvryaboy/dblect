@@ -17,12 +17,14 @@ A property has three pieces:
   default ``times``-fold is correct, others (uniqueness through GROUP BY,
   fanout through COUNT) install a specific rule here.
 
-``propagate(graph, prop)`` walks each output column's projection expression
-top-down. At a leaf column reference it recursively annotates the upstream
-column the builder stamped on the node. At an internal expression it
-dispatches on the type. Anything without a registered rule folds its
-children with ``semiring.times``; an expression with no children at all
-returns ``Property.default()`` so detectors stay silent rather than guess.
+``propagate(graph, prop)`` walks each column's projection expression
+top-down. At an ``exp.Column`` leaf it recurses into the single upstream
+``ColumnRef`` the builder stamped onto the node. At a ``UnionConfluence``
+it folds the carried arm refs via ``semiring.plus`` (the K-relations
+confluence rule for ``UNION ALL``). Other expressions consult
+``Property.operators`` / ``Property.aggregates`` and fall through to a
+``semiring.times`` fold of children. An expression with no children at all
+returns ``Property.default()``.
 """
 
 from __future__ import annotations
@@ -30,10 +32,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, ClassVar, Generic, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.expressions.core import Expression
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef
 from dblect.lineage.semiring import Semiring
@@ -44,10 +47,26 @@ OperatorTransfer = Callable[[Expr, tuple[K, ...]], K]
 AggregateTransfer = Callable[[exp.AggFunc, K], K]
 SourceRule = Callable[[ColumnRef], K]
 
-# Key on ``Expr.meta`` where the builder records the ``ColumnRef`` an
-# ``exp.Column`` resolves to. Centralised so builder and propagator stay in
-# sync; tests pin the contract.
+# Key on ``Expr.meta`` where the builder records the single ``ColumnRef``
+# an ``exp.Column`` resolves to. Centralised so builder and propagator stay
+# in sync; tests pin the contract.
 COLUMNREF_META_KEY = "dblect_columnref"
+
+
+class UnionConfluence(Expression):
+    """Synthetic confluence node for a ``UNION ALL`` combined output column.
+
+    Carries the per-arm ``ColumnRef``s on the instance so the propagator
+    can plus-fold them directly. Distinct from ``exp.Union`` (and not an
+    ``exp.Column``), so qualifier passes and column resolution can never
+    misread it as a real reference.
+    """
+
+    arg_types: ClassVar[dict[str, bool]] = {}
+
+    def __init__(self, arm_refs: tuple[ColumnRef, ...] = ()) -> None:
+        super().__init__()
+        self.arm_refs: tuple[ColumnRef, ...] = arm_refs
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,21 +144,18 @@ def _walk(
 
     Dispatch order, from most-specific to least:
 
-    1. ``Alias`` is a wrapper; look through it to the wrapped expression.
-    2. ``Column`` resolves to the upstream column the builder stamped onto
-       it. If a single Column references several upstream leaves (because a
-       CTE intermediate like ``a.x + a.y`` collapsed into one outer
-       reference), their values fold via ``semiring.times``, the same fold
-       the walker would use for an operator without a registered rule. The
-       multiple leaves stand in for the structural inputs the collapse
-       erased.
-    3. Aggregates (``AggFunc`` subclasses) check ``prop.aggregates`` with
+    1. ``Alias`` looks through to the wrapped expression.
+    2. ``Column`` recurses into its stamped upstream ``ColumnRef``.
+       Unstamped Column returns ``prop.default()``.
+    3. ``UnionConfluence`` plus-folds its arm refs (the K-relations
+       confluence rule). No registered rule can override this; the algebra
+       requires confluences to fold with ``plus``.
+    4. Aggregates (``AggFunc`` subclasses) check ``prop.aggregates`` with
        MRO lookup, so a rule registered on ``AggFunc`` itself catches every
-       aggregate subclass that has no more specific entry.
-    4. Any other expression type checks ``prop.operators`` (also MRO).
-    5. With no registered rule, fold the expression's children via
-       ``semiring.times``. With no expression children at all, return
-       ``prop.default()``.
+       subclass that has no more specific entry.
+    5. Any other expression type checks ``prop.operators`` (also MRO).
+    6. Fallback: fold the expression's Expr children via ``semiring.times``,
+       or ``prop.default()`` if there are none.
     """
     if isinstance(expr, exp.Alias):
         inner = expr.this
@@ -147,10 +163,14 @@ def _walk(
             return _walk(inner, prop, annotate)
         return prop.default()
     if isinstance(expr, exp.Column):
-        refs = _column_refs_meta(expr)
-        if not refs:
+        ref = _column_ref_meta(expr)
+        if ref is None:
             return prop.default()
-        return reduce(prop.semiring.times, (annotate(r) for r in refs))
+        return annotate(ref)
+    if isinstance(expr, UnionConfluence):
+        if not expr.arm_refs:
+            return prop.default()
+        return reduce(prop.semiring.plus, (annotate(r) for r in expr.arm_refs))
     if isinstance(expr, exp.AggFunc):
         agg_transfer = _lookup_subclass(prop.aggregates, type(expr))
         if agg_transfer is not None:
@@ -210,27 +230,16 @@ def _lookup_subclass(table: Mapping[type[Any], _T_TRANSFER], cls: type) -> _T_TR
     return None
 
 
-def _column_refs_meta(col: exp.Column) -> frozenset[ColumnRef]:
-    """Read the set of ``ColumnRef``s the builder attached to this ``exp.Column``.
+def _column_ref_meta(col: exp.Column) -> ColumnRef | None:
+    """Read the ``ColumnRef`` the builder stamped on ``col``.
 
-    Returns the empty frozenset for an unstamped Column (either the builder
-    couldn't resolve the reference or it never visited the node). The
-    propagator treats that as "unknown" and falls back to ``Property.default()``.
+    Returns ``None`` for an unstamped Column; the propagator falls back to
+    ``Property.default()``.
     """
     meta = col.meta.get(COLUMNREF_META_KEY)
-    if isinstance(meta, frozenset):
-        return cast("frozenset[ColumnRef]", meta)
-    return frozenset()
+    return meta if isinstance(meta, ColumnRef) else None
 
 
-def attach_column_refs(col: exp.Column, refs: frozenset[ColumnRef]) -> None:
-    """Builder-side hook: stamp ``col`` with the set of leaf ``ColumnRef``s it resolves to.
-
-    A column expression like ``a.x + a.y`` inside a CTE collapses, at the
-    outer projection, into a single ``exp.Column`` referring to the CTE
-    intermediate. To preserve every leaf the original expression touched, the
-    builder records all of them here as a frozenset. Single-leaf cases pass a
-    singleton; the propagator treats the multi-leaf case as a structural
-    times-fold (see ``_walk`` for the rationale).
-    """
-    col.meta[COLUMNREF_META_KEY] = refs
+def attach_column_ref(col: exp.Column, ref: ColumnRef) -> None:
+    """Stamp ``col`` with the single ``ColumnRef`` it resolves to."""
+    col.meta[COLUMNREF_META_KEY] = ref

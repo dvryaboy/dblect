@@ -1,40 +1,43 @@
 """Build ``ColumnLineageGraph`` from compiled model SQL.
 
-The per-model builder calls ``sqlglot.lineage`` (which itself does the
-parse + qualification + downstream walk) and translates the returned ``Node``
-trees into our graph shape. The translation stamps each ``exp.Column`` in the
-captured projection expression with the resolved ``ColumnRef`` of its
-ultimate leaf source, so the propagator can walk the expression directly.
+For each model we parse + qualify the SQL with sqlglot, walk the scope
+tree, and register one ``ColumnRef`` per "interesting" projection:
 
-V0 scope: CTE intermediate columns are collapsed at translation time. Each
-top-level ``exp.Column`` is stamped with the *set* of leaf ``ColumnRef``s
-that the CTE intermediate's expression touched, walked across every
-downstream branch in the lineage chain. Where-provenance recovers the full
-leaf union by folding that set with the semiring's ``times`` at propagation
-time. Properties that need per-CTE intermediate annotations (e.g.,
-nullability across multi-step transforms in CTEs, where the operator
-structure matters) still want a follow-up that materialises CTE columns as
-their own graph entries.
+* The top-level SELECT's projections become ``ColumnRef``s on the model.
+* CTE and inline-subquery projections become ``ColumnRef``s on a
+  synthetic ``cte.<model_uid>.<scope_path>`` source.
+* UNION ALL combined output columns become ``ColumnRef``s on a synthetic
+  ``union.<model_uid>.<scope_path>.<col>`` source whose expression is a
+  ``UnionConfluence`` carrying the per-arm ``ColumnRef``s. Each arm is
+  itself a ``ColumnRef`` on ``union.<...>#<arm_index>``.
 
-Cross-model composition is a topological walk over the manifest DAG that
-calls the per-model builder for each model and merges results. We deliberately
-do not pass ``sources`` into ``sqlglot.lineage`` so the lineage walk stops at
-each upstream model's boundary; the propagator stitches the annotations
-together via the merged graph.
+Each ``exp.Column`` inside any projection is stamped with the single
+immediate-upstream ``ColumnRef`` the qualifier resolves to. The propagator
+walks at an ``exp.Column`` into that one upstream; structural fan-out
+(CTE expressions, UNION arms) lives in the graph as separate nodes.
+
+Cross-model composition is a topological walk that calls the per-model
+builder and merges results. The per-model build stops at upstream-model
+boundaries: a column qualified by an upstream model name resolves to that
+model's ``ColumnRef`` (kind ``MODEL``) rather than recursing into the
+upstream model's SQL.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import cast
 
+import sqlglot
 from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
-from sqlglot.lineage import Node, lineage
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
-from dblect.lineage.property import attach_column_refs
+from dblect.lineage.property import UnionConfluence, attach_column_ref
 from dblect.manifest import Manifest, ResourceType
 from dblect.manifest import Node as ManifestNode
 
@@ -43,9 +46,8 @@ from dblect.manifest import Node as ManifestNode
 class BuildIssue:
     """One non-fatal problem encountered while building lineage for a model.
 
-    The builder collects these rather than raising so a single model's
-    sqlglot failure does not blank out the whole audit graph. Callers can
-    surface issues in the audit report.
+    Collected rather than raised so a single model's failure does not
+    blank out the audit graph; callers surface them in the report.
     """
 
     model_unique_id: str
@@ -65,11 +67,8 @@ def build_manifest_graph(
 ) -> BuildResult:
     """Build the cross-model ``ColumnLineageGraph`` for every model in ``manifest``.
 
-    Walks the manifest DAG in topological order. Each model's SQL is parsed
-    independently via ``sqlglot.lineage``; the qualifier-to-source resolver is
-    derived from the manifest so cross-model references land as edges to the
-    upstream model's columns. Models without compiled SQL are skipped and
-    reported in ``BuildResult.issues``.
+    Walks the manifest DAG in topological order. Models without compiled
+    SQL are skipped and reported in ``BuildResult.issues``.
     """
     name_to_source = _build_name_to_source(manifest)
     schema = _build_schema(manifest)
@@ -97,11 +96,10 @@ def build_manifest_graph(
             issues.append(BuildIssue(model_unique_id=uid, message=f"sqlglot: {e}"))
             continue
         except Exception as e:
-            # sqlglot.lineage runs parse + qualifier + optimizer + walker; not
-            # every failure on that path subclasses SqlglotError (KeyError on a
-            # missing schema entry, AttributeError on an unexpected Expression
-            # shape, RecursionError on pathological nesting). One bad model
-            # shouldn't blank lineage for every downstream model.
+            # Parse + qualify + scope-build is a deep call chain through
+            # sqlglot; not every failure subclasses SqlglotError (KeyError,
+            # AttributeError, RecursionError). One bad model shouldn't
+            # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
         graph = graph.merge(per_model)
@@ -116,151 +114,312 @@ def build_model_graph(
     schema: Mapping[str, Mapping[str, str]] | None = None,
     dialect: str | None = "duckdb",
 ) -> ColumnLineageGraph:
-    """Build the lineage graph entries for one model's output columns.
-
-    Calls ``sqlglot.lineage(None, sql, schema=schema, dialect=dialect)`` and
-    translates the resulting ``dict[str, Node]`` into a ``ColumnLineageGraph``.
-    For each top-level output column, the projection expression is stored on
-    the graph with each ``exp.Column`` stamped with a ``ColumnRef`` pointing
-    at the leaf upstream column. Edges are the flattened set of leaves.
-
-    `name_to_source` resolves the qualifier that appears on ``exp.Column``s
-    (typically a model name, source identifier, or CTE alias) to a
-    ``SourceRef``. CTE aliases never have a manifest entry; their columns are
-    collapsed to leaf references via the downstream walk before stamping.
+    """Build the lineage graph entries for one model: top-level output columns
+    plus all materialised intermediates (CTEs, derived tables, UNION outputs).
     """
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
-    nodes = lineage(None, sql, schema=schema, dialect=dialect)  # type: ignore[arg-type]
-    edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
-    expressions: dict[ColumnRef, Expr] = {}
-    for output_col, root in nodes.items():
-        output_ref = ColumnRef(source=self_ref, column=output_col.lower())
-        expression = root.expression
-        leaves = _stamp_and_collect(expression, root, name_to_source=name_to_source)
-        expressions[output_ref] = expression
-        edges[output_ref] = leaves
-    return ColumnLineageGraph(edges=edges, expressions=expressions)
+    expression: Expr = sqlglot.parse_one(sql, dialect=dialect)
+    expression = qualify(
+        expression,
+        dialect=dialect,
+        schema=cast("dict[str, object] | None", schema),
+        validate_qualify_columns=False,
+        identify=False,
+    )
+    root_scope = build_scope(expression)
+    if root_scope is None:
+        raise SqlglotError("Cannot build scope from SQL")
+
+    walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
+    walker.walk(root_scope, scope_path=())
+    return ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
 
 
-def _stamp_and_collect(
-    expression: Expr,
-    root: Node,
-    *,
-    name_to_source: Mapping[str, SourceRef],
-) -> frozenset[ColumnRef]:
-    """Stamp every ``exp.Column`` in ``expression`` with the set of leaf ``ColumnRef``s
-    it resolves to, and return the union of those leaves.
+class _Walker:
+    """Per-model scope walker that builds graph entries as it descends."""
 
-    For each Column inside the expression, walk the lineage chain from the
-    matching downstream ``Node`` to every Table-sourced leaf reachable from
-    it. A Column that came from a CTE intermediate like ``a.x + a.y``
-    resolves to both ``leaf.x`` and ``leaf.y``; the stamp records the full
-    set so the propagator can fold them at walk time. Columns that don't
-    resolve are left unstamped; the propagator treats them as "unknown" and
-    falls back to its default.
-    """
-    downstream_by_name = _index_downstream(root)
-    leaves: set[ColumnRef] = set()
-    for col in expression.find_all(exp.Column):
-        qual_name = _qualified_name(col)
-        if qual_name is None:
-            continue
-        resolved = _resolve_to_leaves(qual_name, downstream_by_name)
-        refs: set[ColumnRef] = set()
-        for source_name, leaf_column in resolved:
-            source_ref = name_to_source.get(source_name)
-            if source_ref is None:
+    def __init__(
+        self,
+        *,
+        model_uid: str,
+        self_ref: SourceRef,
+        name_to_source: Mapping[str, SourceRef],
+    ) -> None:
+        self._model_uid = model_uid
+        self._self_ref = self_ref
+        self._name_to_source = name_to_source
+        self.edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
+        self.expressions: dict[ColumnRef, Expr] = {}
+        # Indices the resolver needs when stamping a Column whose qualifier
+        # names a child scope: which SourceRef each child scope was assigned,
+        # and which synthetic UNION combined-output SourceRef stands in for
+        # each output column name of a union derived-table.
+        self._scope_source_ref: dict[int, SourceRef] = {}
+        self._union_output_ref: dict[tuple[int, str], SourceRef] = {}
+
+    def walk(
+        self,
+        scope: Scope,
+        *,
+        scope_path: tuple[str, ...],
+        register_projections: bool = True,
+    ) -> None:
+        """Recursively walk ``scope``, registering each interesting projection.
+
+        Child scopes (CTEs, derived tables, UNION arms) are assigned and
+        registered before the parent's selects are stamped, so qualifiers
+        like ``r.combined`` resolve to the right child SourceRef.
+
+        ``register_projections=False`` descends into child scopes without
+        registering this scope's own projections. ``_emit_union_nodes``
+        uses this for UNION arms: the arm's projections are registered
+        positionally under arm 0's output names rather than under the
+        arm's own per-position aliases, so a single arm projection ends
+        up in ``expressions`` once.
+        """
+        for cte_scope in scope.cte_scopes:
+            cte_name = self._alias_for_child_scope(cte_scope, scope)
+            if cte_name is None:
                 continue
-            refs.add(ColumnRef(source=source_ref, column=leaf_column.lower()))
-        if not refs:
-            continue
-        attach_column_refs(col, frozenset(refs))
-        leaves |= refs
-    return frozenset(leaves)
+            cte_ref = SourceRef(
+                kind=SourceKind.CTE,
+                unique_id=self._synthetic_id("cte", scope_path, cte_name),
+            )
+            self._scope_source_ref[id(cte_scope)] = cte_ref
+            self.walk(cte_scope, scope_path=(*scope_path, cte_name))
 
+        for dt_scope in scope.derived_table_scopes:
+            dt_alias = self._alias_for_child_scope(dt_scope, scope)
+            if dt_alias is None:
+                continue
+            if isinstance(dt_scope.expression, exp.Union):
+                self._register_derived_table_union(dt_scope, scope_path=(*scope_path, dt_alias))
+            else:
+                dt_ref = SourceRef(
+                    kind=SourceKind.CTE,
+                    unique_id=self._synthetic_id("cte", scope_path, dt_alias),
+                )
+                self._scope_source_ref[id(dt_scope)] = dt_ref
+                self.walk(dt_scope, scope_path=(*scope_path, dt_alias))
 
-def _index_downstream(root: Node) -> dict[str, Node]:
-    """Flatten ``root``'s downstream walk into a name -> Node map.
+        # Inline (non-derived-table, non-CTE) subquery scopes: EXISTS(...),
+        # scalar subqueries in projections. We descend so nested CTEs and
+        # derived tables get registered, but we never register the inline
+        # subquery's own selects: it isn't a materialised intermediate, and
+        # registering them under the parent's source ref would surface
+        # phantom columns on whatever node the parent resolves to.
+        for sub_scope in scope.subquery_scopes:
+            self.walk(sub_scope, scope_path=scope_path, register_projections=False)
 
-    Each ``Node`` carries a qualified ``name`` like ``"alias.column"``. This
-    map lets the stamper find the chain entry for a given qualified column
-    reference in the top expression.
-    """
-    out: dict[str, Node] = {}
-    stack: list[Node] = list(root.downstream)
-    while stack:
-        node = stack.pop()
-        if node.name and node.name not in out:
-            out[node.name] = node
-            stack.extend(node.downstream)
-    return out
+        scope_expr = scope.expression
+        if isinstance(scope_expr, exp.Union):
+            self._register_top_level_union(scope, scope_path=scope_path)
+            return
+        if not register_projections or not isinstance(scope_expr, exp.Selectable):
+            return
+        scope_source = self._source_ref_for_scope(scope)
+        for select in scope_expr.selects:
+            self._register_projection(select, scope=scope, scope_source=scope_source)
 
+    def _register_projection(
+        self,
+        select: Expr,
+        *,
+        scope: Scope,
+        scope_source: SourceRef,
+    ) -> None:
+        # A surviving ``Star`` means qualify couldn't expand ``SELECT *`` (no
+        # schema for the source). Registering it would surface a phantom
+        # ``"*"`` column on the scope's source.
+        if isinstance(select, exp.Star):
+            return
+        out_name = self._alias_or_name(select)
+        if not out_name:
+            return
+        col_ref = ColumnRef(source=scope_source, column=out_name.lower())
+        immediate = self._stamp_columns(select, scope=scope)
+        self.expressions[col_ref] = select
+        self.edges[col_ref] = immediate
 
-def _resolve_to_leaves(qual_name: str, by_name: Mapping[str, Node]) -> frozenset[tuple[str, str]]:
-    """Walk every branch from ``qual_name`` to its Table-sourced leaves.
+    def _stamp_columns(self, expr: Expr, *, scope: Scope) -> frozenset[ColumnRef]:
+        """Stamp every ``exp.Column`` in ``expr`` with its immediate upstream ``ColumnRef``.
 
-    Each result is a ``(source_table_name, column_name)`` pair: the source
-    table's real identifier off the leaf ``Node``'s ``exp.Table`` source
-    (distinct from any FROM alias the lineage chain carried) and the column
-    name parsed off the leaf's qualified ``.name``.
+        Returns the deduped set of those refs as this projection's ``edges``
+        entry. An unresolved Column is silently skipped: the propagator
+        treats the unstamped Column as "unknown" via ``Property.default()``.
+        """
+        immediate: set[ColumnRef] = set()
+        for col in expr.find_all(exp.Column):
+            ref = self._resolve_column(col, scope=scope)
+            if ref is None:
+                continue
+            attach_column_ref(col, ref)
+            immediate.add(ref)
+        return frozenset(immediate)
 
-    A single qualified name can expand into multiple leaves when an
-    intermediate column in the lineage chain (most commonly a CTE column or
-    inline-subquery projection) was built from several upstream columns
-    (``a.x + a.y AS combined``). The outer projection only sees one Column
-    referencing that intermediate, so resolving has to fan out across every
-    downstream branch rather than picking one arbitrarily.
+    def _resolve_column(self, col: exp.Column, *, scope: Scope) -> ColumnRef | None:
+        table = col.table
+        col_name = col.name
+        if not table or not col_name:
+            return None
+        src = scope.sources.get(table)
+        if src is None:
+            return None
+        if isinstance(src, exp.Table):
+            source_ref = self._name_to_source.get(src.name)
+            if source_ref is None:
+                return None
+            return ColumnRef(source=source_ref, column=col_name.lower())
+        # ``scope.sources`` values are ``Table | Scope``, so by elimination
+        # ``src`` is a Scope here. Union derived tables: the source is the
+        # union's combined output, not the derived-table scope itself.
+        union_ref = self._union_output_ref.get((id(src), col_name.lower()))
+        if union_ref is not None:
+            return ColumnRef(source=union_ref, column=col_name.lower())
+        scope_ref = self._scope_source_ref.get(id(src))
+        if scope_ref is None:
+            return None
+        return ColumnRef(source=scope_ref, column=col_name.lower())
 
-    Only chain branches that terminate at an ``exp.Table`` contribute. A
-    branch sqlglot couldn't trace to a real table (CTE alias the walker
-    didn't expand, unqualified column reference, subquery whose lineage
-    wasn't extracted) contributes nothing: the function returns absence
-    rather than a guess shaped like a leaf. Where-provenance's empty
-    annotation is the correct answer for "unresolved"; properties that need
-    to track unresolved-ness explicitly should model it with their own
-    sentinel rather than rely on a stand-in here.
+    def _register_derived_table_union(
+        self,
+        dt_scope: Scope,
+        *,
+        scope_path: tuple[str, ...],
+    ) -> None:
+        def output_source(out_name: str) -> SourceRef:
+            return SourceRef(
+                kind=SourceKind.UNION,
+                unique_id=self._synthetic_id_union_output(scope_path, out_name),
+            )
 
-    Returns the empty frozenset if no Table-sourced leaf is reachable.
-    Cycles are tolerated by tracking visited names.
-    """
-    out: set[tuple[str, str]] = set()
-    seen: set[str] = set()
-    stack: list[str] = [qual_name]
-    while stack:
-        name = stack.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        node = by_name.get(name)
-        if node is None:
-            continue
-        if isinstance(node.source, exp.Table):
-            split = _split_qualified(node.name)
-            if split is not None:
-                _, column = split
-                out.add((node.source.name, column))
-            continue
-        stack.extend(nxt.name for nxt in node.downstream if nxt.name)
-    return frozenset(out)
+        def on_registered(out_name: str, src: SourceRef) -> None:
+            self._union_output_ref[(id(dt_scope), out_name.lower())] = src
 
+        self._emit_union_nodes(
+            dt_scope,
+            scope_path=scope_path,
+            output_source_for=output_source,
+            on_output_registered=on_registered,
+        )
 
-def _qualified_name(col: exp.Column) -> str | None:
-    """Render an ``exp.Column`` as ``"<qualifier>.<column>"`` if both parts are present."""
-    table = col.table
-    name = col.name
-    if not table or not name:
+    def _register_top_level_union(
+        self,
+        union_scope: Scope,
+        *,
+        scope_path: tuple[str, ...],
+    ) -> None:
+        # Combined output IS the model column; no synthetic UNION node needed.
+        self._emit_union_nodes(
+            union_scope,
+            scope_path=scope_path,
+            output_source_for=lambda _: self._self_ref,
+            on_output_registered=None,
+        )
+
+    def _emit_union_nodes(
+        self,
+        union_scope: Scope,
+        *,
+        scope_path: tuple[str, ...],
+        output_source_for: Callable[[str], SourceRef],
+        on_output_registered: Callable[[str, SourceRef], None] | None,
+    ) -> None:
+        """Register arms and per-column combined-output ``UnionConfluence`` nodes.
+
+        Output column names come from arm 0 (standard SQL); arms contribute
+        positionally, so an arm that aliases position i differently still
+        binds to the same output column. Arms shorter than arm 0 (malformed
+        SQL) contribute nothing for the missing positions.
+        """
+        arm_scopes = list(union_scope.union_scopes)
+        if not arm_scopes:
+            return
+        first_arm = arm_scopes[0].expression
+        if not isinstance(first_arm, exp.Selectable):
+            return
+        output_names = [self._alias_or_name(s) for s in first_arm.selects]
+
+        per_arm_selects: list[list[Expr]] = []
+        for arm in arm_scopes:
+            arm_expr = arm.expression
+            per_arm_selects.append(
+                list(arm_expr.selects) if isinstance(arm_expr, exp.Selectable) else []
+            )
+
+        arm_refs_per_col: list[list[ColumnRef]] = [[] for _ in output_names]
+        for arm_idx, arm_scope in enumerate(arm_scopes):
+            arm_path = (*scope_path, f"arm{arm_idx}")
+            arm_ref = SourceRef(
+                kind=SourceKind.UNION_ARM,
+                unique_id=self._synthetic_id_union_arm(scope_path, arm_idx),
+            )
+            self._scope_source_ref[id(arm_scope)] = arm_ref
+            self.walk(arm_scope, scope_path=arm_path, register_projections=False)
+            arm_selects = per_arm_selects[arm_idx]
+            for col_idx, out_name in enumerate(output_names):
+                if not out_name or col_idx >= len(arm_selects):
+                    continue
+                arm_select = arm_selects[col_idx]
+                arm_col_ref = ColumnRef(source=arm_ref, column=out_name.lower())
+                arm_refs_per_col[col_idx].append(arm_col_ref)
+                immediate = self._stamp_columns(arm_select, scope=arm_scope)
+                self.expressions[arm_col_ref] = arm_select
+                self.edges[arm_col_ref] = immediate
+
+        for col_idx, out_name in enumerate(output_names):
+            if not out_name or not arm_refs_per_col[col_idx]:
+                continue
+            output_src = output_source_for(out_name)
+            if on_output_registered is not None:
+                on_output_registered(out_name, output_src)
+            output_col_ref = ColumnRef(source=output_src, column=out_name.lower())
+            arm_refs = tuple(arm_refs_per_col[col_idx])
+            self.expressions[output_col_ref] = UnionConfluence(arm_refs)
+            self.edges[output_col_ref] = frozenset(arm_refs)
+
+    def _source_ref_for_scope(self, scope: Scope) -> SourceRef:
+        ref = self._scope_source_ref.get(id(scope))
+        if ref is not None:
+            return ref
+        if scope.scope_type == ScopeType.ROOT:
+            return self._self_ref
+        # Fallback for subquery scopes that don't materialise referenced
+        # outputs: anchor on the model so entries remain discoverable.
+        return self._self_ref
+
+    def _synthetic_id(self, prefix: str, scope_path: tuple[str, ...], leaf: str) -> str:
+        path_parts = (*scope_path, leaf)
+        return f"{prefix}.{self._model_uid}.{'.'.join(path_parts)}"
+
+    def _synthetic_id_union_arm(self, scope_path: tuple[str, ...], arm_idx: int) -> str:
+        path = ".".join(scope_path) if scope_path else "__top__"
+        return f"union.{self._model_uid}.{path}#{arm_idx}"
+
+    def _synthetic_id_union_output(self, scope_path: tuple[str, ...], col: str) -> str:
+        path = ".".join(scope_path) if scope_path else "__top__"
+        return f"union.{self._model_uid}.{path}.{col}"
+
+    @staticmethod
+    def _alias_or_name(select: Expr) -> str:
+        # ``alias_or_name`` returns the projection's alias if set, else the
+        # bare column name. Cast through ``str`` because Star and similar
+        # expressions return non-string values.
+        name = getattr(select, "alias_or_name", "")
+        return str(name) if name else ""
+
+    @staticmethod
+    def _alias_for_child_scope(child: Scope, parent: Scope) -> str | None:
+        """Find an alias the parent scope uses for this child scope.
+
+        A Scope can appear in ``parent.sources`` under multiple aliases (a
+        CTE referenced twice with different aliases); we return the first
+        match, which is the introducing alias for path purposes.
+        """
+        for alias, src in parent.sources.items():
+            if src is child:
+                return alias
         return None
-    return f"{table}.{name}"
-
-
-def _split_qualified(name: str) -> tuple[str, str] | None:
-    """Split ``"qual.col"`` into ``(qual, col)``. Returns ``None`` if there's no dot."""
-    if "." not in name:
-        return None
-    qual, _, col = name.rpartition(".")
-    if not qual or not col:
-        return None
-    return qual, col
 
 
 def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
@@ -268,7 +427,7 @@ def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
 
     Includes models (by ``name``), sources (by ``identifier or name`` since
     dbt compiles ``{{ source(...) }}`` to ``identifier``), and seeds. On a
-    name collision, models win, matching the convention that ``ref('x')``
+    name collision, models win — matching the convention that ``ref('x')``
     refers to a model named ``x`` over a source that happens to share it.
     """
     out: dict[str, SourceRef] = {}
@@ -285,18 +444,13 @@ def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
 
 
 def _build_schema(manifest: Manifest) -> Mapping[str, Mapping[str, str]]:
-    """Schema dict for ``sqlglot.lineage``: ``{table_name: {column: type}}``.
+    """Schema dict for sqlglot's qualifier: ``{table_name: {column: type}}``.
 
-    Lets sqlglot qualify columns and walk lineage cleanly. Type strings come
-    from manifest column metadata; missing types default to ``UNKNOWN`` (a
-    sqlglot-accepted placeholder).
-
-    Tables with no documented columns are omitted from the result rather than
-    emitted as ``{}``. sqlglot.lineage rejects an empty column dict with
-    ``Table must have at least one column``, which would kill the build for
-    any model that transitively touches an undocumented seed or source. When
-    the table is simply absent from the schema dict, sqlglot trusts the
-    qualifiers already present in the SQL and lineage proceeds.
+    Tables with no documented columns are omitted rather than emitted as
+    ``{}``. The qualifier rejects an empty column dict, which would kill the
+    build for any model that transitively touches an undocumented seed or
+    source. With the table simply absent, sqlglot trusts the qualifiers
+    already present in the SQL.
     """
     out: dict[str, dict[str, str]] = {}
     for src in manifest.sources.values():

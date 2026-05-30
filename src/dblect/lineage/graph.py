@@ -1,20 +1,25 @@
 """Data model for the column-level lineage graph.
 
-Per output column the graph stores two things:
+Per column the graph stores two things:
 
-* ``edges``: *where* the column's values came from, the set of upstream
-  columns it ultimately draws from. (In the K-relations literature this is
-  called "where-provenance.")
-* ``expressions``: *how* the column was built, the sqlglot expression for
-  this column at the projection level, like ``Alias(Sum(Column))``. The
-  propagator walks this expression top-down when computing any property.
-  (In the K-relations literature this is "how-provenance.")
+* ``edges``: the immediate upstream columns this column's projection
+  expression references. One step only; the propagator stitches longer
+  chains by recursing through the refs stamped on ``exp.Column``s.
+* ``expressions``: the sqlglot expression that produced this column at
+  the projection level, like ``Alias(Sum(Column))``. (In the K-relations
+  literature, "how-provenance.") The propagator walks it top-down.
 
-The graph is built by ``builder.py`` from each model's compiled SQL and
-then merged across the manifest DAG. Leaf source columns (dbt sources and
-seeds) appear as ``ColumnRef`` keys with no entry in ``expressions``:
-those are the points where ``Property.source`` is consulted to seed the
-value before propagation.
+CTE intermediates, inline-subquery projections, and UNION ALL combined
+outputs are all first-class entries: a reference like ``r.combined`` from
+an outer SELECT stamps to a ``ColumnRef`` on a synthetic CTE source whose
+own projection expression then lives in ``expressions``. UNION ALL
+combined outputs carry a ``UnionConfluence`` synthetic node that
+plus-folds the per-arm ``ColumnRef``s.
+
+The graph is built by ``builder.py`` per model and merged across the
+manifest DAG. Leaf source columns (sources, seeds) appear as ``ColumnRef``
+keys with no ``expressions`` entry; ``Property.source`` seeds their value
+before propagation.
 """
 
 from __future__ import annotations
@@ -27,23 +32,42 @@ from sqlglot import Expr
 
 
 class SourceKind(StrEnum):
-    """What kind of dbt node a ``ColumnRef`` lives on."""
+    """What kind of dbt node a ``ColumnRef`` lives on.
+
+    ``MODEL``, ``SOURCE``, ``SEED``, ``SNAPSHOT`` map to real manifest
+    entries. ``CTE``, ``UNION``, ``UNION_ARM`` are synthetic kinds the
+    builder invents to materialise CTE intermediates, inline-subquery
+    projections, UNION ALL combined outputs, and the individual arms as
+    first-class graph entries. Detectors that walk the graph should treat
+    synthetic kinds as opaque internal scaffolding.
+    """
 
     MODEL = "model"
     SOURCE = "source"
     SEED = "seed"
     SNAPSHOT = "snapshot"
+    CTE = "cte"
+    UNION = "union"
+    UNION_ARM = "union_arm"
 
 
 @dataclass(frozen=True, slots=True)
 class SourceRef:
     """Identifier for the node a column belongs to.
 
-    ``unique_id`` matches dbt's ``unique_id`` convention (``model.<project>.<name>``,
-    ``source.<project>.<source_name>.<table_name>``, etc.) when available. For
-    in-flight CTEs that haven't been materialised as a node, callers can pass a
-    synthetic id (typically ``cte.<query_id>.<cte_name>``); detectors that consume
-    the graph should treat unknown prefixes as opaque and skip.
+    For manifest-backed kinds, ``unique_id`` is the dbt ``unique_id``
+    (``model.<project>.<name>``, ``source.<project>.<source_name>.<table_name>``,
+    etc.).
+
+    Synthetic-kind id shapes:
+
+    * ``CTE``: ``cte.<model_uid>.<scope_path>``, where ``scope_path`` is a
+      dot-joined chain of CTE / derived-table aliases from outermost to
+      innermost. Disambiguates same-named CTEs in different scopes.
+    * ``UNION``: ``union.<model_uid>.<scope_path>.<col>`` — the combined
+      output node for a UNION ALL's column.
+    * ``UNION_ARM``: ``union.<model_uid>.<scope_path>#<arm_index>`` —
+      individual arm projection, indexed in source order.
     """
 
     kind: SourceKind
@@ -68,21 +92,12 @@ class ColumnRef:
 class ColumnLineageGraph:
     """Per-audit column lineage assembled across the manifest DAG.
 
-    ``edges`` is the flattened where-provenance: every output column points
-    to the source-level columns it ultimately depends on. Useful for cheap
-    queries like "did this output come from X?" without invoking the full
-    propagator.
-
-    ``expressions`` is the per-column projection expression as sqlglot
-    parsed it. The propagator walks this expression top-down for each
-    output column, dispatching on the expression type to
-    ``Property.operators`` or ``Property.aggregates`` and recursing into
-    upstream columns at ``exp.Column`` leaves.
-
-    A column that appears in ``edges`` keys but not in ``expressions`` is
-    a leaf source (a dbt source or seed column, or an unresolved
-    reference). ``Property.source`` supplies its starting value before
-    propagation.
+    ``edges`` is the immediate upstream relation; the propagator stitches
+    longer chains by recursing through ``ColumnRef``s stamped on
+    ``exp.Column``s in each projection. ``expressions`` carries the
+    sqlglot projection expression the propagator walks. A column with no
+    ``expressions`` entry is a leaf (source, seed, upstream-model boundary,
+    or unresolved), and ``Property.source`` seeds it.
     """
 
     edges: Mapping[ColumnRef, frozenset[ColumnRef]]
