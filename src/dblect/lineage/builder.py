@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import cast
 
 import sqlglot
 from sqlglot import Expr
@@ -117,11 +118,11 @@ def build_model_graph(
     plus all materialised intermediates (CTEs, derived tables, UNION outputs).
     """
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
-    expression = sqlglot.maybe_parse(sql, dialect=dialect, copy=True)
+    expression: Expr = sqlglot.parse_one(sql, dialect=dialect)
     expression = qualify(
         expression,
         dialect=dialect,
-        schema=schema,
+        schema=cast("dict[str, object] | None", schema),
         validate_qualify_columns=False,
         identify=False,
     )
@@ -211,7 +212,7 @@ class _Walker:
         if isinstance(scope_expr, exp.Union):
             self._register_top_level_union(scope, scope_path=scope_path)
             return
-        if not register_projections or not hasattr(scope_expr, "selects"):
+        if not register_projections or not isinstance(scope_expr, exp.Selectable):
             return
         scope_source = self._source_ref_for_scope(scope)
         for select in scope_expr.selects:
@@ -261,17 +262,16 @@ class _Walker:
             if source_ref is None:
                 return None
             return ColumnRef(source=source_ref, column=col_name.lower())
-        if isinstance(src, Scope):
-            # Union derived tables: the source is the union's combined output,
-            # not the derived-table scope itself.
-            union_ref = self._union_output_ref.get((id(src), col_name.lower()))
-            if union_ref is not None:
-                return ColumnRef(source=union_ref, column=col_name.lower())
-            scope_ref = self._scope_source_ref.get(id(src))
-            if scope_ref is None:
-                return None
-            return ColumnRef(source=scope_ref, column=col_name.lower())
-        return None
+        # ``scope.sources`` values are ``Table | Scope``, so by elimination
+        # ``src`` is a Scope here. Union derived tables: the source is the
+        # union's combined output, not the derived-table scope itself.
+        union_ref = self._union_output_ref.get((id(src), col_name.lower()))
+        if union_ref is not None:
+            return ColumnRef(source=union_ref, column=col_name.lower())
+        scope_ref = self._scope_source_ref.get(id(src))
+        if scope_ref is None:
+            return None
+        return ColumnRef(source=scope_ref, column=col_name.lower())
 
     def _register_derived_table_union(
         self,
@@ -328,14 +328,16 @@ class _Walker:
         if not arm_scopes:
             return
         first_arm = arm_scopes[0].expression
-        if not hasattr(first_arm, "selects"):
+        if not isinstance(first_arm, exp.Selectable):
             return
         output_names = [self._alias_or_name(s) for s in first_arm.selects]
 
         per_arm_selects: list[list[Expr]] = []
         for arm in arm_scopes:
             arm_expr = arm.expression
-            per_arm_selects.append(list(arm_expr.selects) if hasattr(arm_expr, "selects") else [])
+            per_arm_selects.append(
+                list(arm_expr.selects) if isinstance(arm_expr, exp.Selectable) else []
+            )
 
         arm_refs_per_col: list[list[ColumnRef]] = [[] for _ in output_names]
         for arm_idx, arm_scope in enumerate(arm_scopes):

@@ -36,6 +36,7 @@ from typing import Any, ClassVar, Generic, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.expressions.core import Expression
 
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef
 from dblect.lineage.semiring import Semiring
@@ -52,7 +53,7 @@ SourceRule = Callable[[ColumnRef], K]
 COLUMNREF_META_KEY = "dblect_columnref"
 
 
-class UnionConfluence(exp.Expression):
+class UnionConfluence(Expression):
     """Synthetic confluence node for a ``UNION ALL`` combined output column.
 
     Carries the per-arm ``ColumnRef``s on the instance so the propagator
