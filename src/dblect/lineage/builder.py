@@ -203,10 +203,13 @@ class _Walker:
                 self.walk(dt_scope, scope_path=(*scope_path, dt_alias))
 
         # Inline (non-derived-table, non-CTE) subquery scopes: EXISTS(...),
-        # scalar subqueries in projections. Their inner Columns still want
-        # stamping in case a property walks into them.
+        # scalar subqueries in projections. We descend so nested CTEs and
+        # derived tables get registered, but we never register the inline
+        # subquery's own selects: it isn't a materialised intermediate, and
+        # registering them under the parent's source ref would surface
+        # phantom columns on whatever node the parent resolves to.
         for sub_scope in scope.subquery_scopes:
-            self.walk(sub_scope, scope_path=scope_path)
+            self.walk(sub_scope, scope_path=scope_path, register_projections=False)
 
         scope_expr = scope.expression
         if isinstance(scope_expr, exp.Union):
@@ -225,6 +228,11 @@ class _Walker:
         scope: Scope,
         scope_source: SourceRef,
     ) -> None:
+        # A surviving ``Star`` means qualify couldn't expand ``SELECT *`` (no
+        # schema for the source). Registering it would surface a phantom
+        # ``"*"`` column on the scope's source.
+        if isinstance(select, exp.Star):
+            return
         out_name = self._alias_or_name(select)
         if not out_name:
             return

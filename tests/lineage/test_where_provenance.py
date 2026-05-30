@@ -146,6 +146,41 @@ def test_union_arms_bind_positionally_not_by_alias() -> None:
     assert anns[out] == frozenset({ColumnRef(_source("t1"), "a"), ColumnRef(_source("t2"), "b")})
 
 
+def test_inline_scalar_subquery_does_not_register_phantom_model_columns() -> None:
+    """A scalar subquery inside a projection is an inline expression, not a
+    materialised intermediate. The model's registered columns must be
+    exactly the outer projection's aliases; the inner SELECT's projections
+    must not surface as their own ``ColumnRef`` on the model.
+    """
+    sql = "SELECT a.x AS x, (SELECT MAX(b.z) FROM b) AS subq FROM a"
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"a": _source("a"), "b": _source("b")},
+        schema={"a": {"x": "INT"}, "b": {"z": "INT"}},
+    )
+    model = SourceRef(SourceKind.MODEL, "model.test.m")
+    model_columns = {ref.column for ref in graph.expressions if ref.source == model}
+    assert model_columns == {"x", "subq"}
+
+
+def test_unexpanded_star_does_not_register_phantom_model_column() -> None:
+    """When the source has no documented columns, ``qualify`` cannot expand
+    ``SELECT *`` and the ``Star`` survives in the projection list. The
+    model must not surface a ``"*"`` column for it; the correct answer is
+    "we don't know what columns this model exposes."
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT * FROM raw_t",
+        name_to_source={"raw_t": _source("raw_t")},
+        schema=None,
+    )
+    model = SourceRef(SourceKind.MODEL, "model.test.m")
+    model_columns = {ref.column for ref in graph.expressions if ref.source == model}
+    assert "*" not in model_columns
+
+
 def test_edges_are_immediate_upstream_and_annotation_is_leaf_closure() -> None:
     """On a CTE-rich query, ``graph.edges`` for a model column points at a
     CTE column (one step up), the CTE column's edges point at sources, and
