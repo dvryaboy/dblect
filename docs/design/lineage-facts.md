@@ -48,7 +48,9 @@ The framework's licence to *infer* a transfer (rather than ask the user) follows
 - **drop-to-aggregate**: an `AggFunc` transfer, structurally gated (a `SUM` may preserve a currency axis and erase a row-identity axis).
 - **branch-join**: the `+` fold at a confluence.
 
-Because properties propagate independently, the two classes compose by running as separate passes over one graph. The assumption that keeps that clean is that a property's transfer rules do not need another property's annotations. Where one would (a `VOUCHED` `drop-to-aggregate` rule that wants to know whether a structural key survived the `GROUP BY`), the dependency has to be made explicit rather than smuggled in. Aggregates and window functions are where to watch for it, and the place to pin the assumption with a test rather than assert it.
+Properties compose by running as separate passes over one graph, in dependency order. A property may declare that its transfer rules consume another property's annotations: cardinality reads uniqueness to tell a fanout join from a key-preserving one, and a user-domain axis like currency reads a functional dependency to decide whether `SUM(amount) GROUP BY g` preserves the axis (when `g → currency` holds, every summed row shares a currency) or mixes it (when it does not, the sum is meaningless and the axis erases). Such a dependency is declared on the property (`depends_on`) and supplied to the transfer as a read-only context, so the propagator evaluates dependencies first and a transfer can see only what it declared it needs, never a shared global map reached through a side channel. Two constraints keep this sound: the dependency graph is acyclic (no property needs another that needs it back, which would force a joint fixpoint over the product lattice), and an edge never points into a `PROVEN` property from a `VOUCHED` one, since structural soundness must not become conditional on a user declaration. Where a property declares no dependency, a test guards that independence, so a hidden edge cannot creep in later through a shared annotation map. That test pins an *asserted* independence; it is not a mechanism for handling a real dependency, which is always a declared, typed input.
+
+The user never writes any of this. The `depends_on` edge for currency originates in a type-layer declaration like `Money(denominated_by="currency")` (or `Additive(within="currency")` on a custom type), which says "this measure is additive only within a constant currency." The framework compiles that intent into the dependency and the transfer; see "User-land origin" in the types layer.
 
 ## What a fact is
 
@@ -291,16 +293,36 @@ The two rows that carry the design:
 The property bundle gains the pieces this needs, and a constructor hides them behind a single call:
 
 ```python
+class DepContext(Protocol):
+    """Read-only access to the annotations of a property's declared
+    dependencies, supplied to its transfers. A transfer can read only the
+    properties its ``Property.depends_on`` names, never an arbitrary global
+    map, so a cross-property dependency is always visible in the type."""
+
+    def annotation(self, prop: "PropertyId", scope: Scope) -> object | None: ...
+
+
+# Transfers receive the dependency context. A property with no dependencies
+# ignores it; the common case never touches another property's annotations.
+OperatorTransfer  = Callable[["Expr", tuple[K, ...], DepContext], K]
+AggregateTransfer = Callable[["exp.AggFunc", K, DepContext], K]
+
+
 @dataclass(frozen=True, slots=True)
 class Property(Generic[K]):
     name:       str
     soundness:  Soundness
     scope_kind: ScopeKind
     semiring:   Semiring[K]
-    operators:  Mapping[type["Expr"], "OperatorTransfer[K]"]
-    aggregates: Mapping[type["exp.AggFunc"], "AggregateTransfer[K]"]
+    operators:  Mapping[type["Expr"], OperatorTransfer[K]]
+    aggregates: Mapping[type["exp.AggFunc"], AggregateTransfer[K]]
     facts:      Callable[[Scope], K | None]   # the lookup; returns None everywhere if the property opts out
     consistent: Callable[[K, K], bool]        # derived from the order for lattices; overridden for equality K
+    # Other properties this one's transfers read (cardinality → uniqueness,
+    # currency → functional dependency). The propagator evaluates dependencies
+    # first. Invariants: the depends_on graph is acyclic, and a PROVEN property
+    # never depends on a VOUCHED one.
+    depends_on: tuple["PropertyId", ...] = ()
     unknown_value: K | None = None
 
 
@@ -420,7 +442,7 @@ Steps 1 and 2 ship together. The rest are independent and land driven by the con
 
 This is a proposal. Adopting it means evolving `Property[K]` and the propagator, and a few adopted-direction docs state the older shape. Those are left as-is here on purpose: rewriting them now would assert an API still under review, and [`column-level-lineage.md`](./column-level-lineage.md) currently tracks the implemented `property.py`. The substantive rewrites land with the implementation. When adopted:
 
-- [`column-level-lineage.md`](./column-level-lineage.md): `Property[K]` gains `soundness`, `scope_kind`, `facts`, and `consistent`; `source` folds into `facts`; the propagator dispatches its walk on `scope_kind` and grows the relation-algebra path.
+- [`column-level-lineage.md`](./column-level-lineage.md): `Property[K]` gains `soundness`, `scope_kind`, `facts`, `consistent`, and `depends_on`; `source` folds into `facts`; transfers take a read-only `DepContext`; the propagator evaluates properties in dependency order and dispatches its walk on `scope_kind`, and grows the relation-algebra path.
 - [`design-concepts-digest.md`](./design-concepts-digest.md): the "Two lattices, not one" section reconciles to the single-engine, single-tag framing.
 - [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md): the model-keyed `ConditionalUniquenessFact` shape moves to a relation-scoped `Fact[K]` carrying the predicate.
 
