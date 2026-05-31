@@ -96,6 +96,13 @@ class Property(Generic[K]):
     # Initial K from source-level facts (dbt tests, manifest schema).
     source: Callable[[ColumnRef], K]
 
+# The proposed lineage-facts design (lineage-facts.md) revises this bundle:
+# `source` folds into a `facts` lookup that also grounds derived nodes, and
+# `soundness`, `scope_kind`, and `consistent` are added. Relation-scoped
+# properties (uniqueness) annotate a SourceRef node rather than a column. This
+# doc and `property.py` get updated to that shape if and when the design is
+# adopted and built.
+
 
 def propagate(
     graph: ColumnLineageGraph,

@@ -405,6 +405,16 @@ Steps 1 and 2 ship together. The rest are independent and land driven by the con
 - **Uniqueness parity.** Before retiring `uniqueness/facts.py`, run both paths against the jaffle fixture and assert agreement on every model's candidate keys.
 - **Conditional-fact capture.** A `not_null` or `unique` test with a `where` filter produces a fact with the predicate attached, and `fact_lookup` ignores it.
 
+## Documentation updates on adoption
+
+This is a proposal. Adopting it means evolving `Property[K]` and the propagator, and a few adopted-direction docs state the older shape. Those are left as-is here on purpose: rewriting them now would assert an API still under review, and [`column-level-lineage.md`](./column-level-lineage.md) currently tracks the implemented `property.py`. The substantive rewrites land with the implementation. When adopted:
+
+- [`column-level-lineage.md`](./column-level-lineage.md): `Property[K]` gains `soundness`, `scope_kind`, `facts`, and `consistent`; `source` folds into `facts`; the propagator dispatches its walk on `scope_kind` and grows the relation-algebra path.
+- [`design-concepts-digest.md`](./design-concepts-digest.md): the "Two lattices, not one" section reconciles to the single-engine, single-tag framing.
+- [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md): the model-keyed `ConditionalUniquenessFact` shape moves to a relation-scoped `Fact[K]` carrying the predicate.
+
+Both docs above carry a forward-pointing note to here in the meantime.
+
 ## References
 
 - The substrate this layers on: [`column-level-lineage.md`](./column-level-lineage.md), including the K-relations encoding for uniqueness this migration uses.
