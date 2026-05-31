@@ -340,6 +340,17 @@ The existing `Property.source: Callable[[ColumnRef], K]` is subsumed by `facts`:
 5. **Facts cross model boundaries only through propagation.** A fact applies to the node on the model that declared it. The flow value carries downstream through the lineage graph; the boundary value gates cross-model contract checks.
 6. **Asserted facts are checked, and the boundary is stable.** A fact on a derived node runs through `consistent` against the inferred value. A mismatch is a finding. The declared value remains the contract callers built against, and downstream-of-violation annotations are provisional.
 
+## Trusting unenforced constraints
+
+`PROVEN` classifies a property's transfer rules, not its leaf facts. The transfer rules (a `JOIN` multiplies cardinality, `DISTINCT` introduces a key) are theorems. The candidate key, foreign key, or `not_null` claim that *seeds* the propagation is an assertion the framework cannot verify, since it never reads source data. So the guarantee a `PROVEN` property makes is conditional: given the declared source facts, the propagated values are theorems. A constraint the warehouse declares but does not enforce is a leaf-fact risk, not a transfer-rule risk: it can make a propagated annotation wrong about the data while the rules that produced it stay sound. The tag must not be read as "verified against data."
+
+Many warehouses (Snowflake, BigQuery, Redshift, Databricks) treat `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY` as informational. Some support a `RELY` form the optimiser trusts for rewrites without validating the data, which is the same conditional bet this substrate makes; others are documentation only. Enforcement is therefore a gradient (enforced, `RELY`, informational), distinct from declaration authority. A consequence inverts the naive `FactSource` rank: a dbt `unique` test runs against the data and fails on violation, so on an enforcement-free adapter it is *stronger* evidence than an advisory `PRIMARY KEY`, even though the constraint sits higher in `FACT_SOURCE_RANK`.
+
+Two things follow:
+
+- **Discoverers are adapter-aware about enforcement.** The native-constraint discoverer knows the active adapter and tags each fact with its enforcement tier. The merge and reporting use that tier, so an advisory constraint does not outrank a running test for the same scope. Carrying enforcement on the `Fact` (or splitting the native-constraint source into enforced and advisory) is the clean way to express it.
+- **The runtime layer is the backstop, and the gap gets a finding.** The audit's empirical checks (a model's identified primary key is unique in output) and the generator intents named for these violations (Orphan, NullKey, Duplicate, Boundary) exist to test whether advisory constraints actually hold. The static layer trusts the declaration; the runtime layer probes it. Where a load-bearing `PROVEN` annotation rests on an unenforced constraint that no running test guards, the audit emits a finding ("uniqueness on `dim_customer.id` rests on an advisory `PRIMARY KEY` and no `unique` test guards it; the downstream key annotation is unverified, add a test"), turning a silent assumption into an actionable recommendation.
+
 ## Failure modes
 
 - **Manifest sparse on a discoverer's axis.** The discoverer yields nothing for that node, the propagator returns the default, and the audit report counts how many nodes each discoverer grounded so reviewers see when a manifest is sparse.
