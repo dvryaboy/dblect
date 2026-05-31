@@ -106,7 +106,7 @@ class FactDiscoverer(Protocol[K]):
     ) -> Iterable[ColumnFact[K]]: ...
 ```
 
-A property that wants facts declares a tuple of discoverers, a combine rule for stacking multiple facts on the same column, and a policy for the case that motivates this whole module (see Property integration). The factory `fact_lookup` builds the inner callable:
+A property that wants facts declares a tuple of discoverers, a combine rule for stacking multiple facts on the same column, and a `consistent` predicate for the case where both a fact and an inferred K exist on a column (see Property integration). The factory `fact_lookup` builds the inner callable:
 
 ```python
 def fact_lookup(
@@ -158,29 +158,39 @@ A discoverer must be pure and total within its axis. "Total" means: every column
 
 ## Property integration
 
-A property that consults facts needs to answer two questions:
+A property's `K` is a type, the propagator does type inference over it, and a fact is a type annotation at a `ColumnRef`. The substrate combines them the way a compiler does, not via a dispatch dial.
 
-1. What does the propagator do at a column that has a fact and no expression? (Anchoring case.)
-2. What does the propagator do at a column that has *both* a fact and an expression? (Asserted case.)
+At each column, the propagator has up to two inputs:
 
-The first is uncontroversial: use the fact. The second is where the design earns its keep, because it is the bridge between developer-declared refinements and the SQL that's supposed to uphold them. The property declares a `FactPolicy`:
+- The **inferred K**, computed by walking the column's projection expression. Absent when the column has no expression (sources, seeds).
+- The **declared K**, supplied by `fact_lookup`. Absent when no fact lands on the column.
+
+The output K is determined by which inputs are present, in the order any compiler resolves them:
+
+| Inferred | Declared | Output K          | Behaviour                                                          |
+|----------|----------|-------------------|--------------------------------------------------------------------|
+| absent   | absent   | `prop.default()`  | No information.                                                    |
+| present  | absent   | inferred          | Standard propagation.                                              |
+| absent   | present  | declared          | The declaration anchors the column (source, seed, opaque upstream).|
+| present  | present  | declared          | Subject to a subtyping check.                                      |
+
+The last row is where the design earns its keep. The property declares a `consistent: Callable[[K, K], bool]` predicate, evaluated as `consistent(declared, inferred)`. It expresses "the inferred K is at least as specific as what the declaration committed to." When it holds, the declared K is the column's annotation downstream because the declaration is the contract callers built against. When it fails, the inferred K is strictly more permissive than the declaration admits, and the audit surfaces it as a finding; downstream still sees the declared K so one upstream regression does not blank analysis of every consumer.
+
+For lattice-shaped K's (most of them), `consistent` is the lattice's precision order. For nullability:
 
 ```python
-class FactPolicy(StrEnum):
-    """How a property combines a fact with the propagator's walk result."""
-
-    VERIFY   = "verify"     # walk, check against the fact, use fact downstream
-    OVERRIDE = "override"   # use the fact, skip the walk
-    COMBINE  = "combine"    # walk and fold via combine
+def consistent(declared: Nullability, inferred: Nullability) -> bool:
+    """``declared`` holds if ``inferred`` admits no values ``declared`` forbids."""
+    # NON_NULL declared: inferred must be NON_NULL, or UNKNOWN if upstream is opaque.
+    # NULLABLE or UNKNOWN declared: any inference is consistent (declaration is a weakening).
+    if declared is Nullability.NON_NULL:
+        return inferred is not Nullability.NULLABLE
+    return True
 ```
 
-The three modes:
+The opaque-upstream case (a macro the analyser cannot see through) reaches this rule with `inferred = Nullability.UNKNOWN` and passes vacuously: `UNKNOWN` is the lattice top, so any declaration refines it. No "trust me" mode is needed because the lattice already encodes "I have no information that contradicts the declaration." A property whose K does not have a natural precision order can supply equality, or can decline to opt into facts.
 
-- **Verify.** The propagator walks the column's expression, computes a K-value from the upstream, and the property compares it against the fact via a property-defined `verify` predicate. A mismatch surfaces as a finding through the audit reporter; the *fact* is what propagates downstream, because the developer's declaration is the contract that downstream callers built against. This is the default for refinement-type properties and is the project's headline capability: it catches the case where a `Money(USD)` declaration on `B.amount` is silently broken by `A → B`'s SQL changing units.
-- **Override.** The propagator uses the fact and does not walk. Useful when the upstream is unanalyzable (opaque macro, dialect gap) and the developer is asserting through it, or when computation is genuinely irrelevant and the declaration is the only ground truth available. The audit surfaces a per-column "asserted, not verified" note so the override is visible in review.
-- **Combine.** The propagator walks, then folds the walk result with the fact via the property's combine rule. Useful for accumulating properties where two pieces of evidence merge (a fact contributes "this column is at least depth-1 aggregated" without claiming there isn't more).
-
-A property exposes a constructor that bundles facts, combine rule, default, and policy:
+A property exposes a constructor that bundles facts, the consistency rule, and the default:
 
 ```python
 class Nullability(StrEnum):
@@ -194,15 +204,14 @@ def nullability_with_facts(
     *,
     name_to_source: Mapping[str, SourceRef],
     extra_discoverers: tuple[FactDiscoverer[Nullability], ...] = (),
-    policy: FactPolicy = FactPolicy.VERIFY,
 ) -> Property[Nullability]:
     """Build the nullability property with facts grounded from manifest.
 
     Combines the shipping discoverers (``not_null`` tests, column
     ``nullable`` flag, native NOT NULL constraints) with any caller-supplied
-    extras. Verify policy by default: a declared ``not_null`` on a derived
-    column is checked against the propagator's walk, and a mismatch is a
-    finding.
+    extras. ``consistent`` is the standard nullability precision order; a
+    declared ``not_null`` on a derived column whose upstream is inferred
+    ``NULLABLE`` is a type error surfaced through the audit reporter.
     """
     facts = collect_facts(
         manifest,
@@ -217,15 +226,14 @@ def nullability_with_facts(
             combine=NullabilitySemiring().times,
             default=Nullability.UNKNOWN,
         ),
-        fact_policy=policy,
-        verify=lambda declared, walked: declared == walked or walked is Nullability.UNKNOWN,
+        consistent=_nullability_consistent,
         operators={...},
         aggregates={...},
         unknown_value=Nullability.UNKNOWN,
     )
 ```
 
-This extends the `Property[K]` API in [`column-level-lineage.md`](./column-level-lineage.md): the existing `source: Callable[[ColumnRef], K]` becomes the asserted-fact case rolled into the same lookup. Properties that have no facts (`where_provenance` today; `aggregation_depth` for the foreseeable future) keep the constant-source shape by supplying a `facts` callable that returns `None` everywhere. The propagator's dispatch is the only place the policy lives; everything else is a callable bag.
+This extends the `Property[K]` API in [`column-level-lineage.md`](./column-level-lineage.md) by exactly two callables: `facts` (the lookup) and `consistent` (the subtyping check). Properties that don't opt into facts (`where_provenance`, `aggregation_depth` today) supply a `facts` callable that returns `None` everywhere and never reach the subtyping check.
 
 ## Where facts come from
 
@@ -235,7 +243,7 @@ Anchoring facts come from declarations on the *source* node: `not_null` on a sou
 
 Asserted facts come from declarations on a model: a column-level test on a model output, a model contract, a refinement type bound to a `(model_uid, column)` (when the types layer lands). Same discoverers, same `ColumnFact[K]` shape. The propagator does not distinguish at the type level; what changes is whether the column also has an expression in the lineage graph, and that's a property of the graph, not the fact.
 
-This is what makes the design extend naturally to the developer-refinement story: declaring `B.amount: Money(USD)` is the same operation as declaring `raw_orders.amount: int`; only the column it lands on differs, and the propagator's policy handles the rest.
+This is what makes the design extend naturally to the developer-refinement story: declaring `B.amount: Money(USD)` is the same operation as declaring `raw_orders.amount: int`; only the column it lands on differs, and the property's `consistent` check handles the rest.
 
 ## Soundness contract
 
@@ -246,7 +254,7 @@ Same posture as uniqueness facts, restated for the column level:
 3. **Conditional facts are captured but not activated yet.** A `not_null` test with a `where` filter, or a `dbt_utils.accepted_range` scoped to `country = 'US'`, produces a fact-shaped object with the predicate attached, but the standard `source_rule_from_facts` ignores conditional facts. Activation is a follow-up that picks an activation rule consistent with the rule [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md) commits to.
 4. **Sources for a fact compose by precedence, not by guess.** When two discoverers produce different facts on the same column for the same axis (a `not_null` test says NON_NULL, a column `nullable: true` flag says NULLABLE), the property's `combine` rule decides. The default is to surface a build-time diagnostic and pick the higher-trust source per `FactSource`'s rank; a property can override.
 5. **Facts cross model boundaries only through propagation.** Facts apply to the column on the model that declared them. The propagator carries the K value to downstream models through the lineage graph. There is no facility for "this fact applies to all downstream models" outside the propagator's reach.
-6. **Asserted facts are verified, not assumed.** When a property's `FactPolicy` is `VERIFY`, a fact on a derived column is checked against what the propagator computes from the upstream. A mismatch is a finding, not a silent override. `OVERRIDE` is opt-in and audit-visible, so an asserted-but-unchecked column is something a reviewer can find.
+6. **Asserted facts are checked, not assumed.** A fact on a derived column is run through the property's `consistent` predicate against what the propagator computes from the upstream. A mismatch is a finding, not a silent acceptance. The "we cannot see through the upstream" case is not an escape hatch; it is the normal output of inference (`prop.default()`, lattice top) and the consistency rule passes vacuously, the same way a compiler accepts a type annotation on an opaque value.
 
 ## Failure modes
 
@@ -264,8 +272,8 @@ Same posture as uniqueness facts, restated for the column level:
 
 ## Sequencing
 
-1. The data model: `ColumnFact[K]`, `FactSource`, `FactPolicy`, `FactsByColumn`, `FactDiscoverer`, `fact_lookup`, `collect_facts`, plus the propagator change that consults facts at every column and dispatches on policy. Discoverer-extensible from the start.
-2. Nullability discoverers (`not_null` test, column `nullable`, native `NOT NULL`), nullability promoted to a production property under `VERIFY`. Closes the source-rule piece of [`#26`](https://github.com/dvryaboy/dblect/issues/26) and lets a `not_null` declared on a derived column catch upstream-changed-to-nullable regressions.
+1. The data model: `ColumnFact[K]`, `FactSource`, `FactsByColumn`, `FactDiscoverer`, `fact_lookup`, `collect_facts`. Two callables added to `Property[K]`: `facts` (the lookup) and `consistent` (the subtyping check). Propagator change: consult `facts` at every column and run `consistent` whenever both an inferred and a declared K are present.
+2. Nullability discoverers (`not_null` test, column `nullable`, native `NOT NULL`), nullability promoted to a production property with `consistent` set to the nullability precision order. Closes the source-rule piece of [`#26`](https://github.com/dvryaboy/dblect/issues/26) and lets a `not_null` declared on a derived column catch upstream-changed-to-nullable regressions.
 3. Type discoverer (column `data_type`). First property that consumes it is downstream of the semantic-types substrate.
 4. Accepted-values and range discoverers. Power the first wave of developer-defined refinements (`PositiveInt`, `Country`, …).
 5. Config discoverer with concrete per-key fact mappings as detectors adopt them.
@@ -278,9 +286,9 @@ Steps 1 and 2 are one PR. The rest are independent and can land in any order dri
 - **Per-discoverer PBT.** Generate manifests with random combinations of column-level metadata; assert each discoverer's facts are a function of the manifest input it documents, never invent claims, and never drop claims it should produce.
 - **Combine-rule PBT.** For each property's chosen `combine`, assert associativity and commutativity hold on the discovered facts so reordering discoverers does not change the source rule.
 - **Soundness round-trip on jaffle.** For nullability with manifest-derived facts, assert that every column the audit annotates `NON_NULL` is either a column with a `not_null` test or a column whose projection expression makes it `NON_NULL` (e.g., `COALESCE(x, 0)`). Catches a discoverer that over-claims and a propagator rule that under-checks at the same time.
-- **Asserted-fact verification.** A model with a `not_null` declaration on `B.amount` whose upstream produces `NULL` must surface a finding under `VERIFY`. The contrapositive: a declaration consistent with the upstream must propagate to `C` unchanged and produce no finding. Pins both halves of the verify policy.
-- **Override visibility.** A model with `OVERRIDE` on a column must record an "asserted, not verified" entry in the audit report. Pins that overrides cannot hide.
+- **Subtyping check.** A model with a `not_null` declaration on `B.amount` whose upstream infers `NULLABLE` must surface a finding. The contrapositive: a declaration whose upstream infers a consistent K must propagate to downstream models unchanged and produce no finding. A declaration whose upstream infers `UNKNOWN` (opaque macro, dialect gap) must propagate without a finding, by the same `consistent` check, falling out of the lattice rather than a special escape hatch.
 - **Conditional-fact capture.** A `not_null` test with a `where` filter must produce a fact with the predicate attached and the standard `fact_lookup` must ignore it. Pins the deferred-activation contract.
+- **`consistent` is a partial order.** PBT on each property's `consistent`: reflexivity (`consistent(k, k)`), and that the relation respects the property's semiring (specifically, that `consistent(declared, prop.default())` holds, so opaque upstreams never produce findings).
 
 ## References
 
