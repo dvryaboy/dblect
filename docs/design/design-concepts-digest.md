@@ -16,7 +16,7 @@ Both lattices propagate together through the same SQL, but they remain formally 
 
 The composition rule between the two lattices is straightforward: structural refinements propagate independently of user-domain refinements at each operator, and vice versa. A JOIN's structural rule (cardinality multiplication) applies regardless of what user-domain axes are present on the joined columns; the user-domain rules apply column-wise without reference to the structural state. They commute, which is what makes the formal proof tractable.
 
-For a longer treatment with worked examples, see the type theory tutorial. The proposed substrate realisation collapses this to one propagation engine, with the structural/user-domain distinction expressed as where a property's transfer rules come from (framework-proven versus user-supplied, read off the catalog) rather than two engines or a stored tag, in [lineage-facts.md](lineage-facts.md); if that design is adopted this section gets reconciled to that framing.
+For a longer treatment with worked examples, see the type theory tutorial. The proposed substrate realisation collapses this to one propagation engine, with the structural/user-domain distinction expressed as where a property's transfer rules come from (the proven core versus user declarations) rather than two engines or a stored tag, in [lineage-facts.md](lineage-facts.md); if that design is adopted this section gets reconciled to that framing.
 
 ### The propagation engine as shared substrate
 
