@@ -17,7 +17,7 @@ It is also the convergence point for the three authoring channels the rest of th
 
 A **property** is a value type `K`, a lattice over `K`, and rules for moving a `K` through SQL. `K` is small and ordered by *precision*: a more precise value commits to more about the data. Nullability ranges over `{NON_NULL, NULLABLE, UNKNOWN}`; uniqueness over candidate-key sets `frozenset[frozenset[ColumnRef]]`, where knowing more keys is more precise; a user-domain axis ranges over whatever bounded lattice it needs (the smallest is a two-value axis like `contains_tax` over `{TRUE, FALSE, UNKNOWN}`; currency is an enum, an accepted range is an interval).
 
-For each property, the engine gives every node a value by combining its inputs with one rule per SQL operator, the property's *transfer rules*. Two requirements keep this honest: a rule never reports a value more precise than the SQL guarantees (when in doubt it falls back to the lattice top), and feeding it a more precise input never yields a less precise output. Those are what the references call a sound, monotone transfer, and together they make the whole walk safe to trust. Two of the structural properties have extra structure the engine leans on. Uniqueness key-sets form a lattice (a confluence keeps the keys both branches carry, and resolution accumulates keys), and cardinality counts, so its operators are the natural-number semiring (a `JOIN` multiplies, a `UNION ALL` adds). The value-domain axes neither count nor accumulate, so their rules are ordinary lattice maps. We prove each shipped rule correct directly rather than borrowing a theorem from any one framework, because we annotate a value per column, not per row.
+For each property, the engine gives every node a value by combining its inputs with one rule per SQL operator, the property's *transfer rules*. Two requirements keep this honest: a rule never reports a value more precise than the SQL guarantees (when in doubt it falls back to the lattice top), and feeding it a more precise input never yields a less precise output. Those are what the references call a sound, monotone transfer, and together they make the whole walk safe to trust. Two of the structural properties have extra structure the engine leans on. Uniqueness key-sets form a lattice (a confluence keeps the keys both branches carry, and resolution accumulates keys), and cardinality counts, so its operators are the natural-number semiring (a `JOIN` multiplies, a `UNION ALL` adds). The value-domain axes carry no such extra algebra: at a `JOIN` or `UNION` they take the plain lattice meet or join of their inputs. They still propagate everywhere, and their real work is at the scalar transforms and aggregates (adding two revenue columns, a `COALESCE`, a `SUM` over a group), where a declared meaning is preserved, transformed, or lost.
 
 The **propagator** walks the lineage graph once per property in dependency order and produces an annotation for every node. At a node with a derivation it reduces the node's expression by recursing into upstream nodes and applying the property's per-operator transfer rules. At a node with no derivation (a source or a seed) it reads the starting value from facts. The walk is single-pass because the property dependency graph is acyclic (below) and the lineage graph is acyclic once window and recursive-CTE regions are treated as opaque boundaries, the same scope cut the rest of the design takes.
 
@@ -40,7 +40,7 @@ A finding carries the assumptions in its derivation, which the propagator traces
 A property's behaviour is indexed by relational operator. Most of it is forced by the lattice rather than chosen.
 
 - **Filter / selection**: preserve. Forced.
-- **Confluence (`UNION ALL`)**: the lattice join of the branches. For nullability, nullable if either branch is; for uniqueness, a key survives only if both branches carry it. Forced. `UNION` (distinct) is the same join with one operator-specific addition: set semantics dedups, so the whole projected row becomes a candidate key. The confluence rule is therefore keyed on the specific operator, not on a single fixed join, because `UNION` and `UNION ALL` have different row semantics.
+- **Confluence (`UNION ALL`)**: the lattice join of the branches. For nullability, nullable if either branch is; for uniqueness, a key survives only if both branches carry it. Forced. `UNION` (distinct) is the same join with one operator-specific addition: set semantics dedups, so the whole projected row becomes a candidate key. The confluence rule is therefore keyed on the specific operator: `UNION` and `UNION ALL` have different row semantics.
 - **Cross (`JOIN`)**: each side preserves; a multi-input scalar expression folds its operands by the operator's rule. Forced for the structural core.
 - **Scalar / projection**: preserve, transform, or clear. A genuine choice. An identity (`Alias`, a bare `Column`) preserves and is where tightening happens; a declared map (a currency conversion, a `discount` or `tax` annotation) transforms; an opaque scalar or bare literal clears the value to the lattice top. A binary combine (`a + b`) preserves when operands agree on the axis, raises a finding when two committed operands are incompatible (tax-inclusive plus tax-exclusive), and clears to top when a committed operand meets an unrefined one, recording why it cleared so the seam rule can decide whether to speak.
 - **Aggregation**: the aggregate transfer, whose behaviour is the measure's *combinability*. A genuine choice.
@@ -76,7 +76,7 @@ Facts must be rock-solid because detectors rely on them silently. A wrong fact p
 
 ## Data model
 
-The data model makes illegal states unrepresentable rather than legal-by-docstring. A fact is parameterized by both its value type and its scope kind, so a column property cannot be handed a relation fact. Provenance is a sealed union, so a field that is meaningful only for one kind of fact exists only on that kind.
+The data model makes illegal states unrepresentable. A fact is parameterized by both its value type and its scope kind, so a column property cannot be handed a relation fact. Provenance is a sealed union, so a field that is meaningful only for one kind of fact exists only on that kind.
 
 ```python
 from typing import Any, Callable, Collection, Generic, Mapping, Protocol, TypeVar
@@ -181,7 +181,7 @@ class Annotation(Generic[K]):
 
 ### Grounding a node from facts
 
-Grounding a node returns one of three results, so "no fact" and "declared opaque" are distinct rather than both folded into a top-valued lookup. This distinction is load-bearing for the seam diagnostic.
+Grounding a node returns one of three results, so "no fact" and "declared opaque" are distinct. This distinction is load-bearing for the seam diagnostic.
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -446,7 +446,7 @@ Two things follow:
 
 ## Coverage and degradation
 
-Silent degradation is sound but it can hide behind itself: a manifest where sqlglot resolves few columns produces few annotations and few findings, which can read as a clean bill rather than as thin coverage. The audit therefore treats resolution coverage as a first-class output, not a footnote. Per model it reports the fraction of columns the propagator resolved against the fraction it fell blind on, and per discoverer how many nodes it grounded. A configurable floor turns sustained blindness into a finding ("resolved 38% of columns on `fct_orders`; the contract checks below cover only what was resolved"), so a reviewer sees thin coverage as thin coverage. The default posture stays silent-on-blindness for individual nodes; the floor is about the aggregate.
+Silent degradation is sound but it can hide behind itself: a manifest where sqlglot resolves few columns produces few annotations and few findings, which can read as a clean bill rather than as thin coverage. The audit therefore treats resolution coverage as a first-class output. Per model it reports the fraction of columns the propagator resolved against the fraction it fell blind on, and per discoverer how many nodes it grounded. A configurable floor turns sustained blindness into a finding ("resolved 38% of columns on `fct_orders`; the contract checks below cover only what was resolved"), so a reviewer sees thin coverage as thin coverage. The default posture stays silent-on-blindness for individual nodes; the floor is about the aggregate.
 
 ## Position relative to existing substrate
 
