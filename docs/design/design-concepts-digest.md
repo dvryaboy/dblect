@@ -16,7 +16,7 @@ Both lattices propagate together through the same SQL, but they remain formally 
 
 The composition rule between the two lattices is straightforward: structural refinements propagate independently of user-domain refinements at each operator, and vice versa. A JOIN's structural rule (cardinality multiplication) applies regardless of what user-domain axes are present on the joined columns; the user-domain rules apply column-wise without reference to the structural state. They commute, which is what makes the formal proof tractable.
 
-For a longer treatment with worked examples, see the type theory tutorial. The proposed substrate realisation, where the distinction rides on a single `Soundness` tag (`PROVEN` / `VOUCHED`) over one propagation engine rather than two engines, is in [lineage-facts.md](lineage-facts.md); if that design is adopted this section gets reconciled to the tag framing.
+For a longer treatment with worked examples, see the type theory tutorial. The proposed substrate realisation collapses this to one propagation engine, with the structural/user-domain distinction expressed as where a property's transfer rules come from (framework-proven versus user-supplied, read off the catalog) rather than two engines or a stored tag, in [lineage-facts.md](lineage-facts.md); if that design is adopted this section gets reconciled to that framing.
 
 ### The propagation engine as shared substrate
 
@@ -160,6 +160,8 @@ Different traditions contribute different pieces to dblect's design. Understandi
 *Type qualifiers* (CQual, FlowCaml). The closer prior art for tag-style refinements. Qualifier lattices, qualifier inference, operator signatures expressed as qualifier transformations. This is essentially what dblect's user-domain lattice is, adapted to SQL.
 
 *Information flow* (Sabelfeld and Myers; the broader IF security literature). The deepest source for qualifier-system foundations. Noninterference and security-type-system techniques port directly to our setting with "tax-inclusive" in the role of "high security."
+
+*Gradual typing* (Siek and Taha; Wadler and Findler on blame; the `Any` / implicit-`any` / `unknown` treatments in mypy and TypeScript). The discipline for a partially-typed program: an explicit opt-out (`Any`) that flows silently, an implicit-untyped case that strict modes flag (`noImplicitAny`, `--warn-return-any`), and a runtime cast that assigns blame at the typed/untyped boundary. dblect's adoption gradient is gradual typing for refinements. The static layer stays lenient by default and grows stricter as a project declares more, the seam where a refined value meets an unrefined one is the place it speaks up, and the runtime PBT layer is the blame-assigning check at that seam.
 
 *SQL formal semantics* (HoTTSQL, Cosette). The K-relations framework provides a clean formal model for what SQL operators do. The equivalence-focused results of these papers are less directly portable; the semantic foundation underneath is what we reuse.
 
