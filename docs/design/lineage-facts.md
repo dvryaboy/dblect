@@ -28,7 +28,7 @@ The **propagator** walks the lineage graph once per property and produces an ann
 Two points matter for everything below:
 
 - **One engine, many properties, one pass each.** Adding a property is adding a `Property[K]`, never a new pass. Properties are independent: nullability propagation never reads uniqueness annotations. They share the graph, never the annotations. "Two lattices" elsewhere in the design (structural versus user-domain) is a difference in where transfer rules come from, not two engines.
-- **Annotations degrade, they never lie.** When sqlglot cannot resolve a column the propagator emits the property's `UNKNOWN`-shaped default, and detectors read that as "we don't know" and stay silent. A wrong annotation would produce a wrong finding, so the contract is silence over guessing.
+- **Annotations degrade, they never lie.** A degraded annotation is `UNKNOWN`-shaped, never a wrong precise value. When sqlglot cannot resolve a column the propagator cannot see what the SQL did, so it emits the default and stays silent: a finding there would be a guess, and the contract is silence over guessing. That silence is for blindness, not for every `UNKNOWN`. When a recognized operation clears a *declared* refinement the propagator can name the cause, and that degradation is reported (the seam and coherence cases in "Validation and propagation").
 
 ## Transfer rules: framework-proven and user-supplied
 
