@@ -15,20 +15,20 @@ This module is also the convergence point for the three authoring channels the r
 
 ## How propagation works
 
-A short tour of the engine the facts module feeds, building on the provenance-semiring framework (Green, Karvounarakis, Tannen 2007) and the functional-dependency propagation tradition (Abiteboul, Hull, Vianu).
+A short tour of the engine the facts module feeds. It rests on standard machinery (the provenance-semiring and functional-dependency traditions, collected in the references); the mechanics below stand on their own.
 
-A **property** is a value type `K` plus rules for moving `K` through SQL. `K` is a small lattice: a set of values ordered by *precision*, where a more precise value commits to more about the data. Nullability is the three-point lattice `NON_NULL ⊑ NULLABLE ⊑ UNKNOWN`, read "non-null is more precise than nullable, which is more precise than no information." Uniqueness is the lattice of candidate-key sets `frozenset[frozenset[ColumnRef]]`, where knowing more keys is more precise. The lattice carries a commutative semiring `(K, +, ×, 0, 1)`:
+A **property** is a value type `K` plus rules for moving `K` through SQL. `K` is a small lattice: values ordered by *precision*, where a more precise value commits to more about the data. Nullability is the three-point lattice `NON_NULL ⊑ NULLABLE ⊑ UNKNOWN` ("non-null is more precise than nullable, which is more precise than no information"). Uniqueness is the lattice of candidate-key sets `frozenset[frozenset[ColumnRef]]`, where knowing more keys is more precise. Each lattice carries a commutative semiring `(K, +, ×, 0, 1)`:
 
 - `+` reconciles values at *confluence* points (a `UNION ALL`, or several branches feeding one downstream column). For nullability it is the lattice join (if either branch can be null, the union can be null).
 - `×` combines values at *cross* points (the implicit cross product under every `JOIN`) and folds a multi-input expression into one value.
 - `0` and `1` are the absorbing and neutral elements.
 
-The **propagator** walks the lineage graph once per property and produces an annotation for every node. At a node with a derivation it reduces the node's expression to a single `K` by recursing into upstream nodes and applying the property's per-operator transfer rules; at a node with no derivation (a source or a seed) it reads the starting value from facts. Aggregates use the semimodule extension (Amsterdamer, Deutch, Tannen 2011): each aggregate function is a `K → K` transfer keyed on the sqlglot expression subclass.
+The **propagator** walks the lineage graph once per property and produces an annotation for every node. At a node with a derivation it reduces the node's expression to a single `K` by recursing into upstream nodes and applying the property's per-operator transfer rules. At a node with no derivation (a source or a seed) it reads the starting value from facts. Each aggregate function is a `K → K` transfer keyed on the sqlglot expression subclass (the semimodule extension, in the references).
 
 Two points matter for everything below:
 
-- **One engine, many properties, one pass each.** Adding a property is adding a `Property[K]`, never a new pass. Properties are independent: nullability propagation never reads uniqueness annotations. They share the graph, never the annotations. "Two lattices" elsewhere in the design (structural versus user-domain) is a difference in where transfer rules come from, not two engines.
-- **Annotations degrade, they never lie.** A degraded annotation is `UNKNOWN`-shaped, never a wrong precise value. When sqlglot cannot resolve a column the propagator cannot see what the SQL did, so it emits the default and stays silent: a finding there would be a guess, and the contract is silence over guessing. That silence is for blindness, not for every `UNKNOWN`. When a recognized operation clears a *declared* refinement the propagator can name the cause, and that degradation is reported (the seam and coherence cases in "Validation and propagation").
+- **One engine, many properties, one pass each.** Adding a property is adding a `Property[K]`, never a new pass. Properties are independent: nullability propagation never reads uniqueness annotations. They share the graph, never the annotations.
+- **Annotations degrade, they never lie.** A degraded annotation is `UNKNOWN`-shaped, never a wrong precise value. When sqlglot cannot resolve a column the propagator cannot see what the SQL did, so it emits the default and stays silent: a finding there would be a guess. That silence is for blindness. When a recognized operation clears a *declared* refinement the propagator can name the cause and reports it (the seam and coherence cases under "Validation and propagation").
 
 ## Transfer rules: framework-proven and user-supplied
 
@@ -37,7 +37,7 @@ Properties differ by where their *transfer rules* come from. The engine does not
 - **Framework transfers** are theorems about SQL semantics, true in every project: a `JOIN` multiplies cardinality, `DISTINCT` introduces a key, `COALESCE(x, 0)` is non-null. Nullability, uniqueness, cardinality, grain, and ordering are built from these, the proven core the framework ships and verifies once.
 - **User transfers** rest on declared signatures: whether `revenue * 0.9` preserves tax inclusion is what the author meant, which the framework cannot derive. Currency, tax inclusion, gross/net, and the rest of the user-domain axes are built from these, in an open catalog users extend.
 
-A finding carries the assumptions in its derivation, which the propagator already traces: one built only from core transfers is unconditional, one that passes through a user signature holds given it. All properties tighten toward the most precise justified value, as "Validation and propagation" makes precise.
+A finding carries the assumptions in its derivation, which the propagator already traces: one built only from core transfers is unconditional, one that passes through a user signature holds given that signature. All properties tighten toward the most precise justified value, as "Validation and propagation" makes precise.
 
 A property's transfer behaviour is indexed by relational operator, and most of it is forced by the semiring and lattice rather than chosen:
 
@@ -51,19 +51,21 @@ So a property chooses behaviour only at scalar transforms and at aggregation; th
 
 The aggregate transfer asks whether a measure's meaning survives a `GROUP BY` or aggregate, and under what precondition. Three outcomes cover it: the refinement is **preserved** (a value-returning aggregate over a normal measure keeps its axes), **preserved under coherence** (it survives only where named columns are constant in the aggregation scope, the currency-coherence case, which is where the transfer reads a functional dependency through `depends_on`), or **cleared** (no aggregate preserves it, as for a ratio). Coherence is the only place the aggregate transfer reads another property. The user-land vocabulary that compiles to these outcomes lives in the types layer; the v1 surface is a coherence declaration (`within=<cols>`) plus a flag for measures that never aggregate.
 
-**Properties can read one another, in dependency order.** Most properties propagate alone: nullability never consults uniqueness. A few need another property's annotations to compute their own transfers, and two cases carry the design.
+### Properties can read one another, in dependency order
+
+Most properties propagate alone: nullability never consults uniqueness. A few need another property's annotations to compute their own transfers, and two cases carry the design.
 
 *Cardinality reads uniqueness.* To tell a fan-out join from a key-preserving one, the cardinality transfer at a `JOIN` asks whether the join key is unique on the other side. That answer is the uniqueness property's annotation, read at the join node. Both come from the proven core.
 
-*A user-defined money type reads a functional dependency.* Currency is not built in. It is a refinement a developer declares, say a `Money` semantic type carrying a currency axis, which the types layer compiles to a property like any other. Take `SELECT region, SUM(amount) AS total FROM orders GROUP BY region`, where `amount` is typed `Money`. Does `total` keep its currency? Only if every row folded into a group already shares one, that is, only if `region → currency` holds. The compiled currency transfer reads that functional dependency to decide. Where it holds, currency is preserved. Otherwise the framework cannot guarantee a group shares one currency, so the transfer clears the axis and the audit flags it: the sum may be mixing currencies, which is exactly the bug a developer declares `Money` with `within="currency"` to catch. It does not widen to `UNKNOWN` in silence, because losing a declared refinement is cause for investigation.
+*A user-defined money type reads a functional dependency.* Currency is not built in; it is a refinement a developer declares (a `Money` semantic type carrying a currency axis), which the types layer compiles to a property like any other. Take `SELECT region, SUM(amount) AS total FROM orders GROUP BY region`, where `amount` is typed `Money`. Does `total` keep its currency? Only if every row folded into a group already shares one, that is, only if `region → currency` holds. The compiled transfer reads that functional dependency. Where it holds, currency is preserved; otherwise the framework cannot guarantee a group shares one currency, so the transfer clears the axis and the audit flags it. The sum may be mixing currencies, which is exactly the bug `within="currency"` exists to catch. It does not widen to `UNKNOWN` in silence, because losing a declared refinement is cause for investigation.
 
-A property names the properties its transfers read in `depends_on`, and the propagator evaluates those first. A transfer reaches them only through a read-only `DepContext` that exposes exactly the declared dependencies' annotations, never a shared global map. So the edge is a wire, not a hint: it sets evaluation order and it is the sole channel for the read. A transfer that never declared an edge cannot read that annotation at all, so a missing edge fails at authoring time rather than silently reading stale state. This keeps the wiring between properties honest.
+A property names the properties its transfers read in `depends_on`, and the propagator evaluates those first. A transfer reaches them only through a read-only `DepContext` that exposes exactly the declared dependencies' annotations, never a shared global map. The edge is a wire, not a hint: it sets evaluation order and is the sole channel for the read. A transfer that never declared an edge cannot read that annotation, so a missing edge fails at authoring time rather than silently reading stale state.
 
-Honest wiring does not manufacture information. If no one ever typed `amount` as `Money` (or otherwise declared its currency), there is no currency refinement on that column, and the mixed-currency `SUM` above draws no finding. That is the substrate's posture (absence is silence), not a gap the channel could close.
+The channel does not manufacture information. If no one ever typed `amount` as `Money`, there is no currency refinement on that column, and the mixed-currency `SUM` draws no finding. That is the substrate's posture (absence is silence), not a gap the channel could close.
 
 The `depends_on` graph must be acyclic, so no pair of properties needs a joint fixpoint over a product lattice. An authoring lint warns when a core transfer reads a user-declared axis, since that quietly makes a structural conclusion conditional.
 
-The user never writes any of this. The `depends_on` edge for the example originates in a coherence declaration on the `Money` type (a measure that aggregates only where its currency column is constant, written `within="currency"`). The framework compiles that intent into the dependency and the transfer; the user-land vocabulary lives in the types layer.
+The user writes none of this. The `depends_on` edge originates in the coherence declaration on the `Money` type (`within="currency"`); the framework compiles that intent into the dependency and the transfer.
 
 ## What a fact is
 
@@ -124,11 +126,9 @@ class ScopeKind(StrEnum):
 
 class Channel(StrEnum):
     """Where a fact was authored: provenance, for tracing an annotation back to
-    its grounding and for reporting. It carries no authority ordering. Two facts
-    contend only when they claim the same axis at one scope, and the substrate
-    resolves that without a channel rank (see "Resolving multiple facts at a
-    scope"). Distinct from where a property's transfer rules come from, which is
-    about rule ownership rather than where a leaf value came from."""
+    its grounding and for reporting. It carries no authority ordering; conflicts
+    are resolved by the lattice, not by ranking channels (see "Resolving
+    multiple facts at a scope")."""
 
     NATIVE_CONSTRAINT = "native_constraint"  # dbt 1.5+ constraint on the model
     MODEL_CONTRACT    = "model_contract"     # dbt model-contract declaration
@@ -159,9 +159,7 @@ class Fact(Generic[K]):
     """One claim about one node under one property.
 
     ``world`` is the conditioning regime. ``None`` holds in every flag world; a
-    set value holds in that world and is ground truth there, not a low-confidence
-    guess to be outranked. This is what answers the var question: a compile-value
-    fact is scoped to a world, never ranked beneath an unconditional one.
+    set value holds in (and only in) that world, where it is ground truth.
 
     ``channel`` is provenance only. ``origin`` is set exactly when the channel is
     ``COMPILE_VALUE``. ``enforced_on_write`` is set only on native-constraint
@@ -234,12 +232,12 @@ def fact_lookup(facts: FactsByScope[K], *, merge: FactMerge[K]) -> Callable[[Sco
 
 The substrate ships two default merges, one per shape of property:
 
-- **Alternative properties** (nullability, type, a user-domain axis): two facts compete on one axis. The merge takes the more precise value when one refines the other. A genuine contradiction (neither refines the other, a `nullable: true` column flag against a native `NOT NULL`) is a manifest bug: the merge raises a `BuildIssue`, keeps a deterministic choice so the run is reproducible, and marks downstream annotations provisional. It does not try to decide who is right from the channel, because the channel does not carry that information and a contradiction wants a human, not a silent winner.
+- **Alternative properties** (nullability, type, a user-domain axis): two facts compete on one axis. The merge takes the more precise value when one refines the other. A genuine contradiction (neither refines the other, such as a `nullable: true` column flag against a native `NOT NULL`) is a manifest bug: the merge raises a `BuildIssue`, keeps a deterministic choice so the run is reproducible, and marks downstream annotations provisional. It does not decide who is right from the channel, because the channel does not carry that information and a contradiction wants a human.
 - **Accumulating properties** (uniqueness): two facts are independent claims that both hold. The merge unions them (every declared key is a key). No ordering arises because more keys never contradict.
 
-This is the two-step the earlier sketch described, now without a trust ladder: the lattice operation decides agreement, and a contradiction is surfaced rather than ranked away. Channel stays on the fact for tracing and reporting, not pressed into an authority order it cannot bear.
+The lattice operation decides agreement; a contradiction is surfaced rather than ranked away. Channel stays on the fact for tracing and reporting.
 
-**Compile-value facts do not enter this at all.** The flag layer fixes one world per propagation run and the compile-value discoverers emit their facts under it, so every fact in a bucket shares that world. Within the run such a fact is an anchor like any other, on equal footing with a native constraint or a user assertion. A difference *between* worlds is the flag-world analysis ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)), reported as "this contract holds under world A and fails under world B," never collapsed by a merge. This is the answer to "why would a dbt var be less authoritative than a native constraint": it is not. A var-derived value is scoped to a world rather than ranked beneath one, and inside its world it is ground truth by construction. Where a world-scoped value and an unconditional user assertion genuinely disagree on one axis (a contract claims `contains_tax=True` always, world B produces `False`), that disagreement is the finding the analysis exists to raise, not a tie for the merge to break.
+**Compile-value facts do not enter this.** The flag layer fixes one world per propagation run, and the compile-value discoverers emit their facts under it, so every fact in a bucket shares that world. Within the run such a fact is an anchor like any other, on equal footing with a native constraint or a user assertion: a var-derived value is scoped to a world, not ranked beneath one. A difference *between* worlds is the flag-world analysis ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)), reported as "this contract holds under world A and fails under world B." Where a world-scoped value and an unconditional user assertion genuinely disagree on one axis (a contract claims `contains_tax=True` always, world B produces `False`), that disagreement is the finding the analysis exists to raise, not a tie for the merge to break.
 
 ## Discovery rules
 
@@ -262,7 +260,7 @@ Two discoverers are forward-looking, and the plumbing for them lands with this m
 
 ### From declaration to fact
 
-The point of the facts layer is that the three authoring channels all reduce to `Fact[K]`, and a developer writing a declaration never meets `Scope`, `merge`, or the framework/user transfer catalogs. The channels:
+All three authoring channels reduce to `Fact[K]`, and a developer writing a declaration never meets `Scope`, `merge`, or the transfer catalogs. The channels:
 
 | What the developer writes | Channel | Becomes |
 |---|---|---|
@@ -298,7 +296,7 @@ At a node the propagator has up to two inputs:
 - the **inferred** `K`, from walking the upstream expression (absent at sources and seeds), and
 - the **declared** `K`, from `fact_lookup` (absent when no fact applies).
 
-Two independent decisions follow, and the old design collapsed them into one. They are worth keeping apart.
+Two independent decisions follow, and they are worth keeping apart.
 
 **Validation** asks whether the inferred value honours the declared contract, via a `consistent` predicate. For a lattice-shaped `K` the default is derived from the precision order rather than hand-written per property:
 
@@ -398,16 +396,16 @@ The existing `Property.source: Callable[[ColumnRef], K]` is subsumed by `facts`:
 
 ### Erasure at the typed/untyped seam
 
-A refined value meeting an unrefined one is worth dwelling on, because that seam is where the highest-value bugs hide and where a partial adopter most wants a nudge. dblect follows the gradual-typing settlement here (Siek and Taha on gradual typing; the `Any` / implicit-`any` / `unknown` distinction in mypy and TypeScript; Wadler and Findler on blame). The principle is to separate an explicit opt-out from an absent annotation and treat them oppositely:
+A refined value meeting an unrefined one is worth dwelling on, because that seam is where the highest-value bugs hide and where a partial adopter most wants a nudge. dblect follows the gradual-typing tradition here (see references): separate an explicit opt-out from an absent annotation, and treat them oppositely.
 
-- An `UNKNOWN` the modeler *declared* (an `OpaqueEffect`, a column marked opaque) is the explicit `Any`. It flows silently, because the modeler took responsibility for it.
-- An `UNKNOWN` that is merely *un-annotated* is the implicit one. Where it meets a declared refinement, the audit speaks up, the way `noImplicitAny` and `--warn-return-any` do. This diagnostic is on by default once a project has declared semantic types (the typed-critical-chain layer) and off at the zero-declaration layer, so the signal lands where the investment already is rather than at every incidental untyped touch.
+- An `UNKNOWN` the modeler *declared* (an `OpaqueEffect`, a column marked opaque) is the explicit opt-out. It flows silently, because the modeler took responsibility for it.
+- An `UNKNOWN` that is merely *un-annotated* is implicit. Where it meets a declared refinement, the audit speaks up. This diagnostic is on once a project has declared semantic types and off at the zero-declaration layer, so the signal lands where the investment already is, not at every incidental untyped touch.
 
 The same rule covers any clearing of a *declared* refinement, not just this seam. An aggregate whose coherence precondition is not met (the mixed-currency `SUM` above) and an opaque scalar that drops an axis both lose a refinement the modeler declared, so both report rather than widen in silence. Only an undeclared value (absence is silence) or an explicit opt-out clears without a word.
 
-The runtime layer is the blame-assigning cast at the seam: the static side notes the boundary and the generator probes whether the unrefined side actually respects the refined side's assumption.
+The runtime layer is the check at the seam: the static side notes the boundary, and the generator probes whether the unrefined side actually respects the refined side's assumption.
 
-The diagnostic is a fixed template, not synthesized prose. dblect cannot author domain narrative like "this mixes tax-inclusive and tax-exclusive amounts," because it does not know what a user-domain axis means. It fills slots from what it does have: the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, the type's own name and an optional one-line description carried on the declaration (the Pandera-shaped surface already has a docstring), with graceful fallback to the bare type and axis names when none is given. The two readings (annotate to match, or a real mismatch) and the suppression line are constant; everything else is a named slot. A realistic rendering:
+The diagnostic is a fixed template, not synthesized prose. dblect cannot author domain narrative like "this mixes tax-inclusive and tax-exclusive amounts," because it does not know what a user-domain axis means. It fills slots from what it does have: the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, the type's own name and an optional one-line description from the declaration, with fallback to the bare type and axis names when none is given. A realistic rendering:
 
 > `orders.sql:12`: `total` combines `revenue` and `net_revenue` with `+`. `net_revenue` is `RevenueWithTax` but `revenue` carries no refinement on `contains_tax`, so the result drops it. Annotate `revenue` as `RevenueWithTax` if it qualifies, or treat this as a possible mismatch. To silence: mark `revenue` opaque, or disable `refinement-erased-at-seam` for this model.
 
@@ -422,7 +420,7 @@ The diagnostic is a fixed template, not synthesized prose. dblect cannot author 
 
 ## Trusting unenforced constraints
 
-Framework transfers are theorems; leaf facts are not. The transfer rules (a `JOIN` multiplies cardinality, `DISTINCT` introduces a key) are proven once. The candidate key, foreign key, or `not_null` claim that *seeds* the propagation is an assertion the framework cannot verify, since it never reads source data. So even a core conclusion is conditional: given the declared source facts, the propagated values are theorems. A constraint the warehouse declares but does not enforce is a leaf-fact risk, not a transfer-rule risk: it can make a propagated annotation wrong about the data while the rules that produced it stay sound. "Proven" here must not be read as "verified against data."
+Framework transfers are theorems; leaf facts are not. The transfer rules (a `JOIN` multiplies cardinality, `DISTINCT` introduces a key) are proven once. The candidate key, foreign key, or `not_null` claim that *seeds* the propagation is an assertion the framework cannot verify, since it never reads source data. So even a core conclusion is conditional: given the declared source facts, the propagated values are theorems. "Proven" means proven from the declared inputs, not verified against data. A constraint the warehouse declares but does not enforce is a leaf-fact risk, not a transfer-rule risk: it can make a propagated annotation wrong about the data while the rules that produced it stay sound.
 
 Many warehouses (Snowflake, BigQuery, Redshift, Databricks) treat `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY` as informational. Some support a `RELY` form the optimiser trusts for rewrites without validating the data, the same conditional bet this substrate makes; others are documentation only. So whether a native constraint actually backs its claim is an adapter-and-constraint-kind question (Databricks enforces `CHECK` but not `PRIMARY KEY`, Snowflake enforces neither), captured by the `enforced_on_write` flag on a native-constraint fact. For dblect's purposes the gradient collapses to one question: is the claim checked against data by something that runs? A dbt `unique` test is, because the runtime layer runs it; an advisory `PRIMARY KEY` is not, whatever its prominence. This is why the channel carries no authority order: the signal that matters is whether a running guard exists, and that is read where it is needed rather than baked into a rank.
 
@@ -452,7 +450,7 @@ The existing `uniqueness/facts.py` is the worked example for relation-scoped fac
 | Native `PRIMARY KEY (c1, c2)` constraint       | `Fact.relation(model, value={{c1, c2}})`                            |
 | Native column-level `UNIQUE` on `c`            | `Fact.relation(model, value={{c}})`                                 |
 
-The `merge` is the accumulating one: independent declared keys union, so no contradiction arises and no ordering is needed. `Channel` records which declaration each key came from for the trace, the role `_dedupe`/`_SOURCE_RANK` plays today, now without imposing a rank.
+The `merge` is the accumulating one: independent declared keys union, so no contradiction arises and no ordering is needed. `Channel` records which declaration each key came from, for the trace.
 
 **What goes away.**
 
@@ -502,7 +500,7 @@ Steps 1 and 2 ship together. The rest are independent and land driven by the con
 This is a proposal. Adopting it means evolving `Property[K]` and the propagator, and a few adopted-direction docs state the older shape. Those are left as-is here on purpose: rewriting them now would assert an API still under review, and [`column-level-lineage.md`](./column-level-lineage.md) currently tracks the implemented `property.py`. The substantive rewrites land with the implementation. When adopted:
 
 - [`column-level-lineage.md`](./column-level-lineage.md): `Property[K]` gains `scope_kind`, `facts`, `consistent`, and `depends_on`; `source` folds into `facts`; transfers take a read-only `DepContext`; the propagator evaluates properties in dependency order and dispatches its walk on `scope_kind`, and grows the relation-algebra path.
-- [`design-concepts-digest.md`](./design-concepts-digest.md): the "Two lattices, not one" section reconciles to the single-engine framing, with the structural/user-domain split expressed as where a property's transfers come from (the proven core or a user declaration) rather than a stored tag, and the composition-rules line (preserve, erase, drop-to-aggregate, branch-join) reorganises by relational operator into forced-versus-chosen, with the aggregate behaviour named *combinability* and grounded in the measure-additivity and semimodule traditions.
+- [`design-concepts-digest.md`](./design-concepts-digest.md): the "Two lattices, not one" section reconciles to the single-engine framing, with the structural/user-domain split expressed as where a property's transfers come from (the proven core or a user declaration) rather than a stored tag. The composition-rules line reorganises by relational operator into forced-versus-chosen, with the aggregate behaviour named *combinability*.
 - [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md): the model-keyed `ConditionalUniquenessFact` shape moves to a relation-scoped `Fact[K]` carrying the predicate.
 
 Both docs above carry a forward-pointing note to here in the meantime.
