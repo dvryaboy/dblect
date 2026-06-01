@@ -19,9 +19,7 @@ Beyond the axes themselves, the substrate needs to know how a type behaves as it
 
 ### Behavior at scalar operators
 
-The default is `preserve`: a value-returning scalar (alias, rename, a function that returns the same column) keeps the type's axes. The exceptions are declared at the SQL site, not on the type, using the closed annotation vocabulary from the digest (`dblect: preserves`, `discount(N)`, `tax(rate)`, `currency(from, to)`), because whether `revenue * 0.9` is a discount or a currency conversion is a property of that line of SQL, not of the type. An unannotated opaque scalar clears the axes and asks for an annotation. So the type itself usually declares nothing here.
-
-*Sketch:* whether a type ever wants to declare a default scalar behavior (for example, "any arithmetic clears the currency axis") or whether SQL-site annotation is always the right place is an open question below.
+The default is `preserve`: a value-returning scalar (alias, rename, a function that returns the same column) keeps the type's axes. The exceptions are declared at the SQL site, not on the type, using the closed annotation vocabulary from the digest (`dblect: preserves`, `discount(N)`, `tax(rate)`, `currency(from, to)`), because whether `revenue * 0.9` is a discount or a currency conversion is a property of that line of SQL, not of the type. An unannotated opaque scalar clears the axes and asks for an annotation. A type declares no scalar behavior of its own in v1; the SQL site is the only place a transform is annotated (decision 2 in the appendix).
 
 ### Behavior under aggregation (combinability, v1)
 
@@ -38,7 +36,7 @@ These are orthogonal: money is summable but coherence-bound (`summable=True, wit
 
 ## Multi-column concepts
 
-Per the intro doc's rule, money, ranges, and addresses are modeled as separate columns linked by declarations, not as record-shaped types. Coherence is the linking mechanism: `within=<sibling column>` ties a measure to the column that must stay constant for it to aggregate. `Money` is then thin sugar, a hand-written `SemanticType` that is a `Decimal` measure with coherence on its denomination column, and there is no currency-specific concept anywhere in the framework. Unit-of-measure, fiscal entity, and scenario reuse the same `within`.
+Per the intro doc's rule, money, ranges, and addresses are modeled as separate columns linked by declarations, not as record-shaped types. Coherence is the linking mechanism: `within=<sibling column>` ties a measure to the column that must stay constant for it to aggregate. The split is that the *type* carries that it is coherence-bound, and the `Field` at the binding names the column, since the column exists only at the model (`amount: Money = Field(within="currency")`; decision 1 in the appendix). `Money` is then thin sugar, a hand-written `SemanticType` that is a `Decimal` measure coherence-bound to its denomination column, and there is no currency-specific concept anywhere in the framework. Unit-of-measure, fiscal entity, and scenario reuse the same `within`.
 
 ## How declarations reach the substrate
 
@@ -51,16 +49,16 @@ A type binding compiles to substrate inputs, and the user sees none of them:
 
 The user writes `RevenueNet`, `Field(within="currency")`, `summable=False`. They never see `Scope`, `Fact`, `depends_on`, or a transfer. That round-trip is the test that the substrate can carry the surface.
 
-## Open questions
+## Decisions
 
-The parts genuinely unsettled, which is the point of this sketch.
+The calls made for v1, with the reasoning and what each gives up recorded in the appendix.
 
-1. **Where coherence is declared.** `within="currency"` names a sibling column, which only exists at a `ModelContract` binding, not in a reusable `SemanticType` definition. So does the column reference live on the `Field` at the binding (`amount: Money = Field(within="currency")`), with the type carrying only "Money is coherence-bound to its denomination"? That split (kind-of-coherence on the type, which-column on the binding) seems right but needs confirming.
-2. **Granularity of the non-summable case.** `summable=False` clears under `SUM`/`AVG` but value-selecting aggregates still preserve. Is a single boolean enough for v1, or do real measures need to distinguish "no additive aggregate" from "no aggregate at all"? Leaning boolean for v1.
-3. **Type-level versus SQL-site declaration for scalar behavior.** The digest puts transform annotations at the SQL site. Does a type ever need a default scalar behavior of its own, or is SQL-site annotation always correct? If types never declare scalar behavior, the surface stays smaller.
-4. **One `Field`, two trust classes.** Constraints (checkable, `PROVEN`-like) and axes (`VOUCHED`) share the `Field` surface. Do we surface the distinction to the user at all, or keep it internal and let the report label findings by trust class?
-5. **Refinement-axis enums and coherence columns.** The stdlib ships `Currency`, `Country` as enums (axis values), and also has currency-as-a-column (coherence). How do a `Currency`-typed *column* and a `currency` *axis value* relate, and when does a user reach for which?
-6. **Subtyping at boundaries.** The precise rule for when a producer's refined type satisfies a consumer's declared type (is `RevenueNet` acceptable where `Revenue` is expected, and vice versa), expressed as the user-domain precision order the `consistent` check uses.
+1. Coherence is split: kind on the type, which-column on the `Field` binding.
+2. Scalar transforms are annotated at the SQL site only; a type declares no scalar behavior.
+3. The constraint-versus-axis distinction stays internal; the report labels findings by trust class.
+4. Summability is a single boolean for v1.
+5. Currency-as-axis versus currency-as-column follows the existing global-versus-per-row rule of thumb.
+6. Boundary subtyping reuses the substrate `consistent` check (a producer type must refine the consumer's expectation).
 
 ## What this does not cover
 
@@ -69,6 +67,52 @@ The parts genuinely unsettled, which is the point of this sketch.
 - Flags and world enumeration ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)); a flag's `affects` is another producer of facts under a chosen world.
 - Opaque scalar and UDF handling ([`udf-and-opaque-operators.md`](./udf-and-opaque-operators.md)).
 - Per-dimension semi-additivity, deferred past v1.
+
+## Appendix: decisions and tradeoffs
+
+Each entry records the choice, the alternative weighed, what the choice buys, what it gives up, and what would make us revisit.
+
+### 1. Coherence split: kind on the type, column on the binding
+
+- **Choice.** A `SemanticType` declares that it is coherence-bound (Money is bound to its denomination); the `Field` at the `ModelContract` names the actual column (`amount: Money = Field(within="currency")`).
+- **Alternative.** Put the column name on the type definition.
+- **Buys.** Types stay reusable across models, since a model-specific column name never gets baked into a shared type.
+- **Gives up.** The type alone does not fully specify behavior; a `Money` used without a `within` binding has no coherence and aggregates as a plain decimal, which a careless binding could miss.
+- **Revisit.** If a type's coherence column is almost always the same name, add an optional type-level default that the binding can override.
+
+### 2. Scalar transforms at the SQL site only
+
+- **Choice.** Types declare no scalar behavior. The default is `preserve`; transforms are annotated on the SQL line (`dblect: discount(N)`, `tax(rate)`, `currency(from, to)`); an unannotated opaque scalar clears.
+- **Alternative.** Let a type carry default scalar rules (for example, "any arithmetic clears the currency axis").
+- **Buys.** A smaller type surface, and the annotation lives where the decision is actually made, since whether `revenue * 0.9` is a discount or a conversion is a property of that line, not the type.
+- **Gives up.** A type with a genuinely uniform scalar rule must repeat the annotation at every site; there is no write-once type-level rule.
+- **Revisit.** If repetition becomes painful for a common type, add an optional type-level scalar default.
+
+### 3. Constraint-versus-axis distinction kept internal
+
+- **Choice.** One `Field` surface. The framework classifies checkable constraints (`non_negative`, `PROVEN`-like, runtime-verifiable) apart from `VOUCHED` axis values internally, and the report labels findings by trust class.
+- **Alternative.** Make the user mark which is which.
+- **Buys.** The user writes `Field(...)` without learning the trust taxonomy, while the report still communicates which findings are unconditional.
+- **Gives up.** The user cannot override the classification, and the framework must classify every `Field` key reliably (a key is either a known constraint primitive or an axis).
+- **Revisit.** If a `Field` key is genuinely ambiguous between the two, add an explicit marker for that case.
+
+### 4. Summability as a single boolean
+
+- **Choice.** `summable: bool` (default `True`), orthogonal to `within`. Value-selecting aggregates (`MIN`, `MAX`, `FIRST`, `LAST`) preserve even when `summable=False`; `COUNT` changes the type regardless.
+- **Alternative.** A richer per-aggregate or per-dimension model.
+- **Buys.** A minimal surface that already covers the common cases: currency coherence and non-summable ratios.
+- **Gives up.** Cannot express semi-additive-over-a-dimension (a balance summable across accounts but not across time).
+- **Revisit.** When a real semi-additive measure appears; this is the deferred per-dimension model.
+
+### 5. Currency-as-axis versus currency-as-column
+
+- **Choice.** Follows the existing global-versus-per-row rule of thumb. Currency fixed for a whole column is an axis (`Revenue.refine(currency="USD")`, static); currency varying per row is a column plus coherence (`within="currency"`).
+- **Why no new mechanism.** Both arms already exist; the type author picks on whether the value varies per row. Recorded here only because the two surfaces look similar.
+
+### 6. Boundary subtyping reuses `consistent`
+
+- **Choice.** A producer column satisfies a consumer's declared type when the producer type *refines* the consumer's expectation (`RevenueNet` is accepted where `Revenue` is expected; `Revenue` is a finding where `RevenueNet` is required). This is the substrate `consistent` check over the user-domain precision order, standard subtyping.
+- **Why no new mechanism.** The substrate already computes this for every property; the types layer adds nothing.
 
 ## References
 
