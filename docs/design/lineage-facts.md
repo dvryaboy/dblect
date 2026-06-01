@@ -17,7 +17,9 @@ It is also the convergence point for the three authoring channels the rest of th
 
 A **property** is a value type `K`, a lattice over `K`, and rules for moving a `K` through SQL. `K` is small and ordered by *precision*: a more precise value commits to more about the data. Nullability ranges over `{NON_NULL, NULLABLE, UNKNOWN}`; uniqueness over candidate-key sets `frozenset[frozenset[ColumnRef]]`, where knowing more keys is more precise; a user-domain axis ranges over whatever bounded lattice it needs (the smallest is a two-value axis like `contains_tax` over `{TRUE, FALSE, UNKNOWN}`; currency is an enum, an accepted range is an interval).
 
-For each property, the engine gives every node a value by combining its inputs with one rule per SQL operator, the property's *transfer rules*. Two requirements keep this honest: a rule never reports a value more precise than the SQL guarantees (when in doubt it falls back to the lattice top), and feeding it a more precise input never yields a less precise output. Those are what the references call a sound, monotone transfer, and together they make the whole walk safe to trust. Two of the structural properties have extra structure the engine leans on. Uniqueness key-sets form a lattice (a confluence keeps the keys both branches carry, and resolution accumulates keys), and cardinality counts, so its operators are the natural-number semiring (a `JOIN` multiplies, a `UNION ALL` adds). The value-domain axes carry no such extra algebra: at a `JOIN` or `UNION` they take the plain lattice meet or join of their inputs. They still propagate everywhere, and their real work is at the scalar transforms and aggregates (adding two revenue columns, a `COALESCE`, a `SUM` over a group), where a declared meaning is preserved, transformed, or lost.
+For each property, the engine gives every node a value by combining its inputs with one rule per SQL operator, the property's *transfer rules*. Two requirements keep this honest: a rule never reports a value more precise than the SQL guarantees (when in doubt it falls back to the lattice top), and feeding it a more precise input never yields a less precise output. Those are what the references call a sound, monotone transfer, and together they make the whole walk safe to trust.
+
+Two structures do separate jobs here, and keeping them apart is what keeps the engine honest. The **abstraction domain** is the precision lattice: it powers fact resolution (the meet of several declared facts) and the consistency check (does an inferred value refine a declared one). The **operator algebra** is how values combine *at SQL operators*: the confluence combine at a `UNION ALL`, the cross combine at a `JOIN`. For an idempotent property the confluence combine is exactly the domain join, which is why the two look like one thing. They are not one thing in general. A counting property's confluence is addition, which is not the join of any lattice on counts. The cross combine is the property's own rule, not the domain join by definition: it multiplies for counting, preserves per side for the column properties shipped here, and only for a pure-accumulation property such as where-provenance, whose combine is set union throughout, does it happen to coincide with the join. The properties this module ships are all idempotent (nullability, uniqueness) or value-domain (type, accepted-values, range, the user axes), so their confluence is the domain join and their operator algebra needs no extra structure. The counting and accumulating properties whose confluence is a non-idempotent semiring `+` live on the semiring substrate of [`column-level-lineage.md`](./column-level-lineage.md); a `Property` carries an optional `semiring` slot for them, left unset here. The value-domain axes do their real work at the scalar transforms and aggregates (adding two revenue columns, a `COALESCE`, a `SUM` over a group), where a declared meaning is preserved, transformed, or lost; at a `JOIN` or `UNION` they simply ride their column through.
 
 The **propagator** walks the lineage graph once per property in dependency order and produces an annotation for every node. At a node with a derivation it reduces the node's expression by recursing into upstream nodes and applying the property's per-operator transfer rules. At a node with no derivation (a source or a seed) it reads the starting value from facts. The walk is single-pass because the property dependency graph is acyclic (below) and the lineage graph is acyclic once window and recursive-CTE regions are treated as opaque boundaries, the same scope cut the rest of the design takes.
 
@@ -30,7 +32,7 @@ Two points carry everything below:
 
 Properties differ by where their transfer rules come from, and that difference is the whole of the structural/user-domain distinction. The engine does not branch on it.
 
-- **Framework transfers** are theorems about SQL semantics, true in every project: a `JOIN` multiplies cardinality, `DISTINCT` introduces a key, `COALESCE(x, 0)` is non-null. Nullability, uniqueness, cardinality, grain, and ordering are built from these. They are the proven core, verified once.
+- **Framework transfers** are theorems about SQL semantics, true in every project: a `JOIN` multiplies cardinality, `DISTINCT` introduces a key, `COALESCE(x, 0)` is non-null. Nullability and uniqueness ship here on these; cardinality, grain, and ordering are the same kind of proven-core property and live on the semiring substrate of [`column-level-lineage.md`](./column-level-lineage.md). They are the proven core, verified once.
 - **User transfers** rest on declared signatures: whether `revenue * 0.9` preserves tax inclusion is what the author meant, which the framework cannot derive. Currency, tax inclusion, gross/net, and the other user-domain axes are built from these, in an open catalog users extend.
 
 A finding carries the assumptions in its derivation, which the propagator traces: one built only from core transfers is unconditional, one that passes through a user signature holds given that signature. What has to be proved differs, the machinery does not (see "Soundness contract"): the framework proves its own rules; a user rule is correct as long as the author's declared signature behaves the way they say.
@@ -40,14 +42,14 @@ A finding carries the assumptions in its derivation, which the propagator traces
 A property's behaviour is indexed by relational operator. Most of it is forced by the lattice rather than chosen.
 
 - **Filter / selection**: preserve. Forced.
-- **Confluence (`UNION ALL`)**: the lattice join of the branches. For nullability, nullable if either branch is; for uniqueness, a key survives only if both branches carry it. Forced. `UNION` (distinct) is the same join with one operator-specific addition: set semantics dedups, so the whole projected row becomes a candidate key. The confluence rule is therefore keyed on the specific operator: `UNION` and `UNION ALL` have different row semantics.
-- **Cross (`JOIN`)**: each side preserves; a multi-input scalar expression folds its operands by the operator's rule. Forced for the structural core.
+- **Confluence (`UNION ALL`)**: the property's confluence combine. For the idempotent properties shipped here this is the domain join (nullability: nullable if either branch is; uniqueness: a key survives only if both branches carry it), so it is forced by the lattice. A counting property supplies it instead as the semiring `+` (addition), which is not a domain join; that case lives on the semiring substrate (see [`column-level-lineage.md`](./column-level-lineage.md)). `UNION` (distinct) is the same confluence with one operator-specific addition: set semantics dedups, so the whole projected row is a *superkey*, contributed to the key set only where no existing smaller key already subsumes it (the key set stays a minimal antichain, below). The confluence rule is therefore keyed on the specific operator: `UNION` and `UNION ALL` have different row semantics.
+- **Cross (`JOIN`)**: each side preserves; a multi-input scalar expression folds its operands by the operator's rule. The cross combine is the property's `times`, not the domain join by definition. For uniqueness it combines keys across sides subject to join-condition coverage, a side condition on the join predicate rather than on the two annotations alone, which is why it is proven directly rather than read off a semiring `×`. For a counting property it is the semiring `×` (multiplication), on the semiring substrate. For a pure-accumulation property such as where-provenance the `times` is set union, which coincides with the domain join.
 - **Scalar / projection**: preserve, transform, or clear. A genuine choice. An identity (`Alias`, a bare `Column`) preserves and is where tightening happens; a declared map (a currency conversion, a `discount` or `tax` annotation) transforms; an opaque scalar or bare literal clears the value to the lattice top. A binary combine (`a + b`) preserves when operands agree on the axis, raises a finding when two committed operands are incompatible (tax-inclusive plus tax-exclusive), and clears to top when a committed operand meets an unrefined one, recording why it cleared so the seam rule can decide whether to speak.
 - **Aggregation**: the aggregate transfer, whose behaviour is the measure's *combinability*. A genuine choice.
 
 So a property chooses behaviour only at scalar transforms and at aggregation; the rest follows from the lattice.
 
-The aggregate transfer asks whether a measure's meaning survives a `GROUP BY`, and under what precondition. Three outcomes cover it: **preserved** (a value-returning aggregate over a normal measure keeps its axes), **preserved under coherence** (it survives only where named columns are constant in the aggregation scope), or **cleared** (no aggregate preserves it, as for a ratio). An aggregate transfer must commute with confluence and cross, so that the single-pass walk gives the same annotation regardless of whether an aggregate sits above or below a `UNION ALL`; the framework discharges this for shipped aggregates and requires it of user-supplied ones. Aggregation is the one place the bare lattice does not force the rule, which is why it gets its own slot. The user-land vocabulary that compiles to these outcomes lives in the types layer; the v1 surface is a coherence declaration (`within=<cols>`) plus a flag for measures that never aggregate.
+The aggregate transfer asks whether a measure's meaning survives a `GROUP BY`, and under what precondition. Three outcomes cover it: **preserved** (a value-returning aggregate over a normal measure keeps its axes), **preserved under coherence** (it survives only where named columns are constant in the aggregation scope), or **cleared** (no aggregate preserves it, as for a ratio). An aggregate transfer must commute with confluence and cross, so that the single-pass walk gives the same annotation regardless of whether an aggregate sits above or below a `UNION ALL`. For a value-domain property (no semiring) this is discharged directly for each shipped aggregate and required of user-supplied ones. For a counting or accumulating property it is the semimodule homomorphism law of the aggregate-provenance tradition (the references), inherited rather than re-proven once the property supplies its semimodule. Aggregation is the one place the bare lattice does not force the rule, which is why it gets its own slot. The user-land vocabulary that compiles to these outcomes lives in the types layer; the v1 surface is a coherence declaration (`within=<cols>`) plus a flag for measures that never aggregate.
 
 ### Properties reading one another, in dependency order
 
@@ -57,7 +59,9 @@ Most properties propagate alone. A few need another property's annotations to co
 
 *A user-defined money type reads a functional dependency.* Currency is not built in; it is a refinement a developer declares (a `Money` semantic type carrying a currency axis), which the types layer compiles to a property like any other. Take `SELECT region, SUM(amount) AS total FROM orders GROUP BY region`, where `amount` is typed `Money`. Does `total` keep its currency? Only if every row folded into a group already shares one, that is, only if `region -> currency` holds. The compiled transfer reads that functional dependency. Where it holds, currency is preserved; otherwise the framework cannot guarantee a group shares one currency, so the transfer clears the axis and the audit flags it. The sum may be mixing currencies, which is the bug `within="currency"` exists to catch. It does not widen to top in silence, because losing a declared refinement is cause for investigation.
 
-A property names the properties its transfers read in `depends_on`, and the propagator evaluates those first. A transfer reaches a dependency only through a read-only `DepContext` typed to the declared dependencies, never a shared global map. The edge is a wire: it sets evaluation order and is the sole channel for the read. A transfer that did not declare an edge cannot type a read of that annotation, so a missing or mistyped edge is a type error at authoring time rather than stale state at runtime.
+A property names the properties its transfers read in `depends_on`, and the propagator evaluates those first. A transfer reaches a dependency only through a read-only `DepContext` typed to the declared dependencies, never a shared global map. The edge is a wire: it sets evaluation order and is the sole channel for the read. A transfer that did not declare an edge cannot type a read of that annotation, so a missing edge is a type error at authoring time rather than stale state at runtime.
+
+The typed read is sound because a `PropertyRef[K2, S2]` is never hand-constructed with chosen parameters. The only `PropertyRef` for a property is its own `ref`, minted once when the `Property` is built, so the `K2`/`S2` on the handle are the real value and scope types of that property. A `depends_on` entry is another property's `.ref`, and the registry that assembles a run (below) rejects duplicate names, so name identifies a property uniquely and `DepContext.annotation(ref, scope)` can return that property's annotation at the recovered type without a guess. `annotation` returns `None` when the dependency is silent at that scope (the node was not grounded or not reached); a transfer reads `None` as the dependency's lattice top, the same "we don't know" every other absence means. A transfer reading a relation-scoped dependency from a column node derives the relation scope from the column's own `ColumnRef.source`; that is the only legal way to produce the `S2` the read requires.
 
 The channel does not manufacture information. If no one ever typed `amount` as `Money`, there is no currency refinement on that column, and the mixed-currency `SUM` draws no finding. That is the substrate's posture (absence is silence), not a gap the channel could close.
 
@@ -79,7 +83,7 @@ Facts must be rock-solid because detectors rely on them silently. A wrong fact p
 The data model makes illegal states unrepresentable. A fact is parameterized by both its value type and its scope kind, so a column property cannot be handed a relation fact. Provenance is a sealed union, so a field that is meaningful only for one kind of fact exists only on that kind.
 
 ```python
-from typing import Any, Callable, Collection, Generic, Mapping, Protocol, TypeVar
+from typing import Any, Callable, Collection, Generic, Hashable, Mapping, Protocol, TypeVar, runtime_checkable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -93,8 +97,13 @@ S  = TypeVar("S",  ColumnRef, SourceRef)   # a property is column- OR relation-s
 S2 = TypeVar("S2", ColumnRef, SourceRef)
 
 # A world assignment chosen by the flag layer: the value each enumerated flag takes
-# in this run. Opaque to the substrate; defined by the flag system.
-WorldRef = Mapping[str, object]
+# in this run. Opaque to the substrate in meaning, but its identity must be stable:
+# facts bucket by world, so a world has to be hashable with value equality. Flag
+# values are primitives or enums, hence Hashable. The flag system defines the
+# contents; the substrate only relies on equality and hashing.
+@dataclass(frozen=True, slots=True)
+class WorldRef:
+    assignments: frozenset[tuple[str, Hashable]]
 
 
 class ScopeKind(StrEnum):
@@ -202,6 +211,13 @@ class Absent:
 Grounding = Anchor[K] | Opaque | Absent     # the K-parameterized result of grounding one node
 ```
 
+An opt-out is not a fact: a fact never carries the lattice top, so "declared opaque" cannot be expressed as a top-valued fact. It is its own input. An `OpaqueReader` reads opt-out declarations from the same three authoring channels a fact comes from (a `meta.dblect.opaque` key, an `OpaqueEffect` on a contract, an inline `dblect: opaque` marker) and returns the set of scopes opted out, which `grounding` consults before it consults facts:
+
+```python
+class OpaqueReader(Protocol[S]):
+    def opaque_scopes(self, manifest: "Manifest", *, name_to_source: Mapping[str, SourceRef]) -> Collection[S]: ...
+```
+
 ### The lattice: one source for order, resolution, and consistency
 
 A property states its order once, as a `Lattice`. Fact resolution and the validation check both derive from it, so they cannot drift apart.
@@ -235,8 +251,15 @@ def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
 
 def consistent(lat: Lattice[K]) -> Callable[[K, K], bool]:
     """The inferred value honours the declaration when the SQL revealed nothing (top) or
-    proved something at least as precise. Derived from ``refines``, never hand-written."""
+    proved something at least as precise. Derived from ``refines``, never hand-written.
+
+    ``bottom`` is handled explicitly rather than left to ``refines``: ``bottom`` refines
+    every value, so without this arm an inferred contradiction would pass vacuously. An
+    inferred ``bottom`` means propagation derived a contradiction at this node, which is a
+    finding, not a silent pass."""
     def check(declared: K, inferred: K) -> bool:
+        if inferred == lat.bottom:
+            return False
         return inferred == lat.top or lat.refines(inferred, declared)
     return check
 ```
@@ -258,9 +281,12 @@ A genuine contradiction is `meet == bottom`. For an enum axis it is reachable wh
 ```python
 @dataclass(frozen=True, slots=True)
 class PropertyRef(Generic[K2, S2]):
-    """A typed handle to a property. The K2 and S2 are recovered at a read site, so a
-    transfer reading a dependency gets that dependency's value and scope types back,
-    not ``object``. Equality is on ``name``."""
+    """A typed handle to a property. Minted once, as a property's own ``ref``, never
+    hand-constructed with chosen parameters, so ``K2`` and ``S2`` are the property's
+    real value and scope types rather than a phantom a caller could mismatch. A read
+    site recovers them, so a transfer reading a dependency gets that dependency's value
+    and scope types back, not ``object``. Equality is on ``name``; the registry's
+    name-uniqueness rule is what makes the recovered types sound at runtime."""
     name: str
 
 
@@ -284,18 +310,48 @@ class FactDiscoverer(Protocol[K, S]):
     ) -> Collection[Fact[K, S]]: ...
 
 
+# The existing operator algebra (dblect.lineage.semiring.Semiring), now an optional
+# slot rather than a mandatory field: present only for a property whose confluence or
+# cross counts or accumulates. When present, the engine derives the relational transfers
+# from it (UNION ALL is plus, JOIN is times) and the semiring laws become the obligations
+# that buy plan-shape independence. Left unset for the idempotent and value-domain
+# properties this module ships; populated by the accumulation properties (where-provenance,
+# aggregation depth) and the counting properties on the semiring substrate of
+# column-level-lineage.md. Concrete instances are frozen dataclasses (BooleanSemiring,
+# UnionSemiring), laws PBT'd already.
+@runtime_checkable
+class Semiring(Protocol[K]):
+    @property
+    def zero(self) -> K: ...   # identity for plus, annihilator for a strict times
+    @property
+    def one(self) -> K: ...    # identity for times
+    def plus(self, a: K, b: K) -> K: ...    # confluence combine (UNION ALL)
+    def times(self, a: K, b: K) -> K: ...   # cross combine (JOIN)
+
+
+@dataclass(frozen=True, slots=True)
+class AxisDisplay:
+    """The human-facing names the seam diagnostic fills its template from. Reserved
+    here; the types layer supplies it from a declaration, with fallback to the bare
+    type and axis names."""
+    name:        str
+    description: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class Property(Generic[K, S]):
-    ref:        PropertyRef[K, S]                 # the property's own typed handle; name lives here
-    scope_kind: ScopeKind                         # runtime walk dispatch; pinned by S at the type level
-    lattice:    Lattice[K]                        # the single algebraic source
+    ref:        PropertyRef[K, S]                 # the property's own typed handle, minted once; name lives here
+    scope_kind: ScopeKind                         # runtime walk dispatch; the smart constructors fix it to match S
+    lattice:    Lattice[K]                        # abstraction domain: resolve and consistent only
     operators:  Mapping[type[Expr], OperatorTransfer[K]]
     aggregates: Mapping[type[exp.AggFunc], AggregateTransfer[K]]
     ground:     Callable[[S], Grounding[K]]       # Anchor | Opaque | Absent for a node
+    semiring:   Semiring[K] | None = None         # operator algebra for counting/accumulating properties
+    display:    Callable[[K], AxisDisplay] | None = None   # seam-diagnostic names; None falls back to type/axis names
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 ```
 
-`consistent` and `resolve` are derived from `lattice`, so they are not fields. A constructor wires a property from its discoverers:
+Two invariants hold the optional `semiring` slot together with the rest. When it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`, and an idempotent semiring must satisfy `plus == lattice.join` so confluence has one answer. Both are checked once at construction. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type so the field cannot drift from `S` in practice; the field stays for runtime walk dispatch, where the erased `S` is not available. A constructor wires a property from its discoverers:
 
 ```python
 def nullability_property(
@@ -303,17 +359,33 @@ def nullability_property(
     extra: tuple[FactDiscoverer[Nullability, ColumnRef], ...] = (),
 ) -> Property[Nullability, ColumnRef]:
     facts = collect(manifest, (*_NULLABILITY_DISCOVERERS, *extra), name_to_source=name_to_source)
-    return Property(
-        ref=PropertyRef("nullability"),
-        scope_kind=ScopeKind.COLUMN,
+    return column_property(
+        name="nullability",
         lattice=NULLABILITY_LATTICE,
         operators=_NULLABILITY_OPERATORS,
         aggregates=_NULLABILITY_AGGREGATES,
-        ground=grounding(facts, NULLABILITY_LATTICE),
+        ground=grounding(facts, _NULLABILITY_OPAQUE(manifest), NULLABILITY_LATTICE),
     )
 ```
 
-`grounding` turns the collected facts into the per-node lookup: it folds a scope's bucket through `resolve`, raises on a `bottom` contradiction, returns `Opaque` where the node carries an explicit opt-out declaration, `Anchor` where a value resolved, and `Absent` otherwise.
+`grounding` turns the collected facts into the per-node lookup: it folds a scope's bucket through `resolve`, raises a `BuildIssue` on a `bottom` contradiction, returns `Opaque` for a scope in the opaque-opt-out set, `Anchor` where a value resolved, and `Absent` otherwise.
+
+```python
+def collect(
+    manifest: "Manifest", discoverers: tuple[FactDiscoverer[K, S], ...],
+    *, name_to_source: Mapping[str, SourceRef],
+) -> Mapping[S, tuple[Fact[K, S], ...]]:
+    """Run each discoverer and bucket its facts by scope. A discoverer that raises a
+    DiscovererError contributes nothing and the others are unaffected; any other
+    exception is a substrate bug and propagates, failing the build loudly rather than
+    silently dropping facts."""
+
+def grounding(
+    facts: Mapping[S, tuple[Fact[K, S], ...]], opaque: Collection[S], lat: Lattice[K],
+) -> Callable[[S], Grounding[K]]: ...
+```
+
+The errors are a small sealed set. `BuildIssue` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradiction` is raised by the binary `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
 
 ## Resolving multiple facts at a scope
 
@@ -373,6 +445,25 @@ Fact(
 
 Nothing in that path requires the author to know a fact store exists. The structural channels work the same way against `not_null` tests and native constraints, and the flag channel against `affects` under a chosen world. This is the round-trip check that the substrate carries the end-user surface: the declaration produces facts, the facts feed propagation, and propagation produces the boundary checks and findings the developer sees.
 
+## Assembling a run
+
+A property is not free-floating: it joins a run through a registry, which is the seam a developer-defined refinement enters by. The audit builds one `PropertyRegistry` per run from the built-in properties plus any contributed by the types layer (a compiled `Money` property is one more entry, indistinguishable from a built-in once registered).
+
+```python
+@dataclass(frozen=True, slots=True)
+class PropertyRegistry:
+    properties: tuple[Property[Any, Any], ...]
+
+    def evaluation_order(self) -> tuple[Property[Any, Any], ...]:
+        """Topological order over depends_on. Raises on a cycle, on an edge naming an
+        unregistered property, or on a duplicate name."""
+
+    def dep_context(self, store: "AnnotationStore") -> DepContext:
+        """A read-only view of the annotations computed so far, keyed by (name, scope)."""
+```
+
+Three things this fixes are load-bearing. **Name uniqueness is enforced here**, which is what makes the typed dependency read sound: because a name maps to exactly one registered property and a `PropertyRef` was minted from that property, `dep_context(...).annotation(ref, scope)` returns the right value at the right type. **Ordering is automatic.** A user property declares `depends_on` on a built-in property's `ref` (the coherence edge on `Money` reads the functional-dependency property), and `evaluation_order` interleaves it with the built-ins; the author writes no ordering. **A cycle or a dangling edge is a build error, not a runtime surprise**, so the acyclic `depends_on` guarantee the single-pass walk rests on is checked once at assembly. The propagator runs each property in `evaluation_order`, accumulating annotations into the store the next property's `DepContext` reads.
+
 ## Validation and propagation
 
 At a node the propagator has up to two inputs: the **inferred** annotation, from walking the upstream expression (absent at sources and seeds), and the **declared** value, from `ground` (absent when no fact applies). Two independent decisions follow.
@@ -419,19 +510,20 @@ The same rule covers any clearing of a declared refinement: an aggregate whose c
 
 The runtime layer is the check at the seam: the static side notes the boundary, and the generator probes whether the unrefined side actually respects the refined side's assumption.
 
-The diagnostic is a fixed template, not synthesized prose. dblect cannot author domain narrative like "this mixes tax-inclusive and tax-exclusive amounts," because it does not know what a user-domain axis means. It fills slots from what it has: the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, the type's own name and an optional one-line description from the declaration, with fallback to the bare type and axis names. A realistic rendering:
+The diagnostic is a fixed template, not synthesized prose. dblect cannot author domain narrative like "this mixes tax-inclusive and tax-exclusive amounts," because it does not know what a user-domain axis means. It fills slots from what it has: the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, drawn from the property's `display` slot (the `AxisDisplay` name and optional one-line description), with fallback to the bare type and axis names when no `display` is supplied. The `display` slot is the reserved seam the types layer fills from a declaration; the substrate plumbs the slot and never authors the text. A realistic rendering:
 
 > `orders.sql:12`: `total` combines `revenue` and `net_revenue` with `+`. `net_revenue` is `RevenueWithTax` but `revenue` carries no refinement on `contains_tax`, so the result drops it. Annotate `revenue` as `RevenueWithTax` if it qualifies, or treat this as a possible mismatch. To silence: mark `revenue` opaque, or disable `refinement-erased-at-seam` for this model.
 
 ## Soundness contract
 
 1. **Discoverer correctness is a hard guarantee for the input it reads.** A discoverer that emits a fact its declaration does not support is a substrate bug. PBT covers each shipping discoverer. Whether the resulting conclusion is unconditional depends on what it rests on: one built only from core transfers is a theorem given the declared inputs; one that uses a user signature holds given the declared inputs and that signature.
-2. **Transfer rules stay safe, and that obligation is explicit.** Every rule is conservative: it never reports more than the SQL guarantees, and a more precise input never yields a less precise output (what the references call sound and monotone). The framework proves this for its own rules, once. A user-supplied rule must meet the same bar; that is the obligation the author's vouch discharges, and the runtime layer catches an inaccurate vouch empirically. An aggregate rule additionally commutes with confluence and cross.
-3. **Absence is silence.** A node the input does not cover grounds as `Absent`, the propagator returns the lattice top, and detectors read it as "we don't know."
-4. **Conditional facts are captured but not activated.** A `not_null` or `unique` with a `where` filter produces a fact carrying the predicate, and grounding ignores the predicate for now. A `where` filter is selection, which the provenance tradition handles by conditioning the annotation; activation follows the rule [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md) commits to, so the deferral is engineering sequencing rather than an open question.
-5. **Contradictions are resolved and surfaced.** Two declarations whose values meet to `bottom` raise a `BuildIssue`; resolution keeps a deterministic value and never picks a winner from provenance.
-6. **Facts cross model boundaries only through propagation.** The flow value carries downstream through the lineage graph; the boundary value gates cross-model contract checks.
-7. **Asserted facts are checked, and the boundary is stable.** A fact on a derived node runs through `consistent` against the inferred value. A mismatch is a finding. The declared value remains the contract callers built against, and downstream-of-violation annotations are provisional.
+2. **Transfer rules stay safe, and that obligation is explicit.** Every rule is conservative: it never reports more than the SQL guarantees, and a more precise input never yields a less precise output (what the references call sound and monotone). This obligation is over the annotation's `value`, the `K` carried in the lattice; the framework proves it for its own rules, once. A user-supplied rule must meet the same bar; that is the obligation the author's vouch discharges, and the runtime layer catches an inaccurate vouch empirically. An aggregate rule additionally commutes with confluence and cross, by the semimodule law where a semiring is present and by direct discharge otherwise.
+3. **What flows is deterministic, and the two diagnostic bits are advisory.** The propagator carries an `Annotation`, not a bare `K`. Soundness and monotonicity are claims about its `value`. The `opacity` and `provisional` bits are diagnostic metadata, not part of the precision order, and they are deterministic functions of the walk: the lineage graph is a DAG visited in dependency-then-topological order, so each node's full annotation is fixed by its inputs. `provisional` clears on a fresh consistent anchor, which is non-monotone along dataflow on purpose (error recovery), and it is read only to *downgrade* a finding's severity, never to license a more precise value or suppress a sound finding. So the value's soundness is independent of the taint.
+4. **Absence is silence.** A node the input does not cover grounds as `Absent`, the propagator returns the lattice top, and detectors read it as "we don't know."
+5. **Conditional facts are captured but not activated.** A `not_null` or `unique` with a `where` filter produces a fact carrying the predicate, and grounding ignores the predicate for now. A `where` filter is selection, which the provenance tradition handles by conditioning the annotation; activation follows the rule [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md) commits to, so the deferral is engineering sequencing rather than an open question.
+6. **Contradictions are resolved and surfaced.** Two declarations whose values meet to `bottom` raise a `BuildIssue`; resolution keeps a deterministic value and never picks a winner from provenance. An inferred value that reaches `bottom` during propagation fails `consistent` and is a finding, never a vacuous pass.
+7. **Facts cross model boundaries only through propagation.** The flow value carries downstream through the lineage graph; the boundary value gates cross-model contract checks.
+8. **Asserted facts are checked, and the boundary is stable.** A fact on a derived node runs through `consistent` against the inferred value. A mismatch is a finding. The declared value remains the contract callers built against, and downstream-of-violation annotations are provisional.
 
 ## Trusting unenforced constraints
 
@@ -464,7 +556,7 @@ Silent degradation is sound but it can hide behind itself: a manifest where sqlg
 
 Uniqueness is the worked example for relation-scoped facts.
 
-**Encoding.** Uniqueness becomes a `Property[CandidateKeySet, SourceRef]`, built entirely from core transfers. The K-relations encoding from [`column-level-lineage.md`](./column-level-lineage.md) (`K = frozenset[frozenset[ColumnRef]]`) supplies the algebra. The candidate key is the *value* at the relation node, never a column-set address. Confluence keeps the keys both branches carry (and `UNION` adds the whole projected row as a key); a `JOIN` combines keys subject to join-condition coverage; `DISTINCT` and top-level `GROUP BY` introduce the projection set as a key.
+**Encoding.** Uniqueness becomes a `Property[CandidateKeySet, SourceRef]`, built entirely from core transfers. The K-relations encoding from [`column-level-lineage.md`](./column-level-lineage.md) (`K = frozenset[frozenset[ColumnRef]]`) supplies the algebra. The candidate key is the *value* at the relation node, never a column-set address. The value carries an invariant: it is an antichain under set inclusion, no key a superset of another, so it holds *candidate* (minimal) keys rather than every superkey. Every transfer and `resolve`'s meet re-minimize, dropping any key that subsumes a smaller one. Confluence keeps the keys both branches carry; a `JOIN` combines keys subject to join-condition coverage; `DISTINCT` and top-level `GROUP BY` introduce the projection set as a key. `UNION` (distinct) makes the whole projected row a *superkey*, contributed only where no existing smaller key already subsumes it, so the antichain invariant is what keeps a non-minimal row-key from polluting the set and weakening downstream `JOIN` results.
 
 **Discoverers.** All produce relation facts whose value is a key set:
 
@@ -492,7 +584,7 @@ Resolution is the lattice meet, which for uniqueness unions independent declared
 
 ## Sequencing
 
-1. The data model (`Fact`, `Provenance`, `Annotation`, `Grounding`, `Lattice`, `PropertyRef`, `DepContext`, `FactDiscoverer`, `collect`, `grounding`) and the `Property` shape (`scope_kind`, `lattice`, `ground`, `depends_on`). The propagator grounds at every node, runs `consistent` when both inferred and declared are present, carries `Annotation` through transfers, and dispatches its walk on `scope_kind`. Ships with nullability.
+1. The data model (`Fact`, `Provenance`, `Annotation`, `Grounding`, `Lattice`, `Semiring`, `PropertyRef`, `DepContext`, `FactDiscoverer`, `OpaqueReader`, `collect`, `grounding`, the `BuildIssue`/`SeamContradiction`/`DiscovererError` errors), the `Property` shape (`scope_kind`, `lattice`, `ground`, optional `semiring`, optional `display`, `depends_on`) with its `column_property`/`relation_property` constructors, and the `PropertyRegistry` that orders properties and enforces name uniqueness. The propagator grounds at every node, runs `consistent` when both inferred and declared are present, carries `Annotation` through transfers, and dispatches its walk on `scope_kind`. Ships with nullability, which leaves `semiring` and `display` unset.
 2. Nullability discoverers (`not_null` test, column `nullable`, native `NOT NULL`), nullability promoted to a production property. Closes the source-rule piece of [`#26`](https://github.com/dvryaboy/dblect/issues/26).
 3. Uniqueness migration (own change). Closes [`#16`](https://github.com/dvryaboy/dblect/issues/16).
 4. Type discoverer (column `data_type`). First consumer is the semantic-types substrate.
@@ -506,9 +598,13 @@ Steps 1 and 2 ship together. The rest are independent and land driven by the con
 
 - **Per-discoverer PBT.** Generate manifests and declarations with random metadata; assert each discoverer's facts are a function of its documented input, never invent claims, never drop ones they should produce, and never emit a top-valued claim.
 - **Lattice laws.** PBT on each property's lattice (associativity, commutativity, idempotence of meet and join, absorption, the `top`/`bottom` identities) and on the derived `consistent` (reflexivity, and `consistent(declared, top)` for every value so an opaque upstream never fails the check). Because resolution and `consistent` are derived from the lattice, this is the single place those laws are tested.
-- **Transfer obligations.** Monotonicity of each shipped transfer; commutation of each aggregate transfer with confluence and cross. A user-domain property's transfers are tested for monotonicity in the same harness so a registered axis cannot break the property quietly.
+- **Transfer obligations.** Monotonicity of each shipped transfer over its annotation `value`; commutation of each aggregate transfer with confluence and cross. A user-domain property's transfers are tested for monotonicity in the same harness so a registered axis cannot break the property quietly.
+- **Semiring laws (when a `semiring` is present).** A property carrying a `semiring` is PBT'd for associativity, commutativity, distributivity of `times` over `plus`, the identity and annihilation roles of `zero`/`one`, and, for an idempotent semiring, `plus == lattice.join`. This is the obligation that buys plan-shape independence for the counting and accumulating properties; the properties shipped here carry no `semiring` and skip it.
+- **Annotation determinism.** The full annotation at each node is a deterministic function of its inputs under the dependency-then-topological walk: same graph and same facts yield the same `opacity` and `provisional`, and a `provisional` taint only downgrades finding severity, never licenses a more precise value.
+- **Dependency-read soundness.** A registry with a duplicate property name, a `depends_on` cycle, or an edge to an unregistered property fails assembly; a `DepContext` read returns the dependency's annotation at the recovered type, and a silent dependency reads as top.
+- **Opaque grounding.** A scope in the opaque-opt-out set grounds as `Opaque` rather than `Anchor` or `Absent`, regardless of any facts also present, and flows `EXPLICIT`.
 - **Seam diagnostic.** An `EXPLICIT` top meeting a declared refinement is silent; an `IMPLICIT` top meeting one is silent at the zero-declaration layer and a finding at the typed layer; two committed incompatible operands are a finding at both. The diagnostic names the column, both readings, and the suppression path.
-- **Resolution determinism.** A bucket of facts in any order resolves to the same value; a `bottom` contradiction raises a `BuildIssue` and yields the same deterministic value regardless of order.
+- **Resolution determinism.** A bucket of facts in any order resolves to the same value; a `bottom` contradiction raises a `BuildIssue` and yields the same deterministic value regardless of order. Compile-value facts sharing one `WorldRef` bucket by world equality, so resolution within a world is order-independent.
 - **Tightening and boundary.** A structural property whose inferred value is strictly more precise than the declaration propagates the inferred value as flow, keeps the declared value as boundary, and emits the soft finding. A user-domain property does the same through a preserving chain, and a clearing step stops the tightening.
 - **Asserted-fact end-to-end.** A `not_null` declaration on a column with a `NULLABLE` upstream surfaces a finding and propagates the declared value downstream as provisional; the same with a `NON_NULL` or top upstream propagates without a finding. The analogous test for a candidate-key declaration on a derived model.
 - **Coverage reporting.** A deliberately under-resolvable model reports low coverage and trips the floor finding.
@@ -518,9 +614,19 @@ Steps 1 and 2 ship together. The rest are independent and land driven by the con
 
 Adopting this evolves `Property` and the propagator, so a few companion docs gain the new shape when the implementation lands:
 
-- [`column-level-lineage.md`](./column-level-lineage.md): `Property` gains `scope_kind`, `lattice`, `ground`, and `depends_on`; transfers take a read-only `DepContext` and carry `Annotation`; the propagator evaluates properties in dependency order, dispatches its walk on `scope_kind`, and grows the relation-algebra path.
+- [`column-level-lineage.md`](./column-level-lineage.md): `Property` gains `scope_kind`, `lattice`, `ground`, an optional `semiring`, an optional `display`, and `depends_on`; the bare `Semiring`-keyed bundle becomes the optional operator-algebra slot the accumulation properties (where-provenance, aggregation depth) and the counting properties (cardinality) populate while the idempotent and value-domain properties leave it unset; transfers take a read-only `DepContext` and carry `Annotation`; properties are assembled through a `PropertyRegistry` that fixes evaluation order and enforces name uniqueness; the propagator evaluates properties in dependency order, dispatches its walk on `scope_kind`, and grows the relation-algebra path.
 - [`design-concepts-digest.md`](./design-concepts-digest.md): the structural/user-domain split is expressed as where a property's transfers come from (the proven core or a user declaration), with the composition rules organised by relational operator into forced-versus-chosen and the aggregate behaviour named *combinability*.
 - [`conditional-uniqueness-facts.md`](./conditional-uniqueness-facts.md): the model-keyed conditional fact becomes a relation-scoped `Fact` carrying the predicate.
+
+### Existing lineage code this revises
+
+The substrate already exists in skeletal form; adopting this design evolves it rather than starting fresh. The semiring interface survives; what changes is that it stops being mandatory.
+
+- [`semiring.py`](../../src/dblect/lineage/semiring.py): the `Semiring` protocol and its `BooleanSemiring` / `UnionSemiring` instances are kept as the optional operator-algebra slot. Their laws are already PBT'd, so the obligation that buys plan-shape independence for the accumulation and counting properties is in place. No reshape, only a change of role from required field to optional slot.
+- [`property.py`](../../src/dblect/lineage/property.py): the substantive rewrite. `Property[K]` becomes `Property[K, S]` and gains `lattice`, `scope_kind`, `ground` (replacing `source`), the optional `semiring`, `display`, and `depends_on`. The propagator threads a `DepContext` and carries `Annotation` instead of bare `K`. Confluence stops hardwiring `semiring.plus`: it uses the property's confluence combine, which is `lattice.join` when no semiring is present and `semiring.plus` when one is. The `times`-fold fallback applies only when a semiring is present; otherwise the property supplies the rule or the result is `lattice.top`. `default()` returns `lattice.top` (today's `unknown_value`). The single-`ColumnRef` per-column walk stays for column-scoped properties; the relation-algebra walk for `SourceRef`-scoped properties is the new path the uniqueness migration adds.
+- [`properties/nullability.py`](../../src/dblect/lineage/properties/nullability.py): the demo becomes the production property of step 2. `NullabilitySemiring` (where `plus == times`, both "any nullable taints") is replaced by a `NULLABILITY_LATTICE` whose join is exactly that taint rule, with `semiring=None`; `_source_unknown` becomes `ground` over the nullability discoverers.
+- [`properties/where_provenance.py`](../../src/dblect/lineage/properties/where_provenance.py) and [`properties/aggregation_depth.py`](../../src/dblect/lineage/properties/aggregation_depth.py): the in-tree examples of a populated `semiring` slot, so the optional slot is exercised rather than hypothetical. They keep their semirings and gain a `lattice` for resolution and consistency.
+- `tests/lineage/test_semiring_laws.py`: keeps the semiring-law PBT, now scoped to the properties that carry a semiring, and gains the lattice-law PBT that every property runs.
 
 ## References
 
