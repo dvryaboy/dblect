@@ -42,12 +42,14 @@ Per the intro doc's rule, money, ranges, and addresses are modeled as separate c
 
 A type binding compiles to substrate inputs, and the user sees none of them:
 
+- The type compiles to a single `Property[K, ColumnRef]`: a value-domain axis lattice, the scalar and aggregate transfers below, and `semiring=None` (a user-domain axis does not count or accumulate, so it carries no operator-algebra slot). The compiled property joins the run through the substrate's `PropertyRegistry`, which assigns its evaluation order from `depends_on` and rejects a name collision with a built-in. Registration is the seam: a developer-defined type is one more registry entry, indistinguishable from nullability once compiled.
 - Each refinement axis on a bound column becomes a `USER_ASSERTED` `Fact[K]` at that column's scope.
 - The scalar and aggregate behaviors become the property's operator and aggregate transfers.
-- A coherence declaration becomes a `depends_on` edge on the functional-dependency property plus the aggregate transfer that reads it.
+- A coherence declaration becomes a `depends_on` edge on the functional-dependency property plus the aggregate transfer that reads it. The edge is the depended-on property's `ref`, so the substrate orders the FD property before this one; the read flows through a typed `DepContext` rather than a global.
+- The type's display name and optional one-line description fill the substrate's `display` slot (`AxisDisplay`), which the seam diagnostic reads when this axis is the one that clears at a typed/untyped boundary. The framework authors none of that text; it plumbs the name the modeler chose, falling back to the bare type and axis names when the type supplies no description.
 - Boundary checking (does a producer column satisfy a consumer's declared type) is the substrate's `consistent` check over the user-domain precision order, the same machinery nullability uses.
 
-The user writes `RevenueNet`, `Field(within="currency")`, `summable=False`. They never see `Scope`, `Fact`, `depends_on`, or a transfer. That round-trip is the test that the substrate can carry the surface.
+The user writes `RevenueNet`, `Field(within="currency")`, `summable=False`. They never see `Property`, `PropertyRegistry`, `Scope`, `Fact`, `depends_on`, `AxisDisplay`, or a transfer. That round-trip is the test that the substrate can carry the surface.
 
 ## Decisions
 
@@ -62,7 +64,7 @@ The calls made for v1, with the reasoning and what each gives up recorded in the
 
 ## What this does not cover
 
-- The declaration *syntax* and registry mechanics ([`dblect_technical_intro.md`](./dblect_technical_intro.md)).
+- The declaration *syntax* and the declaration-registry mechanics where Python `ModelContract`s are collected ([`dblect_technical_intro.md`](./dblect_technical_intro.md)); distinct from the substrate's `PropertyRegistry`, which orders compiled properties.
 - The propagation engine and fact substrate ([`lineage-facts.md`](./lineage-facts.md)).
 - Flags and world enumeration ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)); a flag's `affects` is another producer of facts under a chosen world.
 - Opaque scalar and UDF handling ([`udf-and-opaque-operators.md`](./udf-and-opaque-operators.md)).
@@ -117,6 +119,6 @@ Each entry records the choice, the alternative weighed, what the choice buys, wh
 ## References
 
 - [`dblect_technical_intro.md`](./dblect_technical_intro.md): the declaration surface this layer's semantics attach to.
-- [`lineage-facts.md`](./lineage-facts.md): the substrate these declarations compile to (facts, transfers, `depends_on`, `consistent`).
+- [`lineage-facts.md`](./lineage-facts.md): the substrate these declarations compile to (facts, transfers, `depends_on`, `consistent`, the `PropertyRegistry` a compiled property registers through, and the `AxisDisplay` slot the seam diagnostic reads).
 - [`design-concepts-digest.md`](./design-concepts-digest.md): the two trust classes and the Pandera-shaped-surface constraint.
 - Pandera and Pydantic for the declaration pattern; the type-qualifier tradition (CQual, FlowCaml) for refinement axes as a user-domain lattice; Kimball measure additivity for the summability distinction.
