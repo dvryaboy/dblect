@@ -53,17 +53,17 @@ The aggregate transfer asks whether a measure's meaning survives a `GROUP BY` or
 
 **Properties can read one another, in dependency order.** Most properties propagate alone: nullability never consults uniqueness. A few need another property's annotations to compute their own transfers, and two cases carry the design.
 
-*Cardinality reads uniqueness.* To tell a fan-out join from a key-preserving one, the cardinality transfer at a `JOIN` asks whether the join key is unique on the other side. That answer is the uniqueness property's annotation, read at the join node.
+*Cardinality reads uniqueness.* To tell a fan-out join from a key-preserving one, the cardinality transfer at a `JOIN` asks whether the join key is unique on the other side. That answer is the uniqueness property's annotation, read at the join node. Both are framework-owned.
 
-*Currency reads a functional dependency.* Take `SELECT region, SUM(amount) AS total FROM orders GROUP BY region`. Does `total` keep a currency? Only if every row folded into a group already shares one, that is, only if `region → currency` holds. The currency transfer reads that functional dependency to decide: where it holds, currency is preserved; where it does not, the sum mixes currencies and the axis clears to `UNKNOWN`.
+*A user-defined money type reads a functional dependency.* Currency is not a framework property. It is a refinement a developer declares, say a `Money` semantic type carrying a currency axis, which the types layer compiles to a user-extended property. Take `SELECT region, SUM(amount) AS total FROM orders GROUP BY region`, where `amount` is typed `Money`. Does `total` keep its currency? Only if every row folded into a group already shares one, that is, only if `region → currency` holds. The compiled currency transfer reads that functional dependency to decide: where it holds, currency is preserved; where it does not, the sum mixes currencies and the axis clears to `UNKNOWN`. This is the allowed direction, a user-extended property reading a framework-owned one; the reverse is forbidden.
 
 A property names the properties its transfers read in `depends_on`, and the propagator evaluates those first. A transfer reaches them only through a read-only `DepContext` that exposes exactly the declared dependencies' annotations, never a shared global map. So the edge is a wire, not a hint: it sets evaluation order and it is the sole channel for the read. A transfer that never declared an edge cannot read that annotation at all, so a missing edge fails at authoring time rather than silently reading stale state. This keeps the wiring between properties honest.
 
-Honest wiring does not manufacture information. If no one ever declared that `amount` carries a currency, there is no currency property on that column, and the mixed-currency `SUM` above draws no finding. That is the substrate's posture (absence is silence), not a gap the channel could close.
+Honest wiring does not manufacture information. If no one ever typed `amount` as `Money` (or otherwise declared its currency), there is no currency refinement on that column, and the mixed-currency `SUM` above draws no finding. That is the substrate's posture (absence is silence), not a gap the channel could close.
 
 Two invariants keep this sound. The `depends_on` graph is acyclic, so no pair of properties needs a joint fixpoint over a product lattice. And a framework-owned property never depends on a user-extended one, so a structural conclusion never becomes conditional on a user-supplied transfer.
 
-The user never writes any of this. The `depends_on` edge for the currency example originates in a type-layer coherence declaration (a measure that aggregates only where its currency column is constant, written `within="currency"`). The framework compiles that intent into the dependency and the transfer; the user-land vocabulary lives in the types layer.
+The user never writes any of this. The `depends_on` edge for the example originates in a coherence declaration on the `Money` type (a measure that aggregates only where its currency column is constant, written `within="currency"`). The framework compiles that intent into the dependency and the transfer; the user-land vocabulary lives in the types layer.
 
 ## What a fact is
 
