@@ -1,7 +1,7 @@
 # Lineage facts: grounding annotations from declarations
 
 Status: design
-Audience: engineers working on the lineage substrate, on a `Property` that needs values from manifest declarations or developer assertions, or on the flag system that feeds configuration values into propagation. It assumes the propagation calculus from [`propagation-soundness.md`](./propagation-soundness.md) (how a property propagates, and the obligations it meets) and the engine from [`column-level-lineage.md`](./column-level-lineage.md). This doc covers one thing: how declarations become grounded values that enter the walk, and the soundness contract for that grounding.
+Audience: engineers working on the lineage substrate, on a `Property` that needs values from manifest declarations or developer assertions, or on the flag system that feeds configuration values into propagation. It assumes the propagation calculus from [`propagation-soundness.md`](./propagation-soundness.md) (how a property propagates, and the obligations it meets) and the engine from [`column-level-lineage.md`](./column-level-lineage.md). This doc covers one thing: how declarations become grounded values that enter the walk, and the soundness contract for that grounding. The complete type surface is in [`lineage-facts-types.md`](./lineage-facts-types.md); this doc shows only the shapes that carry a design decision.
 
 ## Motivation
 
@@ -33,90 +33,20 @@ A fact grounds a node in one of two ways, depending on whether the node has a de
 
 ## Data model
 
-The data model makes illegal states unrepresentable. A fact is parameterized by both its value type and its scope kind, so a column property cannot be handed a relation fact. Provenance is a sealed union, so a field that is meaningful only for one kind of fact exists only on that kind.
+The data model makes illegal states unrepresentable. A fact is parameterized by both its value type and its scope kind, so a column property cannot be handed a relation fact, and provenance is a sealed union, so a field meaningful for one kind of fact exists only on that kind. The full listing is in [`lineage-facts-types.md`](./lineage-facts-types.md); the shapes below are the ones that carry a decision.
+
+A `Fact[K, S]` is the whole concept:
 
 ```python
-from typing import Any, Callable, Collection, Generic, Hashable, Mapping, Protocol, TypeVar, final, runtime_checkable
-from dataclasses import dataclass, field
-from enum import StrEnum
-
-from dblect.lineage.graph import ColumnRef, SourceRef
-from dblect.lineage.expr import Expr            # the sqlglot expression wrapper
-import sqlglot.expressions as exp
-
-K  = TypeVar("K")
-K2 = TypeVar("K2")
-S  = TypeVar("S",  ColumnRef, SourceRef)   # a property is column- OR relation-scoped, never both
-S2 = TypeVar("S2", ColumnRef, SourceRef)
-
-# A world assignment chosen by the flag layer. Opaque to the substrate in meaning;
-# facts bucket by world, so its identity must be stable (hashable, value equality).
-@dataclass(frozen=True, slots=True)
-class WorldRef:
-    assignments: frozenset[tuple[str, Hashable]]
-
-
-class ScopeKind(StrEnum):
-    COLUMN   = "column"    # propagator walks per-column projections
-    RELATION = "relation"  # propagator walks relation-algebra structure
-```
-
-### Provenance
-
-Provenance records where a fact was authored, for tracing an annotation back to its grounding and for reporting. It carries no authority ordering: conflicts are resolved by the lattice, never by ranking channels. Each variant carries exactly the fields valid for it.
-
-```python
-class DeclaredSource(StrEnum):
-    DBT_GENERIC_TEST = "dbt_generic_test"  # not_null, unique, accepted_values, …
-    DBT_UTILS_TEST   = "dbt_utils_test"    # unique_combination_of_columns, accepted_range, …
-    COLUMN_METADATA  = "column_metadata"   # data_type, nullable in schema.yml
-    DBT_META         = "dbt_meta"          # meta.dblect.* blocks in schema.yml
-    MODEL_CONTRACT   = "model_contract"    # dbt model-contract declaration
-    USER_ASSERTED    = "user_asserted"     # Python SemanticType / Field / ModelContract
-
-
-class CompileOrigin(StrEnum):
-    DBT_VAR    = "dbt_var"     # var() from dbt_project.yml; statically enumerable
-    ENV_VAR    = "env_var"     # env_var(); statically enumerable
-    DBT_CONFIG = "dbt_config"  # node.config[...] key
-    COMPUTED   = "computed"    # Jinja/Python substitution, possibly a DB call; opaque to enumeration
-
-
-@dataclass(frozen=True, slots=True)
-class Declared:
-    """Authored directly: a dbt test, schema.yml metadata or meta, or a Python contract."""
-    source: DeclaredSource
-
-
-@dataclass(frozen=True, slots=True)
-class NativeConstraint:
-    """A warehouse or dbt 1.5+ constraint. ``enforced_on_write`` exists only here and
-    records whether the active adapter enforces the constraint on write. It is read by
-    the unenforced-constraint finding, never by fact resolution."""
-    enforced_on_write: bool
-
-
-@dataclass(frozen=True, slots=True)
-class CompileValue:
-    """A value resolved at compile time. ``world`` exists only here and is never absent:
-    a compile value is ground truth in exactly the world the flag layer fixed for this
-    run. ``origin`` decides whether the flag layer can enumerate worlds over it."""
-    origin: CompileOrigin
-    world:  WorldRef
-
-
-Provenance = Declared | NativeConstraint | CompileValue
-
-
 @dataclass(frozen=True, slots=True)
 class Fact(Generic[K, S]):
-    """One claim about one node (a column when S is ColumnRef, a relation when S is
-    SourceRef), under one property."""
-    scope:      S
-    value:      K
-    provenance: Provenance
+    scope:      S            # ColumnRef (a column) or SourceRef (a relation); S is fixed per property
+    value:      K            # the claim, in the property's value type
+    provenance: Provenance   # where it came from; carries no authority order
     detail:     str | None = None
 ```
+
+`Provenance` is a sealed union of `Declared` (a dbt test, `schema.yml` metadata or meta, or a Python contract), `NativeConstraint` (a warehouse or dbt 1.5+ constraint, carrying `enforced_on_write`, read only by the unenforced-constraint finding), and `CompileValue` (a value resolved at compile time, carrying the `WorldRef` the flag layer fixed). Each variant carries exactly the fields valid for it, and provenance never enters resolution: conflicts are resolved by the lattice, never by ranking channels.
 
 ### One annotation, one way to be unknown
 
@@ -136,7 +66,7 @@ class Annotation(Generic[K]):
     provisional: bool = False   # error-recovery taint, orthogonal to opacity
 ```
 
-`opacity` carries information only when `value` is top: `REFINED` *is* "value is not top," and the choice that matters (`EXPLICIT` versus `IMPLICIT`) is whether a top was chosen or fell out. `provisional` is the one bit that is not about knowing or not knowing: it is an error-recovery taint, set when a node's inferred value conflicts with its declared value, propagated as the logical OR of a transfer's inputs, and cleared when a node is freshly anchored by a fact the inferred value is consistent with. Detectors may downgrade findings that rest on a provisional annotation, and it never licenses a more precise value. It stays distinct from `opacity` on purpose. `enforced_on_write` (does a running guard back this constraint), `CompileOrigin.COMPUTED` (can the flag layer enumerate worlds over this value), and `provisional` are three separate axes, and none of them is a kind of unknown: collapsing them into the opacity vocabulary would lose exactly the distinctions the diagnostics rely on.
+`opacity` carries information only when `value` is top: `REFINED` *is* "value is not top," and the choice that matters (`EXPLICIT` versus `IMPLICIT`) is whether a top was chosen or fell out. `provisional` is the one bit that is not about knowing or not knowing: it is an error-recovery taint, set when a node's inferred value conflicts with its declared value, propagated as the logical OR of a transfer's inputs, and cleared when a node is freshly anchored by a consistent fact. Detectors may downgrade findings that rest on a provisional annotation, and it never licenses a more precise value. It stays distinct from `opacity` on purpose: `enforced_on_write`, `CompileOrigin.COMPUTED`, and `provisional` are three separate axes, and none of them is a kind of unknown, so collapsing them into the opacity vocabulary would lose exactly the distinctions the diagnostics rely on.
 
 ### Grounding returns a declared annotation
 
@@ -148,60 +78,13 @@ Grounding a node yields its **declared annotation**: the value and opacity the n
 | the scope is opted out | `Annotation(top, EXPLICIT)` | declared opaque; flow top, silently |
 | neither | `Annotation(top, IMPLICIT)` | nothing declared; the walk defaults to top |
 
-An opt-out is still not a fact: a discoverer never emits a top-valued fact, so "declared opaque" is synthesized as a top-`EXPLICIT` annotation by the grounding builder rather than stored as a fact. Its input is an `OpaqueReader`, which reads the same three authoring channels a fact comes from (a `meta.dblect.opaque` key, an `OpaqueEffect` on a contract, an inline `dblect: opaque` marker) and returns the scopes opted out; the builder consults it before facts:
-
-```python
-class OpaqueReader(Protocol[S]):
-    def opaque_scopes(self, manifest: "Manifest", *, name_to_source: Mapping[str, SourceRef]) -> Collection[S]: ...
-```
+An opt-out is still not a fact: a discoverer never emits a top-valued fact, so "declared opaque" is synthesized as a top-`EXPLICIT` annotation by the grounding builder rather than stored as a fact. Its input is an `OpaqueReader` (in the types reference), which reads the same three authoring channels a fact comes from (a `meta.dblect.opaque` key, an `OpaqueEffect` on a contract, an inline `dblect: opaque` marker) and returns the scopes opted out, consulted before facts.
 
 The propagator's control flow falls out of the declared annotation without a separate type. A node with no derivation (a source or seed) flows its declared annotation directly. A node whose declared annotation is `EXPLICIT` short-circuits: it flows top silently and the walk is skipped, because the modeler took responsibility for the node. Otherwise the node is derived, the walk produces the **inferred** annotation, and validation (below) reconciles the two.
 
 ### The lattice: one source for order, resolution, and consistency
 
-A property states its order once, as a `Lattice`. Fact resolution and the validation check both derive from it, so they cannot drift apart.
-
-```python
-@dataclass(frozen=True, slots=True)
-class Lattice(Generic[K]):
-    """``meet`` is the greatest lower bound (the more precise value), ``join`` the least
-    upper bound (used at a confluence). ``top`` is 'no information'; ``bottom`` is
-    'contradiction', a value that no data can satisfy."""
-    meet:   Callable[[K, K], K]
-    join:   Callable[[K, K], K]
-    top:    K
-    bottom: K
-
-    def refines(self, finer: K, coarser: K) -> bool:
-        return self.meet(finer, coarser) == finer
-
-
-def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
-    """Fold every fact at one scope to the most precise value consistent with all of
-    them. Meet is associative and commutative by the lattice laws, so the result does
-    not depend on discoverer order. A result of ``bottom`` means the declarations are
-    mutually unsatisfiable; the caller raises a BuildIssue and keeps this deterministic
-    value so the run stays reproducible."""
-    value = lat.top
-    for f in facts:
-        value = lat.meet(value, f.value)
-    return value, value == lat.bottom
-
-
-def consistent(lat: Lattice[K]) -> Callable[[K, K], bool]:
-    """The inferred value honours the declaration when the SQL revealed nothing (top) or
-    proved something at least as precise. Derived from ``refines``, never hand-written.
-
-    ``bottom`` is handled explicitly rather than left to ``refines``: ``bottom`` refines
-    every value, so without this arm an inferred contradiction would pass vacuously. An
-    inferred ``bottom`` means propagation derived a contradiction at this node, which is a
-    finding, not a silent pass."""
-    def check(declared: K, inferred: K) -> bool:
-        if inferred == lat.bottom:
-            return False
-        return inferred == lat.top or lat.refines(inferred, declared)
-    return check
-```
+A property states its order once, as a `Lattice` (`meet`, `join`, `top`, `bottom`). Two operations derive from it, so they cannot drift apart: `resolve` folds a scope's facts with the meet, the most precise value consistent with every claim; `consistent(declared, inferred)` holds when the inferred value revealed nothing (top) or refines the declaration, with an inferred `bottom` treated as a finding rather than a vacuous pass. Both are functions of the lattice, not fields a property can override (the code is in the types reference).
 
 The three property shapes instantiate the one lattice:
 
@@ -211,161 +94,40 @@ The three property shapes instantiate the one lattice:
 | Uniqueness          | `{}` (no keys) | `x` knows a superset of `y`'s keys | union of keys         | keys both branches carry         | no                 |
 | User-domain axis (enum) | `UNKNOWN` | `x == y`, or `y` is `UNKNOWN`     | equal value, else `bottom` | equal value, else `UNKNOWN`   | yes                |
 
-The user-domain row shows the simplest shape, an enum where any two distinct values disagree (`contains_tax`, currency). An axis is free to use any bounded lattice instead: an interval for a range (`meet` is intersection, `join` is the hull, `bottom` is the empty interval), a value set for accepted-values, or a chain where one value genuinely refines another (`daily` under `monthly` under `yearly`). All of them go through the same `resolve` and `consistent`; only the `meet`, `join`, `top`, and `bottom` differ.
+The user-domain row shows the simplest shape, an enum where any two distinct values disagree (`contains_tax`, currency). An axis is free to use any bounded lattice instead: an interval for a range (`meet` is intersection, `join` is the hull, `bottom` is the empty interval), a value set for accepted-values, or a chain where one value genuinely refines another (`daily` under `monthly` under `yearly`). All go through the same `resolve` and `consistent`; only the `meet`, `join`, `top`, and `bottom` differ. A genuine contradiction is `meet == bottom`, reachable for an enum when two declarations name different values and for an interval when two ranges do not overlap. Structural properties never contradict: a `not_null` constraint and a permissive `nullable: true` meet to the stronger guarantee, and two candidate-key declarations simply union.
 
-A genuine contradiction is `meet == bottom`. For an enum axis it is reachable whenever two declarations name different values (a contract says `contains_tax=TRUE`, a meta block says `FALSE`); for an interval axis, whenever two declared ranges do not overlap. Structural properties never contradict: a `not_null` constraint and a permissive `nullable: true` declaration meet to the stronger guarantee, and two candidate-key declarations simply union.
+### What a property bundles
 
-### Properties, transfers, and discoverers
-
-A `Property` bundles the lattice with the transfer catalogs and the grounding function. The transfer semantics and their soundness obligations are in [`propagation-soundness.md`](./propagation-soundness.md); what follows is the substrate shape facts plugs into.
+A `Property` is the lattice plus the transfer catalogs plus the grounding function. The transfer semantics and their obligations live in [`propagation-soundness.md`](./propagation-soundness.md); the shape is:
 
 ```python
-_MINT = object()   # module-private token; only this module can mint a PropertyRef
-
-
-@final
-@dataclass(frozen=True, slots=True)
-class PropertyRef(Generic[K2, S2]):
-    """A typed handle to a property, minted once as a property's own ``ref``. ``K2`` and
-    ``S2`` are the property's real value and scope types, so a read site recovers them
-    rather than ``object``. The handle is un-forgeable: its constructor requires a
-    module-private mint token, so a caller cannot build a ``PropertyRef[WrongK, S]`` with
-    chosen parameters and read another property's annotation back at the wrong type.
-    Equality is on ``name`` (the registry rejects duplicates), and the registry checks a
-    ``depends_on`` edge against the *identity* of a registered property's minted ref, so a
-    forged handle fails assembly rather than silently mistyping a read. Soundness no longer
-    rests on the convention 'never hand-construct this'; the constructor enforces it."""
-    name: str
-    _mint: object = field(repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if self._mint is not _MINT:
-            raise TypeError("PropertyRef is minted by Property, not constructed directly")
-
-
-class DepContext(Protocol):
-    def annotation(self, ref: PropertyRef[K2, S2], scope: S2) -> Annotation[K2] | None: ...
-
-
-# Transfers receive and return annotations, so opacity and the provisional taint flow
-# through them. A property with no dependencies ignores the DepContext.
-OperatorTransfer = Callable[[Expr, tuple[Annotation[K], ...], DepContext], Annotation[K]]
-
-
-@dataclass(frozen=True, slots=True)
-class CoherenceGuard:
-    """A precondition an aggregate's meaning rests on: the ``within`` columns must be
-    constant across each aggregated group, which is the functional dependency
-    ``group_keys -> within``. The guard reads that FD from the dependency property ``fd``
-    at the aggregation's input relation; where it does not hold the aggregate's result
-    clears to top and the seam rule reports it, because a declared refinement was lost.
-    Compiles from a types-layer ``within=<cols>`` declaration."""
-    fd:     PropertyRef[Any, SourceRef]   # the functional-dependency / uniqueness property to read
-    within: tuple[str, ...]               # the columns required constant within the group
-
-
-@dataclass(frozen=True, slots=True)
-class AggregateRule(Generic[K]):
-    """An aggregate transfer split so its soundness obligation is checkable. ``core`` is a
-    pure value-domain map with no DepContext, and it is the piece that must commute with
-    confluence and cross (see propagation-soundness.md). ``coherence`` is the optional
-    clear-on-failure guard, and the FD read it performs is the only way a dependency enters
-    an aggregate, so ``core`` is property-tested in isolation."""
-    core:      Callable[[exp.AggFunc, Annotation[K]], Annotation[K]]
-    coherence: CoherenceGuard | None = None
-
-
-class FactDiscoverer(Protocol[K, S]):
-    """Reads the manifest and dblect declarations, returns facts for any node it can
-    ground. Pure, and it returns a materialized collection so that a discoverer which
-    raises drops all of its facts and none of another's."""
-
-    def discover(
-        self, manifest: "Manifest", *, name_to_source: Mapping[str, SourceRef],
-    ) -> Collection[Fact[K, S]]: ...
-
-
-# The operator algebra (dblect.lineage.semiring.Semiring) is an optional slot, present
-# only for a property whose confluence or cross counts or accumulates; left unset for the
-# idempotent and value-domain properties this module ships. See propagation-soundness.md
-# for what the semiring buys and column-level-lineage.md for the existing instances.
-@runtime_checkable
-class Semiring(Protocol[K]):
-    @property
-    def zero(self) -> K: ...   # identity for plus, annihilator for a strict times
-    @property
-    def one(self) -> K: ...    # identity for times
-    def plus(self, a: K, b: K) -> K: ...    # confluence combine (UNION ALL)
-    def times(self, a: K, b: K) -> K: ...   # cross combine (JOIN)
-
-
-@dataclass(frozen=True, slots=True)
-class AxisDisplay:
-    """The human-facing names the seam diagnostic fills its template from. Reserved
-    here; the types layer supplies it from a declaration, with fallback to the bare
-    type and axis names."""
-    name:        str
-    description: str | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class Property(Generic[K, S]):
     ref:        PropertyRef[K, S]                 # the property's own typed handle, minted once; name lives here
-    scope_kind: ScopeKind                         # runtime walk dispatch; the smart constructors fix it to match S
+    scope_kind: ScopeKind                         # runtime walk dispatch
     lattice:    Lattice[K]                        # abstraction domain: resolve and consistent only
     operators:  Mapping[type[Expr], OperatorTransfer[K]]
     aggregates: Mapping[type[exp.AggFunc], AggregateRule[K]]
-    ground:     Callable[[S], Annotation[K]]      # the node's declared annotation (REFINED / EXPLICIT / IMPLICIT)
-    semiring:   Semiring[K] | None = None         # operator algebra for counting/accumulating properties
-    display:    Callable[[K], AxisDisplay] | None = None   # seam-diagnostic names; None falls back to type/axis names
+    ground:     Callable[[S], Annotation[K]]      # the node's declared annotation
+    semiring:   Semiring[K] | None = None         # operator algebra for counting/accumulating properties only
+    display:    Callable[[K], AxisDisplay] | None = None   # seam-diagnostic names
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 ```
 
-Two invariants hold the optional `semiring` slot together with the rest. When it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`, and an idempotent semiring must satisfy `plus == lattice.join` so confluence has one answer. Both are checked once at construction. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type so the field cannot drift from `S` in practice; the field stays for runtime walk dispatch, where the erased `S` is not available.
+A few of these fields carry a decision worth calling out; the rest are mechanical and documented in the types reference.
 
-A property names the properties its transfers read in `depends_on`, an edge that both sets evaluation order and types the read: a transfer reaches a dependency only through the read-only `DepContext`, and a transfer that did not declare an edge cannot type a read of that annotation, so a missing edge is a type error at authoring time. The typed read is sound because a `PropertyRef` cannot be hand-constructed (the mint token enforces it), the registry rejects duplicate names and checks each edge against a registered property's ref by identity, and a relation-scoped read from a column node derives its scope from the column's own `ColumnRef.source`. `DepContext.annotation` returns `None` when the dependency is silent at that scope, which a transfer reads as the dependency's lattice top, the same "we don't know" every other absence means. The acyclicity, ordering, and monotone-in-the-dependency obligations are in [`propagation-soundness.md`](./propagation-soundness.md); the user writes none of it, since the edge originates in a declaration (the coherence edge on a `Money` type) the framework compiles.
+- **`ref` is an un-forgeable `PropertyRef`.** It is minted once, inside `Property`, behind a module-private token, so a caller cannot hand-construct a `PropertyRef[WrongK, S]` and read another property's annotation back at the wrong type. The registry additionally checks every `depends_on` edge against a registered property's ref by identity. Soundness of the typed dependency read rests on these two checks, not on a "never hand-construct this" convention.
+- **`aggregates` map to `AggregateRule`, not a bare callable.** A rule is a pure `core` plus an optional `CoherenceGuard`. The split is what lets the commute-with-confluence obligation be stated over a pure function: the guard is the only place a dependency (a functional dependency, read for the mixed-currency `SUM`) enters an aggregate, and it clears to top on failure, which commutes trivially. A `within=<cols>` declaration compiles to that guard.
+- **`semiring` is optional.** It is set only for a property whose confluence or cross counts or accumulates, and unset for the idempotent and value-domain properties this module ships. When set, the relational operators derive from it and an idempotent semiring must satisfy `plus == lattice.join`, both checked at construction.
+- **`depends_on` is the typed wire to another property.** A transfer reaches a dependency only through a read-only `DepContext`, and a transfer that did not declare the edge cannot type the read, so a missing edge is a type error at authoring time. `DepContext.annotation` returns `None` when a dependency is silent at a scope, which a transfer reads as that dependency's lattice top, the same "we don't know" every other absence means. The acyclicity and monotone-in-the-dependency obligations are in [`propagation-soundness.md`](./propagation-soundness.md); the user writes none of it, since the edge originates in a declaration the framework compiles.
 
-A constructor wires a property from its discoverers:
-
-```python
-def nullability_property(
-    manifest: "Manifest", *, name_to_source: Mapping[str, SourceRef],
-    extra: tuple[FactDiscoverer[Nullability, ColumnRef], ...] = (),
-) -> Property[Nullability, ColumnRef]:
-    facts = collect(manifest, (*_NULLABILITY_DISCOVERERS, *extra), name_to_source=name_to_source)
-    return column_property(
-        name="nullability",
-        lattice=NULLABILITY_LATTICE,
-        operators=_NULLABILITY_OPERATORS,
-        aggregates=_NULLABILITY_AGGREGATES,
-        ground=grounding(facts, _NULLABILITY_OPAQUE(manifest), NULLABILITY_LATTICE),
-    )
-```
-
-`grounding` turns the collected facts into the per-node lookup: it folds a scope's bucket through `resolve`, raises a `BuildIssue` on a `bottom` contradiction, and returns the declared annotation, `Annotation(top, EXPLICIT)` for a scope in the opaque-opt-out set, `Annotation(value, REFINED)` where a value resolved, and `Annotation(top, IMPLICIT)` otherwise.
-
-```python
-def collect(
-    manifest: "Manifest", discoverers: tuple[FactDiscoverer[K, S], ...],
-    *, name_to_source: Mapping[str, SourceRef],
-) -> Mapping[S, tuple[Fact[K, S], ...]]:
-    """Run each discoverer and bucket its facts by scope. A discoverer that raises a
-    DiscovererError contributes nothing and the others are unaffected; any other
-    exception is a substrate bug and propagates, failing the build loudly rather than
-    silently dropping facts."""
-
-def grounding(
-    facts: Mapping[S, tuple[Fact[K, S], ...]], opaque: Collection[S], lat: Lattice[K],
-) -> Callable[[S], Annotation[K]]: ...
-```
-
-The errors are a small sealed set. `BuildIssue` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradiction` is raised by the binary `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
+A property is wired from its discoverers by a small constructor (`nullability_property` is the worked shape in the types reference): `collect` runs the discoverers and buckets their facts by scope, and `grounding` folds each bucket through `resolve` into the per-node declared annotation, raising a `BuildIssue` on a `bottom` contradiction. The errors are a small sealed set (`BuildIssue`, `SeamContradiction`, `DiscovererError`); only `DiscovererError` is isolated, so one discoverer's failure drops its facts and no other's.
 
 ## Resolving multiple facts at a scope
 
 Several discoverers can ground the same node. `resolve` folds the bucket with the lattice meet, which is the most precise value consistent with every claim. Because meet is associative and commutative, the result is independent of discoverer registration and dict iteration order. A `bottom` result is a genuine contradiction: the build surfaces a `BuildIssue`, keeps the deterministic `bottom`-derived value so the run reproduces, and marks downstream annotations provisional. Provenance stays on each fact for tracing and reporting, and never enters resolution.
 
-**Compile-value facts share one world.** The flag layer fixes one world per propagation run, and the compile-value discoverers emit their facts under it, so every fact in a bucket shares that world and resolution is ordinary. A var-derived value is ground truth in its world, the same standing as a native constraint or a user assertion. A difference *between* worlds is the flag-world analysis ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)), reported as "this contract holds under world A and fails under world B." Where a world-scoped value and an unconditional assertion genuinely disagree on one axis (a contract claims `contains_tax=TRUE` always, world B produces `FALSE`), that disagreement is the finding the analysis exists to raise. The audit exposes a "trace this annotation to its grounding facts" helper that reconstructs a derivation on demand.
+**Compile-value facts share one world.** The flag layer fixes one world per propagation run, and the compile-value discoverers emit their facts under it, so every fact in a bucket shares that world and resolution is ordinary. A var-derived value is ground truth in its world, the same standing as a native constraint or a user assertion. A difference *between* worlds is the flag-world analysis ([`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md)), reported as "this contract holds under world A and fails under world B." The audit exposes a "trace this annotation to its grounding facts" helper that reconstructs a derivation on demand.
 
 ## Discovery
 
@@ -397,20 +159,12 @@ All three authoring channels reduce to a `Fact`, and a developer writing a decla
 | `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract` | Python declaration registry | user-domain fact (`Declared(USER_ASSERTED)`) |
 | `SemanticFlag.affects` resolved under a world | flag world enumerator | `CompileValue` fact scoped to that world |
 
-A worked example, the user-domain channel. A developer writes the Pandera-shaped declaration from the intro doc:
-
-```python
-class FctOrders(ModelContract):
-    dbt_model = "marts.fct_orders"
-    order_total: RevenueNet = Field(non_negative=True)
-```
-
-A discoverer reading the declaration registry returns:
+A worked example, the user-domain channel. A developer writes a Pandera-shaped declaration `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract`, and a discoverer reading the declaration registry returns one fact:
 
 ```python
 Fact(
     scope=ColumnRef(SourceRef("model.shop.fct_orders"), "order_total"),
-    value=RevenueNet,                       # the refinement the developer declared
+    value=RevenueNet,                              # the refinement the developer declared
     provenance=Declared(DeclaredSource.USER_ASSERTED),
 )
 ```
@@ -419,23 +173,13 @@ Nothing in that path requires the author to know a fact store exists. The struct
 
 ## Assembling a run
 
-A property is not free-floating: it joins a run through a registry, which is the seam a developer-defined refinement enters by. The audit builds one `PropertyRegistry` per run from the built-in properties plus any contributed by the types layer (a compiled `Money` property is one more entry, indistinguishable from a built-in once registered).
+A property is not free-floating: it joins a run through a `PropertyRegistry`, which is the seam a developer-defined refinement enters by. The audit builds one registry per run from the built-in properties plus any contributed by the types layer (a compiled `Money` property is one more entry, indistinguishable from a built-in once registered). Three things the registry fixes are load-bearing.
 
-```python
-@dataclass(frozen=True, slots=True)
-class PropertyRegistry:
-    properties: tuple[Property[Any, Any], ...]
+- **Name uniqueness plus ref identity** is what makes the typed dependency read sound: a name maps to exactly one registered property, a `PropertyRef` is minted only inside `Property`, and a `depends_on` edge is checked against the minted ref by identity, so a forged handle cannot mistype a read.
+- **Ordering is automatic.** A user property declares `depends_on` on a built-in property's `ref`, and `evaluation_order` (a topological sort) interleaves it with the built-ins; the author writes no ordering.
+- **A cycle or a dangling edge is a build error**, checked once at assembly, which is the acyclic guarantee the single-pass walk rests on.
 
-    def evaluation_order(self) -> tuple[Property[Any, Any], ...]:
-        """Topological order over depends_on. Raises on a cycle, on a duplicate name, or
-        on an edge whose ref is not the minted ref of a registered property (an identity
-        check, not a name match, so a forged handle fails here)."""
-
-    def dep_context(self, store: "AnnotationStore") -> DepContext:
-        """A read-only view of the annotations computed so far, keyed by (name, scope)."""
-```
-
-Name uniqueness plus ref identity is what makes the typed dependency read sound: a `PropertyRef` is minted only inside `Property`, a name maps to exactly one registered property, and a `depends_on` edge is checked against the minted ref by identity, so `dep_context(...).annotation(ref, scope)` returns the right value at the right type and a forged handle cannot mistype the read. Ordering is automatic: a user property declares `depends_on` on a built-in property's `ref` and `evaluation_order` interleaves it with the built-ins, so the author writes no ordering. A cycle or a dangling edge is a build error checked once at assembly, which is the acyclic guarantee the single-pass walk rests on. The propagator runs each property in `evaluation_order`, accumulating annotations into the store the next property's `DepContext` reads.
+The propagator runs each property in `evaluation_order`, accumulating annotations into the store the next property's `DepContext` reads.
 
 ## Validation and propagation
 
@@ -462,21 +206,9 @@ The two rows that carry the design:
 
 ### Erasure at the typed/untyped seam
 
-A refined value meeting an unrefined one is where the highest-value bugs hide and where a partial adopter most wants a nudge. dblect follows the gradual-typing tradition here (see references): separate an explicit opt-out from an absent annotation, and treat them oppositely. The `Opacity` tag carries exactly this distinction through transfers, so the binary combine can decide whether to speak:
+A refined value meeting an unrefined one is where the highest-value bugs hide and where a partial adopter most wants a nudge. dblect follows the gradual-typing tradition here (see references): separate an explicit opt-out from an absent annotation, and treat them oppositely. The `Opacity` tag carries exactly this distinction through transfers, so the binary `combine` (in the types reference) can decide whether to speak. Its rule: meet the two values; raise `SeamContradiction` if they meet to `bottom` (two committed, incompatible operands); preserve if they agree; otherwise one operand is top and clears the result to top, inheriting *that operand's* opacity.
 
-```python
-def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:
-    m = lat.meet(a.value, b.value)
-    if m == lat.bottom:
-        raise SeamContradiction(a, b)                       # two committed, incompatible operands
-    if a.value == b.value == m:
-        return Annotation(m, provisional=a.provisional or b.provisional)   # agree: preserve
-    cleared = a if a.value == lat.top else b                # one committed, the other top: clears
-    return Annotation(lat.top, opacity=cleared.opacity,
-                      provisional=a.provisional or b.provisional)
-```
-
-A top the modeler *declared* (`EXPLICIT`) flows silently, because the modeler took responsibility. A top that is merely *un-annotated* (`IMPLICIT`), where it clears a declared refinement, makes the audit speak up; the diagnostic is on once a project has declared semantic types and off at the zero-declaration layer, so the signal lands where the investment already is. The same rule covers any clearing of a declared refinement, including an aggregate whose coherence precondition is not met (the mixed-currency `SUM`).
+So a top the modeler *declared* (`EXPLICIT`) flows silently, because the modeler took responsibility, while a top that is merely *un-annotated* (`IMPLICIT`), where it clears a declared refinement, makes the audit speak up. The diagnostic is on once a project has declared semantic types and off at the zero-declaration layer, so the signal lands where the investment already is. The same rule covers any clearing of a declared refinement, including an aggregate whose coherence precondition is not met (the mixed-currency `SUM`).
 
 The diagnostic is a fixed template, not synthesized prose: the substrate does not know what a user-domain axis means, so it fills slots from the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, drawn from the property's `display` slot, with fallback to the bare type and axis names. The types layer fills that slot (see [`semantic-types-layer.md`](./semantic-types-layer.md)); the substrate plumbs it and never authors the text. A realistic rendering:
 
@@ -538,6 +270,7 @@ The transfer, aggregate-commutation, semiring-law, and walk-determinism obligati
 
 ## References
 
+- The complete type surface: [`lineage-facts-types.md`](./lineage-facts-types.md).
 - The propagation calculus and its soundness obligations: [`propagation-soundness.md`](./propagation-soundness.md).
 - The engine this layers on: [`column-level-lineage.md`](./column-level-lineage.md), including the K-relations encoding for uniqueness.
 - The end-user declaration surface the facts layer carries: [`dblect_technical_intro.md`](./dblect_technical_intro.md), [`semantic-types-layer.md`](./semantic-types-layer.md), and [`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md).
