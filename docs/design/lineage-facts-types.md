@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from dblect.lineage.graph import ColumnRef, SourceRef
-from dblect.lineage.expr import Expr            # the sqlglot expression wrapper
+from sqlglot import Expr                        # the sqlglot expression base type
 import sqlglot.expressions as exp
 
 K  = TypeVar("K")
@@ -301,6 +301,29 @@ def nullability_property(
 
 The errors are a small sealed set. `BuildIssue` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradiction` is raised by `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
 
+## The annotation store
+
+The propagator runs each property in `evaluation_order` and writes every node's annotation here as it goes, so a later property's `DepContext` can read an earlier one's results. The store is mutable for the duration of one run and never shared across runs; `DepContext` is the read-only projection of it the registry hands to transfers.
+
+```python
+@dataclass(slots=True)
+class AnnotationStore:
+    """Annotations accumulated across properties during one propagation run, keyed by
+    property name and scope. A scope is a ColumnRef or a SourceRef, so a single store
+    holds both column- and relation-scoped properties; the (name, scope) key keeps them
+    separate without the store knowing a property's scope kind. Write-once per
+    (name, scope) in a correct run: the propagator visits each node once per property."""
+    _by_property: dict[str, dict[ColumnRef | SourceRef, Annotation[Any]]] = field(default_factory=dict)
+
+    def record(self, name: str, scope: ColumnRef | SourceRef, annotation: Annotation[Any]) -> None:
+        self._by_property.setdefault(name, {})[scope] = annotation
+
+    def get(self, name: str, scope: ColumnRef | SourceRef) -> Annotation[Any] | None:
+        return self._by_property.get(name, {}).get(scope)
+```
+
+`DepContext.annotation(ref, scope)` resolves through this store: the registry recovers the property name from `ref` (identity-checked at assembly), reads `store.get(name, scope)`, and returns it at the dependency's value type `K2`. A `None` return is the silent-dependency case every transfer reads as that dependency's lattice top. The recovery of `K2` is sound because `ref` is the minted `PropertyRef[K2, S2]` whose `K2`/`S2` are the registered property's real types; the store erases to `Annotation[Any]` only internally.
+
 ## The registry
 
 ```python
@@ -313,7 +336,7 @@ class PropertyRegistry:
         on an edge whose ref is not the minted ref of a registered property (an identity
         check, not a name match, so a forged handle fails here)."""
 
-    def dep_context(self, store: "AnnotationStore") -> DepContext:
+    def dep_context(self, store: AnnotationStore) -> DepContext:
         """A read-only view of the annotations computed so far, keyed by (name, scope)."""
 ```
 
