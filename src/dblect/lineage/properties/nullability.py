@@ -1,10 +1,4 @@
-"""Demo nullability property: per-column tri-state {NON_NULL, NULLABLE, UNKNOWN}.
-
-**Demo, not a production property.** It pins that a CTE-wrapped ``COALESCE``
-propagates NON_NULL to the outer projection, and that a ``UNION ALL`` with one
-nullable arm taints the combined output. Grounding is trivial here (every node
-IMPLICIT) until the nullability discoverers land and consult ``not_null`` tests,
-the declared ``nullable`` flag, and native ``NOT NULL`` constraints.
+"""Nullability property: per-column tri-state {NON_NULL, NULLABLE, UNKNOWN}.
 
 The lattice orders by precision (NON_NULL refines NULLABLE refines UNKNOWN, the
 "no information" top); ``meet`` keeps the stronger guarantee. A structural
@@ -14,20 +8,45 @@ exists only to make the lattice bounded.
 Confluence uses a semiring rather than the lattice join, so a proven NULLABLE
 arm can beat an UNKNOWN one (a join with the top cannot); see
 :class:`NullabilitySemiring` and ``propagation-soundness.md``.
+
+Grounding comes from two discoverers that read a dbt manifest: a ``not_null``
+generic test and a native ``NOT NULL`` constraint each ground a column to
+NON_NULL. Both are sound-by-omission: a disabled test, a ``where``-conditional
+test, or an axis they do not own grounds nothing rather than over-claiming. Build
+the manifest-backed property with :func:`nullability_property`; the bare
+:data:`nullability` value keeps a trivial grounding for graph-only tests and the
+COALESCE / IS / COUNT transfer demos.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
+from dblect.lineage.facts.grounding import collect, grounding
 from dblect.lineage.facts.lattice import Lattice
-from dblect.lineage.facts.model import Annotation, Opacity
-from dblect.lineage.facts.property import AggregateRule, DepContext, Property, column_property
-from dblect.lineage.graph import ColumnRef
+from dblect.lineage.facts.model import (
+    Annotation,
+    Declared,
+    DeclaredSource,
+    Fact,
+    NativeConstraint,
+    Opacity,
+)
+from dblect.lineage.facts.property import (
+    AggregateRule,
+    DepContext,
+    FactDiscoverer,
+    OperatorTransfer,
+    Property,
+    column_property,
+)
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.manifest import ConstraintType, Manifest, Node, ResourceType
 
 
 class Nullability(StrEnum):
@@ -85,11 +104,6 @@ class NullabilitySemiring:
         return self.plus(a, b)
 
 
-def _ground_unknown(_: ColumnRef) -> Annotation[Nullability]:
-    """Trivial grounding: nothing is declared yet, so every node is IMPLICIT top."""
-    return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
-
-
 def _coalesce_rule(
     _expr: Expr, kids: tuple[Annotation[Nullability], ...], _ctx: DepContext
 ) -> Annotation[Nullability]:
@@ -118,16 +132,182 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotatio
     return Annotation(Nullability.NON_NULL, provisional=child.provisional)
 
 
+_NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
+    exp.Coalesce: _coalesce_rule,
+    exp.Is: _is_not_null_rule,
+}
+_NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
+    exp.Count: AggregateRule(core=_count_core),
+}
+
+
+def _ground_unknown(_: ColumnRef) -> Annotation[Nullability]:
+    """Trivial grounding for the bare demo value: every node is IMPLICIT top."""
+    return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
+
+
 nullability: Property[Nullability, ColumnRef] = column_property(
     name="nullability",
     lattice=NULLABILITY_LATTICE,
-    operators={
-        exp.Coalesce: _coalesce_rule,
-        exp.Is: _is_not_null_rule,
-    },
-    aggregates={
-        exp.Count: AggregateRule(core=_count_core),
-    },
+    operators=_NULLABILITY_OPERATORS,
+    aggregates=_NULLABILITY_AGGREGATES,
     ground=_ground_unknown,
     semiring=NullabilitySemiring(),
 )
+
+
+# --- discoverers -------------------------------------------------------------
+
+_SOURCE_KIND: Mapping[ResourceType, SourceKind] = {
+    ResourceType.MODEL: SourceKind.MODEL,
+    ResourceType.SOURCE: SourceKind.SOURCE,
+    ResourceType.SEED: SourceKind.SEED,
+    ResourceType.SNAPSHOT: SourceKind.SNAPSHOT,
+}
+_TARGET_PREFIXES: tuple[str, ...] = ("model.", "source.", "seed.", "snapshot.")
+
+
+def _test_target_node(node: Node) -> str | None:
+    """The unique_id a generic test is attached to. Prefer ``attached_node`` (the
+    modern shape), fall back to the first eligible ``depends_on`` for older
+    manifests."""
+    if node.attached_node and node.attached_node.startswith(_TARGET_PREFIXES):
+        return node.attached_node
+    for dep in sorted(node.depends_on):
+        if dep.startswith(_TARGET_PREFIXES):
+            return dep
+    return None
+
+
+def _column_ref(manifest: Manifest, target_uid: str, column: str) -> ColumnRef | None:
+    """The graph-keyed ColumnRef for ``column`` on the target node, or None if the
+    node is absent or not a data-flow relation. Column names are case-folded to
+    match how the builder keys the graph."""
+    node = manifest.nodes.get(target_uid)
+    if node is None:
+        return None
+    kind = _SOURCE_KIND.get(node.resource_type)
+    if kind is None:
+        return None
+    return ColumnRef(SourceRef(kind, target_uid), column.lower())
+
+
+class _NotNullTestDiscoverer:
+    """Grounds NON_NULL from enabled, unconditional ``not_null`` generic tests."""
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[Nullability, ColumnRef]]:
+        out: list[Fact[Nullability, ColumnRef]] = []
+        for node in manifest.nodes.values():
+            tm = node.test_metadata
+            if tm is None or not tm.enabled or tm.name != "not_null":
+                continue
+            # A `where` filter makes the assertion conditional ("not null within
+            # rows matching X"). Grounding it as an unconditional NON_NULL would
+            # over-claim, so it is captured-but-not-activated until conditional
+            # facts land (see conditional-uniqueness-facts.md).
+            if tm.where is not None:
+                continue
+            col = tm.kwargs.get("column_name")
+            if not isinstance(col, str) or not col:
+                continue
+            target = _test_target_node(node)
+            if target is None:
+                continue
+            scope = _column_ref(manifest, target, col)
+            if scope is None:
+                continue
+            out.append(
+                Fact(
+                    scope=scope,
+                    value=Nullability.NON_NULL,
+                    provenance=Declared(DeclaredSource.DBT_GENERIC_TEST),
+                    detail=node.name,
+                )
+            )
+        return out
+
+
+# NOT NULL is enforced on write by essentially every warehouse, unlike the
+# advisory PRIMARY KEY / UNIQUE that several leave unchecked, so the default is
+# enforced. The set names adapters known to treat it otherwise (none yet); the
+# flag is descriptive provenance, read only by the unenforced-constraint finding.
+_NOT_NULL_ADVISORY_ADAPTERS: frozenset[str] = frozenset()
+
+
+def _not_null_enforced(adapter_type: str) -> bool:
+    return adapter_type.lower() not in _NOT_NULL_ADVISORY_ADAPTERS
+
+
+class _NativeNotNullDiscoverer:
+    """Grounds NON_NULL from native ``NOT NULL`` constraints (dbt 1.5+)."""
+
+    def __init__(self, adapter_type: str) -> None:
+        self._enforced = _not_null_enforced(adapter_type)
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[Nullability, ColumnRef]]:
+        out: list[Fact[Nullability, ColumnRef]] = []
+        for node in manifest.nodes.values():
+            if node.resource_type is not ResourceType.MODEL:
+                continue
+            source = SourceRef(SourceKind.MODEL, node.unique_id)
+            # Model-level constraints name their columns explicitly.
+            out.extend(
+                self._fact(source, col, "model-level NOT NULL")
+                for c in node.constraints
+                if c.type is ConstraintType.NOT_NULL
+                for col in c.columns
+            )
+            # Column-level constraints attach to the column implicitly.
+            out.extend(
+                self._fact(source, col_name, f"column-level NOT NULL on {col_name}")
+                for col_name, col in node.columns.items()
+                for c in col.constraints
+                if c.type is ConstraintType.NOT_NULL
+            )
+        return out
+
+    def _fact(self, source: SourceRef, column: str, detail: str) -> Fact[Nullability, ColumnRef]:
+        return Fact(
+            scope=ColumnRef(source, column.lower()),
+            value=Nullability.NON_NULL,
+            provenance=NativeConstraint(enforced_on_write=self._enforced),
+            detail=detail,
+        )
+
+
+def not_null_test_discoverer() -> FactDiscoverer[Nullability, ColumnRef]:
+    return _NotNullTestDiscoverer()
+
+
+def native_not_null_discoverer(adapter_type: str) -> FactDiscoverer[Nullability, ColumnRef]:
+    return _NativeNotNullDiscoverer(adapter_type)
+
+
+def nullability_property(
+    manifest: Manifest,
+    *,
+    name_to_source: Mapping[str, SourceRef],
+    extra: tuple[FactDiscoverer[Nullability, ColumnRef], ...] = (),
+) -> Property[Nullability, ColumnRef]:
+    """The manifest-backed nullability property: grounding folds the discoverers'
+    NON_NULL claims (plus any ``extra``) through the lattice, leaving every
+    undeclared column UNKNOWN. No opaque opt-out reader is wired yet, so the
+    opaque set is empty."""
+    discoverers = (
+        not_null_test_discoverer(),
+        native_not_null_discoverer(manifest.adapter_type),
+        *extra,
+    )
+    facts = collect(manifest, discoverers, name_to_source=name_to_source)
+    return column_property(
+        name="nullability",
+        lattice=NULLABILITY_LATTICE,
+        operators=_NULLABILITY_OPERATORS,
+        aggregates=_NULLABILITY_AGGREGATES,
+        ground=grounding(facts, opaque=set(), lat=NULLABILITY_LATTICE),
+        semiring=NullabilitySemiring(),
+    )

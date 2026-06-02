@@ -11,12 +11,21 @@ the operator-coverage gaps that keep them out of audit consumption.
 """
 
 from dblect.lineage.properties.aggregation_depth import aggregation_depth
-from dblect.lineage.properties.nullability import Nullability, nullability
+from dblect.lineage.properties.nullability import (
+    Nullability,
+    native_not_null_discoverer,
+    not_null_test_discoverer,
+    nullability,
+    nullability_property,
+)
 from dblect.lineage.properties.where_provenance import where_provenance
 
 __all__ = [
     "Nullability",
     "aggregation_depth",
+    "native_not_null_discoverer",
+    "not_null_test_discoverer",
     "nullability",
+    "nullability_property",
     "where_provenance",
 ]
