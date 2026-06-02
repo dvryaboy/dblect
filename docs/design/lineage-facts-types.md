@@ -135,7 +135,7 @@ def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
     """Fold every fact at one scope to the most precise value consistent with all of
     them. Meet is associative and commutative by the lattice laws, so the result does
     not depend on discoverer order. A result of ``bottom`` means the declarations are
-    mutually unsatisfiable; the caller raises a BuildIssue and keeps this deterministic
+    mutually unsatisfiable; the caller raises a FactConflictError and keeps this deterministic
     value so the run stays reproducible."""
     value = lat.top
     for f in facts:
@@ -276,7 +276,7 @@ def collect(
 def grounding(
     facts: Mapping[S, tuple[Fact[K, S], ...]], opaque: Collection[S], lat: Lattice[K],
 ) -> Callable[[S], Annotation[K]]:
-    """Fold each scope's bucket through ``resolve``, raise a ``BuildIssue`` on a ``bottom``
+    """Fold each scope's bucket through ``resolve``, raise a ``FactConflictError`` on a ``bottom``
     contradiction, and return the declared annotation: ``Annotation(top, EXPLICIT)`` for a
     scope in the opaque set, ``Annotation(value, REFINED)`` where a value resolved, and
     ``Annotation(top, IMPLICIT)`` otherwise."""
@@ -299,7 +299,7 @@ def nullability_property(
     )
 ```
 
-The errors are a small sealed set. `BuildIssue` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradiction` is raised by `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
+The errors are a small sealed set. `FactConflictError` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradictionError` is raised by `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
 
 ## The annotation store
 
@@ -348,7 +348,7 @@ The binary combine at a scalar expression decides whether a cleared refinement s
 def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:
     m = lat.meet(a.value, b.value)
     if m == lat.bottom:
-        raise SeamContradiction(a, b)                       # two committed, incompatible operands
+        raise SeamContradictionError(a, b)                       # two committed, incompatible operands
     if a.value == b.value == m:
         return Annotation(m, provisional=a.provisional or b.provisional)   # agree: preserve
     cleared = a if a.value == lat.top else b                # one committed, the other top: clears

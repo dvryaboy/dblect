@@ -9,10 +9,10 @@ the propagator reads at leaves and checks at derived nodes.
 """
 
 from dblect.lineage.facts.grounding import (
-    BuildIssue,
     DiscovererError,
+    FactConflictError,
     OpaqueReader,
-    SeamContradiction,
+    SeamContradictionError,
     collect,
     combine,
     grounding,
@@ -50,7 +50,6 @@ __all__ = [
     "Annotation",
     "AnnotationStore",
     "AxisDisplay",
-    "BuildIssue",
     "CoherenceGuard",
     "CompileOrigin",
     "CompileValue",
@@ -59,6 +58,7 @@ __all__ = [
     "DepContext",
     "DiscovererError",
     "Fact",
+    "FactConflictError",
     "FactDiscoverer",
     "Lattice",
     "NativeConstraint",
@@ -70,7 +70,7 @@ __all__ = [
     "PropertyRegistry",
     "Provenance",
     "ScopeKind",
-    "SeamContradiction",
+    "SeamContradictionError",
     "WorldRef",
     "collect",
     "column_property",

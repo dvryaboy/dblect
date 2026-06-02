@@ -39,7 +39,7 @@ class OpaqueReader(Protocol[_S_co]):
     ) -> Collection[_S_co]: ...
 
 
-class BuildIssue(Exception):  # noqa: N818 — name is the design contract, not "...Error"
+class FactConflictError(Exception):
     """Raised when a scope's facts meet to the lattice bottom: the declarations
     are mutually unsatisfiable. Carries the scope and the conflicting facts so the
     audit can report them. Resolution keeps the deterministic bottom-derived value
@@ -51,7 +51,7 @@ class BuildIssue(Exception):  # noqa: N818 — name is the design contract, not 
         super().__init__(f"contradictory facts at {scope!r}: {[f.value for f in facts]}")
 
 
-class SeamContradiction(Exception):  # noqa: N818 — name is the design contract, not "...Error"
+class SeamContradictionError(Exception):
     """Raised by ``combine`` when two committed, incompatible operands meet at a
     scalar expression. It becomes a finding at the combine site."""
 
@@ -104,7 +104,7 @@ def grounding(
     ``Annotation(top, IMPLICIT)``, the "nothing declared" default.
 
     A bucket that resolves to ``bottom`` is a contradiction and raises a
-    ``BuildIssue`` here, at build time. Recovering from a contradiction by
+    ``FactConflictError`` here, at build time. Recovering from a contradiction by
     continuing with the deterministic bottom value and tainting downstream
     annotations provisional is a propagator concern that lands with the findings
     layer; the grounding builder surfaces the conflict rather than swallowing it.
@@ -118,7 +118,7 @@ def grounding(
             continue  # the opt-out already won
         value, is_contradiction = resolve(lat, bucket)
         if is_contradiction:
-            raise BuildIssue(scope, tuple(bucket))
+            raise FactConflictError(scope, tuple(bucket))
         declared[scope] = Annotation(value, Opacity.REFINED)
 
     implicit_top: Annotation[K] = Annotation(lat.top, Opacity.IMPLICIT)
@@ -133,7 +133,7 @@ def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K
     """The binary seam rule at a scalar expression.
 
     Meet the two values; a ``bottom`` meet is two committed, incompatible operands
-    and raises ``SeamContradiction``. Agreeing operands preserve their value. When
+    and raises ``SeamContradictionError``. Agreeing operands preserve their value. When
     one operand is top and the other committed, the result clears to top and
     inherits *that operand's* opacity, so an un-annotated (IMPLICIT) clear speaks
     at the seam while a declared (EXPLICIT) opt-out flows silently.
@@ -141,7 +141,7 @@ def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K
     provisional = a.provisional or b.provisional
     m = lat.meet(a.value, b.value)
     if m == lat.bottom:
-        raise SeamContradiction(a, b)
+        raise SeamContradictionError(a, b)
     if a.value == b.value == m:
         # Operands agree. When they agree on top, keep the stronger opacity claim
         # so a declared opt-out is not silently downgraded to incidental.

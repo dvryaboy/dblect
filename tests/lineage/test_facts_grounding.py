@@ -14,9 +14,9 @@ from collections.abc import Collection, Mapping
 import pytest
 
 from dblect.lineage.facts.grounding import (
-    BuildIssue,
     DiscovererError,
-    SeamContradiction,
+    FactConflictError,
+    SeamContradictionError,
     collect,
     combine,
     grounding,
@@ -88,7 +88,7 @@ def test_combine_explicit_top_clears_silently() -> None:
 
 
 def test_combine_two_committed_incompatible_raises() -> None:
-    with pytest.raises(SeamContradiction):
+    with pytest.raises(SeamContradictionError):
         combine(_FLAT, Annotation("A"), Annotation("B"))
 
 
@@ -176,5 +176,5 @@ def test_grounding_absent_scope_is_implicit_top() -> None:
 
 def test_grounding_contradiction_raises_build_issue() -> None:
     facts = {_COL_A: (_fact(_COL_A, "A"), _fact(_COL_A, "B"))}
-    with pytest.raises(BuildIssue):
+    with pytest.raises(FactConflictError):
         grounding(facts, opaque=set(), lat=_FLAT)

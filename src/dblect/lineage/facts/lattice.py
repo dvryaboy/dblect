@@ -40,7 +40,7 @@ def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
 
     Meet is associative and commutative by the lattice laws, so the result does
     not depend on discoverer order. A result of ``bottom`` means the declarations
-    are mutually unsatisfiable; the caller raises a ``BuildIssue`` and keeps this
+    are mutually unsatisfiable; the caller raises a ``FactConflictError`` and keeps this
     deterministic value so the run stays reproducible.
     """
     value = lat.top
