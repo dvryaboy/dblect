@@ -259,7 +259,7 @@ class Property(Generic[K, S]):
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 ```
 
-Two invariants hold the optional `semiring` slot together with the rest, checked once at construction: when it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`, and an idempotent semiring must satisfy `plus == lattice.join`. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
+Two obligations hold the optional `semiring` slot together with the rest. When it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`; the constructor checks this. An idempotent semiring must additionally satisfy `plus == lattice.join`; function equality is not decidable by inspection, so that law is a semiring-law property test (see [`propagation-soundness.md`](./propagation-soundness.md)) rather than a construction-time check. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
 
 ## Collection, grounding, errors
 
