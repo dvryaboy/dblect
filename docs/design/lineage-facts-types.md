@@ -259,7 +259,7 @@ class Property(Generic[K, S]):
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 ```
 
-Two obligations hold the optional `semiring` slot together with the rest. When it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`; the constructor checks this. An idempotent semiring must additionally satisfy `plus == lattice.join`; function equality is not decidable by inspection, so that law is a semiring-law property test (see [`propagation-soundness.md`](./propagation-soundness.md)) rather than a construction-time check. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
+The optional `semiring` slot carries one construction-time check: when it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`. Its algebraic laws (associativity, commutativity, distributivity, the identity roles) are semiring-law property tests (see [`propagation-soundness.md`](./propagation-soundness.md)) rather than construction-time checks, since function equality is not decidable by inspection. The `plus` need not equal the lattice join: nullability is idempotent yet its confluence lets a committed value beat the "no information" top, which a join with the top cannot. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
 
 ## Collection, grounding, errors
 

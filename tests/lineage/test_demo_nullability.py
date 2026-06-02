@@ -108,6 +108,56 @@ def test_union_arm_nullability_combines_via_plus() -> None:
     assert anns[out].value is Nullability.NULLABLE
 
 
+def test_union_nullable_arm_taints_against_unknown_arm() -> None:
+    """A NULLABLE arm taints the union even when the other arm is UNKNOWN: the
+    proven null appears regardless of what is unknown about the other side. This
+    is exactly the case the lattice join cannot express, since UNKNOWN is the
+    lattice top and a join with the top is the top."""
+    sql = """
+        SELECT u.x AS out FROM (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS x FROM t2
+        ) u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _source("t1"), "t2": _source("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        if c.source.unique_id == "source.test.raw.t1":
+            return Nullability.NULLABLE
+        return Nullability.UNKNOWN  # t2.b is unknown
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
+def test_scalar_expression_nullable_input_taints_unknown() -> None:
+    """``a + b`` with a NULLABLE and an UNKNOWN operand is NULLABLE: adding to a
+    value that can be null yields a value that can be null. The times-fold has to
+    let the proven null dominate the unknown, the same as the confluence plus."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.a + u.b AS out FROM t u",
+        name_to_source={"t": _source("t")},
+        schema={"t": {"a": "INT", "b": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        if c.column == "a":
+            return Nullability.NULLABLE
+        return Nullability.UNKNOWN  # b is unknown
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
 @given(_nullabilities, _nullabilities, _nullabilities)
 def test_nullability_lattice_laws(a: Nullability, b: Nullability, c: Nullability) -> None:
     """The nullability lattice is a bounded distributive chain, so it satisfies the

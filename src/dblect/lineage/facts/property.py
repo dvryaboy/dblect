@@ -150,9 +150,12 @@ class Property(Generic[K, S]):
     def __post_init__(self) -> None:
         # The structurally-checkable invariant: a semiring-carrying property's
         # confluence and cross derive from plus/times, so it must not also pin
-        # those operators by hand. The semiring laws (associativity, distribution,
-        # and plus == lattice.join for an idempotent semiring) are PBT obligations
-        # in propagation-soundness.md; they are not decidable by inspection here.
+        # those operators by hand. The semiring laws (associativity, commutativity,
+        # distribution, the identity roles) are PBT obligations in
+        # propagation-soundness.md; they are not decidable by inspection here. The
+        # plus need not equal the lattice join: nullability is idempotent yet its
+        # confluence lets a committed value beat the "no information" top, which a
+        # join with the top cannot.
         if self.semiring is not None:
             clash = {exp.Union, exp.Join} & set(self.operators)
             if clash:

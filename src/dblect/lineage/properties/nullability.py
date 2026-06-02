@@ -9,17 +9,24 @@ the declared ``nullable`` flag, and native ``NOT NULL`` constraints.
 The lattice orders by precision: NON_NULL (the strongest guarantee) refines
 NULLABLE refines UNKNOWN (the top, "no information"). ``meet`` keeps the stronger
 guarantee, so resolving a ``not_null`` test against a permissive ``nullable: true``
-flag yields NON_NULL; ``join`` is the confluence combine, so a ``UNION ALL`` of a
-non-null and a nullable arm is nullable. A structural property never contradicts,
-so the formal lattice bottom (CONTRADICTION) is unreachable in propagation; it
-exists only to make the lattice bounded.
+flag yields NON_NULL. A structural property never contradicts, so the formal
+lattice bottom (CONTRADICTION) is unreachable in propagation; it exists only to
+make the lattice bounded.
 
-The property carries no semiring: nullability is idempotent, so its confluence is
-exactly the lattice join.
+The confluence combine is a semiring, not the lattice join. A ``UNION ALL`` is
+nullable as soon as one arm is, so a branch proven NULLABLE taints the output even
+against an UNKNOWN one. The lattice cannot express that: UNKNOWN is "no
+information", which has to sit at the top so an opaque upstream never fails the
+consistency check, and a join with the top is always the top, so no lattice with
+UNKNOWN on top can give ``join(NULLABLE, UNKNOWN) == NULLABLE``. So nullability,
+though idempotent, carries a semiring whose ``plus`` (confluence) and ``times``
+(scalar inputs) take the more-null value, with NON_NULL as the identity. COALESCE
+overrides with "non-null wins".
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from sqlglot import Expr
@@ -61,6 +68,37 @@ NULLABILITY_LATTICE: Lattice[Nullability] = Lattice(
     top=Nullability.UNKNOWN,
     bottom=Nullability.CONTRADICTION,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class NullabilitySemiring:
+    """The null-taint combine: both ``plus`` (confluence) and ``times`` (scalar
+    inputs) take the more-null value.
+
+    NULLABLE beats UNKNOWN beats NON_NULL: a branch proven nullable taints the
+    result regardless of what is unknown about the others, and UNKNOWN beats
+    NON_NULL because we should not claim non-null without evidence. NON_NULL is
+    the identity, so a non-null literal in an expression changes nothing.
+
+    This is the join of the taint order NON_NULL < UNKNOWN < NULLABLE, which is
+    not the precision order the lattice meet and join use (there UNKNOWN is the
+    top). CONTRADICTION is the lattice bottom and never reaches the combine, so
+    the laws are pinned over the three operational values; see
+    ``test_nullability_semiring_laws``.
+    """
+
+    zero: Nullability = Nullability.NON_NULL
+    one: Nullability = Nullability.NON_NULL
+
+    def plus(self, a: Nullability, b: Nullability) -> Nullability:
+        if a is Nullability.NULLABLE or b is Nullability.NULLABLE:
+            return Nullability.NULLABLE
+        if a is Nullability.UNKNOWN or b is Nullability.UNKNOWN:
+            return Nullability.UNKNOWN
+        return Nullability.NON_NULL
+
+    def times(self, a: Nullability, b: Nullability) -> Nullability:
+        return self.plus(a, b)
 
 
 def _ground_unknown(_: ColumnRef) -> Annotation[Nullability]:
@@ -107,4 +145,5 @@ nullability: Property[Nullability, ColumnRef] = column_property(
         exp.Count: AggregateRule(core=_count_core),
     },
     ground=_ground_unknown,
+    semiring=NullabilitySemiring(),
 )
