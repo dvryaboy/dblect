@@ -25,7 +25,7 @@ def test_single_aggregate_is_depth_one() -> None:
     )
     anns = propagate(graph, aggregation_depth)
     out = ColumnRef(_model("model.test.m"), "total")
-    assert anns[out] == 1
+    assert anns[out].value == 1
 
 
 def test_non_aggregate_passthrough_is_depth_zero() -> None:
@@ -37,7 +37,7 @@ def test_non_aggregate_passthrough_is_depth_zero() -> None:
     )
     anns = propagate(graph, aggregation_depth)
     out = ColumnRef(_model("model.test.m"), "y")
-    assert anns[out] == 0
+    assert anns[out].value == 0
 
 
 def test_sum_of_sum_through_cte_is_depth_two() -> None:
@@ -57,7 +57,7 @@ def test_sum_of_sum_through_cte_is_depth_two() -> None:
     )
     anns = propagate(graph, aggregation_depth)
     out = ColumnRef(_model("model.test.m"), "grand")
-    assert anns[out] == 2
+    assert anns[out].value == 2
 
 
 def test_aggregate_in_expression_does_not_double_count() -> None:
@@ -72,7 +72,7 @@ def test_aggregate_in_expression_does_not_double_count() -> None:
     )
     anns = propagate(graph, aggregation_depth)
     out = ColumnRef(_model("model.test.m"), "s")
-    assert anns[out] == 1
+    assert anns[out].value == 1
 
 
 def test_union_of_aggregated_arms_keeps_depth_one() -> None:
@@ -94,4 +94,4 @@ def test_union_of_aggregated_arms_keeps_depth_one() -> None:
     )
     anns = propagate(graph, aggregation_depth)
     out = ColumnRef(_model("model.test.m"), "out")
-    assert anns[out] == 1
+    assert anns[out].value == 1

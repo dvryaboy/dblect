@@ -33,7 +33,7 @@ def test_pass_through_column_traces_to_its_source() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "id")
-    assert anns[out] == frozenset({ColumnRef(_source("users"), "id")})
+    assert anns[out].value == frozenset({ColumnRef(_source("users"), "id")})
 
 
 def test_transform_unions_input_columns() -> None:
@@ -46,7 +46,7 @@ def test_transform_unions_input_columns() -> None:
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "sum_ab")
     src = _source("t")
-    assert anns[out] == frozenset({ColumnRef(src, "a"), ColumnRef(src, "b")})
+    assert anns[out].value == frozenset({ColumnRef(src, "a"), ColumnRef(src, "b")})
 
 
 def test_literal_constant_has_empty_provenance() -> None:
@@ -58,7 +58,7 @@ def test_literal_constant_has_empty_provenance() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "the_answer")
-    assert anns[out] == frozenset()
+    assert anns[out].value == frozenset()
 
 
 def test_aggregate_inherits_input_provenance() -> None:
@@ -70,7 +70,7 @@ def test_aggregate_inherits_input_provenance() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "total")
-    assert anns[out] == frozenset({ColumnRef(_source("t"), "x")})
+    assert anns[out].value == frozenset({ColumnRef(_source("t"), "x")})
 
 
 def test_count_star_has_empty_provenance() -> None:
@@ -82,7 +82,7 @@ def test_count_star_has_empty_provenance() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "n")
-    assert anns[out] == frozenset()
+    assert anns[out].value == frozenset()
 
 
 def test_join_merges_both_sides() -> None:
@@ -101,9 +101,9 @@ def test_join_merges_both_sides() -> None:
     anns = propagate(graph, where_provenance)
     self_ref = SourceRef(SourceKind.MODEL, "model.test.m")
     u, o = _source("users"), _source("orders")
-    assert anns[ColumnRef(self_ref, "user_id")] == frozenset({ColumnRef(u, "id")})
-    assert anns[ColumnRef(self_ref, "name")] == frozenset({ColumnRef(u, "name")})
-    assert anns[ColumnRef(self_ref, "amount")] == frozenset({ColumnRef(o, "amount")})
+    assert anns[ColumnRef(self_ref, "user_id")].value == frozenset({ColumnRef(u, "id")})
+    assert anns[ColumnRef(self_ref, "name")].value == frozenset({ColumnRef(u, "name")})
+    assert anns[ColumnRef(self_ref, "amount")].value == frozenset({ColumnRef(o, "amount")})
 
 
 def test_cte_collapses_to_source_leaf() -> None:
@@ -119,7 +119,7 @@ def test_cte_collapses_to_source_leaf() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "bumped")
-    assert anns[out] == frozenset({ColumnRef(_source("t"), "x")})
+    assert anns[out].value == frozenset({ColumnRef(_source("t"), "x")})
 
 
 def test_union_arms_bind_positionally_not_by_alias() -> None:
@@ -143,7 +143,7 @@ def test_union_arms_bind_positionally_not_by_alias() -> None:
     )
     anns = propagate(graph, where_provenance)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "out")
-    assert anns[out] == frozenset({ColumnRef(_source("t1"), "a"), ColumnRef(_source("t2"), "b")})
+    assert anns[out].value == frozenset({ColumnRef(_source("t1"), "a"), ColumnRef(_source("t2"), "b")})
 
 
 def test_inline_scalar_subquery_does_not_register_phantom_model_columns() -> None:
@@ -221,10 +221,10 @@ def test_edges_are_immediate_upstream_and_annotation_is_leaf_closure() -> None:
     assert graph.edges[ColumnRef(cte_b, "label")] == frozenset({ColumnRef(src_b, "label")})
 
     # Annotations walk the chain transitively to the leaf source.
-    assert anns[ColumnRef(model_ref, "id")] == frozenset({ColumnRef(src_a, "id")})
-    assert anns[ColumnRef(model_ref, "value")] == frozenset({ColumnRef(src_a, "value")})
-    assert anns[ColumnRef(model_ref, "label")] == frozenset({ColumnRef(src_b, "label")})
-    assert anns[ColumnRef(model_ref, "bumped")] == frozenset({ColumnRef(src_a, "value")})
+    assert anns[ColumnRef(model_ref, "id")].value == frozenset({ColumnRef(src_a, "id")})
+    assert anns[ColumnRef(model_ref, "value")].value == frozenset({ColumnRef(src_a, "value")})
+    assert anns[ColumnRef(model_ref, "label")].value == frozenset({ColumnRef(src_b, "label")})
+    assert anns[ColumnRef(model_ref, "bumped")].value == frozenset({ColumnRef(src_a, "value")})
 
 
 @pytest.fixture(scope="module")
@@ -257,7 +257,7 @@ def test_jaffle_build_succeeds_and_chains_resolve_to_real_leaves(
         f"{col.source.unique_id}:{col.column} leaks {leaf.source.kind}:{leaf.source.unique_id}"
         for col, ann in anns.items()
         if col.source.kind is SourceKind.MODEL
-        for leaf in ann
+        for leaf in ann.value
         if leaf.source.kind not in manifest_kinds
     ]
     assert not synthetic_in_annotations, "\n".join(synthetic_in_annotations[:5])

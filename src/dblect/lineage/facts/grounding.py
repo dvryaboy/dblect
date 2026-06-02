@@ -11,7 +11,7 @@ speaks. The errors are a small sealed set so a caller can react to each.
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
-from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from dblect.lineage.facts.lattice import Lattice, resolve
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
@@ -23,10 +23,11 @@ if TYPE_CHECKING:
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
+_S_co = TypeVar("_S_co", ColumnRef, SourceRef, covariant=True)
 
 
 @runtime_checkable
-class OpaqueReader(Protocol[S]):
+class OpaqueReader(Protocol[_S_co]):
     """Reads the opaque opt-out channels (a ``meta.dblect.opaque`` key, an
     ``OpaqueEffect`` on a contract, an inline ``dblect: opaque`` marker) and
     returns the scopes opted out of refinement. Its result feeds ``grounding`` as
@@ -35,7 +36,7 @@ class OpaqueReader(Protocol[S]):
 
     def opaque_scopes(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
-    ) -> Collection[S]: ...
+    ) -> Collection[_S_co]: ...
 
 
 class BuildIssue(Exception):  # noqa: N818 — name is the design contract, not "...Error"
@@ -44,7 +45,7 @@ class BuildIssue(Exception):  # noqa: N818 — name is the design contract, not 
     audit can report them. Resolution keeps the deterministic bottom-derived value
     rather than picking a winner from provenance."""
 
-    def __init__(self, scope: object, facts: tuple[Fact[object, object], ...]) -> None:
+    def __init__(self, scope: object, facts: tuple[Fact[Any, Any], ...]) -> None:
         self.scope = scope
         self.facts = facts
         super().__init__(f"contradictory facts at {scope!r}: {[f.value for f in facts]}")
@@ -54,7 +55,7 @@ class SeamContradiction(Exception):  # noqa: N818 — name is the design contrac
     """Raised by ``combine`` when two committed, incompatible operands meet at a
     scalar expression. It becomes a finding at the combine site."""
 
-    def __init__(self, a: Annotation[object], b: Annotation[object]) -> None:
+    def __init__(self, a: Annotation[Any], b: Annotation[Any]) -> None:
         self.a = a
         self.b = b
         super().__init__(f"incompatible operands at a seam: {a.value!r} and {b.value!r}")

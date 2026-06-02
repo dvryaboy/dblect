@@ -20,18 +20,22 @@ Amsterdamer, Deutch, and Tannen ("Provenance for Aggregate Queries", PODS
 ``docs/design/column-level-lineage.md`` for the practical guide.
 """
 
+from dblect.lineage.facts import Annotation, Property, PropertyRegistry
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
-from dblect.lineage.property import Property, propagate
+from dblect.lineage.property import propagate, run
 from dblect.lineage.semiring import BooleanSemiring, Semiring, UnionSemiring
 
 __all__ = [
+    "Annotation",
     "BooleanSemiring",
     "ColumnLineageGraph",
     "ColumnRef",
     "Property",
+    "PropertyRegistry",
     "Semiring",
     "SourceKind",
     "SourceRef",
     "UnionSemiring",
     "propagate",
+    "run",
 ]

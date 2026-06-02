@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from dblect.lineage import propagate
 from dblect.lineage.builder import build_model_graph
+from dblect.lineage.facts.model import Annotation, Opacity
+from dblect.lineage.facts.property import Property, column_property
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import Nullability, nullability
-from dblect.lineage.property import Property
+from dblect.lineage.properties.nullability import NULLABILITY_LATTICE
+from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
+
+_nullabilities = st.sampled_from(list(Nullability))
 
 
 def _source(name: str) -> SourceRef:
@@ -19,14 +27,25 @@ def _model(uid: str) -> SourceRef:
     return SourceRef(SourceKind.MODEL, uid)
 
 
-def _with_source_rule(rule: Callable[[ColumnRef], Nullability]) -> Property[Nullability]:
-    return Property(
+def _with_source_rule(
+    rule: Callable[[ColumnRef], Nullability],
+) -> Property[Nullability, ColumnRef]:
+    """The demo property with leaf values injected as REFINED declarations, so a
+    source column anchors on the test's chosen nullability rather than IMPLICIT."""
+
+    def ground(col: ColumnRef) -> Annotation[Nullability]:
+        value = rule(col)
+        if value is Nullability.UNKNOWN:
+            return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
+        return Annotation(value, Opacity.REFINED)
+
+    return column_property(
         name=nullability.name,
-        semiring=nullability.semiring,
-        source=rule,
+        lattice=NULLABILITY_LATTICE,
         operators=nullability.operators,
         aggregates=nullability.aggregates,
-        unknown_value=nullability.unknown_value,
+        ground=ground,
+        semiring=nullability.semiring,
     )
 
 
@@ -58,7 +77,7 @@ def test_coalesce_inside_cte_propagates_non_null() -> None:
 
     anns = propagate(graph, _with_source_rule(src_rule))
     out = ColumnRef(_model("model.test.m"), "out")
-    assert anns[out] is Nullability.NON_NULL
+    assert anns[out].value is Nullability.NON_NULL
 
 
 def test_union_arm_nullability_combines_via_plus() -> None:
@@ -86,4 +105,16 @@ def test_union_arm_nullability_combines_via_plus() -> None:
 
     anns = propagate(graph, _with_source_rule(src_rule))
     out = ColumnRef(_model("model.test.m"), "out")
-    assert anns[out] is Nullability.NULLABLE
+    assert anns[out].value is Nullability.NULLABLE
+
+
+@given(_nullabilities, _nullabilities, _nullabilities)
+def test_nullability_lattice_laws(a: Nullability, b: Nullability, c: Nullability) -> None:
+    """The nullability lattice is a bounded distributive chain, so it satisfies the
+    full bounded-lattice laws (every property runs this check)."""
+    assert_lattice_laws(NULLABILITY_LATTICE, a, b, c)
+
+
+@given(_nullabilities, _nullabilities)
+def test_nullability_consistency_laws(declared: Nullability, value: Nullability) -> None:
+    assert_consistency_laws(NULLABILITY_LATTICE, declared, value)

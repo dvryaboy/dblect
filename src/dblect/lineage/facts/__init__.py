@@ -43,10 +43,12 @@ from dblect.lineage.facts.property import (
     column_property,
     relation_property,
 )
+from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 
 __all__ = [
     "AggregateRule",
     "Annotation",
+    "AnnotationStore",
     "AxisDisplay",
     "BuildIssue",
     "CoherenceGuard",
@@ -65,6 +67,7 @@ __all__ = [
     "OperatorTransfer",
     "Property",
     "PropertyRef",
+    "PropertyRegistry",
     "Provenance",
     "ScopeKind",
     "SeamContradiction",

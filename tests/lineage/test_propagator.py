@@ -1,0 +1,319 @@
+"""The rewritten propagator: carries Annotation, threads DepContext, reconciles
+declared against inferred into the flow value, and dispatches on scope kind.
+
+The walk cases run on real SQL through ``build_model_graph``; the reconciliation
+cases inject a grounding so declared and inferred can be set independently. The
+property under test uses the subset lattice (meet = intersection, join = union,
+top = the universe, bottom = the empty set), a bona-fide bounded lattice whose
+bottom is reachable, so every arm of the validation table is exercisable.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+
+import pytest
+import sqlglot.expressions as exp
+
+from dblect.lineage.builder import build_model_graph
+from dblect.lineage.facts.lattice import Lattice
+from dblect.lineage.facts.model import Annotation, Opacity
+from dblect.lineage.facts.property import (
+    DepContext,
+    OperatorTransfer,
+    Property,
+    PropertyRef,
+    column_property,
+    relation_property,
+)
+from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.property import propagate, run
+from dblect.lineage.semiring import UnionSemiring
+
+_UNIVERSE = frozenset({0, 1, 2, 3})
+_Set = frozenset[int]
+
+
+def _subset_lattice() -> Lattice[_Set]:
+    return Lattice(meet=lambda a, b: a & b, join=lambda a, b: a | b, top=_UNIVERSE, bottom=frozenset())
+
+
+def _subset_prop(
+    ground: Callable[[ColumnRef], Annotation[_Set]],
+    *,
+    operators: Mapping[type, OperatorTransfer[_Set]] | None = None,
+    semiring: UnionSemiring[int] | None = None,
+) -> Property[_Set, ColumnRef]:
+    return column_property(
+        name="subset",
+        lattice=_subset_lattice(),
+        operators=operators or {},
+        aggregates={},
+        ground=ground,
+        semiring=semiring,
+    )
+
+
+def _src(name: str) -> SourceRef:
+    return SourceRef(SourceKind.SOURCE, f"source.test.raw.{name}")
+
+
+def _model(uid: str = "model.test.m") -> SourceRef:
+    return SourceRef(SourceKind.MODEL, uid)
+
+
+def _refined_for(values: dict[ColumnRef, _Set]) -> Callable[[ColumnRef], Annotation[_Set]]:
+    """Ground the named scopes REFINED to their value; everything else IMPLICIT top."""
+
+    def ground(col: ColumnRef) -> Annotation[_Set]:
+        if col in values:
+            return Annotation(values[col], Opacity.REFINED)
+        return Annotation(_UNIVERSE, Opacity.IMPLICIT)
+
+    return ground
+
+
+# --- carrying Annotation through the walk ------------------------------------
+
+
+def test_pass_through_carries_refined_leaf_value() -> None:
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    anns = propagate(graph, _subset_prop(_refined_for({leaf: frozenset({0})})))
+    assert anns[out] == Annotation(frozenset({0}), Opacity.REFINED)
+
+
+def test_leaf_with_no_declaration_is_implicit_top() -> None:
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    out = ColumnRef(_model(), "id")
+    anns = propagate(graph, _subset_prop(_refined_for({})))
+    assert anns[out] == Annotation(_UNIVERSE, Opacity.IMPLICIT)
+
+
+def test_literal_grounds_to_top() -> None:
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT 42 AS answer FROM t",
+        name_to_source={"t": _src("t")},
+        schema={"t": {"x": "INT"}},
+    )
+    out = ColumnRef(_model(), "answer")
+    anns = propagate(graph, _subset_prop(_refined_for({})))
+    assert anns[out].value == _UNIVERSE
+
+
+# --- confluence --------------------------------------------------------------
+
+
+def test_confluence_without_semiring_uses_lattice_join() -> None:
+    """A UNION ALL of two arms folds with the lattice join (set union here)."""
+    sql = """
+        SELECT u.x AS out FROM (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS x FROM t2
+        ) u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _src("t1"), "t2": _src("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+    ground = _refined_for(
+        {ColumnRef(_src("t1"), "a"): frozenset({0}), ColumnRef(_src("t2"), "b"): frozenset({1})}
+    )
+    out = ColumnRef(_model(), "out")
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[out].value == frozenset({0, 1})
+
+
+def test_confluence_with_semiring_uses_plus() -> None:
+    """With a semiring present the confluence folds with semiring.plus. For the
+    union semiring that is also set union, so the arms merge."""
+    sql = """
+        SELECT u.x AS out FROM (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS x FROM t2
+        ) u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _src("t1"), "t2": _src("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+    ground = _refined_for(
+        {ColumnRef(_src("t1"), "a"): frozenset({0}), ColumnRef(_src("t2"), "b"): frozenset({2})}
+    )
+    out = ColumnRef(_model(), "out")
+    anns = propagate(graph, _subset_prop(ground, semiring=UnionSemiring[int]()))
+    assert anns[out].value == frozenset({0, 2})
+
+
+# --- reconciliation (declared vs inferred -> flow) ---------------------------
+
+
+def test_tightening_flows_the_more_precise_inferred_value() -> None:
+    """Declared loose, SQL proves more precise: the flow value is the inferred one."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    ground = _refined_for({leaf: frozenset({0}), out: frozenset({0, 1})})
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[out].value == frozenset({0})
+    assert not anns[out].provisional
+
+
+def test_conflict_keeps_declared_and_taints_provisional() -> None:
+    """SQL contradicts the declaration: flow stays at the declared value, marked
+    provisional, rather than asserting the unsupported inferred value."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    ground = _refined_for({leaf: frozenset({0, 1}), out: frozenset({0})})
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[out].value == frozenset({0})
+    assert anns[out].provisional
+
+
+def test_opaque_inferred_keeps_declaration_without_a_taint() -> None:
+    """When the SQL reveals nothing (inferred top), the declaration stands and is
+    not tainted."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT 42 AS id FROM t",
+        name_to_source={"t": _src("t")},
+        schema={"t": {"x": "INT"}},
+    )
+    out = ColumnRef(_model(), "id")
+    ground = _refined_for({out: frozenset({0})})
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[out].value == frozenset({0})
+    assert not anns[out].provisional
+
+
+def test_explicit_optout_short_circuits_the_walk() -> None:
+    """A node declared opaque flows top-EXPLICIT even though it has a derivation."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+
+    def ground(col: ColumnRef) -> Annotation[_Set]:
+        if col == out:
+            return Annotation(_UNIVERSE, Opacity.EXPLICIT)
+        if col == leaf:
+            return Annotation(frozenset({0}), Opacity.REFINED)
+        return Annotation(_UNIVERSE, Opacity.IMPLICIT)
+
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[out] == Annotation(_UNIVERSE, Opacity.EXPLICIT)
+
+
+# --- DepContext threading ----------------------------------------------------
+
+
+def test_operator_transfer_receives_threaded_dep_context() -> None:
+    """The dep_context handed to propagate reaches a registered operator transfer,
+    and reads through it resolve against the backing store."""
+    captured: list[DepContext] = []
+    dep_ref: PropertyRef[_Set, ColumnRef] = _subset_prop(_refined_for({})).ref
+
+    def add_rule(_expr: object, kids: tuple[Annotation[_Set], ...], ctx: DepContext) -> Annotation[_Set]:
+        captured.append(ctx)
+        seen = ctx.annotation(dep_ref, ColumnRef(_src("t"), "a"))
+        return seen if seen is not None else Annotation(frozenset(), Opacity.REFINED)
+
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.a + u.b AS s FROM t u",
+        name_to_source={"t": _src("t")},
+        schema={"t": {"a": "INT", "b": "INT"}},
+    )
+
+    store = AnnotationStore()
+    store.record(dep_ref.name, ColumnRef(_src("t"), "a"), Annotation(frozenset({3}), Opacity.REFINED))
+    ctx = PropertyRegistry((_subset_prop(_refined_for({})),)).dep_context(store)
+
+    out = ColumnRef(_model(), "s")
+    anns = propagate(graph, _subset_prop(_refined_for({}), operators={exp.Add: add_rule}), dep_context=ctx)
+    assert len(captured) == 1
+    assert captured[0] is ctx
+    assert anns[out].value == frozenset({3})
+
+
+# --- scope dispatch and the registry driver ---------------------------------
+
+
+def test_relation_scope_is_not_yet_implemented() -> None:
+    rel = relation_property(
+        name="uniqueness",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=lambda _s: Annotation(_UNIVERSE, Opacity.IMPLICIT),
+    )
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    with pytest.raises(NotImplementedError, match="relation"):
+        propagate(graph, rel)
+
+
+def test_run_fills_store_for_every_property() -> None:
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    p1 = column_property(
+        name="p1",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=_refined_for({leaf: frozenset({0})}),
+    )
+    p2 = column_property(
+        name="p2",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=_refined_for({leaf: frozenset({1})}),
+    )
+    store = run(graph, PropertyRegistry((p1, p2)))
+    assert store.get("p1", out) == Annotation(frozenset({0}), Opacity.REFINED)
+    assert store.get("p2", out) == Annotation(frozenset({1}), Opacity.REFINED)
