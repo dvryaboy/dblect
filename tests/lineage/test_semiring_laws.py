@@ -46,6 +46,11 @@ def _check_strict_absorption(sr: Semiring[K], a: K) -> None:
     assert sr.times(sr.zero, a) == sr.zero
 
 
+def _check_is_near_not_strict(sr: Semiring[K], a: K) -> None:
+    """A near-semiring has ``zero == one``, so ``times(zero, a) == a``, not ``zero``."""
+    assert sr.times(sr.zero, a) == a
+
+
 @given(st.tuples(st.booleans(), st.booleans(), st.booleans()))
 def test_boolean_core_laws(values: tuple[bool, bool, bool]) -> None:
     _check_core_laws(BooleanSemiring(), values)
@@ -82,9 +87,7 @@ def test_union_semiring_is_a_near_semiring_not_strict() -> None:
     assert sr.times(sr.zero, a) != sr.zero
 
 
-# The max-semiring driving aggregation-depth: non-negative ints, both operations
-# take the max. Like the set-union variant it is a near-semiring (``zero == one``),
-# so the core laws hold but strict absorption does not.
+# MaxSemiring (aggregation-depth) is a near-semiring, like UnionSemiring.
 _depths = st.integers(min_value=0, max_value=8)
 
 
@@ -95,14 +98,11 @@ def test_max_semiring_core_laws(values: tuple[int, int, int]) -> None:
 
 @given(_depths)
 def test_max_semiring_is_a_near_semiring_not_strict(a: int) -> None:
-    """``zero == one == 0`` and ``times`` is max, so ``0 x a == a``, not ``0``."""
-    sr = MaxSemiring()
-    assert sr.times(sr.zero, a) == a
+    _check_is_near_not_strict(MaxSemiring(), a)
 
 
-# The null-taint semiring driving nullability. Its laws are pinned over the three
-# operational values; CONTRADICTION is the lattice bottom and never reaches the
-# combine, so it is excluded here exactly as the property documents.
+# NullabilitySemiring laws hold over the three operational values; CONTRADICTION
+# never reaches the combine (see properties/nullability.py).
 _taints = st.sampled_from([Nullability.NON_NULL, Nullability.NULLABLE, Nullability.UNKNOWN])
 
 
@@ -115,10 +115,7 @@ def test_nullability_semiring_core_laws(
 
 @given(_taints)
 def test_nullability_semiring_is_a_near_semiring_not_strict(a: Nullability) -> None:
-    """``zero == one == NON_NULL`` (the taint-order minimum), so ``times(zero, a)``
-    is ``a``, not ``zero``: a NON_NULL operand never erases a proven taint."""
-    sr = NullabilitySemiring()
-    assert sr.times(sr.zero, a) == a
+    _check_is_near_not_strict(NullabilitySemiring(), a)
 
 
 def test_protocol_runtime_check_passes_for_concrete_impls() -> None:

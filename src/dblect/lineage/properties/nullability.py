@@ -6,22 +6,14 @@ nullable arm taints the combined output. Grounding is trivial here (every node
 IMPLICIT) until the nullability discoverers land and consult ``not_null`` tests,
 the declared ``nullable`` flag, and native ``NOT NULL`` constraints.
 
-The lattice orders by precision: NON_NULL (the strongest guarantee) refines
-NULLABLE refines UNKNOWN (the top, "no information"). ``meet`` keeps the stronger
-guarantee, so resolving a ``not_null`` test against a permissive ``nullable: true``
-flag yields NON_NULL. A structural property never contradicts, so the formal
-lattice bottom (CONTRADICTION) is unreachable in propagation; it exists only to
-make the lattice bounded.
+The lattice orders by precision (NON_NULL refines NULLABLE refines UNKNOWN, the
+"no information" top); ``meet`` keeps the stronger guarantee. A structural
+property never contradicts, so the bottom (CONTRADICTION) is unreachable and
+exists only to make the lattice bounded.
 
-The confluence combine is a semiring, not the lattice join. A ``UNION ALL`` is
-nullable as soon as one arm is, so a branch proven NULLABLE taints the output even
-against an UNKNOWN one. The lattice cannot express that: UNKNOWN is "no
-information", which has to sit at the top so an opaque upstream never fails the
-consistency check, and a join with the top is always the top, so no lattice with
-UNKNOWN on top can give ``join(NULLABLE, UNKNOWN) == NULLABLE``. So nullability,
-though idempotent, carries a semiring whose ``plus`` (confluence) and ``times``
-(scalar inputs) take the more-null value, with NON_NULL as the identity. COALESCE
-overrides with "non-null wins".
+Confluence uses a semiring rather than the lattice join, so a proven NULLABLE
+arm can beat an UNKNOWN one (a join with the top cannot); see
+:class:`NullabilitySemiring` and ``propagation-soundness.md``.
 """
 
 from __future__ import annotations
@@ -72,19 +64,12 @@ NULLABILITY_LATTICE: Lattice[Nullability] = Lattice(
 
 @dataclass(frozen=True, slots=True)
 class NullabilitySemiring:
-    """The null-taint combine: both ``plus`` (confluence) and ``times`` (scalar
-    inputs) take the more-null value.
-
-    NULLABLE beats UNKNOWN beats NON_NULL: a branch proven nullable taints the
-    result regardless of what is unknown about the others, and UNKNOWN beats
-    NON_NULL because we should not claim non-null without evidence. NON_NULL is
-    the identity, so a non-null literal in an expression changes nothing.
-
-    This is the join of the taint order NON_NULL < UNKNOWN < NULLABLE, which is
-    not the precision order the lattice meet and join use (there UNKNOWN is the
-    top). CONTRADICTION is the lattice bottom and never reaches the combine, so
-    the laws are pinned over the three operational values in ``test_semiring_laws``.
-    """
+    """The null-taint combine: ``plus`` (confluence) and ``times`` (scalar inputs)
+    both take the more-null value, ordering NON_NULL < UNKNOWN < NULLABLE with
+    NON_NULL as the identity. A proven NULLABLE taints the result whatever else is
+    unknown, and UNKNOWN beats NON_NULL since we never claim non-null without
+    evidence. CONTRADICTION never reaches the combine, so the laws are pinned over
+    the three operational values in ``test_semiring_laws``."""
 
     zero: Nullability = Nullability.NON_NULL
     one: Nullability = Nullability.NON_NULL

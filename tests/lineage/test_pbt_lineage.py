@@ -615,10 +615,8 @@ def test_pbt_union_all_arms_match_ground_truth(s: UnionScenario) -> None:
         )
 
 
-# Scenario-construction helpers reused by sibling property tests (e.g.
-# test_pbt_nullability_monotone, which reruns these SQL shapes under a different
-# property). Re-exported under public names so importers do not reach into
-# module-private members.
+# Public aliases for scenario helpers reused by sibling tests
+# (test_pbt_nullability_monotone).
 build_manifest = _build_manifest
 leaf_source_ref = _leaf_source_ref
 cte_scenario = _cte_scenario

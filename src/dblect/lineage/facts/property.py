@@ -1,11 +1,10 @@
 """``Property[K, S]``: a lattice, transfer catalogs, and a grounding function.
 
 A property bundles everything the propagator needs to walk one axis: its
-:class:`Lattice` (the abstraction domain ``resolve`` and ``consistent`` derive
-from), per-operator and per-aggregate transfers, the ``ground`` function that
-gives each node its declared :class:`Annotation`, and an optional operator
-algebra (:class:`Semiring`) for counting or accumulating axes. The transfer
-calculus and its obligations are in ``docs/design/propagation-soundness.md``.
+:class:`Lattice`, per-operator and per-aggregate transfers, the ``ground``
+function that gives each node its declared :class:`Annotation`, and an optional
+:class:`Semiring` for counting or accumulating axes. The transfer calculus and
+its obligations are in ``docs/design/propagation-soundness.md``.
 
 A property's typed handle, :class:`PropertyRef`, is minted once by the smart
 constructors behind a module-private token, so a caller cannot forge a handle of
@@ -81,11 +80,9 @@ OperatorTransfer = Callable[[Expr, tuple[Annotation[K], ...], DepContext], Annot
 @dataclass(frozen=True, slots=True)
 class CoherenceGuard:
     """A precondition an aggregate's meaning rests on: the ``within`` columns must
-    be constant across each aggregated group, the functional dependency
-    ``group_keys -> within``. The guard reads that FD from the dependency property
-    ``fd`` at the aggregation's input relation; where it does not hold the
-    aggregate's result clears to top and the seam rule reports it. Compiles from a
-    ``within=<cols>`` declaration."""
+    be constant across each aggregated group. The guard reads that dependency from
+    ``fd``; where it does not hold, the aggregate clears to top and the seam rule
+    reports it. See ``propagation-soundness.md``."""
 
     fd: PropertyRef[Any, SourceRef]
     within: tuple[str, ...]
@@ -93,13 +90,9 @@ class CoherenceGuard:
 
 @dataclass(frozen=True, slots=True)
 class AggregateRule(Generic[K]):
-    """An aggregate transfer split so its soundness obligation stays checkable.
-
-    ``core`` is a pure value-domain map with no DepContext, the piece that must
-    commute with confluence and cross. ``coherence`` is the optional
-    clear-on-failure guard, and the FD read it performs is the only way a
-    dependency enters an aggregate, so ``core`` is property-tested in isolation.
-    """
+    """An aggregate transfer split so its soundness obligation stays checkable:
+    ``core`` is a pure value-domain map (no DepContext), and ``coherence`` is the
+    optional clear-on-failure guard through which any dependency enters."""
 
     core: Callable[[exp.AggFunc, Annotation[K]], Annotation[K]]
     coherence: CoherenceGuard | None = None
@@ -148,14 +141,10 @@ class Property(Generic[K, S]):
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 
     def __post_init__(self) -> None:
-        # The structurally-checkable invariant: a semiring-carrying property's
-        # confluence and cross derive from plus/times, so it must not also pin
-        # those operators by hand. The semiring laws (associativity, commutativity,
-        # distribution, the identity roles) are PBT obligations in
-        # propagation-soundness.md; they are not decidable by inspection here. The
-        # plus need not equal the lattice join: nullability is idempotent yet its
-        # confluence lets a committed value beat the "no information" top, which a
-        # join with the top cannot.
+        # A semiring-carrying property derives its confluence and cross from
+        # plus/times, so it must not also pin those operators by hand. The semiring
+        # laws themselves are PBT obligations (see propagation-soundness.md), not
+        # decidable here.
         if self.semiring is not None:
             clash = {exp.Union, exp.Join} & set(self.operators)
             if clash:

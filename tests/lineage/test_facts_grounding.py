@@ -109,10 +109,9 @@ def test_combine_propagates_provisional() -> None:
 
 @st.composite
 def _well_formed_annotation(draw: st.DrawFn) -> Annotation[str]:
-    """A committed value carries REFINED; a top carries IMPLICIT or EXPLICIT. This
-    is the invariant the substrate maintains: a top is never REFINED, because a
-    discoverer never emits a top-valued fact and the fold only marks REFINED below
-    top. The opacity asymmetry in ``combine``'s agree-on-top arm relies on it."""
+    """A committed value carries REFINED; a top carries IMPLICIT or EXPLICIT. The
+    substrate maintains this invariant (a top is never REFINED), and combine's
+    opacity choice on an agreeing top relies on it."""
     value = draw(st.sampled_from([_TOP, "A", "B"]))
     provisional = draw(st.booleans())
     if value == _TOP:
@@ -124,10 +123,8 @@ def _well_formed_annotation(draw: st.DrawFn) -> Annotation[str]:
 
 @given(_well_formed_annotation(), _well_formed_annotation())
 def test_combine_is_commutative(a: Annotation[str], b: Annotation[str]) -> None:
-    """The seam combine is symmetric: value, opacity, and the provisional taint do
-    not depend on operand order, and a contradiction is raised for both orders or
-    neither. The meet underneath is commutative; this pins that the opacity choice
-    on a cleared top is too."""
+    """combine is symmetric: value, opacity, and taint do not depend on operand
+    order, and a contradiction is raised for both orders or neither."""
     try:
         forward = combine(_FLAT, a, b)
     except SeamContradictionError:

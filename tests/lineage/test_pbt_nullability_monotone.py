@@ -1,15 +1,11 @@
 """Metamorphic PBT: nullability is monotone in its source assignments.
 
-An independent oracle that shares none of the propagator's branch logic. In the
-taint order NON_NULL < UNKNOWN < NULLABLE, making any source column *more null*
-must never make a downstream column *less null*: every nullability transfer is
-monotone in that order (taint-max at confluence and cross, the constant NON_NULL
-of COUNT, COALESCE's non-null-wins), so the whole walk must be too. A violation
-points at a non-monotone transfer or a fold bug rather than a restated branch.
-
-The SQL shapes come from the end-to-end scenario generator (passthrough, scalar
-expressions, SUM, single/join/multi-model chains); the assignment pair is drawn
-so the two runs are ordered by construction.
+In the taint order NON_NULL < UNKNOWN < NULLABLE, making a source column more
+null must never make a downstream column less null. Every nullability transfer
+is monotone in that order, so the whole walk must be. This oracle shares no
+branch logic with the propagator, so a failure is a real non-monotone transfer
+or fold bug, not a restated branch. SQL shapes are reused from the end-to-end
+scenario generator; the assignment pair is drawn already ordered.
 """
 
 from __future__ import annotations
@@ -38,9 +34,8 @@ from tests.lineage.test_pbt_lineage import (
 
 _WRAP_ALL = ("none", "coalesce", "case", "aggregate")
 
-# Taint order: less null is smaller. CONTRADICTION should never surface from a
-# structural walk; it is ranked below everything so a stray one is a loud failure
-# rather than a KeyError that masks the real outcome.
+# Taint order: less null is smaller. CONTRADICTION should never surface; ranking
+# it below everything turns a stray one into a failure, not a masking KeyError.
 _TAINT_RANK: dict[Nullability, int] = {
     Nullability.CONTRADICTION: -1,
     Nullability.NON_NULL: 0,
@@ -106,9 +101,8 @@ def test_nullability_is_monotone_in_source_assignments(
 def _cte_with_ordered_assignments(
     draw: st.DrawFn,
 ) -> tuple[CTEScenario, dict[ColumnRef, Nullability], dict[ColumnRef, Nullability]]:
-    """A CTE scenario plus an ordered pair of leaf assignments. The COALESCE / CASE
-    / SUM wrappings put the hand-written COALESCE transfer (and the default
-    children-fold for CASE) on the monotonicity hook, not just passthrough/SUM."""
+    """A CTE scenario plus an ordered leaf-assignment pair. The COALESCE/CASE/SUM
+    wrappings exercise the COALESCE transfer, not just passthrough and SUM."""
     scenario = draw(cte_scenario(multi_source=True, wrap_choices=_WRAP_ALL))
     src = SourceRef(SourceKind.SOURCE, "source.test.raw.leaf_0")
     lo: dict[ColumnRef, Nullability] = {}

@@ -46,9 +46,7 @@ def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
     value = lat.top
     for f in facts:
         value = lat.meet(value, f.value)
-    # A degenerate lattice (top == bottom, the inert bottom a nominal property
-    # carries) has no distinct contradiction state, so the fold is always "no
-    # information", never a conflict.
+    # A degenerate lattice (top == bottom) has no distinct contradiction state.
     return value, value == lat.bottom and lat.bottom != lat.top
 
 
@@ -57,13 +55,10 @@ def consistent(lat: Lattice[K]) -> Callable[[K, K], bool]:
     declaration when the SQL revealed nothing (top) or proved something at least
     as precise.
 
-    ``top`` is checked before ``bottom``: an opaque inference always honours a
-    declaration, including on a degenerate lattice (``top == bottom``, the inert
-    bottom a nominal property carries) where the two coincide. ``bottom`` is then
-    handled explicitly rather than left to ``refines``: ``bottom`` refines every
-    value, so without its own arm an inferred contradiction would pass vacuously.
-    An inferred ``bottom`` means propagation derived a contradiction at this node,
-    which is a finding, not a silent pass.
+    ``top`` is checked before ``bottom`` so an opaque inference passes even on a
+    degenerate lattice (``top == bottom``). ``bottom`` is then handled explicitly:
+    it refines every value, so without its own arm an inferred contradiction would
+    pass vacuously, when it should be a finding.
     """
 
     def check(declared: K, inferred: K) -> bool:

@@ -95,19 +95,16 @@ def test_consistent_handles_top_and_bottom() -> None:
 
 
 def _degenerate_lattice() -> Lattice[frozenset[int]]:
-    """A nominal lattice whose inert bottom coincides with its top, the shape the
-    semiring-driven properties (where-provenance, aggregation-depth) carry: only
-    ``top`` is read, and ``meet``/``join``/``bottom`` never resolve real facts."""
+    """A nominal lattice with ``top == bottom``, the shape where-provenance and
+    aggregation-depth carry."""
     empty: frozenset[int] = frozenset()
     return Lattice(meet=lambda a, b: a | b, join=lambda a, b: a & b, top=empty, bottom=empty)
 
 
 def test_resolve_and_consistent_stay_sound_on_a_degenerate_lattice() -> None:
-    """When ``top == bottom`` the substrate must not read the "no information" top
-    as a contradiction: an empty bucket still resolves to top without flagging a
-    conflict, and an opaque (top) inference still honours any declaration. The two
-    nominal-lattice properties depend on this rather than only on never routing
-    through these functions."""
+    """When ``top == bottom``, "no information" must not read as a contradiction:
+    an empty bucket resolves to top without flagging a conflict, and an opaque
+    inference still honours any declaration."""
     lat = _degenerate_lattice()
     value, is_contradiction = resolve(lat, ())
     assert value == lat.top

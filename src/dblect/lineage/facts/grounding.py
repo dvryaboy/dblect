@@ -42,8 +42,7 @@ class OpaqueReader(Protocol[_S_co]):
 class FactConflictError(Exception):
     """Raised when a scope's facts meet to the lattice bottom: the declarations
     are mutually unsatisfiable. Carries the scope and the conflicting facts so the
-    audit can report them. Resolution keeps the deterministic bottom-derived value
-    rather than picking a winner from provenance."""
+    audit can report them."""
 
     def __init__(self, scope: object, facts: tuple[Fact[Any, Any], ...]) -> None:
         self.scope = scope
@@ -103,11 +102,9 @@ def grounding(
     grounds ``Annotation(value, REFINED)``. Every other scope grounds
     ``Annotation(top, IMPLICIT)``, the "nothing declared" default.
 
-    A bucket that resolves to ``bottom`` is a contradiction and raises a
-    ``FactConflictError`` here, at build time. Recovering from a contradiction by
-    continuing with the deterministic bottom value and tainting downstream
-    annotations provisional is a propagator concern that lands with the findings
-    layer; the grounding builder surfaces the conflict rather than swallowing it.
+    A bucket that resolves to ``bottom`` is a contradiction and raises
+    ``FactConflictError`` here, at build time, rather than swallowing it; recovery
+    is a propagator concern that lands with the findings layer.
     """
     opaque_set = set(opaque)
     declared: dict[S, Annotation[K]] = {}
