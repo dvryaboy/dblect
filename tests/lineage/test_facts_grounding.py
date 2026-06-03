@@ -1,10 +1,10 @@
 """The seam combine, fact collection, and grounding.
 
-Written against the contract in ``lineage-facts.md``: combine clears a refined
+Written against the contract in ``lineage-facts.md``: combine clears a concrete
 value at a typed/untyped seam and speaks or stays silent by the cleared
 operand's opacity; collect buckets facts by scope and isolates a failing
-discoverer; grounding turns a scope's bucket into its declared annotation
-(EXPLICIT opt-out, REFINED value, or IMPLICIT default).
+discoverer; grounding turns a scope's bucket into its grounded annotation
+(EXPLICIT opt-out, CONCRETE value, or IMPLICIT default).
 """
 
 from __future__ import annotations
@@ -69,9 +69,9 @@ def _fact(scope: ColumnRef, value: str) -> Fact[str, ColumnRef]:
 # --- combine (the typed/untyped seam) ---------------------------------------
 
 
-def test_combine_preserves_agreeing_refined_values() -> None:
+def test_combine_preserves_agreeing_concrete_values() -> None:
     out = combine(_FLAT, Annotation("A"), Annotation("A"))
-    assert out == Annotation("A", Opacity.REFINED, provisional=False)
+    assert out == Annotation("A", Opacity.CONCRETE, provisional=False)
 
 
 def test_combine_implicit_top_clears_and_speaks() -> None:
@@ -109,15 +109,15 @@ def test_combine_propagates_provisional() -> None:
 
 @st.composite
 def _well_formed_annotation(draw: st.DrawFn) -> Annotation[str]:
-    """A committed value carries REFINED; a top carries IMPLICIT or EXPLICIT. The
-    substrate maintains this invariant (a top is never REFINED), and combine's
+    """A committed value carries CONCRETE; a top carries IMPLICIT or EXPLICIT. The
+    substrate maintains this invariant (a top is never CONCRETE), and combine's
     opacity choice on an agreeing top relies on it."""
     value = draw(st.sampled_from([_TOP, "A", "B"]))
     provisional = draw(st.booleans())
     if value == _TOP:
         opacity = draw(st.sampled_from([Opacity.IMPLICIT, Opacity.EXPLICIT]))
     else:
-        opacity = Opacity.REFINED
+        opacity = Opacity.CONCRETE
     return Annotation(value, opacity, provisional=provisional)
 
 
@@ -204,10 +204,10 @@ def test_grounding_opaque_scope_is_explicit_top() -> None:
     assert ground(_COL_A) == Annotation(_TOP, Opacity.EXPLICIT)
 
 
-def test_grounding_resolves_fact_to_refined() -> None:
+def test_grounding_resolves_fact_to_concrete() -> None:
     facts = {_COL_A: (_fact(_COL_A, "A"),)}
     ground = grounding(facts, opaque=set(), lat=_FLAT)
-    assert ground(_COL_A) == Annotation("A", Opacity.REFINED)
+    assert ground(_COL_A) == Annotation("A", Opacity.CONCRETE)
 
 
 def test_grounding_absent_scope_is_implicit_top() -> None:

@@ -30,14 +30,14 @@ def _model(uid: str) -> SourceRef:
 def _with_source_rule(
     rule: Callable[[ColumnRef], Nullability],
 ) -> Property[Nullability, ColumnRef]:
-    """The demo property with leaf values injected as REFINED declarations, so a
+    """The demo property with leaf values injected as CONCRETE declarations, so a
     source column anchors on the test's chosen nullability rather than IMPLICIT."""
 
     def ground(col: ColumnRef) -> Annotation[Nullability]:
         value = rule(col)
         if value is Nullability.UNKNOWN:
             return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
-        return Annotation(value, Opacity.REFINED)
+        return Annotation(value, Opacity.CONCRETE)
 
     return column_property(
         name=nullability.name,

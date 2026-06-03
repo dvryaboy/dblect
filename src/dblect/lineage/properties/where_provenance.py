@@ -43,7 +43,7 @@ _PROVENANCE_LATTICE: Lattice[WhereProvenance] = Lattice(
 
 def _ground(col: ColumnRef) -> Annotation[WhereProvenance]:
     if col.source.kind in _BASE_KINDS:
-        return Annotation(frozenset({col}), Opacity.REFINED)
+        return Annotation(frozenset({col}), Opacity.CONCRETE)
     return Annotation(_EMPTY, Opacity.IMPLICIT)
 
 

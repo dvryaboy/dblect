@@ -6,14 +6,14 @@ aggregates (its transfer catalogs), and how to order values for resolution (its
 lattice). This module walks the graph once per property, carrying an
 :class:`~dblect.lineage.facts.Annotation` at every node:
 
-* At a node with no derivation (a source or seed) it flows the node's *declared*
+* At a node with no derivation (a source or seed) it flows the node's *grounded*
   annotation from ``ground``.
-* At a node declared opaque (``EXPLICIT``) it short-circuits, flowing top
+* At a node grounded opaque (``EXPLICIT``) it short-circuits, flowing top
   silently because the modeller took responsibility for it.
 * At a derived node it reduces the projection expression to an *inferred*
-  annotation, then reconciles it against the declaration into the **flow** value:
-  a more precise inferred value tightens, an opaque inference keeps the
-  declaration, and a conflict keeps the declaration but taints it provisional.
+  annotation, then reconciles it against the grounded value into the **flow**
+  value: a more precise inferred value tightens, an opaque inference keeps the
+  grounded value, and a conflict keeps it but taints it provisional.
 
 Confluences (``UNION ALL``) fold with the property's ``semiring.plus`` when it
 carries one, otherwise the lattice join; multi-input scalars fold with
@@ -113,16 +113,16 @@ def propagate(
             return default_ann
         in_progress.add(col)
         try:
-            declared = prop.ground(col)
-            if declared.opacity is Opacity.EXPLICIT:
-                result = declared
+            grounded = prop.ground(col)
+            if grounded.opacity is Opacity.EXPLICIT:
+                result = grounded
             else:
                 expr = graph.expressions.get(col)
                 if expr is None:
-                    result = declared  # a leaf anchors on its declaration
+                    result = grounded  # a leaf anchors on its grounded value
                 else:
                     inferred = _walk(expr, prop, annotate, dep_context, default_ann)
-                    result = _reconcile(lat, check, declared, inferred)
+                    result = _reconcile(lat, check, grounded, inferred)
             annotations[col] = result
             return result
         finally:
@@ -149,23 +149,23 @@ def run(graph: ColumnLineageGraph, registry: PropertyRegistry) -> AnnotationStor
 def _reconcile(
     lat: Lattice[K],
     check: Callable[[K, K], bool],
-    declared: Annotation[K],
+    grounded: Annotation[K],
     inferred: Annotation[K],
 ) -> Annotation[K]:
-    """Combine a derived node's declared and inferred annotations into its flow value.
+    """Combine a derived node's grounded and inferred annotations into its flow value.
 
-    Nothing declared: the SQL stands. An opaque inference keeps the declaration. A
-    more precise (consistent) inference tightens to the inferred value. A conflict
-    keeps the declared value as the contract but taints it provisional, so one
+    Nothing grounded: the SQL stands. An opaque inference keeps the grounded value.
+    A more precise (consistent) inference tightens to the inferred value. A conflict
+    keeps the grounded value as the contract but taints it provisional, so one
     upstream regression does not blank analysis of every consumer.
     """
-    if declared.opacity is Opacity.IMPLICIT:
+    if grounded.opacity is Opacity.IMPLICIT:
         return inferred
     if inferred.value == lat.top:
-        return declared
-    if check(declared.value, inferred.value):
+        return grounded
+    if check(grounded.value, inferred.value):
         return inferred
-    return Annotation(declared.value, declared.opacity, provisional=True)
+    return Annotation(grounded.value, grounded.opacity, provisional=True)
 
 
 def _walk(
@@ -243,7 +243,7 @@ def _fold(
 ) -> Annotation[K]:
     """Combine annotation values with ``combine`` and derive the result's opacity.
 
-    A non-top result is ``REFINED``. A top result is ``EXPLICIT`` if any input was
+    A non-top result is ``CONCRETE``. A top result is ``EXPLICIT`` if any input was
     a declared opt-out, otherwise ``IMPLICIT``. The provisional taint is the OR of
     the inputs'.
     """
@@ -251,7 +251,7 @@ def _fold(
     value = reduce(combine, (a.value for a in items))
     provisional = any(a.provisional for a in items)
     if value != lat.top:
-        return Annotation(value, Opacity.REFINED, provisional=provisional)
+        return Annotation(value, Opacity.CONCRETE, provisional=provisional)
     explicit = any(a.opacity is Opacity.EXPLICIT for a in items)
     opacity = Opacity.EXPLICIT if explicit else Opacity.IMPLICIT
     return Annotation(value, opacity, provisional=provisional)

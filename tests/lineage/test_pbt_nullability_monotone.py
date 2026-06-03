@@ -49,13 +49,13 @@ def _rule_property(
     assignment: dict[ColumnRef, Nullability],
 ) -> Property[Nullability, ColumnRef]:
     """Nullability grounded by an explicit per-source-column assignment: a named
-    column anchors REFINED on its value, everything else stays IMPLICIT UNKNOWN."""
+    column anchors CONCRETE on its value, everything else stays IMPLICIT UNKNOWN."""
 
     def ground(col: ColumnRef) -> Annotation[Nullability]:
         value = assignment.get(col, Nullability.UNKNOWN)
         if value is Nullability.UNKNOWN:
             return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
-        return Annotation(value, Opacity.REFINED)
+        return Annotation(value, Opacity.CONCRETE)
 
     return column_property(
         name=nullability.name,

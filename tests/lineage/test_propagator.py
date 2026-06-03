@@ -1,8 +1,8 @@
 """The rewritten propagator: carries Annotation, threads DepContext, reconciles
-declared against inferred into the flow value, and dispatches on scope kind.
+grounded against inferred into the flow value, and dispatches on scope kind.
 
 The walk cases run on real SQL through ``build_model_graph``; the reconciliation
-cases inject a grounding so declared and inferred can be set independently. The
+cases inject a grounding so grounded and inferred can be set independently. The
 property under test uses the subset lattice (meet = intersection, join = union,
 top = the universe, bottom = the empty set), a bona-fide bounded lattice whose
 bottom is reachable, so every arm of the validation table is exercisable.
@@ -65,12 +65,12 @@ def _model(uid: str = "model.test.m") -> SourceRef:
     return SourceRef(SourceKind.MODEL, uid)
 
 
-def _refined_for(values: dict[ColumnRef, _Set]) -> Callable[[ColumnRef], Annotation[_Set]]:
-    """Ground the named scopes REFINED to their value; everything else IMPLICIT top."""
+def _concrete_for(values: dict[ColumnRef, _Set]) -> Callable[[ColumnRef], Annotation[_Set]]:
+    """Ground the named scopes CONCRETE to their value; everything else IMPLICIT top."""
 
     def ground(col: ColumnRef) -> Annotation[_Set]:
         if col in values:
-            return Annotation(values[col], Opacity.REFINED)
+            return Annotation(values[col], Opacity.CONCRETE)
         return Annotation(_UNIVERSE, Opacity.IMPLICIT)
 
     return ground
@@ -79,7 +79,7 @@ def _refined_for(values: dict[ColumnRef, _Set]) -> Callable[[ColumnRef], Annotat
 # --- carrying Annotation through the walk ------------------------------------
 
 
-def test_pass_through_carries_refined_leaf_value() -> None:
+def test_pass_through_carries_concrete_leaf_value() -> None:
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT u.id FROM users u",
@@ -88,8 +88,8 @@ def test_pass_through_carries_refined_leaf_value() -> None:
     )
     leaf = ColumnRef(_src("users"), "id")
     out = ColumnRef(_model(), "id")
-    anns = propagate(graph, _subset_prop(_refined_for({leaf: frozenset({0})})))
-    assert anns[out] == Annotation(frozenset({0}), Opacity.REFINED)
+    anns = propagate(graph, _subset_prop(_concrete_for({leaf: frozenset({0})})))
+    assert anns[out] == Annotation(frozenset({0}), Opacity.CONCRETE)
 
 
 def test_leaf_with_no_declaration_is_implicit_top() -> None:
@@ -100,7 +100,7 @@ def test_leaf_with_no_declaration_is_implicit_top() -> None:
         schema={"users": {"id": "INT"}},
     )
     out = ColumnRef(_model(), "id")
-    anns = propagate(graph, _subset_prop(_refined_for({})))
+    anns = propagate(graph, _subset_prop(_concrete_for({})))
     assert anns[out] == Annotation(_UNIVERSE, Opacity.IMPLICIT)
 
 
@@ -112,7 +112,7 @@ def test_literal_grounds_to_top() -> None:
         schema={"t": {"x": "INT"}},
     )
     out = ColumnRef(_model(), "answer")
-    anns = propagate(graph, _subset_prop(_refined_for({})))
+    anns = propagate(graph, _subset_prop(_concrete_for({})))
     assert anns[out].value == _UNIVERSE
 
 
@@ -134,7 +134,7 @@ def test_confluence_without_semiring_uses_lattice_join() -> None:
         name_to_source={"t1": _src("t1"), "t2": _src("t2")},
         schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
     )
-    ground = _refined_for(
+    ground = _concrete_for(
         {ColumnRef(_src("t1"), "a"): frozenset({0}), ColumnRef(_src("t2"), "b"): frozenset({1})}
     )
     out = ColumnRef(_model(), "out")
@@ -158,7 +158,7 @@ def test_confluence_with_semiring_uses_plus() -> None:
         name_to_source={"t1": _src("t1"), "t2": _src("t2")},
         schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
     )
-    ground = _refined_for(
+    ground = _concrete_for(
         {ColumnRef(_src("t1"), "a"): frozenset({0}), ColumnRef(_src("t2"), "b"): frozenset({2})}
     )
     out = ColumnRef(_model(), "out")
@@ -166,11 +166,11 @@ def test_confluence_with_semiring_uses_plus() -> None:
     assert anns[out].value == frozenset({0, 2})
 
 
-# --- reconciliation (declared vs inferred -> flow) ---------------------------
+# --- reconciliation (grounded vs inferred -> flow) ---------------------------
 
 
 def test_tightening_flows_the_more_precise_inferred_value() -> None:
-    """Declared loose, SQL proves more precise: the flow value is the inferred one."""
+    """Grounded loose, SQL proves more precise: the flow value is the inferred one."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT u.id FROM users u",
@@ -179,15 +179,15 @@ def test_tightening_flows_the_more_precise_inferred_value() -> None:
     )
     leaf = ColumnRef(_src("users"), "id")
     out = ColumnRef(_model(), "id")
-    ground = _refined_for({leaf: frozenset({0}), out: frozenset({0, 1})})
+    ground = _concrete_for({leaf: frozenset({0}), out: frozenset({0, 1})})
     anns = propagate(graph, _subset_prop(ground))
     assert anns[out].value == frozenset({0})
     assert not anns[out].provisional
 
 
-def test_conflict_keeps_declared_and_taints_provisional() -> None:
-    """SQL contradicts the declaration: flow stays at the declared value, marked
-    provisional, rather than asserting the unsupported inferred value."""
+def test_conflict_keeps_grounded_and_taints_provisional() -> None:
+    """SQL contradicts the grounded value: flow stays at it, marked provisional,
+    rather than asserting the unsupported inferred value."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT u.id FROM users u",
@@ -196,15 +196,15 @@ def test_conflict_keeps_declared_and_taints_provisional() -> None:
     )
     leaf = ColumnRef(_src("users"), "id")
     out = ColumnRef(_model(), "id")
-    ground = _refined_for({leaf: frozenset({0, 1}), out: frozenset({0})})
+    ground = _concrete_for({leaf: frozenset({0, 1}), out: frozenset({0})})
     anns = propagate(graph, _subset_prop(ground))
     assert anns[out].value == frozenset({0})
     assert anns[out].provisional
 
 
-def test_opaque_inferred_keeps_declaration_without_a_taint() -> None:
-    """When the SQL reveals nothing (inferred top), the declaration stands and is
-    not tainted."""
+def test_opaque_inferred_keeps_grounded_without_a_taint() -> None:
+    """When the SQL reveals nothing (inferred top), the grounded value stands and
+    is not tainted."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT 42 AS id FROM t",
@@ -212,14 +212,14 @@ def test_opaque_inferred_keeps_declaration_without_a_taint() -> None:
         schema={"t": {"x": "INT"}},
     )
     out = ColumnRef(_model(), "id")
-    ground = _refined_for({out: frozenset({0})})
+    ground = _concrete_for({out: frozenset({0})})
     anns = propagate(graph, _subset_prop(ground))
     assert anns[out].value == frozenset({0})
     assert not anns[out].provisional
 
 
 def test_explicit_optout_short_circuits_the_walk() -> None:
-    """A node declared opaque flows top-EXPLICIT even though it has a derivation."""
+    """A node grounded opaque flows top-EXPLICIT even though it has a derivation."""
     graph = build_model_graph(
         model_uid="model.test.m",
         sql="SELECT u.id FROM users u",
@@ -233,7 +233,7 @@ def test_explicit_optout_short_circuits_the_walk() -> None:
         if col == out:
             return Annotation(_UNIVERSE, Opacity.EXPLICIT)
         if col == leaf:
-            return Annotation(frozenset({0}), Opacity.REFINED)
+            return Annotation(frozenset({0}), Opacity.CONCRETE)
         return Annotation(_UNIVERSE, Opacity.IMPLICIT)
 
     anns = propagate(graph, _subset_prop(ground))
@@ -247,14 +247,14 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
     """The dep_context handed to propagate reaches a registered operator transfer,
     and reads through it resolve against the backing store."""
     captured: list[DepContext] = []
-    dep_ref: PropertyRef[_Set, ColumnRef] = _subset_prop(_refined_for({})).ref
+    dep_ref: PropertyRef[_Set, ColumnRef] = _subset_prop(_concrete_for({})).ref
 
     def add_rule(
         _expr: object, kids: tuple[Annotation[_Set], ...], ctx: DepContext
     ) -> Annotation[_Set]:
         captured.append(ctx)
         seen = ctx.annotation(dep_ref, ColumnRef(_src("t"), "a"))
-        return seen if seen is not None else Annotation(frozenset(), Opacity.REFINED)
+        return seen if seen is not None else Annotation(frozenset(), Opacity.CONCRETE)
 
     graph = build_model_graph(
         model_uid="model.test.m",
@@ -265,13 +265,13 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
 
     store = AnnotationStore()
     store.record(
-        dep_ref.name, ColumnRef(_src("t"), "a"), Annotation(frozenset({3}), Opacity.REFINED)
+        dep_ref.name, ColumnRef(_src("t"), "a"), Annotation(frozenset({3}), Opacity.CONCRETE)
     )
-    ctx = PropertyRegistry((_subset_prop(_refined_for({})),)).dep_context(store)
+    ctx = PropertyRegistry((_subset_prop(_concrete_for({})),)).dep_context(store)
 
     out = ColumnRef(_model(), "s")
     anns = propagate(
-        graph, _subset_prop(_refined_for({}), operators={exp.Add: add_rule}), dep_context=ctx
+        graph, _subset_prop(_concrete_for({}), operators={exp.Add: add_rule}), dep_context=ctx
     )
     assert len(captured) == 1
     assert captured[0] is ctx
@@ -313,15 +313,15 @@ def test_run_fills_store_for_every_property() -> None:
         lattice=_subset_lattice(),
         operators={},
         aggregates={},
-        ground=_refined_for({leaf: frozenset({0})}),
+        ground=_concrete_for({leaf: frozenset({0})}),
     )
     p2 = column_property(
         name="p2",
         lattice=_subset_lattice(),
         operators={},
         aggregates={},
-        ground=_refined_for({leaf: frozenset({1})}),
+        ground=_concrete_for({leaf: frozenset({1})}),
     )
     store = run(graph, PropertyRegistry((p1, p2)))
-    assert store.get("p1", out) == Annotation(frozenset({0}), Opacity.REFINED)
-    assert store.get("p2", out) == Annotation(frozenset({1}), Opacity.REFINED)
+    assert store.get("p1", out) == Annotation(frozenset({0}), Opacity.CONCRETE)
+    assert store.get("p2", out) == Annotation(frozenset({1}), Opacity.CONCRETE)

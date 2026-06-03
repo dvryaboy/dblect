@@ -2,8 +2,8 @@
 the typed/untyped seam combine.
 
 ``collect`` runs the discoverers and buckets their facts by scope; ``grounding``
-folds each bucket through ``resolve`` into the per-node declared annotation
-(EXPLICIT for an opt-out, REFINED for a resolved value, IMPLICIT otherwise);
+folds each bucket through ``resolve`` into the per-node grounded annotation
+(EXPLICIT for an opt-out, CONCRETE for a resolved value, IMPLICIT otherwise);
 ``combine`` is the binary seam rule that decides whether a cleared refinement
 speaks. The errors are a small sealed set so a caller can react to each.
 """
@@ -95,11 +95,11 @@ def grounding(
     opaque: Collection[S],
     lat: Lattice[K],
 ) -> Callable[[S], Annotation[K]]:
-    """Fold each scope's bucket into its declared annotation and return the lookup.
+    """Fold each scope's bucket into its grounded annotation and return the lookup.
 
     An opaque scope grounds ``Annotation(top, EXPLICIT)`` regardless of any facts
     present (an opt-out is consulted before facts). A scope whose bucket resolves
-    grounds ``Annotation(value, REFINED)``. Every other scope grounds
+    grounds ``Annotation(value, CONCRETE)``. Every other scope grounds
     ``Annotation(top, IMPLICIT)``, the "nothing declared" default.
 
     A bucket that resolves to ``bottom`` is a contradiction and raises
@@ -107,21 +107,21 @@ def grounding(
     is a propagator concern that lands with the findings layer.
     """
     opaque_set = set(opaque)
-    declared: dict[S, Annotation[K]] = {}
+    grounded: dict[S, Annotation[K]] = {}
     for scope in opaque_set:
-        declared[scope] = Annotation(lat.top, Opacity.EXPLICIT)
+        grounded[scope] = Annotation(lat.top, Opacity.EXPLICIT)
     for scope, bucket in facts.items():
         if scope in opaque_set:
             continue  # the opt-out already won
         value, is_contradiction = resolve(lat, bucket)
         if is_contradiction:
             raise FactConflictError(scope, tuple(bucket))
-        declared[scope] = Annotation(value, Opacity.REFINED)
+        grounded[scope] = Annotation(value, Opacity.CONCRETE)
 
     implicit_top: Annotation[K] = Annotation(lat.top, Opacity.IMPLICIT)
 
     def ground(scope: S) -> Annotation[K]:
-        return declared.get(scope, implicit_top)
+        return grounded.get(scope, implicit_top)
 
     return ground
 

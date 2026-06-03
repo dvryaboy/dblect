@@ -104,7 +104,7 @@ class Fact(Generic[K, S]):
 
 
 class Opacity(StrEnum):
-    REFINED = "refined"  # value carries information (value is not top)
+    CONCRETE = "concrete"  # value carries information (value is not top)
     EXPLICIT = "explicit"  # value is top by a declared opt-out; flows silently
     IMPLICIT = "implicit"  # value is top incidentally (nothing declared it); warns at a seam
 
@@ -114,17 +114,17 @@ class Annotation(Generic[K]):
     """A propagated value plus its diagnostic bits.
 
     ``opacity`` carries information only when ``value`` is the lattice top:
-    ``REFINED`` *is* "value is not top", and the choice that matters is
+    ``CONCRETE`` *is* "value is not top", and the choice that matters is
     ``EXPLICIT`` (a declared opt-out, flows silently) versus ``IMPLICIT``
     (incidental top, warns at a refinement seam).
 
     ``provisional`` is the one bit that is not about knowing or not knowing: an
     error-recovery taint set when a node's inferred value conflicts with its
-    declaration, propagated as the logical OR of a transfer's inputs, and cleared
+    grounded value, propagated as the logical OR of a transfer's inputs, and cleared
     when a node is freshly anchored by a consistent fact. It never licenses a more
     precise value; detectors may downgrade a finding that rests on it.
     """
 
     value: K
-    opacity: Opacity = Opacity.REFINED
+    opacity: Opacity = Opacity.CONCRETE
     provisional: bool = False
