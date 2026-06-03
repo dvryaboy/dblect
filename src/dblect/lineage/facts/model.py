@@ -51,10 +51,10 @@ class DeclaredSource(StrEnum):
 
 
 class CompileOrigin(StrEnum):
-    DBT_VAR = "dbt_var"  # var() from dbt_project.yml; statically enumerable
-    ENV_VAR = "env_var"  # env_var(); statically enumerable
+    DBT_VAR = "dbt_var"  # var() from dbt_project.yml; statically discoverable
+    ENV_VAR = "env_var"  # env_var(); statically discoverable
     DBT_CONFIG = "dbt_config"  # node.config[...] key
-    COMPUTED = "computed"  # Jinja/Python substitution, possibly a DB call; opaque to enumeration
+    COMPUTED = "computed"  # Jinja/Python or a DB call; not statically discoverable
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +77,11 @@ class NativeConstraint:
 class CompileValue:
     """A value resolved at compile time. ``world`` exists only here and is never
     absent: a compile value is ground truth in exactly the world the flag layer
-    fixed for this run. ``origin`` decides whether the flag layer can enumerate
-    worlds over it."""
+    fixed for this run. ``origin`` records how the value is produced and whether the
+    framework can auto-discover it; whether worlds can be enumerated over it is a
+    function of the flag's declared-or-inferred domain (owned by the flag layer),
+    not of ``origin`` alone. A COMPUTED value with a user-declared finite domain is
+    enumerable; a DBT_VAR with an open domain is not."""
 
     origin: CompileOrigin
     world: WorldRef
