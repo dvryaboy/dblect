@@ -92,3 +92,25 @@ def test_consistent_handles_top_and_bottom() -> None:
     assert not check(declared, frozenset({0, 1, 2}))
     # An inferred contradiction is a finding, not a vacuous pass.
     assert not check(declared, lat.bottom)
+
+
+def _degenerate_lattice() -> Lattice[frozenset[int]]:
+    """A nominal lattice whose inert bottom coincides with its top, the shape the
+    semiring-driven properties (where-provenance, aggregation-depth) carry: only
+    ``top`` is read, and ``meet``/``join``/``bottom`` never resolve real facts."""
+    empty: frozenset[int] = frozenset()
+    return Lattice(meet=lambda a, b: a | b, join=lambda a, b: a & b, top=empty, bottom=empty)
+
+
+def test_resolve_and_consistent_stay_sound_on_a_degenerate_lattice() -> None:
+    """When ``top == bottom`` the substrate must not read the "no information" top
+    as a contradiction: an empty bucket still resolves to top without flagging a
+    conflict, and an opaque (top) inference still honours any declaration. The two
+    nominal-lattice properties depend on this rather than only on never routing
+    through these functions."""
+    lat = _degenerate_lattice()
+    value, is_contradiction = resolve(lat, ())
+    assert value == lat.top
+    assert not is_contradiction
+    check = consistent(lat)
+    assert check(frozenset({0, 1}), lat.top)

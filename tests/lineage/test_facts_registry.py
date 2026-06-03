@@ -25,11 +25,15 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 
-_BOOL: Lattice[bool] = Lattice(meet=lambda a, b: a and b, join=lambda a, b: a or b, top=False, bottom=True)
+_BOOL: Lattice[bool] = Lattice(
+    meet=lambda a, b: a and b, join=lambda a, b: a or b, top=False, bottom=True
+)
 _COL = ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.fct"), "x")
 
 
-def _prop(name: str, depends_on: tuple[PropertyRef[Any, Any], ...] = ()) -> Property[bool, ColumnRef]:
+def _prop(
+    name: str, depends_on: tuple[PropertyRef[Any, Any], ...] = ()
+) -> Property[bool, ColumnRef]:
     return column_property(
         name=name,
         lattice=_BOOL,

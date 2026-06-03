@@ -36,7 +36,9 @@ _Set = frozenset[int]
 
 
 def _subset_lattice() -> Lattice[_Set]:
-    return Lattice(meet=lambda a, b: a & b, join=lambda a, b: a | b, top=_UNIVERSE, bottom=frozenset())
+    return Lattice(
+        meet=lambda a, b: a & b, join=lambda a, b: a | b, top=_UNIVERSE, bottom=frozenset()
+    )
 
 
 def _subset_prop(
@@ -247,7 +249,9 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
     captured: list[DepContext] = []
     dep_ref: PropertyRef[_Set, ColumnRef] = _subset_prop(_refined_for({})).ref
 
-    def add_rule(_expr: object, kids: tuple[Annotation[_Set], ...], ctx: DepContext) -> Annotation[_Set]:
+    def add_rule(
+        _expr: object, kids: tuple[Annotation[_Set], ...], ctx: DepContext
+    ) -> Annotation[_Set]:
         captured.append(ctx)
         seen = ctx.annotation(dep_ref, ColumnRef(_src("t"), "a"))
         return seen if seen is not None else Annotation(frozenset(), Opacity.REFINED)
@@ -260,11 +264,15 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
     )
 
     store = AnnotationStore()
-    store.record(dep_ref.name, ColumnRef(_src("t"), "a"), Annotation(frozenset({3}), Opacity.REFINED))
+    store.record(
+        dep_ref.name, ColumnRef(_src("t"), "a"), Annotation(frozenset({3}), Opacity.REFINED)
+    )
     ctx = PropertyRegistry((_subset_prop(_refined_for({})),)).dep_context(store)
 
     out = ColumnRef(_model(), "s")
-    anns = propagate(graph, _subset_prop(_refined_for({}), operators={exp.Add: add_rule}), dep_context=ctx)
+    anns = propagate(
+        graph, _subset_prop(_refined_for({}), operators={exp.Add: add_rule}), dep_context=ctx
+    )
     assert len(captured) == 1
     assert captured[0] is ctx
     assert anns[out].value == frozenset({3})

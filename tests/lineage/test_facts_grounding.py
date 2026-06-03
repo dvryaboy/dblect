@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from dblect.lineage.facts.grounding import (
     DiscovererError,
@@ -103,6 +105,49 @@ def test_combine_explicit_dominates_implicit_at_top() -> None:
 def test_combine_propagates_provisional() -> None:
     out = combine(_FLAT, Annotation("A", provisional=True), Annotation("A"))
     assert out.provisional
+
+
+@st.composite
+def _well_formed_annotation(draw: st.DrawFn) -> Annotation[str]:
+    """A committed value carries REFINED; a top carries IMPLICIT or EXPLICIT. This
+    is the invariant the substrate maintains: a top is never REFINED, because a
+    discoverer never emits a top-valued fact and the fold only marks REFINED below
+    top. The opacity asymmetry in ``combine``'s agree-on-top arm relies on it."""
+    value = draw(st.sampled_from([_TOP, "A", "B"]))
+    provisional = draw(st.booleans())
+    if value == _TOP:
+        opacity = draw(st.sampled_from([Opacity.IMPLICIT, Opacity.EXPLICIT]))
+    else:
+        opacity = Opacity.REFINED
+    return Annotation(value, opacity, provisional=provisional)
+
+
+@given(_well_formed_annotation(), _well_formed_annotation())
+def test_combine_is_commutative(a: Annotation[str], b: Annotation[str]) -> None:
+    """The seam combine is symmetric: value, opacity, and the provisional taint do
+    not depend on operand order, and a contradiction is raised for both orders or
+    neither. The meet underneath is commutative; this pins that the opacity choice
+    on a cleared top is too."""
+    try:
+        forward = combine(_FLAT, a, b)
+    except SeamContradictionError:
+        with pytest.raises(SeamContradictionError):
+            combine(_FLAT, b, a)
+        return
+    assert combine(_FLAT, b, a) == forward
+
+
+@given(_well_formed_annotation(), _well_formed_annotation())
+def test_combine_value_and_taint_invariants(a: Annotation[str], b: Annotation[str]) -> None:
+    """Off the contradiction arm, the result is the meet or a cleared top, never
+    bottom, and the provisional taint is the OR of the operands'."""
+    try:
+        out = combine(_FLAT, a, b)
+    except SeamContradictionError:
+        return
+    assert out.value in (_FLAT.meet(a.value, b.value), _FLAT.top)
+    assert out.value != _FLAT.bottom
+    assert out.provisional == (a.provisional or b.provisional)
 
 
 # --- collect -----------------------------------------------------------------

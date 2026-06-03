@@ -146,11 +146,7 @@ def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K
         # Operands agree. When they agree on top, keep the stronger opacity claim
         # so a declared opt-out is not silently downgraded to incidental.
         if m == lat.top:
-            opacity = (
-                Opacity.EXPLICIT
-                if Opacity.EXPLICIT in (a.opacity, b.opacity)
-                else a.opacity
-            )
+            opacity = Opacity.EXPLICIT if Opacity.EXPLICIT in (a.opacity, b.opacity) else a.opacity
             return Annotation(m, opacity=opacity, provisional=provisional)
         return Annotation(m, provisional=provisional)
     cleared = a if a.value == lat.top else b

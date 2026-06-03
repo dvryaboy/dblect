@@ -188,7 +188,11 @@ def _walk(
 
     if isinstance(expr, exp.Alias):
         inner = expr.this
-        return _walk(inner, prop, annotate, dep_context, default_ann) if isinstance(inner, Expr) else default_ann
+        return (
+            _walk(inner, prop, annotate, dep_context, default_ann)
+            if isinstance(inner, Expr)
+            else default_ann
+        )
 
     if isinstance(expr, exp.Column):
         ref = _column_ref_meta(expr)

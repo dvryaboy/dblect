@@ -613,3 +613,13 @@ def test_pbt_union_all_arms_match_ground_truth(s: UnionScenario) -> None:
             f"expected={sorted(repr(c) for c in expected)} "
             f"got={sorted(repr(c) for c in got)}"
         )
+
+
+# Scenario-construction helpers reused by sibling property tests (e.g.
+# test_pbt_nullability_monotone, which reruns these SQL shapes under a different
+# property). Re-exported under public names so importers do not reach into
+# module-private members.
+build_manifest = _build_manifest
+leaf_source_ref = _leaf_source_ref
+cte_scenario = _cte_scenario
+build_cte_sql = _build_cte_sql

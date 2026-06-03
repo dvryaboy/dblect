@@ -83,8 +83,7 @@ class NullabilitySemiring:
     This is the join of the taint order NON_NULL < UNKNOWN < NULLABLE, which is
     not the precision order the lattice meet and join use (there UNKNOWN is the
     top). CONTRADICTION is the lattice bottom and never reaches the combine, so
-    the laws are pinned over the three operational values; see
-    ``test_nullability_semiring_laws``.
+    the laws are pinned over the three operational values in ``test_semiring_laws``.
     """
 
     zero: Nullability = Nullability.NON_NULL
