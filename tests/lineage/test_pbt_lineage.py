@@ -301,10 +301,10 @@ def test_pbt_propagator_matches_ground_truth(scenario: Scenario) -> None:
                 ColumnRef(source=_leaf_source_ref(scenario, leaf_name), column=leaf_col)
                 for leaf_name, leaf_col in gt[(m.name, p.out.lower())]
             )
-            assert anns[col] == expected, (
+            assert anns[col].value == expected, (
                 f"mismatch on {m.name}.{p.out}: sql={_build_sql(m)!r} "
                 f"expected={sorted(repr(c) for c in expected)} "
-                f"got={sorted(repr(c) for c in anns[col])}"
+                f"got={sorted(repr(c) for c in anns[col].value)}"
             )
 
 
@@ -486,7 +486,7 @@ def _run_cte(s: CTEScenario) -> dict[str, frozenset[ColumnRef]]:
     )
     anns = propagate(graph, where_provenance)
     model_src = SourceRef(kind=SourceKind.MODEL, unique_id="model.test.m")
-    return {p.out: anns[ColumnRef(source=model_src, column=p.out.lower())] for p in s.outer}
+    return {p.out: anns[ColumnRef(source=model_src, column=p.out.lower())].value for p in s.outer}
 
 
 _WRAP_BARE = ("none",)
@@ -607,9 +607,17 @@ def test_pbt_union_all_arms_match_ground_truth(s: UnionScenario) -> None:
     model_src = SourceRef(SourceKind.MODEL, "model.test.m")
     gt = _union_ground_truth(s)
     for out_name, expected in gt.items():
-        got = anns[ColumnRef(model_src, out_name)]
+        got = anns[ColumnRef(model_src, out_name)].value
         assert got == expected, (
             f"{out_name}: sql={sql!r} "
             f"expected={sorted(repr(c) for c in expected)} "
             f"got={sorted(repr(c) for c in got)}"
         )
+
+
+# Public aliases for scenario helpers reused by sibling tests
+# (test_pbt_nullability_monotone).
+build_manifest = _build_manifest
+leaf_source_ref = _leaf_source_ref
+cte_scenario = _cte_scenario
+build_cte_sql = _build_cte_sql

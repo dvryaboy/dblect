@@ -45,10 +45,10 @@ class DeclaredSource(StrEnum):
 
 
 class CompileOrigin(StrEnum):
-    DBT_VAR    = "dbt_var"     # var() from dbt_project.yml; statically enumerable
-    ENV_VAR    = "env_var"     # env_var(); statically enumerable
+    DBT_VAR    = "dbt_var"     # var() from dbt_project.yml; statically discoverable
+    ENV_VAR    = "env_var"     # env_var(); statically discoverable
     DBT_CONFIG = "dbt_config"  # node.config[...] key
-    COMPUTED   = "computed"    # Jinja/Python substitution, possibly a DB call; opaque to enumeration
+    COMPUTED   = "computed"    # Jinja/Python or a DB call; not statically discoverable
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +69,11 @@ class NativeConstraint:
 class CompileValue:
     """A value resolved at compile time. ``world`` exists only here and is never absent:
     a compile value is ground truth in exactly the world the flag layer fixed for this
-    run. ``origin`` decides whether the flag layer can enumerate worlds over it."""
+    run. ``origin`` records how the value is produced and whether the framework can
+    auto-discover it; whether worlds can be enumerated over it is a function of the
+    flag's declared-or-inferred domain (owned by the flag layer), not of ``origin``
+    alone. A COMPUTED value with a user-declared finite domain is enumerable; a
+    DBT_VAR with an open domain is not."""
     origin: CompileOrigin
     world:  WorldRef
 
@@ -135,7 +139,7 @@ def resolve(lat: Lattice[K], facts: tuple[Fact[K, Any], ...]) -> tuple[K, bool]:
     """Fold every fact at one scope to the most precise value consistent with all of
     them. Meet is associative and commutative by the lattice laws, so the result does
     not depend on discoverer order. A result of ``bottom`` means the declarations are
-    mutually unsatisfiable; the caller raises a BuildIssue and keeps this deterministic
+    mutually unsatisfiable; the caller raises a FactConflictError and keeps this deterministic
     value so the run stays reproducible."""
     value = lat.top
     for f in facts:
@@ -259,7 +263,7 @@ class Property(Generic[K, S]):
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
 ```
 
-Two invariants hold the optional `semiring` slot together with the rest, checked once at construction: when it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`, and an idempotent semiring must satisfy `plus == lattice.join`. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
+The optional `semiring` slot carries one construction-time check: when it is set, the relational operators (`Union`, `Join`) are derived from `plus`/`times` and must not be redefined in `operators`. Its algebraic laws (associativity, commutativity, distributivity, the identity roles) are semiring-law property tests (see [`propagation-soundness.md`](./propagation-soundness.md)) rather than construction-time checks, since function equality is not decidable by inspection. The `plus` need not equal the lattice join: nullability is idempotent yet its confluence lets a committed value beat the "no information" top, which a join with the top cannot. `consistent` and `resolve` are derived from `lattice`, so they are not fields. Two smart constructors, `column_property` (fixing `scope_kind=COLUMN`) and `relation_property` (fixing `RELATION`), set `scope_kind` from the scope type.
 
 ## Collection, grounding, errors
 
@@ -276,7 +280,7 @@ def collect(
 def grounding(
     facts: Mapping[S, tuple[Fact[K, S], ...]], opaque: Collection[S], lat: Lattice[K],
 ) -> Callable[[S], Annotation[K]]:
-    """Fold each scope's bucket through ``resolve``, raise a ``BuildIssue`` on a ``bottom``
+    """Fold each scope's bucket through ``resolve``, raise a ``FactConflictError`` on a ``bottom``
     contradiction, and return the declared annotation: ``Annotation(top, EXPLICIT)`` for a
     scope in the opaque set, ``Annotation(value, REFINED)`` where a value resolved, and
     ``Annotation(top, IMPLICIT)`` otherwise."""
@@ -299,7 +303,7 @@ def nullability_property(
     )
 ```
 
-The errors are a small sealed set. `BuildIssue` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradiction` is raised by `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
+The errors are a small sealed set. `FactConflictError` is raised by resolution when a scope's facts meet to `bottom`; it carries the scope and the conflicting facts, is collected and reported rather than aborting, and the run continues from the deterministic `bottom`-derived value with downstream annotations marked provisional. `SeamContradictionError` is raised by `combine` when two committed operands are incompatible; it becomes a finding at the combine site. `DiscovererError` is the only exception `collect` treats as expected, isolating one discoverer's failure from the rest.
 
 ## The annotation store
 
@@ -348,7 +352,7 @@ The binary combine at a scalar expression decides whether a cleared refinement s
 def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:
     m = lat.meet(a.value, b.value)
     if m == lat.bottom:
-        raise SeamContradiction(a, b)                       # two committed, incompatible operands
+        raise SeamContradictionError(a, b)                       # two committed, incompatible operands
     if a.value == b.value == m:
         return Annotation(m, provisional=a.provisional or b.provisional)   # agree: preserve
     cleared = a if a.value == lat.top else b                # one committed, the other top: clears

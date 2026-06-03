@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from dblect.lineage import propagate
 from dblect.lineage.builder import build_model_graph
+from dblect.lineage.facts.model import Annotation, Opacity
+from dblect.lineage.facts.property import Property, column_property
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import Nullability, nullability
-from dblect.lineage.property import Property
+from dblect.lineage.properties.nullability import NULLABILITY_LATTICE
+from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
+
+_nullabilities = st.sampled_from(list(Nullability))
 
 
 def _source(name: str) -> SourceRef:
@@ -19,14 +27,25 @@ def _model(uid: str) -> SourceRef:
     return SourceRef(SourceKind.MODEL, uid)
 
 
-def _with_source_rule(rule: Callable[[ColumnRef], Nullability]) -> Property[Nullability]:
-    return Property(
+def _with_source_rule(
+    rule: Callable[[ColumnRef], Nullability],
+) -> Property[Nullability, ColumnRef]:
+    """The demo property with leaf values injected as CONCRETE declarations, so a
+    source column anchors on the test's chosen nullability rather than IMPLICIT."""
+
+    def ground(col: ColumnRef) -> Annotation[Nullability]:
+        value = rule(col)
+        if value is Nullability.UNKNOWN:
+            return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
+        return Annotation(value, Opacity.CONCRETE)
+
+    return column_property(
         name=nullability.name,
-        semiring=nullability.semiring,
-        source=rule,
+        lattice=NULLABILITY_LATTICE,
         operators=nullability.operators,
         aggregates=nullability.aggregates,
-        unknown_value=nullability.unknown_value,
+        ground=ground,
+        semiring=nullability.semiring,
     )
 
 
@@ -58,7 +77,7 @@ def test_coalesce_inside_cte_propagates_non_null() -> None:
 
     anns = propagate(graph, _with_source_rule(src_rule))
     out = ColumnRef(_model("model.test.m"), "out")
-    assert anns[out] is Nullability.NON_NULL
+    assert anns[out].value is Nullability.NON_NULL
 
 
 def test_union_arm_nullability_combines_via_plus() -> None:
@@ -86,4 +105,66 @@ def test_union_arm_nullability_combines_via_plus() -> None:
 
     anns = propagate(graph, _with_source_rule(src_rule))
     out = ColumnRef(_model("model.test.m"), "out")
-    assert anns[out] is Nullability.NULLABLE
+    assert anns[out].value is Nullability.NULLABLE
+
+
+def test_union_nullable_arm_taints_against_unknown_arm() -> None:
+    """A NULLABLE arm taints the union even when the other arm is UNKNOWN: the
+    proven null appears regardless of what is unknown about the other side. This
+    is exactly the case the lattice join cannot express, since UNKNOWN is the
+    lattice top and a join with the top is the top."""
+    sql = """
+        SELECT u.x AS out FROM (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS x FROM t2
+        ) u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _source("t1"), "t2": _source("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        if c.source.unique_id == "source.test.raw.t1":
+            return Nullability.NULLABLE
+        return Nullability.UNKNOWN  # t2.b is unknown
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
+def test_scalar_expression_nullable_input_taints_unknown() -> None:
+    """``a + b`` with a NULLABLE and an UNKNOWN operand is NULLABLE: adding to a
+    value that can be null yields a value that can be null. The times-fold has to
+    let the proven null dominate the unknown, the same as the confluence plus."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.a + u.b AS out FROM t u",
+        name_to_source={"t": _source("t")},
+        schema={"t": {"a": "INT", "b": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        if c.column == "a":
+            return Nullability.NULLABLE
+        return Nullability.UNKNOWN  # b is unknown
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
+@given(_nullabilities, _nullabilities, _nullabilities)
+def test_nullability_lattice_laws(a: Nullability, b: Nullability, c: Nullability) -> None:
+    """The nullability lattice is a bounded distributive chain, so it satisfies the
+    full bounded-lattice laws (every property runs this check)."""
+    assert_lattice_laws(NULLABILITY_LATTICE, a, b, c)
+
+
+@given(_nullabilities, _nullabilities)
+def test_nullability_consistency_laws(declared: Nullability, value: Nullability) -> None:
+    assert_consistency_laws(NULLABILITY_LATTICE, declared, value)
