@@ -40,7 +40,9 @@ def _manifest(*nodes: Node, adapter_type: str = "duckdb") -> Manifest:
     )
 
 
-def _model(uid: str, *, columns: Mapping[str, Column] = {}, constraints: tuple[ConstraintSpec, ...] = ()) -> Node:
+def _model(
+    uid: str, *, columns: Mapping[str, Column] = {}, constraints: tuple[ConstraintSpec, ...] = ()
+) -> Node:
     return Node(
         unique_id=uid,
         name=uid.split(".")[-1],
@@ -71,7 +73,9 @@ def _source(uid: str) -> Node:
     )
 
 
-def _not_null_test(uid: str, *, column: str, target: str, where: str | None = None, enabled: bool = True) -> Node:
+def _not_null_test(
+    uid: str, *, column: str, target: str, where: str | None = None, enabled: bool = True
+) -> Node:
     return Node(
         unique_id=uid,
         name=uid.split(".")[-1],
@@ -187,7 +191,9 @@ def test_column_level_not_null_constraint_grounds_non_null() -> None:
 def test_model_level_not_null_constraint_grounds_each_named_column() -> None:
     model = _model(
         "model.shop.fct_orders",
-        constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL, columns=("order_id", "customer_id")),),
+        constraints=(
+            ConstraintSpec(type=ConstraintType.NOT_NULL, columns=("order_id", "customer_id")),
+        ),
     )
     facts = list(native_not_null_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
     cols = {f.scope.column for f in facts}
