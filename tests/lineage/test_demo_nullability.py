@@ -12,8 +12,13 @@ from dblect.lineage.builder import build_model_graph
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import Property, column_property
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.lineage.properties import Nullability, nullability
-from dblect.lineage.properties.nullability import NULLABILITY_LATTICE
+from dblect.lineage.properties import Nullability
+from dblect.lineage.properties.nullability import (
+    NULLABILITY_AGGREGATES,
+    NULLABILITY_LATTICE,
+    NULLABILITY_OPERATORS,
+    NullabilitySemiring,
+)
 from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
 
 _nullabilities = st.sampled_from(list(Nullability))
@@ -40,12 +45,12 @@ def _with_source_rule(
         return Annotation(value, Opacity.CONCRETE)
 
     return column_property(
-        name=nullability.name,
+        name="nullability",
         lattice=NULLABILITY_LATTICE,
-        operators=nullability.operators,
-        aggregates=nullability.aggregates,
+        operators=NULLABILITY_OPERATORS,
+        aggregates=NULLABILITY_AGGREGATES,
         ground=ground,
-        semiring=nullability.semiring,
+        semiring=NullabilitySemiring(),
     )
 
 

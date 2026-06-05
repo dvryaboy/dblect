@@ -34,7 +34,14 @@ from typing import Any, cast
 
 from sqlglot import Expr
 
-from dblect.manifest import ConstraintSpec, ConstraintType, Manifest, Node, ResourceType
+from dblect.manifest import (
+    ConstraintSpec,
+    ConstraintType,
+    Manifest,
+    Node,
+    ResourceType,
+    generic_test_target_uid,
+)
 from dblect.sql import SQLParseError, parse_sql
 
 
@@ -260,21 +267,12 @@ def _uniqueness_columns(c: ConstraintSpec) -> frozenset[str] | None:
     return frozenset(c.columns)
 
 
+# Models and sources both accept generic tests and both feed downstream model
+# SQL, so both ground facts. Seeds and snapshots are eligible in the shared
+# default but kept out here until the downstream consumers are tested against
+# them; see issue #52.
 _TARGET_PREFIXES: tuple[str, ...] = ("model.", "source.")
 
 
 def _test_target_node(node: Node) -> str | None:
-    """The unique_id a generic test is attached to, or None if undeterminable.
-
-    Prefer ``attached_node`` (the modern shape); fall back to the first
-    eligible entry in ``depends_on`` for older manifest versions where
-    ``attached_node`` isn't populated. Models and sources both accept generic
-    tests and both feed downstream model SQL, so both ground facts; seeds and
-    snapshots are out of scope for now.
-    """
-    if node.attached_node and node.attached_node.startswith(_TARGET_PREFIXES):
-        return node.attached_node
-    for dep in sorted(node.depends_on):
-        if dep.startswith(_TARGET_PREFIXES):
-            return dep
-    return None
+    return generic_test_target_uid(node, eligible_prefixes=_TARGET_PREFIXES)

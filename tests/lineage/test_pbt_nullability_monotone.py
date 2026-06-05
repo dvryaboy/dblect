@@ -20,8 +20,13 @@ from dblect.lineage.builder import build_manifest_graph, build_model_graph
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import Property, column_property
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.lineage.properties import Nullability, nullability
-from dblect.lineage.properties.nullability import NULLABILITY_LATTICE
+from dblect.lineage.properties import Nullability
+from dblect.lineage.properties.nullability import (
+    NULLABILITY_AGGREGATES,
+    NULLABILITY_LATTICE,
+    NULLABILITY_OPERATORS,
+    NullabilitySemiring,
+)
 from tests.lineage.test_pbt_lineage import (
     CTEScenario,
     Scenario,
@@ -58,12 +63,12 @@ def _rule_property(
         return Annotation(value, Opacity.CONCRETE)
 
     return column_property(
-        name=nullability.name,
+        name="nullability",
         lattice=NULLABILITY_LATTICE,
-        operators=nullability.operators,
-        aggregates=nullability.aggregates,
+        operators=NULLABILITY_OPERATORS,
+        aggregates=NULLABILITY_AGGREGATES,
         ground=ground,
-        semiring=nullability.semiring,
+        semiring=NullabilitySemiring(),
     )
 
 

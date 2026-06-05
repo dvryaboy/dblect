@@ -13,9 +13,10 @@ Grounding comes from two discoverers that read a dbt manifest: a ``not_null``
 generic test and a native ``NOT NULL`` constraint each ground a column to
 NON_NULL. Both are sound-by-omission: a disabled test, a ``where``-conditional
 test, or an axis they do not own grounds nothing rather than over-claiming. Build
-the manifest-backed property with :func:`nullability_property`; the bare
-:data:`nullability` value keeps a trivial grounding for graph-only tests and the
-COALESCE / IS / COUNT transfer demos.
+the manifest-backed property with :func:`nullability_property`. The axis pieces a
+custom grounding reuses (the lattice, the transfer catalogs, the semiring) are
+public, so a graph-only test or a transfer demo can assemble its own property
+without a manifest.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from dblect.lineage.facts.property import (
     column_property,
 )
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.manifest import ConstraintType, Manifest, Node, ResourceType
+from dblect.manifest import ConstraintType, Manifest, ResourceType, generic_test_target_uid
 
 
 class Nullability(StrEnum):
@@ -132,28 +133,16 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotatio
     return Annotation(Nullability.NON_NULL, provisional=child.provisional)
 
 
-_NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
+# The transfer catalogs are the reusable axis surface: :func:`nullability_property`
+# and any custom-grounding caller (graph-only tests, transfer demos) build their
+# property from these plus a ``ground`` function of their own.
+NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Coalesce: _coalesce_rule,
     exp.Is: _is_not_null_rule,
 }
-_NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
+NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
     exp.Count: AggregateRule(core=_count_core),
 }
-
-
-def _ground_unknown(_: ColumnRef) -> Annotation[Nullability]:
-    """Trivial grounding for the bare demo value: every node is IMPLICIT top."""
-    return Annotation(Nullability.UNKNOWN, Opacity.IMPLICIT)
-
-
-nullability: Property[Nullability, ColumnRef] = column_property(
-    name="nullability",
-    lattice=NULLABILITY_LATTICE,
-    operators=_NULLABILITY_OPERATORS,
-    aggregates=_NULLABILITY_AGGREGATES,
-    ground=_ground_unknown,
-    semiring=NullabilitySemiring(),
-)
 
 
 # --- discoverers -------------------------------------------------------------
@@ -164,19 +153,6 @@ _SOURCE_KIND: Mapping[ResourceType, SourceKind] = {
     ResourceType.SEED: SourceKind.SEED,
     ResourceType.SNAPSHOT: SourceKind.SNAPSHOT,
 }
-_TARGET_PREFIXES: tuple[str, ...] = ("model.", "source.", "seed.", "snapshot.")
-
-
-def _test_target_node(node: Node) -> str | None:
-    """The unique_id a generic test is attached to. Prefer ``attached_node`` (the
-    modern shape), fall back to the first eligible ``depends_on`` for older
-    manifests."""
-    if node.attached_node and node.attached_node.startswith(_TARGET_PREFIXES):
-        return node.attached_node
-    for dep in sorted(node.depends_on):
-        if dep.startswith(_TARGET_PREFIXES):
-            return dep
-    return None
 
 
 def _column_ref(manifest: Manifest, target_uid: str, column: str) -> ColumnRef | None:
@@ -205,14 +181,14 @@ class _NotNullTestDiscoverer:
                 continue
             # A `where` filter makes the assertion conditional ("not null within
             # rows matching X"). Grounding it as an unconditional NON_NULL would
-            # over-claim, so it is captured-but-not-activated until conditional
-            # facts land (see conditional-uniqueness-facts.md).
+            # over-claim, so it grounds nothing until conditional facts land (see
+            # conditional-uniqueness-facts.md).
             if tm.where is not None:
                 continue
             col = tm.kwargs.get("column_name")
             if not isinstance(col, str) or not col:
                 continue
-            target = _test_target_node(node)
+            target = generic_test_target_uid(node)
             if target is None:
                 continue
             scope = _column_ref(manifest, target, col)
@@ -306,8 +282,8 @@ def nullability_property(
     return column_property(
         name="nullability",
         lattice=NULLABILITY_LATTICE,
-        operators=_NULLABILITY_OPERATORS,
-        aggregates=_NULLABILITY_AGGREGATES,
+        operators=NULLABILITY_OPERATORS,
+        aggregates=NULLABILITY_AGGREGATES,
         ground=grounding(facts, opaque=set(), lat=NULLABILITY_LATTICE),
         semiring=NullabilitySemiring(),
     )
