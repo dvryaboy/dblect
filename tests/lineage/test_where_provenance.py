@@ -88,6 +88,70 @@ def test_inline_scalar_subquery_does_not_register_phantom_model_columns() -> Non
     assert model_columns == {"x", "subq"}
 
 
+# --- subquery and predicate provenance (issue #23) ---------------------------
+#
+# A scalar subquery in SELECT contributes the provenance of its *selected*
+# expression: its value is what lands in the output column. A subquery used as a
+# WHERE predicate (EXISTS, IN) contributes nothing, since a predicate filters rows
+# rather than supplying a value (why-provenance, a different axis). These pin both,
+# including the trap where a correlated scalar subquery's own predicate columns
+# resolve against the outer scope and must still be excluded.
+
+_MODEL = SourceRef(SourceKind.MODEL, "model.test.m")
+
+
+def test_scalar_subquery_in_select_contributes_its_selected_leaf() -> None:
+    sql = "SELECT a.x AS x, (SELECT MAX(b.z) FROM b) AS subq FROM a"
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"a": _source("a"), "b": _source("b")},
+        schema={"a": {"x": "INT"}, "b": {"z": "INT"}},
+    )
+    anns = propagate(graph, where_provenance)
+    assert anns[ColumnRef(_MODEL, "subq")].value == frozenset({ColumnRef(_source("b"), "z")})
+    assert anns[ColumnRef(_MODEL, "x")].value == frozenset({ColumnRef(_source("a"), "x")})
+
+
+def test_correlated_scalar_subquery_excludes_its_predicate_columns() -> None:
+    """The scalar's value is ``MAX(b.z)``; the correlated ``WHERE b.k = c.k`` only
+    filters which rows the aggregate sees. Even though ``c.k`` resolves against the
+    outer FROM, it is a predicate column and must not enter ``subq``'s provenance."""
+    sql = "SELECT a.x AS x, (SELECT MAX(b.z) FROM b WHERE b.k = c.k) AS subq FROM a, c"
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"a": _source("a"), "b": _source("b"), "c": _source("c")},
+        schema={"a": {"x": "INT"}, "b": {"z": "INT", "k": "INT"}, "c": {"k": "INT"}},
+    )
+    anns = propagate(graph, where_provenance)
+    assert anns[ColumnRef(_MODEL, "subq")].value == frozenset({ColumnRef(_source("b"), "z")})
+
+
+def test_exists_predicate_in_where_does_not_contribute() -> None:
+    sql = "SELECT a.x AS x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.x)"
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"a": _source("a"), "b": _source("b")},
+        schema={"a": {"x": "INT"}, "b": {"k": "INT", "z": "INT"}},
+    )
+    anns = propagate(graph, where_provenance)
+    assert anns[ColumnRef(_MODEL, "x")].value == frozenset({ColumnRef(_source("a"), "x")})
+
+
+def test_in_subquery_predicate_in_where_does_not_contribute() -> None:
+    sql = "SELECT a.x AS x FROM a WHERE a.x IN (SELECT b.z FROM b)"
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"a": _source("a"), "b": _source("b")},
+        schema={"a": {"x": "INT"}, "b": {"z": "INT"}},
+    )
+    anns = propagate(graph, where_provenance)
+    assert anns[ColumnRef(_MODEL, "x")].value == frozenset({ColumnRef(_source("a"), "x")})
+
+
 def test_unexpanded_star_does_not_register_phantom_model_column() -> None:
     """When the source has no documented columns, ``qualify`` cannot expand
     ``SELECT *`` and the ``Star`` survives in the projection list. The

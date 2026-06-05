@@ -62,6 +62,27 @@ class Projection:
     out: str
     sources: tuple[tuple[str, str], ...]
     aggregate: bool
+    # When set, the projection is a scalar subquery ``(SELECT MAX(rel.col) FROM rel)``
+    # over its single source. Its where-provenance is that source's closure (the
+    # scalar's value is what lands in the column), identical to a passthrough, so
+    # ``sources`` carries the single ``(rel, col)`` and ground truth is unchanged.
+    scalar_subquery: bool = False
+
+
+@dataclass(frozen=True)
+class WherePredicate:
+    """A model-level ``WHERE`` predicate built from a subquery.
+
+    A predicate filters rows; it supplies no value, so it contributes nothing to
+    any output column's where-provenance (predicates are why-provenance, a
+    different axis). Both forms are correlated/anchored on a real upstream column
+    so the generated SQL qualifies, and both must leave ground truth untouched.
+    """
+
+    form: str  # "exists" | "in"
+    probe: tuple[str, str]  # (outer alias, column) the predicate anchors on
+    sub_rel: str  # relation in the subquery's FROM (a model upstream)
+    sub_col: str  # column read in the subquery
 
 
 @dataclass(frozen=True)
@@ -71,6 +92,7 @@ class ModelSpec:
     # a JOIN model has two with distinct aliases.
     aliases: tuple[tuple[str, str], ...]
     projections: tuple[Projection, ...]
+    where: WherePredicate | None = None
 
 
 @dataclass(frozen=True)
@@ -132,29 +154,51 @@ def lineage_scenario(draw: st.DrawFn) -> Scenario:
             (alias, col) for alias, cols in cols_per_alias.items() for col in cols
         ]
 
+        rel_of: dict[str, str] = dict(aliases)
+
         n_proj = draw(st.integers(min_value=1, max_value=4))
         projections: list[Projection] = []
         for k in range(n_proj):
-            kind = draw(st.sampled_from(("passthrough", "expr", "literal")))
-            aggregate = draw(st.booleans()) if kind != "literal" else False
+            kind = draw(st.sampled_from(("passthrough", "expr", "literal", "scalar_subquery")))
+            aggregate = draw(st.booleans()) if kind in ("passthrough", "expr") else False
             if kind == "literal":
                 projections.append(Projection(out=f"o{k}", sources=(), aggregate=aggregate))
                 continue
-            if kind == "passthrough":
+            if kind in ("passthrough", "scalar_subquery"):
                 alias, col = draw(st.sampled_from(available))
-                relation = next(rn for a, rn in aliases if a == alias)
                 projections.append(
-                    Projection(out=f"o{k}", sources=((relation, col),), aggregate=aggregate)
+                    Projection(
+                        out=f"o{k}",
+                        sources=((rel_of[alias], col),),
+                        aggregate=aggregate,
+                        scalar_subquery=(kind == "scalar_subquery"),
+                    )
                 )
                 continue
             # ``expr`` mixes two source columns (possibly with repeats and
             # possibly across both join sides).
             picks = draw(st.lists(st.sampled_from(available), min_size=2, max_size=3))
-            srcs = tuple((next(rn for a, rn in aliases if a == alias), col) for alias, col in picks)
+            srcs = tuple((rel_of[alias], col) for alias, col in picks)
             projections.append(Projection(out=f"o{k}", sources=srcs, aggregate=aggregate))
 
+        # Optionally anchor a WHERE predicate (EXISTS / IN over a subquery) on the
+        # model. It must not perturb any column's provenance; emitting it exercises
+        # that predicate columns stay out of the where axis.
+        where: WherePredicate | None = None
+        if draw(st.booleans()):
+            p_alias, p_col = draw(st.sampled_from(available))
+            s_alias, s_col = draw(st.sampled_from(available))
+            where = WherePredicate(
+                form=draw(st.sampled_from(("exists", "in"))),
+                probe=(p_alias, p_col),
+                sub_rel=rel_of[s_alias],
+                sub_col=s_col,
+            )
+
         m_name = f"m_{i}"
-        models.append(ModelSpec(name=m_name, aliases=aliases, projections=tuple(projections)))
+        models.append(
+            ModelSpec(name=m_name, aliases=aliases, projections=tuple(projections), where=where)
+        )
         # Models are available as upstream relations for later models. Their
         # exposed column list is the set of output names.
         m_cols = tuple(dict.fromkeys(p.out for p in projections))
@@ -177,9 +221,14 @@ def _build_sql(m: ModelSpec) -> str:
     # Map relation name -> alias for the FROM/JOIN clause.
     alias_for: dict[str, str] = {rel: alias for alias, rel in m.aliases}
     parts: list[str] = []
-    for p in m.projections:
+    for k, p in enumerate(m.projections):
         if not p.sources:
             parts.append(f"42 AS {p.out}")
+            continue
+        if p.scalar_subquery:
+            (rel, col) = p.sources[0]
+            sq = f"sq{k}"
+            parts.append(f"(SELECT MAX({sq}.{col}) FROM {rel} AS {sq}) AS {p.out}")
             continue
         terms = [f"{alias_for[rel]}.{col}" for rel, col in p.sources]
         expr = " + ".join(terms) if len(terms) > 1 else terms[0]
@@ -192,7 +241,21 @@ def _build_sql(m: ModelSpec) -> str:
     else:
         (a_alias, a_rel), (b_alias, b_rel) = m.aliases
         from_clause = f"{a_rel} AS {a_alias} CROSS JOIN {b_rel} AS {b_alias}"
-    return f"SELECT {', '.join(parts)} FROM {from_clause}"
+    return f"SELECT {', '.join(parts)} FROM {from_clause}{_where_sql(m.where)}"
+
+
+def _where_sql(where: WherePredicate | None) -> str:
+    """Render a ``WHERE`` predicate, or empty string for none. Both forms anchor on
+    a real upstream column so the SQL qualifies; neither contributes provenance."""
+    if where is None:
+        return ""
+    p_alias, p_col = where.probe
+    if where.form == "exists":
+        return (
+            f" WHERE EXISTS (SELECT 1 FROM {where.sub_rel} AS sqw "
+            f"WHERE sqw.{where.sub_col} = {p_alias}.{p_col})"
+        )
+    return f" WHERE {p_alias}.{p_col} IN (SELECT sqw.{where.sub_col} FROM {where.sub_rel} AS sqw)"
 
 
 def _leaf_node(le: LeafSpec) -> Node:

@@ -226,6 +226,11 @@ class _Walker:
         # each output column name of a union derived-table.
         self._scope_source_ref: dict[int, SourceRef] = {}
         self._union_output_ref: dict[tuple[int, str], SourceRef] = {}
+        # A scalar subquery in a projection contributes the provenance of its
+        # selected expression, resolved against its own scope. Keyed by the id of
+        # the scope's inner expression (``exp.Subquery.this``) so the stamper can
+        # find the scope for a subquery it meets inside a projection.
+        self._subquery_scope_by_expr: dict[int, Scope] = {}
 
     def walk(
         self,
@@ -279,6 +284,7 @@ class _Walker:
         # registering them under the parent's source ref would surface
         # phantom columns on whatever node the parent resolves to.
         for sub_scope in scope.subquery_scopes:
+            self._subquery_scope_by_expr[id(sub_scope.expression)] = sub_scope
             self.walk(sub_scope, scope_path=scope_path, register_projections=False)
 
         scope_expr = scope.expression
@@ -312,19 +318,35 @@ class _Walker:
         self.edges[col_ref] = immediate
 
     def _stamp_columns(self, expr: Expr, *, scope: Scope) -> frozenset[ColumnRef]:
-        """Stamp every ``exp.Column`` in ``expr`` with its immediate upstream ``ColumnRef``.
+        """Stamp the columns that supply ``expr``'s value with their upstream ``ColumnRef``.
 
-        Returns the deduped set of those refs as this projection's ``edges``
-        entry. An unresolved Column is silently skipped: the propagator
-        treats the unstamped Column as "unknown" via ``Property.default()``.
+        Columns lying directly in ``expr`` resolve against ``scope``. A scalar
+        subquery contributes the provenance of its *selected* expression only: we
+        recurse into its projection against the subquery's own scope and never
+        touch its WHERE/FROM, so a correlated predicate column (which filters rows
+        rather than supplying the value) does not leak in even though it may
+        resolve against the outer scope. Returns the deduped set of refs as this
+        projection's ``edges`` entry. An unresolved Column is silently skipped:
+        the propagator reads an unstamped Column as "unknown" via the property
+        default.
         """
+        direct, subqueries = _projection_leaves(expr)
         immediate: set[ColumnRef] = set()
-        for col in expr.find_all(exp.Column):
+        for col in direct:
             ref = self._resolve_column(col, scope=scope)
             if ref is None:
                 continue
             attach_column_ref(col, ref)
             immediate.add(ref)
+        for subq in subqueries:
+            inner = subq.this
+            sub_scope = self._subquery_scope_by_expr.get(id(inner))
+            if sub_scope is None or not isinstance(inner, exp.Selectable):
+                continue
+            for sel in inner.selects:
+                if isinstance(sel, exp.Star):
+                    continue
+                immediate |= self._stamp_columns(sel, scope=sub_scope)
         return frozenset(immediate)
 
     def _resolve_column(self, col: exp.Column, *, scope: Scope) -> ColumnRef | None:
@@ -490,6 +512,37 @@ class _Walker:
             if src is child:
                 return alias
         return None
+
+
+def _projection_leaves(expr: Expr) -> tuple[list[exp.Column], list[exp.Subquery]]:
+    """Split ``expr`` into the columns lying directly in it and the outermost
+    scalar subqueries within it.
+
+    The walk stops at each ``Column`` and ``Subquery``, so a subquery's interior
+    is left for a separate pass against its own scope rather than being resolved
+    against this one. That boundary is what keeps a subquery's WHERE/FROM columns
+    out of the enclosing projection's provenance.
+    """
+    direct: list[exp.Column] = []
+    subqueries: list[exp.Subquery] = []
+
+    def visit(node: Expr) -> None:
+        if isinstance(node, exp.Column):
+            direct.append(node)
+            return
+        if isinstance(node, exp.Subquery):
+            subqueries.append(node)
+            return
+        for value in node.args.values():
+            if isinstance(value, Expr):
+                visit(value)
+            elif isinstance(value, list):
+                for item in cast("list[object]", value):
+                    if isinstance(item, Expr):
+                        visit(item)
+
+    visit(expr)
+    return direct, subqueries
 
 
 def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
