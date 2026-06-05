@@ -2,6 +2,7 @@
 
 from dblect.manifest.dag import CycleError, Dag
 from dblect.manifest.parse import (
+    DATA_FLOW_UID_PREFIXES,
     Column,
     ConstraintSpec,
     ConstraintType,
@@ -9,9 +10,11 @@ from dblect.manifest.parse import (
     Manifest,
     Node,
     ResourceType,
+    generic_test_target_uid,
 )
 
 __all__ = [
+    "DATA_FLOW_UID_PREFIXES",
     "Column",
     "ConstraintSpec",
     "ConstraintType",
@@ -21,4 +24,5 @@ __all__ = [
     "Manifest",
     "Node",
     "ResourceType",
+    "generic_test_target_uid",
 ]

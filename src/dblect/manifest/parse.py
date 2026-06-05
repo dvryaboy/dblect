@@ -174,6 +174,33 @@ class Node:
         return self.compiled_code
 
 
+# The unique_id prefixes dbt gives the data-flow node kinds, derived from the
+# resource types so the two stay in lockstep ("model.", "source.", "seed.",
+# "snapshot."). ``OTHER`` (tests, analyses) never anchors a generic test.
+DATA_FLOW_UID_PREFIXES: tuple[str, ...] = tuple(
+    f"{rt.value}." for rt in ResourceType if rt is not ResourceType.OTHER
+)
+
+
+def generic_test_target_uid(
+    node: Node, *, eligible_prefixes: tuple[str, ...] = DATA_FLOW_UID_PREFIXES
+) -> str | None:
+    """The unique_id a generic test is attached to, or None if undeterminable.
+
+    Prefer ``attached_node`` (the modern manifest shape); fall back to the first
+    eligible entry in ``depends_on`` for older manifests where ``attached_node``
+    isn't populated. ``eligible_prefixes`` narrows which target kinds count, so a
+    caller that grounds only models and sources can pass a subset of the
+    data-flow default.
+    """
+    if node.attached_node and node.attached_node.startswith(eligible_prefixes):
+        return node.attached_node
+    for dep in sorted(node.depends_on):
+        if dep.startswith(eligible_prefixes):
+            return dep
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Manifest:
     """A dblect-shaped view of a parsed dbt ``manifest.json``."""
