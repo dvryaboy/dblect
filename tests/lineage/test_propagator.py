@@ -17,7 +17,7 @@ import sqlglot.expressions as exp
 
 from dblect.lineage.builder import build_model_graph
 from dblect.lineage.facts.lattice import Lattice
-from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
+from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import (
     DepContext,
     OperatorTransfer,
@@ -27,7 +27,7 @@ from dblect.lineage.facts.property import (
     relation_property,
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceKind, SourceRef
 from dblect.lineage.property import propagate, run
 from dblect.lineage.semiring import UnionSemiring
 
@@ -307,12 +307,12 @@ def test_scope_kind_with_no_registered_reducer_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The driver dispatches by scope kind at one point; a kind with no registered
-    reducer raises there rather than mid-walk. Relation reducers are registered by
-    the property that needs them, so we clear the table to the column-only baseline
-    to exercise the guard deterministically."""
+    reducer raises there rather than mid-walk. Reducers are registered by the
+    properties that need them, so we clear the table to exercise the guard
+    deterministically regardless of what else has been imported."""
     from dblect.lineage import property as prop_mod
 
-    monkeypatch.setattr(prop_mod, "_REDUCERS", {ScopeKind.COLUMN: prop_mod._column_reduce})
+    monkeypatch.setattr(prop_mod, "_REDUCERS", {})
     rel = relation_property(
         name="rel",
         lattice=_subset_lattice(),
@@ -320,14 +320,8 @@ def test_scope_kind_with_no_registered_reducer_raises(
         aggregates={},
         ground=lambda _s: Annotation(_UNIVERSE, Opacity.IMPLICIT),
     )
-    graph = build_model_graph(
-        model_uid="model.test.m",
-        sql="SELECT u.id FROM users u",
-        name_to_source={"users": _src("users")},
-        schema={"users": {"id": "INT"}},
-    )
     with pytest.raises(NotImplementedError, match="relation"):
-        propagate(graph, rel)
+        propagate(RelationLineageGraph.empty(), rel)
 
 
 def test_run_fills_store_for_every_property() -> None:
