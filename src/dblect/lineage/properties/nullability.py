@@ -37,6 +37,7 @@ from dblect.lineage.facts.model import (
     Fact,
     NativeConstraint,
     Opacity,
+    Predicate,
 )
 from dblect.lineage.facts.property import (
     AggregateRule,
@@ -169,7 +170,11 @@ def _column_ref(manifest: Manifest, target_uid: str, column: str) -> ColumnRef |
 
 
 class _NotNullTestDiscoverer:
-    """Grounds NON_NULL from enabled, unconditional ``not_null`` generic tests."""
+    """Grounds NON_NULL from enabled ``not_null`` generic tests.
+
+    A ``where`` filter makes the claim conditional: the fact carries the predicate
+    and is captured, but grounding does not fold a conditional NON_NULL into the
+    unconditional annotation (see :class:`~dblect.lineage.facts.model.Predicate`)."""
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
@@ -178,12 +183,6 @@ class _NotNullTestDiscoverer:
         for node in manifest.nodes.values():
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "not_null":
-                continue
-            # A `where` filter makes the assertion conditional ("not null within
-            # rows matching X"). Grounding it as an unconditional NON_NULL would
-            # over-claim, so it grounds nothing until conditional facts land (see
-            # conditional-uniqueness-facts.md).
-            if tm.where is not None:
                 continue
             col = tm.kwargs.get("column_name")
             if not isinstance(col, str) or not col:
@@ -200,6 +199,7 @@ class _NotNullTestDiscoverer:
                     value=Nullability.NON_NULL,
                     provenance=Declared(DeclaredSource.DBT_GENERIC_TEST),
                     detail=node.name,
+                    condition=Predicate(tm.where) if tm.where is not None else None,
                 )
             )
         return out
