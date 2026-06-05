@@ -58,8 +58,7 @@ class RowFilter:
         return RowFilter(frozenset(atoms))
 
 
-# The empty filter: "no filter known", the value every relation grounds to and the
-# meet identity.
+# The value every relation grounds to ("no filter known"), and the meet identity.
 NO_FILTER: RowFilter = RowFilter(frozenset())
 
 # The formal universal element, present so the lattice is bounded; unreachable when
@@ -93,14 +92,12 @@ PREDICATE_FLOW_LATTICE: Lattice[RowFilter] = Lattice(
 
 # --- the relation reducer ----------------------------------------------------
 #
-# The relation-algebra walk for row filters. It mirrors the uniqueness walk's job
-# (turn a derivation into an inferred annotation, recursing into referenced nodes)
-# but accumulates a filter rather than keys: a FROM carries the source's filter, a
-# WHERE conjoins, a projection renames the filter onto output names, and the shapes
-# that change row identity or blur columns (JOIN, UNION, GROUP BY) drop to top.
+# The relation-algebra walk for row filters: the same shape as the uniqueness walk
+# (reduce a derivation to an inferred annotation, recursing into referenced nodes),
+# accumulating a filter rather than keys. The per-case rules are in the module
+# docstring; each case below carries the reason it carries or drops.
 
-# Resolves the accumulated filter of a base (non-CTE) table reference, by reading the
-# table's stamped SourceRef and recursing through the shared propagator.
+# Resolves a base (non-CTE) table's accumulated filter via its stamped SourceRef.
 _BaseFilter = Callable[["exp.Table"], frozenset[Canon]]
 
 
@@ -149,7 +146,7 @@ class _FlowWalk:
     ) -> frozenset[Canon]:
         if isinstance(node, exp.Select):
             return self._select(node, cte_scope=cte_scope)
-        return frozenset()  # UNION and anything else: row identity differs, drop to top
+        return frozenset()  # UNION (arms may differ) and other non-SELECT shapes carry nothing
 
     def _select(
         self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Canon]]
@@ -212,7 +209,7 @@ def _project_filter(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon
     out: set[Canon] = set()
     for atom in atoms:
         if not isinstance(atom, CmpAtom | InAtom):
-            continue  # opaque atom: column unknown, cannot survive an explicit projection
+            continue
         col = atom_column(atom)
         if col is None:
             continue
