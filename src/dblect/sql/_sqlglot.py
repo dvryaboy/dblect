@@ -37,6 +37,10 @@ def from_of(sel: exp.Select) -> exp.From | None:
     return cast("exp.From | None", sel.args.get("from_") or sel.args.get("from"))
 
 
+def where_of(sel: exp.Select) -> exp.Where | None:
+    return cast("exp.Where | None", sel.args.get("where"))
+
+
 def joins_of(sel: exp.Select) -> list[exp.Join]:
     return cast("list[exp.Join]", sel.args.get("joins") or [])
 

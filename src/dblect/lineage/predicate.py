@@ -177,6 +177,49 @@ def implies(strong: Expr, weak: Expr) -> bool:
     return _entails(cmp_atoms, in_sets, weak)
 
 
+# --- atom extraction and column renaming -----------------------------------------
+#
+# The predicate-flow property carries a relation's accumulated row filter as a set
+# of these atoms, so it needs to lift a ``WHERE`` expression into atoms and rename
+# an atom's column through a projection. Both operate on the same typed atom forms
+# the entailment core reasons about, so they live here rather than re-deriving the
+# recognition logic elsewhere.
+
+
+def atoms_of(e: Expr) -> frozenset[Canon]:
+    """The conjuncts of ``e``, each canonicalised to an atom. A conjunct outside the
+    fragment (an ``OR``, an unmodelled shape) becomes an :class:`OpaqueAtom`, carried
+    but inert to interval reasoning."""
+    return frozenset(_canon(c) for c in _conjuncts(e))
+
+
+def atom_column(atom: Canon) -> str | None:
+    """The single base column an atom constrains, or ``None`` for an
+    :class:`OpaqueAtom` (whose columns the engine does not model)."""
+    if isinstance(atom, CmpAtom | InAtom):
+        return _term_column(atom.term)
+    return None
+
+
+def rename_atom(atom: CmpAtom | InAtom, new_column: str) -> CmpAtom | InAtom:
+    """``atom`` with its base column replaced by ``new_column`` (renaming the inner
+    column of a truncation term), so a filter follows a projection's ``col AS x``."""
+    term = _rename_term_column(atom.term, new_column)
+    if isinstance(atom, CmpAtom):
+        return CmpAtom(term, atom.op, atom.lit)
+    return InAtom(term, atom.values)
+
+
+def _term_column(t: Term) -> str:
+    return t.name if isinstance(t, Column) else _term_column(t.inner)
+
+
+def _rename_term_column(t: Term, new_column: str) -> Term:
+    if isinstance(t, Column):
+        return Column(new_column)
+    return Trunc(t.unit, _rename_term_column(t.inner, new_column))
+
+
 # --- decomposition ---------------------------------------------------------------
 
 
