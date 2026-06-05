@@ -46,7 +46,15 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
-from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
+from dblect.lineage.predicate import (
+    Canon,
+    CmpAtom,
+    InAtom,
+    atom_column,
+    atoms_of,
+    parse_predicate,
+    rename_atom,
+)
 from dblect.lineage.properties.activation import activate
 from dblect.lineage.properties.predicate_flow import RowFilter
 from dblect.manifest import (
@@ -348,11 +356,23 @@ _QCol = tuple[str, str]
 _QKey = frozenset[_QCol]
 
 
-# Resolves the candidate keys of a base (non-CTE) table reference. Two
-# implementations: the graph reducer reads the table's stamped SourceRef and
-# recurses through the shared propagator; the detector index resolves the table
-# by name against the per-model keys propagation already produced.
-_BaseKeys = Callable[["exp.Table"], frozenset[Key]]
+@dataclass(frozen=True, slots=True)
+class _Carried:
+    """What a scope carries up the walk: its candidate keys and the conditional keys
+    riding through it (each in the scope's own output column names)."""
+
+    keys: frozenset[Key]
+    conditional: frozenset[ConditionalKey] = frozenset()
+
+
+_EMPTY: _Carried = _Carried(frozenset())
+
+# Resolves a base (non-CTE) table reference to what it carries. Two implementations:
+# the graph reducer reads the table's stamped SourceRef and recurses through the
+# shared propagator (so conditional keys cross model boundaries); the detector index
+# resolves the table by name against the per-model keys propagation already produced
+# (it consumes already-activated keys, so it carries no conditional payload).
+_BaseResolve = Callable[["exp.Table"], _Carried]
 
 
 def _relation_reduce(
@@ -365,23 +385,23 @@ def _relation_reduce(
     """Reduce a model's relational tree to its inferred candidate-key set.
 
     A base table resolves through ``recurse`` on its stamped ``SourceRef``, so
-    cross-model keys, declarations, and the provisional taint flow in. CTEs and
-    inline subqueries are resolved structurally within the walk.
+    cross-model keys, conditional keys, declarations, and the provisional taint flow
+    in. CTEs and inline subqueries are resolved structurally within the walk.
     """
     provisional = False
 
-    def base_keys(table: exp.Table) -> frozenset[Key]:
+    def base_resolve(table: exp.Table) -> _Carried:
         nonlocal provisional
         ref = source_ref_meta(table)
         if ref is None:
-            return frozenset()
+            return _EMPTY
         ann = recurse(ref)
         provisional = provisional or ann.provisional
-        return ann.value.keys
+        return _Carried(ann.value.keys, ann.value.conditional)
 
-    keys = _RelationWalk(base_keys).scope_keys(deriv, cte_scope={})
-    value = CandidateKeySet(keys)
-    opacity = Opacity.CONCRETE if keys else Opacity.IMPLICIT
+    carried = _RelationWalk(base_resolve).scope_keys(deriv, cte_scope={})
+    value = CandidateKeySet(carried.keys, carried.conditional)
+    opacity = Opacity.CONCRETE if (carried.keys or carried.conditional) else Opacity.IMPLICIT
     return Annotation(value, opacity, provisional=provisional)
 
 
@@ -397,44 +417,48 @@ def relation_scope_keys(
     detector consults to get a CTE's or inline subquery's keys, since those
     intermediate scopes are not relations the propagator annotates. The returned
     map is valid only for the lifetime of ``tree``.
+
+    Base keys here are already activated (the per-model map is built after
+    activation), so this walk carries no conditional payload of its own.
     """
 
-    def base_keys(table: exp.Table) -> frozenset[Key]:
-        return model_keys.get(table.name, frozenset())
+    def base_resolve(table: exp.Table) -> _Carried:
+        return _Carried(model_keys.get(table.name, frozenset()))
 
-    walk = _RelationWalk(base_keys, record=True)
+    walk = _RelationWalk(base_resolve, record=True)
     walk.scope_keys(tree, cte_scope={})
-    return walk.scopes
+    return {node_id: carried.keys for node_id, carried in walk.scopes.items()}
 
 
 class _RelationWalk:
     """Bottom-up candidate-key inference over one relational tree.
 
-    ``base_keys`` resolves a base (non-CTE) table's keys; CTEs and inline
-    subqueries are resolved structurally within the walk. With ``record`` set,
-    every SELECT/UNION scope's output keys are kept in ``scopes`` keyed by
-    ``id(node)`` so a detector can read intermediate-scope keys.
+    ``base_resolve`` resolves a base (non-CTE) table to what it carries; CTEs and
+    inline subqueries are resolved structurally within the walk. Conditional keys
+    ride through a single-source, no-join, no-group scope, renamed onto its output
+    columns; a JOIN / UNION / GROUP BY drops them, exactly where the predicate flow
+    also drops, so a carried key could never activate there. With ``record`` set,
+    every SELECT/UNION scope's output is kept in ``scopes`` keyed by ``id(node)`` so
+    a detector can read intermediate-scope keys.
     """
 
-    def __init__(self, base_keys: _BaseKeys, *, record: bool = False) -> None:
-        self._base_keys = base_keys
+    def __init__(self, base_resolve: _BaseResolve, *, record: bool = False) -> None:
+        self._base_resolve = base_resolve
         self._record = record
-        self.scopes: dict[int, frozenset[Key]] = {}
+        self.scopes: dict[int, _Carried] = {}
 
-    def scope_keys(self, node: Expr, *, cte_scope: Mapping[str, frozenset[Key]]) -> frozenset[Key]:
+    def scope_keys(self, node: Expr, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
         if isinstance(node, exp.Select):
-            keys = self._select(node, cte_scope=cte_scope)
+            carried = self._select(node, cte_scope=cte_scope)
         elif isinstance(node, exp.Union):
-            keys = self._union(node, cte_scope=cte_scope)
+            carried = self._union(node, cte_scope=cte_scope)
         else:
-            return frozenset()
+            return _EMPTY
         if self._record:
-            self.scopes[id(node)] = keys
-        return keys
+            self.scopes[id(node)] = carried
+        return carried
 
-    def _select(
-        self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Key]]
-    ) -> frozenset[Key]:
+    def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
         local = dict(cte_scope)
         with_ = sel.args.get("with_")
         if isinstance(with_, exp.With):
@@ -444,25 +468,33 @@ class _RelationWalk:
 
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):
-            return frozenset()
+            return _EMPTY
         resolved = self._resolve_source(from_.this, cte_scope=local)
         if resolved is None:
-            return frozenset()
-        from_alias, from_keys = resolved
-        combined = _qualify(from_alias, from_keys)
+            return _EMPTY
+        from_alias, from_carried = resolved
+        combined = _qualify(from_alias, from_carried.keys)
 
-        for j in sg.joins_of(sel):
+        # WHERE filters cannot add duplicates, so keys (and conditional keys) are
+        # preserved across it; the WHERE is the predicate flow's concern, not ours.
+        joins = sg.joins_of(sel)
+        for j in joins:
             combined = self._apply_join(j, combined, cte_scope=local)
 
-        # WHERE filters cannot add duplicates, so keys are preserved across it.
         group = sg.group_of(sel)
-        if group is not None and group.expressions:
-            grouped = _group_key(group, from_alias=from_alias)
-            combined = grouped if grouped is not None else frozenset[_QKey]()
+        grouped = group is not None and bool(group.expressions)
+        if group is not None and grouped:
+            gk = _group_key(group, from_alias=from_alias)
+            combined = gk if gk is not None else frozenset[_QKey]()
 
-        return _project(sel, combined, from_alias=from_alias)
+        projection = _Projection.build(sel, from_alias=from_alias)
+        keys = _project(sel, combined, projection)
+        conditional: frozenset[ConditionalKey] = frozenset()
+        if not joins and not grouped:
+            conditional = _carry_conditional(from_carried.conditional, projection, from_alias)
+        return _Carried(keys, conditional)
 
-    def _union(self, u: exp.Union, *, cte_scope: Mapping[str, frozenset[Key]]) -> frozenset[Key]:
+    def _union(self, u: exp.Union, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
         left = u.this
         right = u.args.get("expression")
         if isinstance(left, Expr):
@@ -471,21 +503,22 @@ class _RelationWalk:
             self.scope_keys(right, cte_scope=cte_scope)
         # UNION ALL concatenates, so a key on both arms still need not hold on the
         # result (the same value can appear in both). UNION (distinct) dedupes the
-        # full projected tuple, which is therefore a key.
+        # full projected tuple, which is therefore a key. Conditional keys drop: the
+        # arms may carry different predicates.
         if not bool(u.args.get("distinct")) or not isinstance(left, exp.Select):
-            return frozenset()
+            return _EMPTY
         names = _output_names(left)
-        return frozenset({frozenset(names)}) if names else frozenset()
+        return _Carried(frozenset({frozenset(names)}) if names else frozenset())
 
     def _resolve_source(
-        self, node: Expr, *, cte_scope: Mapping[str, frozenset[Key]]
-    ) -> tuple[str, frozenset[Key]] | None:
+        self, node: Expr, *, cte_scope: Mapping[str, _Carried]
+    ) -> tuple[str, _Carried] | None:
         if isinstance(node, exp.Table):
             alias = node.alias_or_name
             name = node.name
             if name in cte_scope:
                 return alias, cte_scope[name]
-            return alias, self._base_keys(node)
+            return alias, self._base_resolve(node)
         if isinstance(node, exp.Subquery):
             inner = node.this
             alias = node.alias_or_name
@@ -495,7 +528,7 @@ class _RelationWalk:
         return None
 
     def _apply_join(
-        self, j: exp.Join, combined: frozenset[_QKey], *, cte_scope: Mapping[str, frozenset[Key]]
+        self, j: exp.Join, combined: frozenset[_QKey], *, cte_scope: Mapping[str, _Carried]
     ) -> frozenset[_QKey]:
         if sg.join_side_of(j) is JoinSide.CROSS:
             return frozenset()  # explicit cartesian product: no key survives
@@ -505,8 +538,8 @@ class _RelationWalk:
         resolved = self._resolve_source(target, cte_scope=cte_scope)
         if resolved is None:
             return frozenset()
-        r_alias, r_keys = resolved
-        if not r_keys:
+        r_alias, r_carried = resolved
+        if not r_carried.keys:
             return frozenset()  # joined-in side has no known key: can't rule out fanout
         on = sg.on_of(j)
         if on is None:
@@ -516,7 +549,7 @@ class _RelationWalk:
             return frozenset()
         # The joined-in side cannot multiply probe rows when its join columns cover
         # one of its keys, so the probe side's keys carry through unchanged.
-        if not any(k <= right_join_cols for k in r_keys):
+        if not any(k <= right_join_cols for k in r_carried.keys):
             return frozenset()
         return combined
 
@@ -552,10 +585,11 @@ def _output_names(sel: exp.Select) -> list[str]:
     return names
 
 
-def _project(sel: exp.Select, combined: frozenset[_QKey], *, from_alias: str) -> frozenset[Key]:
+def _project(
+    sel: exp.Select, combined: frozenset[_QKey], projection: _Projection
+) -> frozenset[Key]:
     """Map the scope's qualified keys onto bare output-column names, then add the
     DISTINCT full-tuple key when present."""
-    projection = _Projection.build(sel, from_alias=from_alias)
     out: set[Key] = set()
     for qkey in combined:
         mapped = projection.map_key(qkey)
@@ -565,6 +599,56 @@ def _project(sel: exp.Select, combined: frozenset[_QKey], *, from_alias: str) ->
         names = _output_names(sel)
         if names:
             out.add(frozenset(names))
+    return frozenset(out)
+
+
+def _qualify_key(alias: str, key: Key) -> _QKey:
+    """Lift one bare key into an alias-qualified key for the working scope."""
+    return frozenset((alias, col) for col in key)
+
+
+def _carry_conditional(
+    conditional: frozenset[ConditionalKey], projection: _Projection, from_alias: str
+) -> frozenset[ConditionalKey]:
+    """Carry the source's conditional keys onto this scope's output columns.
+
+    Both the key columns and the predicate columns rename through the same
+    projection, so the carried predicate stays in the same column space the predicate
+    flow uses; activation can then match them. A conditional key whose key column or
+    any predicate column does not survive the projection is dropped.
+    """
+    out: set[ConditionalKey] = set()
+    for ck in conditional:
+        mapped_key = projection.map_key(_qualify_key(from_alias, ck.key))
+        if mapped_key is None:
+            continue
+        mapped_predicate = _carry_predicate(ck.predicate, projection, from_alias)
+        if mapped_predicate is None:
+            continue
+        out.add(ConditionalKey(mapped_key, mapped_predicate))
+    return frozenset(out)
+
+
+def _carry_predicate(
+    predicate: frozenset[Canon], projection: _Projection, from_alias: str
+) -> frozenset[Canon] | None:
+    """Rename a conditional key's predicate through the projection, or ``None`` if any
+    atom cannot be carried (its column is dropped, or it is opaque under an explicit
+    projection). All-or-nothing: dropping an atom would weaken the predicate and let
+    the key activate too readily, so the whole conditional key drops instead."""
+    if projection.unrestricted or from_alias in projection.star_aliases:
+        return predicate  # full passthrough: every column survives under its own name
+    out: set[Canon] = set()
+    for atom in predicate:
+        if not isinstance(atom, CmpAtom | InAtom):
+            return None  # opaque: its column is unknown, so it cannot be tracked
+        col = atom_column(atom)
+        if col is None:
+            return None
+        names = projection.names_for((from_alias, col))
+        if not names:
+            return None
+        out.add(rename_atom(atom, min(names)))
     return frozenset(out)
 
 
@@ -629,13 +713,13 @@ class _Projection:
         columns does not survive the projection."""
         out: set[str] = set()
         for qc in key:
-            names = self._names_for(qc)
+            names = self.names_for(qc)
             if not names:
                 return None
             out.add(min(names))  # one occurrence suffices; pick a stable representative
         return frozenset(out)
 
-    def _names_for(self, qc: _QCol) -> list[str]:
+    def names_for(self, qc: _QCol) -> list[str]:
         out: list[str] = []
         if qc in self.aliased:
             out.extend(n for n in self.aliased[qc] if n not in self.ambiguous)
