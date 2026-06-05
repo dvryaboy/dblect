@@ -27,7 +27,7 @@ from dblect.lineage.facts.property import (
     relation_property,
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceKind, SourceRef
 from dblect.lineage.property import propagate, run
 from dblect.lineage.semiring import UnionSemiring
 
@@ -46,6 +46,7 @@ def _subset_prop(
     *,
     operators: Mapping[type, OperatorTransfer[_Set]] | None = None,
     semiring: UnionSemiring[int] | None = None,
+    reconcile_by_meet: bool = False,
 ) -> Property[_Set, ColumnRef]:
     return column_property(
         name="subset",
@@ -54,6 +55,7 @@ def _subset_prop(
         aggregates={},
         ground=ground,
         semiring=semiring,
+        reconcile_by_meet=reconcile_by_meet,
     )
 
 
@@ -202,6 +204,26 @@ def test_conflict_keeps_grounded_and_taints_provisional() -> None:
     assert anns[out].provisional
 
 
+def test_reconcile_by_meet_composes_declared_and_inferred_without_conflict() -> None:
+    """A property whose declared and inferred values are the same-polarity lower
+    bounds (uniqueness: candidate keys) composes them by meet and never flags a
+    conflict. Here declared {0,1} and inferred {1,2} neither refines the other, so
+    the default path would taint provisional; under ``reconcile_by_meet`` the flow
+    value is their meet {1}, untainted."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    ground = _concrete_for({leaf: frozenset({1, 2}), out: frozenset({0, 1})})
+    anns = propagate(graph, _subset_prop(ground, reconcile_by_meet=True))
+    assert anns[out].value == frozenset({1})
+    assert not anns[out].provisional
+
+
 def test_opaque_inferred_keeps_grounded_without_a_taint() -> None:
     """When the SQL reveals nothing (inferred top), the grounded value stands and
     is not tainted."""
@@ -281,22 +303,21 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
 # --- scope dispatch and the registry driver ---------------------------------
 
 
-def test_relation_scope_is_not_yet_implemented() -> None:
+def test_relation_property_without_a_reducer_cannot_propagate() -> None:
+    """A relation property carries its relation-algebra walk as ``reducer``; one
+    built without it has no generic fallback (unlike column scope), so the driver
+    raises at its single dispatch point rather than mid-walk. The property itself
+    holds the reducer, so no global state or monkeypatching is involved."""
     rel = relation_property(
-        name="uniqueness",
+        name="rel",
         lattice=_subset_lattice(),
         operators={},
         aggregates={},
         ground=lambda _s: Annotation(_UNIVERSE, Opacity.IMPLICIT),
     )
-    graph = build_model_graph(
-        model_uid="model.test.m",
-        sql="SELECT u.id FROM users u",
-        name_to_source={"users": _src("users")},
-        schema={"users": {"id": "INT"}},
-    )
-    with pytest.raises(NotImplementedError, match="relation"):
-        propagate(graph, rel)
+    assert rel.reducer is None
+    with pytest.raises(NotImplementedError, match="reducer"):
+        propagate(RelationLineageGraph.empty(), rel)
 
 
 def test_run_fills_store_for_every_property() -> None:

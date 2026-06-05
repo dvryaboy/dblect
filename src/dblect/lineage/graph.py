@@ -24,11 +24,35 @@ before propagation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol, TypeVar
 
+import sqlglot.expressions as exp
 from sqlglot import Expr
+
+# Invariant: a view both yields subjects (output) and reads a subject back
+# (input), so it cannot vary in either direction.
+S = TypeVar("S", "ColumnRef", "SourceRef")
+
+
+class LineageView(Protocol[S]):
+    """The minimal view the propagator's grounded-fixpoint driver needs of a
+    lineage graph, independent of scope.
+
+    A *subject* is a node the propagator annotates (a column for column-scoped
+    properties, a relation for relation-scoped ones). ``derivation`` returns the
+    sqlglot expression that produced a subject, or ``None`` when the subject is a
+    leaf (a source or seed) that grounds from facts. The scope-specific reducer
+    is what walks a derivation; the driver only needs to enumerate subjects and
+    fetch each one's derivation, so both the column and relation graphs satisfy
+    this same protocol.
+    """
+
+    def subjects(self) -> Iterable[S]: ...
+
+    def derivation(self, subject: S) -> Expr | None: ...
 
 
 class SourceKind(StrEnum):
@@ -107,6 +131,19 @@ class ColumnLineageGraph:
     def empty() -> ColumnLineageGraph:
         return ColumnLineageGraph(edges={}, expressions={})
 
+    def subjects(self) -> Iterable[ColumnRef]:
+        """Every column the propagator should annotate: those with a derivation,
+        then leaf columns that appear only as an upstream edge. Order is stable
+        (derivations first) and memoisation makes the rest order-insensitive."""
+        seen: dict[ColumnRef, None] = dict.fromkeys(self.expressions)
+        for col in self.edges:
+            seen.setdefault(col, None)
+        return tuple(seen)
+
+    def derivation(self, subject: ColumnRef) -> Expr | None:
+        """The projection expression that built ``subject``; ``None`` for a leaf."""
+        return self.expressions.get(subject)
+
     def merge(self, other: ColumnLineageGraph) -> ColumnLineageGraph:
         """Union two graphs. Edges union per column; expressions take ``other`` on collision.
 
@@ -122,3 +159,48 @@ class ColumnLineageGraph:
         merged_exprs: dict[ColumnRef, Expr] = dict(self.expressions)
         merged_exprs.update(other.expressions)
         return ColumnLineageGraph(edges=merged_edges, expressions=merged_exprs)
+
+
+# Key on ``exp.Table.meta`` where the relation-graph builder records the
+# ``SourceRef`` an upstream table reference resolves to, so the relation reducer
+# can recurse into it without re-resolving names. Mirrors how the column builder
+# stamps ``exp.Column``s; centralised so builder and reducer stay in sync.
+SOURCEREF_META_KEY = "dblect_sourceref"
+
+
+def attach_source_ref(table: exp.Table, ref: SourceRef) -> None:
+    """Stamp ``table`` with the upstream ``SourceRef`` its name resolves to."""
+    table.meta[SOURCEREF_META_KEY] = ref
+
+
+def source_ref_meta(table: exp.Table) -> SourceRef | None:
+    """Read the ``SourceRef`` the builder stamped on ``table``; ``None`` if unstamped
+    (a CTE or derived-table reference, which the reducer resolves structurally)."""
+    meta = table.meta.get(SOURCEREF_META_KEY)
+    return meta if isinstance(meta, SourceRef) else None
+
+
+@dataclass(frozen=True, slots=True)
+class RelationLineageGraph:
+    """Per-audit relation lineage: each model relation paired with the SQL tree
+    that derives it.
+
+    A relation-scoped property annotates a :class:`SourceRef`; its derivation is
+    the model's compiled-SQL tree, whose upstream ``exp.Table`` references are
+    stamped with the :class:`SourceRef` they resolve to (see
+    :func:`attach_source_ref`). A source or seed relation has no derivation and
+    grounds from facts, so it appears only as a recursion target, never as a
+    derivation key.
+    """
+
+    derivations: Mapping[SourceRef, Expr]
+
+    @staticmethod
+    def empty() -> RelationLineageGraph:
+        return RelationLineageGraph(derivations={})
+
+    def subjects(self) -> Iterable[SourceRef]:
+        return tuple(self.derivations)
+
+    def derivation(self, subject: SourceRef) -> Expr | None:
+        return self.derivations.get(subject)
