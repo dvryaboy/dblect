@@ -139,6 +139,15 @@ class Property(Generic[K, S]):
     semiring: Semiring[K] | None = None
     display: Callable[[K], AxisDisplay] | None = None
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
+    reconcile_by_meet: bool = False
+    """How a derived node's declared and inferred annotations combine.
+
+    Default (``False``): an inferred value that fails ``consistent`` against the
+    declaration is a conflict; the flow value keeps the declaration, tainted
+    provisional (nullability: a declared ``NOT NULL`` the SQL can violate). Set
+    (``True``): declared and inferred are the same-polarity lower bounds and
+    compose by the lattice ``meet``, never conflicting (uniqueness: a declared
+    candidate key and a SQL-derived one both hold, so they union)."""
 
     def __post_init__(self) -> None:
         # A semiring-carrying property derives its confluence and cross from
@@ -169,6 +178,7 @@ def column_property(
     semiring: Semiring[K] | None = None,
     display: Callable[[K], AxisDisplay] | None = None,
     depends_on: tuple[PropertyRef[Any, Any], ...] = (),
+    reconcile_by_meet: bool = False,
 ) -> Property[K, ColumnRef]:
     """Mint a column-scoped property: ``scope_kind`` is COLUMN and facts address columns."""
     return Property(
@@ -181,6 +191,7 @@ def column_property(
         semiring=semiring,
         display=display,
         depends_on=depends_on,
+        reconcile_by_meet=reconcile_by_meet,
     )
 
 
@@ -194,6 +205,7 @@ def relation_property(
     semiring: Semiring[K] | None = None,
     display: Callable[[K], AxisDisplay] | None = None,
     depends_on: tuple[PropertyRef[Any, Any], ...] = (),
+    reconcile_by_meet: bool = False,
 ) -> Property[K, SourceRef]:
     """Mint a relation-scoped property: ``scope_kind`` is RELATION and facts address relations."""
     return Property(
@@ -206,4 +218,5 @@ def relation_property(
         semiring=semiring,
         display=display,
         depends_on=depends_on,
+        reconcile_by_meet=reconcile_by_meet,
     )

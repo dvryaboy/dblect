@@ -40,9 +40,22 @@ from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import AggregateRule, DepContext, OperatorTransfer, Property
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, LineageView, SourceRef
 
 K = TypeVar("K")
+S = TypeVar("S", ColumnRef, SourceRef)
+
+# A reducer turns one node's derivation into an inferred annotation, calling
+# ``recurse`` to pull in the annotation of any node the derivation references.
+# Column and relation scope differ *only* here: every other step of the walk
+# (grounding, the EXPLICIT short-circuit, reconcile, the provisional taint,
+# memoisation, the cycle guard) is shared and lives in ``propagate``. The
+# signature is erased to ``Any`` because the driver dispatches reducers by scope
+# kind; the public ``propagate`` stays precisely typed.
+Reducer = Callable[
+    [Expr, Property[Any, Any], Callable[[Any], Annotation[Any]], DepContext, Annotation[Any]],
+    Annotation[Any],
+]
 
 # Key on ``Expr.meta`` where the builder records the single ``ColumnRef`` an
 # ``exp.Column`` resolves to. Centralised so builder and propagator stay in sync.
@@ -77,25 +90,28 @@ _NULL_DEP_CONTEXT: DepContext = cast("DepContext", _NullDepContext())
 
 
 def propagate(
-    graph: ColumnLineageGraph,
-    prop: Property[K, Any],
+    graph: LineageView[S],
+    prop: Property[K, S],
     *,
     dep_context: DepContext = _NULL_DEP_CONTEXT,
-) -> Mapping[ColumnRef, Annotation[K]]:
-    """Compute ``prop``'s flow annotation for every column in ``graph``.
+) -> Mapping[S, Annotation[K]]:
+    """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
-    Memoised per column, so each column is annotated once regardless of how many
+    This is the one propagation engine: a memoised grounded fixpoint over the
+    lineage DAG. For each subject it grounds a declared annotation, short-circuits
+    on a declared opt-out, reduces the subject's derivation to an inferred
+    annotation, and reconciles the two. The scope-specific part is the *reducer*
+    selected by ``prop.scope_kind``: how a derivation reduces, and how recursion
+    into referenced subjects is triggered. Everything else here is shared by
+    column- and relation-scoped properties alike.
+
+    Memoised per subject, so each is annotated once regardless of how many
     downstream paths touch it. A defensive cycle guard returns the property's
-    no-information default if recursion ever revisits a column mid-walk, so a
+    no-information default if recursion ever revisits a subject mid-walk, so a
     malformed input degrades instead of looping forever (a manifest-derived graph
     is acyclic).
     """
-    if prop.scope_kind is ScopeKind.RELATION:
-        raise NotImplementedError(
-            "relation-scoped propagation lands with the uniqueness migration; "
-            "this walk handles column-scoped properties only"
-        )
-
+    reduce = _reducer_for(prop.scope_kind)
     lat = prop.lattice
     check = consistent(lat)
     # The "no information" value a node grounds to when nothing derives or
@@ -103,36 +119,47 @@ def propagate(
     # (semiring.zero), otherwise the lattice top. Both read as "we don't know".
     default_value = prop.semiring.zero if prop.semiring is not None else lat.top
     default_ann = Annotation(default_value, Opacity.IMPLICIT)
-    annotations: dict[ColumnRef, Annotation[K]] = {}
-    in_progress: set[ColumnRef] = set()
+    annotations: dict[S, Annotation[K]] = {}
+    in_progress: set[S] = set()
 
-    def annotate(col: ColumnRef) -> Annotation[K]:
-        if col in annotations:
-            return annotations[col]
-        if col in in_progress:
+    def annotate(subject: S) -> Annotation[K]:
+        if subject in annotations:
+            return annotations[subject]
+        if subject in in_progress:
             return default_ann
-        in_progress.add(col)
+        in_progress.add(subject)
         try:
-            grounded = prop.ground(col)
+            grounded = prop.ground(subject)
             if grounded.opacity is Opacity.EXPLICIT:
                 result = grounded
             else:
-                expr = graph.expressions.get(col)
-                if expr is None:
+                deriv = graph.derivation(subject)
+                if deriv is None:
                     result = grounded  # a leaf anchors on its grounded value
                 else:
-                    inferred = _walk(expr, prop, annotate, dep_context, default_ann)
-                    result = _reconcile(lat, check, grounded, inferred)
-            annotations[col] = result
+                    inferred = reduce(deriv, prop, annotate, dep_context, default_ann)
+                    result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
+            annotations[subject] = result
             return result
         finally:
-            in_progress.discard(col)
+            in_progress.discard(subject)
 
-    for col in graph.expressions:
-        annotate(col)
-    for col in graph.edges:
-        annotate(col)
+    for subject in graph.subjects():
+        annotate(subject)
     return annotations
+
+
+def _reducer_for(scope_kind: ScopeKind) -> Reducer:
+    """The reducer for a scope kind. Relation-scoped propagation lands with the
+    uniqueness migration; until then a relation property raises here, at the
+    single dispatch point, rather than mid-walk."""
+    reducer = _REDUCERS.get(scope_kind)
+    if reducer is None:
+        raise NotImplementedError(
+            "relation-scoped propagation lands with the uniqueness migration; "
+            f"no reducer registered for scope kind {scope_kind!r}"
+        )
+    return reducer
 
 
 def run(graph: ColumnLineageGraph, registry: PropertyRegistry) -> AnnotationStore:
@@ -151,31 +178,42 @@ def _reconcile(
     check: Callable[[K, K], bool],
     grounded: Annotation[K],
     inferred: Annotation[K],
+    reconcile_by_meet: bool,
 ) -> Annotation[K]:
     """Combine a derived node's grounded and inferred annotations into its flow value.
 
     Nothing grounded: the SQL stands. An opaque inference keeps the grounded value.
-    A more precise (consistent) inference tightens to the inferred value. A conflict
-    keeps the grounded value as the contract but taints it provisional, so one
-    upstream regression does not blank analysis of every consumer.
+
+    When ``reconcile_by_meet`` (a same-polarity property like uniqueness), declared
+    and inferred are both lower bounds, so the flow value is their meet and there is
+    no conflict: meet subsumes the tighten case (a refining inferred meets to itself)
+    and unions otherwise.
+
+    Otherwise (the default, value-domain like nullability): a more precise
+    (consistent) inference tightens to the inferred value; a conflict keeps the
+    grounded value as the contract but taints it provisional, so one upstream
+    regression does not blank analysis of every consumer.
     """
     if grounded.opacity is Opacity.IMPLICIT:
         return inferred
     if inferred.value == lat.top:
         return grounded
+    if reconcile_by_meet:
+        provisional = grounded.provisional or inferred.provisional
+        return Annotation(lat.meet(grounded.value, inferred.value), grounded.opacity, provisional)
     if check(grounded.value, inferred.value):
         return inferred
     return Annotation(grounded.value, grounded.opacity, provisional=True)
 
 
-def _walk(
+def _column_reduce(
     expr: Expr,
     prop: Property[K, Any],
     annotate: Callable[[ColumnRef], Annotation[K]],
     dep_context: DepContext,
     default_ann: Annotation[K],
 ) -> Annotation[K]:
-    """Reduce ``expr`` to a single annotation by walking it and combining children.
+    """The column-scoped reducer: reduce a projection ``expr`` to one annotation.
 
     Dispatch, most-specific first: an ``Alias`` looks through; a ``Column``
     recurses into its stamped upstream ref; a ``UnionConfluence`` folds its arms
@@ -189,7 +227,7 @@ def _walk(
     if isinstance(expr, exp.Alias):
         inner = expr.this
         return (
-            _walk(inner, prop, annotate, dep_context, default_ann)
+            _column_reduce(inner, prop, annotate, dep_context, default_ann)
             if isinstance(inner, Expr)
             else default_ann
         )
@@ -210,13 +248,14 @@ def _walk(
             child = expr.this if isinstance(expr.this, Expr) else None
             if child is None:
                 return default_ann
-            child_ann = _walk(child, prop, annotate, dep_context, default_ann)
+            child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann)
             return _apply_aggregate(rule, expr, child_ann)
         # An aggregate with no registered rule falls through to operator dispatch.
 
     op = _lookup_subclass(prop.operators, type(expr))
     child_anns = tuple(
-        _walk(c, prop, annotate, dep_context, default_ann) for c in _expression_children(expr)
+        _column_reduce(c, prop, annotate, dep_context, default_ann)
+        for c in _expression_children(expr)
     )
     if op is not None:
         return op(expr, child_anns, dep_context)
@@ -224,6 +263,26 @@ def _walk(
         return default_ann
     combine = prop.semiring.times if prop.semiring is not None else lat.join
     return _fold(lat, combine, child_anns)
+
+
+# The reducer table the driver dispatches on. Column scope ships here; relation
+# scope is registered by the property that needs it (see ``register_reducer``).
+_REDUCERS: dict[ScopeKind, Reducer] = {
+    ScopeKind.COLUMN: _column_reduce,
+}
+
+
+def register_reducer(scope_kind: ScopeKind, reducer: Reducer) -> None:
+    """Register the reducer for a scope kind.
+
+    Column reduction is generic (it dispatches to the property's own operator,
+    aggregate, semiring, and lattice). Relation reduction is property-specific
+    today: the relation algebra a uniqueness key-set walk performs does not yet
+    have a per-property transfer protocol, so the uniqueness module registers its
+    reducer on import. A second relation property would motivate folding this into
+    the ``Property`` bundle, at which point this hook goes away.
+    """
+    _REDUCERS[scope_kind] = reducer
 
 
 def _apply_aggregate(

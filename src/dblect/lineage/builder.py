@@ -36,10 +36,18 @@ from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import (
+    ColumnLineageGraph,
+    ColumnRef,
+    RelationLineageGraph,
+    SourceKind,
+    SourceRef,
+    attach_source_ref,
+)
 from dblect.lineage.property import UnionConfluence, attach_column_ref
 from dblect.manifest import Manifest, ResourceType
 from dblect.manifest import Node as ManifestNode
+from dblect.sql import SQLParseError, parse_sql
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +66,59 @@ class BuildIssue:
 class BuildResult:
     graph: ColumnLineageGraph
     issues: tuple[BuildIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RelationBuildResult:
+    graph: RelationLineageGraph
+    issues: tuple[BuildIssue, ...]
+
+
+def build_relation_graph(
+    manifest: Manifest,
+    *,
+    dialect: str | None = "duckdb",
+) -> RelationBuildResult:
+    """Build the cross-model ``RelationLineageGraph`` for relation-scoped
+    propagation (uniqueness).
+
+    Each model's compiled SQL is parsed and its upstream ``exp.Table`` references
+    are stamped with the ``SourceRef`` they resolve to, so the relation reducer
+    recurses across model boundaries via the propagator's shared ``recurse`` rather
+    than re-resolving names. A model with no compiled SQL or a parse error is
+    reported in ``issues`` and left out of the graph, so one bad model does not
+    blank the rest. Sources and seeds carry no derivation; they enter only as
+    recursion targets that ground from facts.
+    """
+    name_to_source = _build_name_to_source(manifest)
+    derivations: dict[SourceRef, Expr] = {}
+    issues: list[BuildIssue] = []
+    for uid, model in manifest.models.items():
+        sql = model.analysis_sql
+        if sql is None:
+            issues.append(BuildIssue(model_unique_id=uid, message="model has no compiled SQL"))
+            continue
+        try:
+            tree = parse_sql(sql, dialect=dialect)
+        except SQLParseError as e:
+            issues.append(BuildIssue(model_unique_id=uid, message=f"parse error: {e}"))
+            continue
+        _stamp_tables(tree, name_to_source)
+        derivations[SourceRef(kind=SourceKind.MODEL, unique_id=uid)] = tree
+    return RelationBuildResult(graph=RelationLineageGraph(derivations), issues=tuple(issues))
+
+
+def _stamp_tables(tree: Expr, name_to_source: Mapping[str, SourceRef]) -> None:
+    """Stamp every upstream table reference with its ``SourceRef``.
+
+    Naive by name: a reference whose rightmost name matches a manifest relation is
+    stamped. A local CTE that shadows a relation name is also stamped, but the
+    reducer consults its CTE scope before reading a stamp, so the shadow wins.
+    """
+    for table in tree.find_all(exp.Table):
+        ref = name_to_source.get(table.name)
+        if ref is not None:
+            attach_source_ref(table, ref)
 
 
 def build_manifest_graph(
