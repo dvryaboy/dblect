@@ -93,17 +93,36 @@ Provenance = Declared | NativeConstraint | CompileValue
 
 
 @dataclass(frozen=True, slots=True)
+class Predicate:
+    """The row filter a conditional fact is scoped to: a dbt test's ``where``.
+
+    A fact carrying a predicate holds only over rows matching it (``unique`` on
+    ``customer_id`` *where* ``country = 'US'``). Grounding does not fold such a
+    fact into the unconditional annotation, since that would over-claim. Matching
+    the predicate against a consumer scope's own filter is the activation step, a
+    layer that parses ``sql``; this value only carries the claim.
+    """
+
+    sql: str
+
+
+@dataclass(frozen=True, slots=True)
 class Fact(Generic[K, S]):
     """One claim about one node, under one property.
 
     A candidate key ``{customer_id, region}`` is a relation fact whose *value*
     names the columns: the address is the relation, never the column set.
+
+    ``condition`` scopes the claim to a row filter when present (a ``where``-
+    filtered dbt test). A conditional fact is captured and carried through
+    ``collect``, but grounding does not fold it into the unconditional annotation.
     """
 
     scope: S
     value: K
     provenance: Provenance
     detail: str | None = None
+    condition: Predicate | None = None
 
 
 class Opacity(StrEnum):

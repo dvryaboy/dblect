@@ -102,6 +102,12 @@ def grounding(
     grounds ``Annotation(value, CONCRETE)``. Every other scope grounds
     ``Annotation(top, IMPLICIT)``, the "nothing declared" default.
 
+    Conditional facts (those carrying a ``condition``) are excluded from the fold:
+    they hold only over a row filter, so grounding them unconditionally would
+    over-claim. A scope whose only facts are conditional grounds the IMPLICIT-top
+    default, exactly as if nothing were declared; the facts stay captured in the
+    bucket for an activation step to consume.
+
     A bucket that resolves to ``bottom`` is a contradiction and raises
     ``FactConflictError`` here, at build time, rather than swallowing it; recovery
     is a propagator concern that lands with the findings layer.
@@ -113,9 +119,12 @@ def grounding(
     for scope, bucket in facts.items():
         if scope in opaque_set:
             continue  # the opt-out already won
-        value, is_contradiction = resolve(lat, bucket)
+        unconditional = tuple(f for f in bucket if f.condition is None)
+        if not unconditional:
+            continue  # only conditional facts here: nothing grounds unconditionally
+        value, is_contradiction = resolve(lat, unconditional)
         if is_contradiction:
-            raise FactConflictError(scope, tuple(bucket))
+            raise FactConflictError(scope, unconditional)
         grounded[scope] = Annotation(value, Opacity.CONCRETE)
 
     implicit_top: Annotation[K] = Annotation(lat.top, Opacity.IMPLICIT)

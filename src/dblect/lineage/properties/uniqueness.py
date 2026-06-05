@@ -42,6 +42,7 @@ from dblect.lineage.facts.model import (
     Fact,
     NativeConstraint,
     Opacity,
+    Predicate,
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
@@ -168,7 +169,11 @@ def _single_key(*cols: str) -> CandidateKeySet:
 
 
 class _UniqueTestDiscoverer:
-    """Grounds a single-column key from an enabled, unconditional ``unique`` test."""
+    """Grounds a single-column key from an enabled ``unique`` test.
+
+    A ``where`` filter makes the key conditional: the fact carries the predicate
+    and is captured, but grounding does not fold it into the unconditional key set
+    (see :class:`~dblect.lineage.facts.model.Predicate`)."""
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
@@ -177,11 +182,6 @@ class _UniqueTestDiscoverer:
         for node in manifest.nodes.values():
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "unique":
-                continue
-            # A `where` filter makes the assertion conditional; grounding it as an
-            # unconditional key would over-claim, so it grounds nothing until
-            # conditional facts land (see conditional-uniqueness-facts.md).
-            if tm.where is not None:
                 continue
             col = tm.kwargs.get("column_name")
             if not isinstance(col, str) or not col:
@@ -196,6 +196,7 @@ class _UniqueTestDiscoverer:
                     value=_single_key(col),
                     provenance=Declared(DeclaredSource.DBT_GENERIC_TEST),
                     detail=node.name,
+                    condition=Predicate(tm.where) if tm.where is not None else None,
                 )
             )
         return out
@@ -217,8 +218,6 @@ class _UniqueCombinationDiscoverer:
             # grounds.
             if not tm.name.endswith("unique_combination_of_columns"):
                 continue
-            if tm.where is not None:
-                continue
             raw = tm.kwargs.get("combination_of_columns")
             if not isinstance(raw, list):
                 continue
@@ -239,6 +238,7 @@ class _UniqueCombinationDiscoverer:
                     value=_single_key(*cols),
                     provenance=Declared(DeclaredSource.DBT_UTILS_TEST),
                     detail=node.name,
+                    condition=Predicate(tm.where) if tm.where is not None else None,
                 )
             )
         return out

@@ -13,7 +13,7 @@ from collections.abc import Mapping
 
 from dblect.lineage import propagate
 from dblect.lineage.builder import build_model_graph
-from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint
+from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint, Predicate
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.nullability import (
     Nullability,
@@ -126,13 +126,16 @@ def test_not_null_test_column_name_is_case_folded() -> None:
     assert facts[0].scope.column == "orderid"
 
 
-def test_conditional_not_null_test_is_not_activated() -> None:
-    """A ``where`` filter makes the assertion conditional; capturing it as an
-    unconditional NON_NULL would over-claim, so it grounds nothing for now."""
+def test_conditional_not_null_test_is_captured_with_its_predicate() -> None:
+    """A ``where`` filter does not drop the fact: it is captured carrying the
+    predicate. Grounding still does not fold a conditional NON_NULL into the
+    unconditional annotation (pinned in the grounding tests)."""
     src = _source("source.shop.raw.orders")
     test = _not_null_test("test.shop.nn", column="id", target=src.unique_id, where="amount > 0")
     facts = list(not_null_test_discoverer().discover(_manifest(src, test), name_to_source={}))
-    assert facts == []
+    assert len(facts) == 1
+    assert facts[0].value is Nullability.NON_NULL
+    assert facts[0].condition == Predicate("amount > 0")
 
 
 def test_disabled_not_null_test_grounds_nothing() -> None:

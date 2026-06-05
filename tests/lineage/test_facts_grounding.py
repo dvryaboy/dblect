@@ -24,7 +24,14 @@ from dblect.lineage.facts.grounding import (
     grounding,
 )
 from dblect.lineage.facts.lattice import Lattice
-from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact, Opacity
+from dblect.lineage.facts.model import (
+    Annotation,
+    Declared,
+    DeclaredSource,
+    Fact,
+    Opacity,
+    Predicate,
+)
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.manifest import Manifest
 
@@ -220,3 +227,31 @@ def test_grounding_contradiction_raises_build_issue() -> None:
     facts = {_COL_A: (_fact(_COL_A, "A"), _fact(_COL_A, "B"))}
     with pytest.raises(FactConflictError):
         grounding(facts, opaque=set(), lat=_FLAT)
+
+
+def _conditional_fact(scope: ColumnRef, value: str, *, where: str) -> Fact[str, ColumnRef]:
+    return Fact(
+        scope=scope,
+        value=value,
+        provenance=Declared(DeclaredSource.DBT_GENERIC_TEST),
+        condition=Predicate(where),
+    )
+
+
+def test_grounding_skips_a_conditional_fact() -> None:
+    """A fact carrying a predicate is not folded into the unconditional annotation:
+    a scope whose only fact is conditional grounds the IMPLICIT-top default, as if
+    nothing were declared. The fact stays in the bucket for activation to read."""
+    facts = {_COL_A: (_conditional_fact(_COL_A, "A", where="country = 'US'"),)}
+    ground = grounding(facts, opaque=set(), lat=_FLAT)
+    assert ground(_COL_A) == Annotation(_TOP, Opacity.IMPLICIT)
+
+
+def test_grounding_folds_unconditional_and_ignores_conditional_in_one_bucket() -> None:
+    """An unconditional fact still grounds even when a conditional one shares the
+    bucket; the conditional fact neither contributes nor triggers a contradiction."""
+    facts = {
+        _COL_A: (_fact(_COL_A, "A"), _conditional_fact(_COL_A, "B", where="active")),
+    }
+    ground = grounding(facts, opaque=set(), lat=_FLAT)
+    assert ground(_COL_A) == Annotation("A", Opacity.CONCRETE)
