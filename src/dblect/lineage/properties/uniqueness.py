@@ -375,7 +375,7 @@ _EMPTY: _Carried = _Carried(frozenset())
 _BaseResolve = Callable[["exp.Table"], _Carried]
 
 
-def _relation_reduce(
+def relation_reduce(
     deriv: Expr,
     prop: Property[CandidateKeySet, SourceRef],
     recurse: Callable[[SourceRef], Annotation[CandidateKeySet]],
@@ -387,6 +387,11 @@ def _relation_reduce(
     A base table resolves through ``recurse`` on its stamped ``SourceRef``, so
     cross-model keys, conditional keys, declarations, and the provisional taint flow
     in. CTEs and inline subqueries are resolved structurally within the walk.
+
+    This also serves as the relation-algebra carrier for any one-column conditional
+    claim, since a relation that grounds no unconditional keys carries only its
+    conditional payload: nullability reuses it to flow conditional NON_NULL columns
+    (a one-column :class:`ConditionalKey` per column) across model boundaries.
     """
     provisional = False
 
@@ -819,7 +824,7 @@ def uniqueness_property(
         aggregates={},
         ground=_grounding_with_conditional(facts),
         reconcile_by_meet=True,
-        reducer=_relation_reduce,
+        reducer=relation_reduce,
     )
 
 

@@ -28,6 +28,7 @@ from enum import StrEnum
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
+from dblect.lineage.builder import build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.grounding import collect, grounding
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
@@ -46,8 +47,20 @@ from dblect.lineage.facts.property import (
     OperatorTransfer,
     Property,
     column_property,
+    relation_property,
 )
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.predicate import atoms_of, parse_predicate
+from dblect.lineage.properties.predicate_flow import predicate_flow_property
+from dblect.lineage.properties.uniqueness import (
+    NO_KEYS,
+    UNIQUENESS_LATTICE,
+    CandidateKeySet,
+    ConditionalKey,
+    activate_conditional,
+    relation_reduce,
+)
+from dblect.lineage.property import propagate
 from dblect.manifest import ConstraintType, Manifest, ResourceType, generic_test_target_uid
 
 
@@ -287,3 +300,94 @@ def nullability_property(
         ground=grounding(facts, opaque=set(), lat=NULLABILITY_LATTICE),
         semiring=NullabilitySemiring(),
     )
+
+
+# --- conditional activation --------------------------------------------------
+#
+# A ``where``-filtered ``not_null`` activates the same way a conditional key does: at
+# a scope whose row filter implies the predicate. Nullability is column-scoped, but
+# the carrying and predicate-renaming a conditional claim needs are relation-scoped,
+# so we reuse the uniqueness carrier: a conditional NON_NULL column is a one-column
+# conditional "key" (the column is non-null under the predicate), flowed across
+# relations by ``relation_reduce`` and promoted by ``activate_conditional``. The
+# activated columns then fold NON_NULL into the column annotations.
+
+
+def _conditional_notnull_carrier(manifest: Manifest) -> Property[CandidateKeySet, SourceRef]:
+    """A relation-scoped carrier for conditional NON_NULL columns, grounded from the
+    ``where``-filtered ``not_null`` tests and flowed across model boundaries."""
+    facts = collect(
+        manifest,
+        (not_null_test_discoverer(), native_not_null_discoverer(manifest.adapter_type)),
+        name_to_source={},
+    )
+    conditional = _conditional_columns_by_relation(facts)
+
+    def ground(scope: SourceRef) -> Annotation[CandidateKeySet]:
+        cks = conditional.get(scope)
+        if cks is None:
+            return Annotation(NO_KEYS, Opacity.IMPLICIT)
+        # CONCRETE so reconcile keeps the conditional payload (an IMPLICIT grounded
+        # value is dropped in favour of the inferred one).
+        return Annotation(CandidateKeySet(frozenset(), cks), Opacity.CONCRETE)
+
+    return relation_property(
+        name="conditional_not_null",
+        lattice=UNIQUENESS_LATTICE,
+        operators={},
+        aggregates={},
+        ground=ground,
+        reconcile_by_meet=True,
+        reducer=relation_reduce,
+    )
+
+
+def _conditional_columns_by_relation(
+    facts: Mapping[ColumnRef, tuple[Fact[Nullability, ColumnRef], ...]],
+) -> dict[SourceRef, frozenset[ConditionalKey]]:
+    """Group ``where``-filtered NON_NULL facts into one-column conditional keys per
+    relation, parsing each predicate to atoms. A predicate that does not parse carries
+    no information, so its column is dropped rather than activated on a guess."""
+    out: dict[SourceRef, set[ConditionalKey]] = {}
+    for bucket in facts.values():
+        for fact in bucket:
+            if fact.condition is None:
+                continue
+            parsed = parse_predicate(fact.condition.sql)
+            if parsed is None:
+                continue
+            claim = ConditionalKey(frozenset({fact.scope.column}), atoms_of(parsed))
+            out.setdefault(fact.scope.source, set()).add(claim)
+    return {relation: frozenset(claims) for relation, claims in out.items()}
+
+
+def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[Nullability]]:
+    """Per-column nullability with conditional NON_NULL facts activated against the
+    predicate flow.
+
+    The unconditional annotations come from the column-scoped property as usual; the
+    conditional carrier flows each ``where``-filtered NON_NULL across relations, the
+    flow says which scopes satisfy the predicate, and every activated column folds
+    NON_NULL into its annotation. No detector consumes nullability yet, so this is the
+    annotation-level entry point activation is exercised through.
+    """
+    base = dict(
+        propagate(
+            build_manifest_graph(manifest).graph, nullability_property(manifest, name_to_source={})
+        )
+    )
+    relation_graph = build_relation_graph(manifest).graph
+    carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest))
+    flow = propagate(relation_graph, predicate_flow_property())
+    for ref, activated in activate_conditional(carrier, flow).items():
+        for key in activated.keys:
+            for column in key:
+                column_ref = ColumnRef(ref, column)
+                prior = base.get(column_ref)
+                if prior is None:
+                    base[column_ref] = Annotation(Nullability.NON_NULL, Opacity.CONCRETE)
+                else:
+                    base[column_ref] = Annotation(
+                        _meet(prior.value, Nullability.NON_NULL), prior.opacity, prior.provisional
+                    )
+    return base
