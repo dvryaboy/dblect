@@ -115,6 +115,32 @@ def test_conditional_key_activates_under_a_narrower_filter() -> None:
     assert _key("id") in res["model.shop.dim"].keys
 
 
+def test_conditional_key_activates_when_a_cte_carries_the_filter() -> None:
+    # The filter sits in a CTE, not the outer WHERE. Flow accumulates through CTEs
+    # for free, so the model's flow still implies the predicate.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _model(
+            "model.shop.dim",
+            "WITH a AS (SELECT * FROM orders WHERE active) SELECT * FROM a",
+        ),
+        _unique("test.shop.u", column="id", target="model.shop.dim", where="active"),
+    )
+    assert _key("id") in res["model.shop.dim"].keys
+
+
+def test_conditional_key_activates_when_an_inline_subquery_carries_the_filter() -> None:
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _model(
+            "model.shop.dim",
+            "SELECT * FROM (SELECT * FROM orders WHERE active) s",
+        ),
+        _unique("test.shop.u", column="id", target="model.shop.dim", where="active"),
+    )
+    assert _key("id") in res["model.shop.dim"].keys
+
+
 def test_conditional_key_stays_conditional_without_a_matching_filter() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
