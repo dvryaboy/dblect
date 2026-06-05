@@ -13,10 +13,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import sqlglot.expressions as exp
+
 # The relation-graph builder lives next to the column builder.
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind
-from dblect.lineage.properties.uniqueness import CandidateKeySet, Key, uniqueness_property
+from dblect.lineage.properties.uniqueness import (
+    CandidateKeySet,
+    Key,
+    relation_scope_keys,
+    uniqueness_property,
+)
 from dblect.lineage.property import propagate
 from dblect.manifest import (
     Column,
@@ -27,6 +34,7 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
+from dblect.sql import parse_sql
 
 
 def _model(uid: str, sql: str, *, constraints: tuple[ConstraintSpec, ...] = (),
@@ -213,6 +221,30 @@ def test_cross_model_propagation_through_a_stage() -> None:
         _model("model.shop.mart", "SELECT id FROM stg"),
     )
     assert keys["model.shop.mart"] == CandidateKeySet.of(_key("id"))
+
+
+def test_passthrough_through_a_cte_carries_the_source_key() -> None:
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _unique("test.shop.u", column="id", target=src.unique_id),
+        _model(
+            "model.shop.stg",
+            "WITH s AS (SELECT id, amount FROM orders) SELECT id FROM s",
+        ),
+    )
+    assert keys["model.shop.stg"] == CandidateKeySet.of(_key("id"))
+
+
+def test_relation_scope_keys_exposes_cte_intermediate_keys() -> None:
+    """The detector-facing per-scope index carries a CTE body's keys, resolving
+    base tables by name against the per-model keys propagation produced."""
+    tree = parse_sql("WITH s AS (SELECT id, amount FROM orders) SELECT id FROM s")
+    model_keys = {"orders": frozenset({_key("id")})}
+    scopes = relation_scope_keys(tree, model_keys)
+    cte_body = next(c.this for c in tree.find_all(exp.CTE))
+    assert scopes[id(cte_body)] == frozenset({_key("id")})
+    assert scopes[id(tree)] == frozenset({_key("id")})
 
 
 def test_declared_model_key_unions_with_sql_derived_key() -> None:

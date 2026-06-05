@@ -327,6 +327,13 @@ _QCol = tuple[str, str]
 _QKey = frozenset[_QCol]
 
 
+# Resolves the candidate keys of a base (non-CTE) table reference. Two
+# implementations: the graph reducer reads the table's stamped SourceRef and
+# recurses through the shared propagator; the detector index resolves the table
+# by name against the per-model keys propagation already produced.
+_BaseKeys = Callable[["exp.Table"], frozenset[Key]]
+
+
 def _relation_reduce(
     deriv: Expr,
     prop: Property[CandidateKeySet, SourceRef],
@@ -334,39 +341,81 @@ def _relation_reduce(
     _ctx: DepContext,
     _default: Annotation[CandidateKeySet],
 ) -> Annotation[CandidateKeySet]:
-    """Reduce a model's relational tree to its inferred candidate-key set."""
-    walk = _RelationWalk(recurse)
-    keys = walk.scope_keys(deriv, cte_scope={})
+    """Reduce a model's relational tree to its inferred candidate-key set.
+
+    A base table resolves through ``recurse`` on its stamped ``SourceRef``, so
+    cross-model keys, declarations, and the provisional taint flow in. CTEs and
+    inline subqueries are resolved structurally within the walk.
+    """
+    provisional = False
+
+    def base_keys(table: exp.Table) -> frozenset[Key]:
+        nonlocal provisional
+        ref = source_ref_meta(table)
+        if ref is None:
+            return frozenset()
+        ann = recurse(ref)
+        provisional = provisional or ann.provisional
+        return ann.value.keys
+
+    keys = _RelationWalk(base_keys).scope_keys(deriv, cte_scope={})
     value = CandidateKeySet(keys)
     opacity = Opacity.CONCRETE if keys else Opacity.IMPLICIT
-    return Annotation(value, opacity, provisional=walk.provisional)
+    return Annotation(value, opacity, provisional=provisional)
+
+
+def relation_scope_keys(
+    tree: Expr, model_keys: Mapping[str, frozenset[Key]]
+) -> Mapping[int, frozenset[Key]]:
+    """Per-scope candidate keys for every SELECT/UNION node in ``tree``, keyed by
+    ``id(node)``.
+
+    The same relation algebra the reducer runs, but for one already-parsed tree
+    and with base tables resolved by name against ``model_keys`` (the per-model
+    keys propagation produced) rather than by stamp. This is what an audit
+    detector consults to get a CTE's or inline subquery's keys, since those
+    intermediate scopes are not relations the propagator annotates. The returned
+    map is valid only for the lifetime of ``tree``.
+    """
+
+    def base_keys(table: exp.Table) -> frozenset[Key]:
+        return model_keys.get(table.name, frozenset())
+
+    walk = _RelationWalk(base_keys, record=True)
+    walk.scope_keys(tree, cte_scope={})
+    return walk.scopes
 
 
 class _RelationWalk:
-    """Bottom-up candidate-key inference over one model's relational tree.
+    """Bottom-up candidate-key inference over one relational tree.
 
-    ``recurse`` resolves an upstream relation's keys through the shared
-    propagator (so cross-model keys, declarations, and the provisional taint flow
-    in). CTEs and inline subqueries are resolved structurally within the walk;
-    only a base table reference crosses a model boundary via ``recurse``.
+    ``base_keys`` resolves a base (non-CTE) table's keys; CTEs and inline
+    subqueries are resolved structurally within the walk. With ``record`` set,
+    every SELECT/UNION scope's output keys are kept in ``scopes`` keyed by
+    ``id(node)`` so a detector can read intermediate-scope keys.
     """
 
-    def __init__(self, recurse: Callable[[SourceRef], Annotation[CandidateKeySet]]) -> None:
-        self._recurse = recurse
-        self.provisional = False
+    def __init__(self, base_keys: _BaseKeys, *, record: bool = False) -> None:
+        self._base_keys = base_keys
+        self._record = record
+        self.scopes: dict[int, frozenset[Key]] = {}
 
     def scope_keys(self, node: Expr, *, cte_scope: Mapping[str, frozenset[Key]]) -> frozenset[Key]:
         if isinstance(node, exp.Select):
-            return self._select(node, cte_scope=cte_scope)
-        if isinstance(node, exp.Union):
-            return self._union(node, cte_scope=cte_scope)
-        return frozenset()
+            keys = self._select(node, cte_scope=cte_scope)
+        elif isinstance(node, exp.Union):
+            keys = self._union(node, cte_scope=cte_scope)
+        else:
+            return frozenset()
+        if self._record:
+            self.scopes[id(node)] = keys
+        return keys
 
     def _select(
         self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Key]]
     ) -> frozenset[Key]:
         local = dict(cte_scope)
-        with_ = sel.args.get("with")
+        with_ = sel.args.get("with_")
         if isinstance(with_, exp.With):
             for cte in with_.expressions:
                 if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
@@ -415,12 +464,7 @@ class _RelationWalk:
             name = node.name
             if name in cte_scope:
                 return alias, cte_scope[name]
-            ref = source_ref_meta(node)
-            if ref is None:
-                return alias, frozenset()
-            ann = self._recurse(ref)
-            self.provisional = self.provisional or ann.provisional
-            return alias, ann.value.keys
+            return alias, self._base_keys(node)
         if isinstance(node, exp.Subquery):
             inner = node.this
             alias = node.alias_or_name
