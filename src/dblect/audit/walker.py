@@ -37,7 +37,6 @@ from dblect.sql import (
     detect_where_on_outer_joined_nullable,
     parse_sql,
 )
-from dblect.uniqueness import facts_from_manifest
 from dblect.uniqueness.detector import make_fact_grounded_detectors
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
@@ -116,8 +115,7 @@ def run_audit(
     """
     parsed = _parse_models_for_audit(manifest, dialect=dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
-    facts = facts_from_manifest(manifest, parsed=trees)
-    fact_grounded = make_fact_grounded_detectors(manifest, facts)
+    fact_grounded = make_fact_grounded_detectors(manifest, dialect=dialect, parsed=trees)
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []

@@ -78,6 +78,7 @@ def build_relation_graph(
     manifest: Manifest,
     *,
     dialect: str | None = "duckdb",
+    parsed: Mapping[str, Expr] | None = None,
 ) -> RelationBuildResult:
     """Build the cross-model ``RelationLineageGraph`` for relation-scoped
     propagation (uniqueness).
@@ -85,24 +86,34 @@ def build_relation_graph(
     Each model's compiled SQL is parsed and its upstream ``exp.Table`` references
     are stamped with the ``SourceRef`` they resolve to, so the relation reducer
     recurses across model boundaries via the propagator's shared ``recurse`` rather
-    than re-resolving names. A model with no compiled SQL or a parse error is
-    reported in ``issues`` and left out of the graph, so one bad model does not
-    blank the rest. Sources and seeds carry no derivation; they enter only as
-    recursion targets that ground from facts.
+    than re-resolving names. ``parsed`` lets a caller share already-parsed trees
+    (the audit walker does) so the SQL is parsed once; the trees are stamped in
+    place. A model with no compiled SQL or a parse error is reported in ``issues``
+    and left out of the graph, so one bad model does not blank the rest. Sources
+    and seeds carry no derivation; they enter only as recursion targets that
+    ground from facts.
     """
     name_to_source = _build_name_to_source(manifest)
     derivations: dict[SourceRef, Expr] = {}
     issues: list[BuildIssue] = []
     for uid, model in manifest.models.items():
-        sql = model.analysis_sql
-        if sql is None:
-            issues.append(BuildIssue(model_unique_id=uid, message="model has no compiled SQL"))
-            continue
-        try:
-            tree = parse_sql(sql, dialect=dialect)
-        except SQLParseError as e:
-            issues.append(BuildIssue(model_unique_id=uid, message=f"parse error: {e}"))
-            continue
+        if parsed is not None:
+            tree = parsed.get(uid)
+            if tree is None:
+                issues.append(
+                    BuildIssue(model_unique_id=uid, message="model has no parsed SQL")
+                )
+                continue
+        else:
+            sql = model.analysis_sql
+            if sql is None:
+                issues.append(BuildIssue(model_unique_id=uid, message="model has no compiled SQL"))
+                continue
+            try:
+                tree = parse_sql(sql, dialect=dialect)
+            except SQLParseError as e:
+                issues.append(BuildIssue(model_unique_id=uid, message=f"parse error: {e}"))
+                continue
         _stamp_tables(tree, name_to_source)
         derivations[SourceRef(kind=SourceKind.MODEL, unique_id=uid)] = tree
     return RelationBuildResult(graph=RelationLineageGraph(derivations), issues=tuple(issues))

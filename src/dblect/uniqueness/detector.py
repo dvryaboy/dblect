@@ -1,22 +1,19 @@
-"""Fact-grounded detectors that consume uniqueness facts about source models.
+"""Fact-grounded audit detectors that consume relation-scoped uniqueness keys.
 
-Two detectors live here, both opportunistic (they fire only when the project
-gives us enough information to make a claim; they stay silent everywhere
-else):
+Two opportunistic detectors (they fire only when the project gives enough
+information to make a claim, and stay silent otherwise):
 
-* `detect_non_unique_window_order_keys`: window functions whose combined
-  (partition, order) columns aren't covered by any uniqueness fact on the
-  scope's source (a ref'd model, a CTE, or an inline subquery whose facts
-  propagation knows). Ties in the ordering produce non-deterministic
-  rankings.
-* `detect_join_fanout`: JOINs whose joined-in side has uniqueness facts but
-  none of them covers the join's equality predicate columns. The joined-in
-  side may be a ref'd model or an in-scope CTE; the propagation map tells
-  us which keys hold for either.
+* ``detect_non_unique_window_order_keys``: window functions whose combined
+  (partition, order) columns are not covered by any candidate key of the scope's
+  single source. Ties in the ordering produce non-deterministic rankings.
+* ``detect_join_fanout``: JOINs whose joined-in side has known keys, none of
+  which is covered by the join's equality predicate columns, so the join can
+  multiply rows.
 
-Both consult the same per-tree propagation map (computed once per tree and
-cached across the two detectors) so a CTE that pass-throughs a ref'd
-model's keys is treated like the model for fact-coverage purposes.
+Both read keys from the lineage.facts uniqueness substrate: per-model keys come
+from cross-model propagation (``uniqueness_property`` over the relation graph),
+and a per-tree scope index (``relation_scope_keys``) supplies the keys of CTE and
+inline-subquery scopes, which are not relations the propagator annotates.
 """
 
 from __future__ import annotations
@@ -26,40 +23,46 @@ from collections.abc import Callable, Mapping
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.lineage.builder import build_relation_graph
+from dblect.lineage.facts.model import Annotation
+from dblect.lineage.graph import SourceKind, SourceRef
+from dblect.lineage.properties.uniqueness import (
+    CandidateKeySet,
+    Key,
+    relation_scope_keys,
+    uniqueness_property,
+)
+from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
-from dblect.uniqueness.facts import UniquenessFact
-from dblect.uniqueness.propagation import ScopeFacts, propagate_facts
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
+
+# Per-model (and per-source) candidate keys, addressed by relation name as it
+# appears in SQL. Per-scope keys are addressed by ``id(node)`` for the lifetime
+# of one parsed tree.
+ModelKeys = Mapping[str, frozenset[Key]]
+ScopeIndex = Mapping[int, frozenset[Key]]
 
 
 def detect_non_unique_window_order_keys(
     tree: Expr,
     *,
-    facts: Mapping[str, tuple[UniquenessFact, ...]],
-    model_name_to_uid: Mapping[str, str],
-    propagation: Mapping[int, ScopeFacts] | None = None,
+    model_keys: ModelKeys,
+    scope_index: ScopeIndex | None = None,
 ) -> tuple[Finding, ...]:
-    """Flag window ORDER BYs whose partition+order keys aren't a unique tuple.
+    """Flag window ORDER BYs whose partition+order keys are not a unique tuple.
 
-    A scope is checkable when its FROM resolves to a single relation with
-    known facts (a ref'd model, an in-scope CTE, or an inline subquery whose
-    output the propagation pass figured out) and there are no joins.
-    Multi-source scopes need column-level lineage we don't yet model and
-    stay silent.
+    A scope is checkable when its FROM resolves to a single relation with known
+    keys (a ref'd model or an in-scope CTE) and there are no joins. Multi-source
+    scopes need column-level lineage and stay silent.
     """
-    prop = _propagation_for(tree, facts, model_name_to_uid, propagation)
+    scopes = _scope_index_for(tree, model_keys, scope_index)
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        source_keys = _single_source_keys(
-            sel,
-            facts=facts,
-            model_name_to_uid=model_name_to_uid,
-            propagation=prop,
-        )
+        source_keys = _single_source_keys(sel, model_keys=model_keys, scope_index=scopes)
         if source_keys is None:
             continue
         for w in sg.find_all_windows(sel):
@@ -72,8 +75,8 @@ def detect_non_unique_window_order_keys(
             partition_cols = _bare_column_names(sg.partition_of(w))
             if order_cols is None or partition_cols is None:
                 # We only reason about windows whose keys are bare columns.
-                # Expressions (`order by date_trunc(...)`) need a more careful
-                # equivalence check; skip for now.
+                # Expressions (`order by date_trunc(...)`) need an equivalence
+                # check we don't model yet; skip.
                 continue
             key_set = frozenset(order_cols) | frozenset(partition_cols)
             if any(k <= key_set for k in source_keys):
@@ -85,9 +88,9 @@ def detect_non_unique_window_order_keys(
                     message=(
                         f"window {rendered} orders by {sorted(order_cols)} "
                         f"partitioned by {sorted(partition_cols) or '()'}, "
-                        f"and no known uniqueness fact on the source covers "
-                        f"the combined key set. Ties in the order keys produce a "
-                        f"non-deterministic ranking; add a stable tiebreaker."
+                        f"and no known uniqueness key on the source covers the combined "
+                        f"key set. Ties in the order keys produce a non-deterministic "
+                        f"ranking; add a stable tiebreaker."
                     ),
                     sql_snippet=rendered,
                     line_start=_line_start(w),
@@ -100,30 +103,20 @@ def detect_non_unique_window_order_keys(
 def detect_join_fanout(
     tree: Expr,
     *,
-    facts: Mapping[str, tuple[UniquenessFact, ...]],
-    model_name_to_uid: Mapping[str, str],
-    propagation: Mapping[int, ScopeFacts] | None = None,
+    model_keys: ModelKeys,
+    scope_index: ScopeIndex | None = None,
 ) -> tuple[Finding, ...]:
-    """Flag JOINs whose joined-in side has facts that don't cover the join.
+    """Flag JOINs whose joined-in side has keys that don't cover the join.
 
-    For each JOIN whose joined-in side resolves to either an in-scope CTE
-    (with propagated facts) or a ref'd model (with declared/propagated
-    facts), we ask: does any known key fit within the right-side equality
-    predicate columns? If yes, the join can't multiply rows. If no, we flag.
+    For each JOIN whose joined-in side resolves to keys (an in-scope CTE or a
+    ref'd model), we ask whether any known key fits within the right-side equality
+    predicate columns. If yes, the join cannot multiply rows. If no, we flag.
 
-    The detector stays silent when:
-
-    * The joined-in side isn't a relation we can resolve to known facts
-      (e.g., a CTE the propagation pass couldn't ground, or a model with
-      no known keys at all).
-    * The ON predicate isn't a conjunction of equalities between bare
-      columns where one side belongs to the joined-in alias and the other
-      doesn't. Anything fancier (function calls, range comparisons, OR)
-      gets skipped to keep the rule conservative.
-    * The join is `CROSS`: an explicit cartesian product, not a
-      fanout-by-accident.
+    Silent when the joined-in side has no known keys, when the ON predicate is not
+    a conjunction of equalities between bare columns with exactly one side on the
+    joined-in alias, or on a ``CROSS`` join (an explicit cartesian product).
     """
-    prop = _propagation_for(tree, facts, model_name_to_uid, propagation)
+    scopes = _scope_index_for(tree, model_keys, scope_index)
     cte_bodies: Mapping[str, Expr] = {
         cte.alias_or_name: cte.this for cte in tree.find_all(exp.CTE) if isinstance(cte.this, Expr)
     }
@@ -136,11 +129,7 @@ def detect_join_fanout(
             if not isinstance(target, exp.Table):
                 continue
             target_keys = _resolve_target_keys(
-                target.name,
-                cte_bodies=cte_bodies,
-                propagation=prop,
-                facts=facts,
-                model_name_to_uid=model_name_to_uid,
+                target.name, cte_bodies=cte_bodies, scope_index=scopes, model_keys=model_keys
             )
             if not target_keys:
                 continue
@@ -148,7 +137,7 @@ def detect_join_fanout(
             if on is None:
                 continue
             joined_cols = sg.equality_cols_on_alias(on, target.alias_or_name)
-            if joined_cols is None or not joined_cols:
+            if not joined_cols:
                 continue
             if any(k <= joined_cols for k in target_keys):
                 continue
@@ -171,135 +160,120 @@ def detect_join_fanout(
     return tuple(out)
 
 
-def _resolve_target_keys(
-    name: str,
-    *,
-    cte_bodies: Mapping[str, Expr],
-    propagation: Mapping[int, ScopeFacts],
-    facts: Mapping[str, tuple[UniquenessFact, ...]],
-    model_name_to_uid: Mapping[str, str],
-) -> frozenset[frozenset[str]]:
-    """Keys for `name`, looked up as a CTE first, then as a model ref.
-
-    Returning an empty set means "no known facts" — the join-fanout detector
-    treats that as "stay silent." A local CTE always shadows a model with the
-    same name; this matches SQL's resolution rules and avoids the over-claim
-    the old `cte_names` carve-out was guarding against.
-    """
-    body = cte_bodies.get(name)
-    if body is not None:
-        sf = propagation.get(id(body))
-        return sf.keys if sf is not None else frozenset()
-    uid = model_name_to_uid.get(name)
-    if uid is None:
-        return frozenset()
-    return frozenset(f.columns for f in facts.get(uid, ()))
-
-
 def make_fact_grounded_detectors(
-    manifest: Manifest, facts: Mapping[str, tuple[UniquenessFact, ...]]
+    manifest: Manifest,
+    *,
+    dialect: str | None = "duckdb",
+    parsed: Mapping[str, Expr] | None = None,
 ) -> tuple[Detector, ...]:
-    """Curry the fact-grounded detectors against an audit-scoped context.
+    """Curry the fact-grounded detectors against substrate-derived keys.
 
-    Returns a tuple of plain `Detector` callables
-    (`Callable[[Expr], tuple[Finding, ...]]`) the walker drops into its
-    detector pipeline. Each curried detector consults a shared per-tree
-    propagation cache so the propagation pass runs at most once per tree
-    no matter how many detectors consume it.
+    Per-model keys come from one cross-model propagation of the uniqueness
+    property over the relation graph; ``parsed`` lets the caller share the audit's
+    already-parsed trees so the graph build does not re-parse. Each curried
+    detector consults a per-tree scope index, cached so the relation walk runs at
+    most once per tree no matter how many detectors consume it.
     """
-    name_to_uid: dict[str, str] = {m.name: uid for uid, m in manifest.models.items()}
-    cache: dict[int, Mapping[int, ScopeFacts]] = {}
+    graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
+    anns = propagate(graph, uniqueness_property(manifest, name_to_source={}))
+    model_keys = _model_keys_by_name(manifest, anns)
+    cache: dict[int, ScopeIndex] = {}
 
-    def get_propagation(tree: Expr) -> Mapping[int, ScopeFacts]:
-        k = id(tree)
-        hit = cache.get(k)
+    def scope_index(tree: Expr) -> ScopeIndex:
+        hit = cache.get(id(tree))
         if hit is None:
-            hit = propagate_facts(tree, model_facts=facts, model_name_to_uid=name_to_uid)
-            cache[k] = hit
+            hit = relation_scope_keys(tree, model_keys)
+            cache[id(tree)] = hit
         return hit
 
     def window_keys(tree: Expr) -> tuple[Finding, ...]:
         return detect_non_unique_window_order_keys(
-            tree,
-            facts=facts,
-            model_name_to_uid=name_to_uid,
-            propagation=get_propagation(tree),
+            tree, model_keys=model_keys, scope_index=scope_index(tree)
         )
 
     def fanout(tree: Expr) -> tuple[Finding, ...]:
-        return detect_join_fanout(
-            tree,
-            facts=facts,
-            model_name_to_uid=name_to_uid,
-            propagation=get_propagation(tree),
-        )
+        return detect_join_fanout(tree, model_keys=model_keys, scope_index=scope_index(tree))
 
     return (window_keys, fanout)
 
 
-def _propagation_for(
-    tree: Expr,
-    facts: Mapping[str, tuple[UniquenessFact, ...]],
-    model_name_to_uid: Mapping[str, str],
-    propagation: Mapping[int, ScopeFacts] | None,
-) -> Mapping[int, ScopeFacts]:
-    """Resolve a propagation map for `tree`, computing one if the caller didn't.
+def _model_keys_by_name(
+    manifest: Manifest, anns: Mapping[SourceRef, Annotation[CandidateKeySet]]
+) -> dict[str, frozenset[Key]]:
+    """Index propagated keys by relation name. Models win over sources on a name
+    collision (applied last), matching how a ``ref`` resolves."""
+    by_name: dict[str, frozenset[Key]] = {}
+    models: dict[str, frozenset[Key]] = {}
+    for ref, ann in anns.items():
+        node = manifest.nodes.get(ref.unique_id)
+        if node is None:
+            continue
+        target = models if ref.kind is SourceKind.MODEL else by_name
+        target[node.name] = ann.value.keys
+    by_name.update(models)
+    return by_name
 
-    Tests usually call the detectors directly without going through
-    ``make_fact_grounded_detectors``; computing the map on demand keeps those
-    call sites short. The audit walker always supplies the precomputed map
-    so this branch costs nothing in production.
+
+def _scope_index_for(
+    tree: Expr, model_keys: ModelKeys, scope_index: ScopeIndex | None
+) -> ScopeIndex:
+    """Resolve a per-scope index, computing one if the caller didn't supply it.
+
+    Tests call the detectors directly without precomputing the index; the audit
+    walker always supplies a cached one so this branch costs nothing in production.
     """
-    if propagation is not None:
-        return propagation
-    return propagate_facts(tree, model_facts=facts, model_name_to_uid=model_name_to_uid)
+    if scope_index is not None:
+        return scope_index
+    return relation_scope_keys(tree, model_keys)
 
 
 def _single_source_keys(
-    sel: exp.Select,
-    *,
-    facts: Mapping[str, tuple[UniquenessFact, ...]],
-    model_name_to_uid: Mapping[str, str],
-    propagation: Mapping[int, ScopeFacts],
-) -> frozenset[frozenset[str]] | None:
-    """Keys for ``sel``'s single FROM source, or ``None`` if not a clean single-source scope.
+    sel: exp.Select, *, model_keys: ModelKeys, scope_index: ScopeIndex
+) -> frozenset[Key] | None:
+    """Keys for ``sel``'s single FROM source, or ``None`` if it is not a clean
+    single-source scope with known keys.
 
-    A scope is single-source when ``FROM`` is a bare table reference and
-    there are no JOINs. The source resolves to a CTE (whose body sits in
-    the propagation map), an inline subquery (likewise), or a model ref.
-    Returns the source's keys (possibly empty); ``None`` when the shape
-    doesn't qualify and the window-keys detector should stay silent.
+    A scope qualifies when FROM is a bare table and there are no JOINs. The source
+    resolves to a CTE (keys from the scope index) or a model ref (keys from the
+    per-model map). Returns ``None`` when the shape doesn't qualify or no key is
+    known, so the window detector stays silent.
     """
     from_ = sg.from_of(sel)
-    if from_ is None or from_.this is None:
+    if from_ is None or not isinstance(from_.this, exp.Table):
         return None
     if sg.joins_of(sel):
         return None
     target = from_.this
-    if not isinstance(target, exp.Table):
-        return None
     cte_body = _cte_body_for(target.name, sel)
     if cte_body is not None:
-        sf = propagation.get(id(cte_body))
-        if sf is None or not sf.keys:
-            return None
-        return sf.keys
-    uid = model_name_to_uid.get(target.name)
-    if uid is None:
-        return None
-    source_facts = facts.get(uid)
-    if not source_facts:
-        return None
-    return frozenset(f.columns for f in source_facts)
+        keys = scope_index.get(id(cte_body), frozenset())
+        return keys or None
+    keys = model_keys.get(target.name, frozenset())
+    return keys or None
+
+
+def _resolve_target_keys(
+    name: str,
+    *,
+    cte_bodies: Mapping[str, Expr],
+    scope_index: ScopeIndex,
+    model_keys: ModelKeys,
+) -> frozenset[Key]:
+    """Keys for ``name``, looked up as an in-scope CTE first, then as a model ref.
+
+    An empty result means "no known keys", which the join-fanout detector reads as
+    "stay silent". A local CTE shadows a model of the same name, matching SQL's
+    resolution rules.
+    """
+    body = cte_bodies.get(name)
+    if body is not None:
+        return scope_index.get(id(body), frozenset())
+    return model_keys.get(name, frozenset())
 
 
 def _cte_body_for(name: str, sel: exp.Select) -> Expr | None:
-    """The CTE body matching `name` in `sel`'s enclosing WITH, if any.
-
-    Walks outward (`sel`'s own WITH, then parents') to honor lexical CTE
-    scoping. A CTE defined in an outer WITH is visible inside an inner
-    SELECT that doesn't redefine it.
-    """
+    """The CTE body matching ``name`` in ``sel``'s enclosing WITH, walking outward
+    to honour lexical CTE scoping."""
     node: Expr | None = sel
     while node is not None:
         if isinstance(node, exp.Select):
@@ -314,7 +288,7 @@ def _cte_body_for(name: str, sel: exp.Select) -> Expr | None:
 
 
 def _window_is_in_scope(w: exp.Window, sel: exp.Select) -> bool:
-    """True when window `w` belongs to ``sel`` (not a nested sub-SELECT)."""
+    """True when window ``w`` belongs to ``sel`` (not a nested sub-SELECT)."""
     node: Expr | None = w.parent
     while node is not None:
         if isinstance(node, exp.Select):
@@ -324,7 +298,7 @@ def _window_is_in_scope(w: exp.Window, sel: exp.Select) -> bool:
 
 
 def _bare_column_names(expressions: list[Expr]) -> list[str] | None:
-    """Return column names if every expression is a bare ``exp.Column``; else None."""
+    """Column names if every expression is a bare ``exp.Column``; else ``None``."""
     names: list[str] = []
     for e in expressions:
         target = e

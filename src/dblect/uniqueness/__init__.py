@@ -1,32 +1,19 @@
-"""Uniqueness facts derived from dbt declarations and model SQL.
+"""Fact-grounded audit detectors for uniqueness hazards.
 
-This is the substrate detectors consult when they need to reason about which
-column sets are unique on each model. Facts are derived opportunistically:
-we use what the project tells us (tests, constraints, structural proof from
-SQL, propagation through SQL operations) and stay silent where we can't
-ground a claim.
+The uniqueness *facts* (candidate keys per relation, declared and propagated)
+live on the lineage.facts substrate as ``dblect.lineage.properties.uniqueness``.
+This package is the audit-facing consumer: detectors that read those keys and
+flag window order-key and join-fanout hazards on a project's SQL.
 """
 
-from dblect.uniqueness.facts import (
-    UniquenessFact,
-    UniquenessSource,
-    facts_from_declarations,
-    facts_from_manifest,
-)
-from dblect.uniqueness.propagation import (
-    ScopeFacts,
-    facts_from_tree,
-    propagate_facts,
-    top_scope_facts,
+from dblect.uniqueness.detector import (
+    detect_join_fanout,
+    detect_non_unique_window_order_keys,
+    make_fact_grounded_detectors,
 )
 
 __all__ = [
-    "ScopeFacts",
-    "UniquenessFact",
-    "UniquenessSource",
-    "facts_from_declarations",
-    "facts_from_manifest",
-    "facts_from_tree",
-    "propagate_facts",
-    "top_scope_facts",
+    "detect_join_fanout",
+    "detect_non_unique_window_order_keys",
+    "make_fact_grounded_detectors",
 ]
