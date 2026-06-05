@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from hypothesis import given
 from hypothesis import strategies as st
 
-from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint
+from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint, Predicate
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
@@ -148,11 +148,17 @@ def test_unique_test_column_is_case_folded() -> None:
     assert facts[0].value == CandidateKeySet.of(_key("customerid"))
 
 
-def test_conditional_unique_test_is_not_activated() -> None:
+def test_conditional_unique_test_is_captured_with_its_predicate() -> None:
+    """A ``where`` filter does not drop the fact: it is captured carrying the
+    predicate, so an activation step can consume it. Grounding still does not fold
+    a conditional key into the unconditional key set (pinned in the grounding
+    tests)."""
     model = _model("model.shop.dim_customer")
     test = _unique("test.shop.u", column="customer_id", target=model.unique_id, where="active")
     facts = list(unique_test_discoverer().discover(_manifest(model, test), name_to_source={}))
-    assert facts == []
+    assert len(facts) == 1
+    assert facts[0].value == CandidateKeySet.of(_key("customer_id"))
+    assert facts[0].condition == Predicate("active")
 
 
 def test_disabled_unique_test_grounds_nothing() -> None:
