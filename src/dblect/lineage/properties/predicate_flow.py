@@ -135,18 +135,26 @@ class _FlowWalk:
 
     ``base_filter`` resolves a base table's filter; CTEs and inline subqueries are
     resolved structurally within the walk. A scope is carried only when it is a
-    single source with no join; everything else drops to the empty filter.
+    single source with no join; everything else drops to the empty filter. With
+    ``record`` set, every scope's filter is kept in ``scopes`` keyed by ``id(node)``,
+    so a detector can read the filter in force at an intermediate CTE / subquery.
     """
 
-    def __init__(self, base_filter: _BaseFilter) -> None:
+    def __init__(self, base_filter: _BaseFilter, *, record: bool = False) -> None:
         self._base_filter = base_filter
+        self._record = record
+        self.scopes: dict[int, frozenset[Canon]] = {}
 
     def scope_filter(
         self, node: Expr, *, cte_scope: Mapping[str, frozenset[Canon]]
     ) -> frozenset[Canon]:
         if isinstance(node, exp.Select):
-            return self._select(node, cte_scope=cte_scope)
-        return frozenset()  # UNION (arms may differ) and other non-SELECT shapes carry nothing
+            atoms = self._select(node, cte_scope=cte_scope)
+        else:
+            atoms = frozenset[Canon]()  # UNION (arms may differ) and non-SELECTs carry nothing
+        if self._record:
+            self.scopes[id(node)] = atoms
+        return atoms
 
     def _select(
         self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Canon]]
@@ -258,6 +266,27 @@ def _projection_pair(proj: Expr) -> tuple[str, str] | None:
         name = sg.column_name(proj).lower()
         return (name, name)
     return None
+
+
+def relation_scope_filters(
+    tree: Expr, model_flow: Mapping[str, RowFilter]
+) -> Mapping[int, frozenset[Canon]]:
+    """Per-scope row filter for every SELECT/UNION node in ``tree``, keyed by
+    ``id(node)``.
+
+    The same flow algebra the reducer runs, but for one already-parsed tree with base
+    tables resolved by name against ``model_flow`` (the per-model filters propagation
+    produced). This is what a detector consults to learn the filter in force at an
+    intermediate CTE or inline subquery, so it can activate a conditional key there.
+    The returned map is valid only for the lifetime of ``tree``.
+    """
+
+    def base_filter(table: exp.Table) -> frozenset[Canon]:
+        return model_flow.get(table.name, NO_FILTER).atoms
+
+    walk = _FlowWalk(base_filter, record=True)
+    walk.scope_filter(tree, cte_scope={})
+    return walk.scopes
 
 
 # --- the property ------------------------------------------------------------

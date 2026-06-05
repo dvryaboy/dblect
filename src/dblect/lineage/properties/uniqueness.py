@@ -430,6 +430,43 @@ def relation_scope_keys(
     return {node_id: carried.keys for node_id, carried in walk.scopes.items()}
 
 
+def activated_scope_keys(
+    tree: Expr,
+    model_keys: Mapping[str, frozenset[Key]],
+    conditional_by_name: Mapping[str, frozenset[ConditionalKey]],
+    scope_flow: Mapping[int, frozenset[Canon]],
+) -> Mapping[int, frozenset[Key]]:
+    """Per-scope candidate keys with conditional keys activated against each scope's
+    own row filter, keyed by ``id(node)``.
+
+    Like :func:`relation_scope_keys`, but base tables resolve to both their keys and
+    their conditional keys, so the walk carries conditional keys into each
+    intermediate scope, and each scope promotes the ones its flow (``scope_flow``,
+    from :func:`~dblect.lineage.properties.predicate_flow.relation_scope_filters`)
+    implies. This lets a window or join over a CTE that filters an upstream see the
+    key the filter activates.
+    """
+
+    def base_resolve(table: exp.Table) -> _Carried:
+        name = table.name
+        return _Carried(
+            model_keys.get(name, frozenset()), conditional_by_name.get(name, frozenset())
+        )
+
+    walk = _RelationWalk(base_resolve, record=True)
+    walk.scope_keys(tree, cte_scope={})
+    out: dict[int, frozenset[Key]] = {}
+    for node_id, carried in walk.scopes.items():
+        promoted = activate(
+            CandidateKeySet(carried.keys),
+            ((CandidateKeySet.of(ck.key), ck.predicate) for ck in carried.conditional),
+            scope_flow.get(node_id, frozenset()),
+            _meet,
+        )
+        out[node_id] = promoted.keys
+    return out
+
+
 class _RelationWalk:
     """Bottom-up candidate-key inference over one relational tree.
 
