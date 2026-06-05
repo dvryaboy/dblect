@@ -38,24 +38,18 @@ from sqlglot.expressions.core import Expression
 
 from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
-from dblect.lineage.facts.property import AggregateRule, DepContext, OperatorTransfer, Property
+from dblect.lineage.facts.property import (
+    AggregateRule,
+    DepContext,
+    OperatorTransfer,
+    Property,
+    Reducer,
+)
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, LineageView, SourceRef
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
-
-# A reducer turns one node's derivation into an inferred annotation, calling
-# ``recurse`` to pull in the annotation of any node the derivation references.
-# Column and relation scope differ *only* here: every other step of the walk
-# (grounding, the EXPLICIT short-circuit, reconcile, the provisional taint,
-# memoisation, the cycle guard) is shared and lives in ``propagate``. The
-# signature is erased to ``Any`` because the driver dispatches reducers by scope
-# kind; the public ``propagate`` stays precisely typed.
-Reducer = Callable[
-    [Expr, Property[Any, Any], Callable[[Any], Annotation[Any]], DepContext, Annotation[Any]],
-    Annotation[Any],
-]
 
 # Key on ``Expr.meta`` where the builder records the single ``ColumnRef`` an
 # ``exp.Column`` resolves to. Centralised so builder and propagator stay in sync.
@@ -100,10 +94,11 @@ def propagate(
     This is the one propagation engine: a memoised grounded fixpoint over the
     lineage DAG. For each subject it grounds a declared annotation, short-circuits
     on a declared opt-out, reduces the subject's derivation to an inferred
-    annotation, and reconciles the two. The scope-specific part is the *reducer*
-    selected by ``prop.scope_kind``: how a derivation reduces, and how recursion
-    into referenced subjects is triggered. Everything else here is shared by
-    column- and relation-scoped properties alike.
+    annotation, and reconciles the two. The scope-specific part is the *reducer*:
+    how a derivation reduces, and how recursion into referenced subjects is
+    triggered. A property carries its own reducer (relation scope) or falls back
+    to the generic column reducer. Everything else here is shared by column- and
+    relation-scoped properties alike.
 
     Memoised per subject, so each is annotated once regardless of how many
     downstream paths touch it. A defensive cycle guard returns the property's
@@ -111,7 +106,7 @@ def propagate(
     malformed input degrades instead of looping forever (a manifest-derived graph
     is acyclic).
     """
-    reduce = _reducer_for(prop.scope_kind)
+    reduce = _reducer_for(prop)
     lat = prop.lattice
     check = consistent(lat)
     # The "no information" value a node grounds to when nothing derives or
@@ -149,17 +144,22 @@ def propagate(
     return annotations
 
 
-def _reducer_for(scope_kind: ScopeKind) -> Reducer:
-    """The reducer for a scope kind. Relation-scoped propagation lands with the
-    uniqueness migration; until then a relation property raises here, at the
-    single dispatch point, rather than mid-walk."""
-    reducer = _REDUCERS.get(scope_kind)
-    if reducer is None:
-        raise NotImplementedError(
-            "relation-scoped propagation lands with the uniqueness migration; "
-            f"no reducer registered for scope kind {scope_kind!r}"
-        )
-    return reducer
+def _reducer_for(prop: Property[Any, Any]) -> Reducer:
+    """The reducer this property propagates with, resolved at the single dispatch
+    point so a missing one raises here rather than mid-walk.
+
+    A property that carries its own ``reducer`` uses it. Otherwise column scope
+    falls back to the generic ``_column_reduce``; relation scope has no generic
+    reducer, so a relation property that supplies none cannot propagate."""
+    if prop.reducer is not None:
+        return prop.reducer
+    if prop.scope_kind is ScopeKind.COLUMN:
+        return _column_reduce
+    raise NotImplementedError(
+        f"relation-scoped property {prop.name!r} carries no reducer; a relation "
+        "property must supply its relation-algebra walk, since relation reduction "
+        "has no generic default"
+    )
 
 
 def run(graph: ColumnLineageGraph, registry: PropertyRegistry) -> AnnotationStore:
@@ -263,26 +263,6 @@ def _column_reduce(
         return default_ann
     combine = prop.semiring.times if prop.semiring is not None else lat.join
     return _fold(lat, combine, child_anns)
-
-
-# The reducer table the driver dispatches on. Column scope ships here; relation
-# scope is registered by the property that needs it (see ``register_reducer``).
-_REDUCERS: dict[ScopeKind, Reducer] = {
-    ScopeKind.COLUMN: _column_reduce,
-}
-
-
-def register_reducer(scope_kind: ScopeKind, reducer: Reducer) -> None:
-    """Register the reducer for a scope kind.
-
-    Column reduction is generic (it dispatches to the property's own operator,
-    aggregate, semiring, and lattice). Relation reduction is property-specific
-    today: the relation algebra a uniqueness key-set walk performs does not yet
-    have a per-property transfer protocol, so the uniqueness module registers its
-    reducer on import. A second relation property would motivate folding this into
-    the ``Property`` bundle, at which point this hook goes away.
-    """
-    _REDUCERS[scope_kind] = reducer
 
 
 def _apply_aggregate(

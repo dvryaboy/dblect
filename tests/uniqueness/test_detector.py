@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from sqlglot import Expr
 
+from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness.detector import (
     detect_join_fanout,
     detect_non_unique_window_order_keys,
+    make_fact_grounded_detectors,
 )
 
 _Keys = dict[str, frozenset[frozenset[str]]]
@@ -21,8 +23,7 @@ _Keys = dict[str, frozenset[frozenset[str]]]
 def _model_keys(**name_to_keys: tuple[tuple[str, ...], ...]) -> _Keys:
     """Per-relation candidate keys by name: ``_model_keys(src=[("id",)])``."""
     return {
-        name: frozenset(frozenset(cols) for cols in keys)
-        for name, keys in name_to_keys.items()
+        name: frozenset(frozenset(cols) for cols in keys) for name, keys in name_to_keys.items()
     }
 
 
@@ -115,6 +116,28 @@ def test_window_against_cte_covered_via_propagation_is_silent() -> None:
     assert findings == ()
 
 
+def test_window_against_inline_subquery_inherits_keys() -> None:
+    # The inline subquery `(select * from raw)` pass-throughs `raw`, so its keys
+    # propagate. The window's (customer_id, ts) tuple isn't covered by raw's key
+    # (id), so flag — an inline subquery source is checkable, like a CTE.
+    parsed = _parse(
+        "select row_number() over (partition by customer_id order by ts) "
+        "from (select * from raw) sub"
+    )
+    findings = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys(raw=(("id",),)))
+    assert len(findings) == 1
+
+
+def test_window_against_inline_subquery_covered_is_silent() -> None:
+    # Same pass-through, but the window partitions by id; the inherited key covers
+    # the (id, ts) superkey, so no finding.
+    parsed = _parse(
+        "select row_number() over (partition by id order by ts) from (select * from raw) sub"
+    )
+    findings = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys(raw=(("id",),)))
+    assert findings == ()
+
+
 def test_multiple_windows_each_evaluated_independently() -> None:
     parsed = _parse(
         "select "
@@ -131,7 +154,9 @@ def test_multiple_windows_each_evaluated_independently() -> None:
 
 def test_finding_carries_line_number() -> None:
     sql = "select\n  row_number() over (partition by customer_id order by ts) as rn\nfrom src\n"
-    findings = detect_non_unique_window_order_keys(_parse(sql), model_keys=_model_keys(src=(("id",),)))
+    findings = detect_non_unique_window_order_keys(
+        _parse(sql), model_keys=_model_keys(src=(("id",),))
+    )
     assert len(findings) == 1
     assert findings[0].line_start == 2
 
@@ -253,3 +278,85 @@ def test_fanout_finding_carries_join_line() -> None:
     findings = detect_join_fanout(_parse(sql), model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
     assert findings[0].line_start == 3
+
+
+# --- end-to-end key resolution through make_fact_grounded_detectors ----------
+#
+# The direct-call tests above hand the detector a ``model_keys`` map keyed the way
+# the production indexer produces it. These exercise that indexer
+# (``_model_keys_by_name``) so the name a relation is looked up by matches the
+# name it appears under in compiled SQL.
+
+
+def _source_with_identifier(uid: str, *, name: str, identifier: str) -> Node:
+    return Node(
+        unique_id=uid,
+        name=name,
+        resource_type=ResourceType.SOURCE,
+        fqn=(uid,),
+        package_name="shop",
+        schema="raw",
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+        identifier=identifier,
+    )
+
+
+def _model(uid: str, sql: str) -> Node:
+    return Node(
+        unique_id=uid,
+        name=uid.split(".")[-1],
+        resource_type=ResourceType.MODEL,
+        fqn=(uid,),
+        package_name="shop",
+        schema="analytics",
+        raw_code=None,
+        compiled_code=sql,
+        original_file_path=None,
+        columns={},
+    )
+
+
+def _unique_test(uid: str, *, column: str, target: str) -> Node:
+    return Node(
+        unique_id=uid,
+        name=uid.split(".")[-1],
+        resource_type=ResourceType.OTHER,
+        fqn=(uid,),
+        package_name="shop",
+        schema=None,
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
+        attached_node=target,
+    )
+
+
+def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
+    """A source whose ``identifier`` diverges from its ``name`` (a common
+    ``schema.yml`` setting) appears in compiled SQL under the identifier. The
+    detectors must look its keys up by that identifier, matching the relation-graph
+    builder. Keyed by ``name`` instead, the declared key would be invisible and the
+    hazard would go unflagged."""
+    src = _source_with_identifier("source.shop.raw.orders", name="orders", identifier="orders_v2")
+    test = _unique_test("test.shop.u", column="id", target=src.unique_id)
+    # The compiled SQL references the source by its identifier, as dbt emits it.
+    sql = "select row_number() over (partition by customer_id order by ts) as rn from orders_v2"
+    model = _model("model.shop.ranked", sql)
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in (src, test, model)},
+    )
+    tree = _parse(sql)
+    window_keys, _fanout = make_fact_grounded_detectors(manifest, parsed={model.unique_id: tree})
+    findings = window_keys(tree)
+    # `orders_v2` is unique on (id); the window's (customer_id, ts) key is not
+    # covered, so the non-deterministic ranking is flagged.
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS

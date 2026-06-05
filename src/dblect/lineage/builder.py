@@ -100,9 +100,7 @@ def build_relation_graph(
         if parsed is not None:
             tree = parsed.get(uid)
             if tree is None:
-                issues.append(
-                    BuildIssue(model_unique_id=uid, message="model has no parsed SQL")
-                )
+                issues.append(BuildIssue(model_unique_id=uid, message="model has no parsed SQL"))
                 continue
         else:
             sql = model.analysis_sql

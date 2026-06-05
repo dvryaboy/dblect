@@ -303,16 +303,11 @@ def test_operator_transfer_receives_threaded_dep_context() -> None:
 # --- scope dispatch and the registry driver ---------------------------------
 
 
-def test_scope_kind_with_no_registered_reducer_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The driver dispatches by scope kind at one point; a kind with no registered
-    reducer raises there rather than mid-walk. Reducers are registered by the
-    properties that need them, so we clear the table to exercise the guard
-    deterministically regardless of what else has been imported."""
-    from dblect.lineage import property as prop_mod
-
-    monkeypatch.setattr(prop_mod, "_REDUCERS", {})
+def test_relation_property_without_a_reducer_cannot_propagate() -> None:
+    """A relation property carries its relation-algebra walk as ``reducer``; one
+    built without it has no generic fallback (unlike column scope), so the driver
+    raises at its single dispatch point rather than mid-walk. The property itself
+    holds the reducer, so no global state or monkeypatching is involved."""
     rel = relation_property(
         name="rel",
         lattice=_subset_lattice(),
@@ -320,7 +315,8 @@ def test_scope_kind_with_no_registered_reducer_raises(
         aggregates={},
         ground=lambda _s: Annotation(_UNIVERSE, Opacity.IMPLICIT),
     )
-    with pytest.raises(NotImplementedError, match="relation"):
+    assert rel.reducer is None
+    with pytest.raises(NotImplementedError, match="reducer"):
         propagate(RelationLineageGraph.empty(), rel)
 
 

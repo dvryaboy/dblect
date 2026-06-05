@@ -148,6 +148,15 @@ class Property(Generic[K, S]):
     (``True``): declared and inferred are the same-polarity lower bounds and
     compose by the lattice ``meet``, never conflicting (uniqueness: a declared
     candidate key and a SQL-derived one both hold, so they union)."""
+    reducer: Reducer | None = None
+    """The scope-specific step that turns a derivation into an inferred annotation.
+
+    ``None`` lets the propagator supply its default for the scope kind. Column
+    reduction is generic (it dispatches to this property's own operators,
+    aggregates, semiring, and lattice), so a column property leaves this unset.
+    Relation reduction is property-specific today (a relation-algebra walk has no
+    per-property transfer protocol yet), so a relation property carries its walk
+    here rather than relying on a global registry."""
 
     def __post_init__(self) -> None:
         # A semiring-carrying property derives its confluence and cross from
@@ -166,6 +175,19 @@ class Property(Generic[K, S]):
     @property
     def name(self) -> str:
         return self.ref.name
+
+
+# A reducer turns one node's derivation into an inferred annotation, calling
+# ``recurse`` to pull in the annotation of any node the derivation references.
+# It is the *only* scope-specific step of propagation; grounding, reconcile, the
+# cycle guard, and memoisation are shared. A relation property carries its reducer
+# on ``Property.reducer``; column scope uses the propagator's generic default. The
+# signature erases to ``Any`` because the propagator dispatches it dynamically
+# while keeping its public ``propagate`` precisely typed.
+Reducer = Callable[
+    [Expr, Property[Any, Any], Callable[[Any], Annotation[Any]], DepContext, Annotation[Any]],
+    Annotation[Any],
+]
 
 
 def column_property(
@@ -192,7 +214,7 @@ def column_property(
         display=display,
         depends_on=depends_on,
         reconcile_by_meet=reconcile_by_meet,
-    )
+    )  # column scope leaves reducer unset: the propagator's generic reducer serves it.
 
 
 def relation_property(
@@ -206,8 +228,13 @@ def relation_property(
     display: Callable[[K], AxisDisplay] | None = None,
     depends_on: tuple[PropertyRef[Any, Any], ...] = (),
     reconcile_by_meet: bool = False,
+    reducer: Reducer | None = None,
 ) -> Property[K, SourceRef]:
-    """Mint a relation-scoped property: ``scope_kind`` is RELATION and facts address relations."""
+    """Mint a relation-scoped property: ``scope_kind`` is RELATION and facts address relations.
+
+    A relation property must supply ``reducer`` (its relation-algebra walk);
+    propagation raises if it is left unset, since relation reduction has no
+    generic default the way column reduction does."""
     return Property(
         ref=PropertyRef(name=name, _mint=_MINT),
         scope_kind=ScopeKind.RELATION,
@@ -219,4 +246,5 @@ def relation_property(
         display=display,
         depends_on=depends_on,
         reconcile_by_meet=reconcile_by_meet,
+        reducer=reducer,
     )

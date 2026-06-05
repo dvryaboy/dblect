@@ -8,8 +8,9 @@ properties.
 ``where_provenance`` is production. ``nullability_property`` and
 ``uniqueness_property`` read a manifest for their grounding; ``aggregation_depth``
 is a demo property whose module docstring lists the operator-coverage gaps that
-keep it out of audit consumption. Importing this package also registers the
-relation-scoped reducer uniqueness propagation needs (see ``register_reducer``).
+keep it out of audit consumption. ``uniqueness_property`` is relation-scoped and
+carries its relation-algebra walk on the property itself, so the propagator
+dispatches it with no global registration step.
 """
 
 from dblect.lineage.properties.aggregation_depth import aggregation_depth

@@ -37,8 +37,13 @@ from dblect.manifest import (
 from dblect.sql import parse_sql
 
 
-def _model(uid: str, sql: str, *, constraints: tuple[ConstraintSpec, ...] = (),
-           columns: Mapping[str, Column] = {}) -> Node:
+def _model(
+    uid: str,
+    sql: str,
+    *,
+    constraints: tuple[ConstraintSpec, ...] = (),
+    columns: Mapping[str, Column] = {},
+) -> Node:
     return Node(
         unique_id=uid,
         name=uid.split(".")[-1],
@@ -100,13 +105,9 @@ def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
         nodes={n.unique_id: n for n in nodes},
     )
     result = build_relation_graph(manifest)
-    prop = uniqueness_property(manifest, name_to_source={})
+    prop = uniqueness_property(manifest)
     anns = propagate(result.graph, prop)
-    return {
-        ref.unique_id: ann.value
-        for ref, ann in anns.items()
-        if ref.kind is SourceKind.MODEL
-    }
+    return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
 
 
 def test_passthrough_carries_the_source_key() -> None:
@@ -162,8 +163,7 @@ def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> No
         _unique("test.shop.c", column="id", target=customers.unique_id),
         _model(
             "model.shop.enriched",
-            "SELECT o.id, c.region FROM orders o "
-            "LEFT JOIN customers c ON o.customer_id = c.id",
+            "SELECT o.id, c.region FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
         ),
     )
     assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
@@ -256,7 +256,11 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
         _model(
             "model.shop.d",
             "SELECT DISTINCT customer_id, region FROM orders",
-            constraints=(ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("customer_id",)),),
+            constraints=(
+                ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("customer_id",)),
+            ),
         ),
     )
-    assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id"), _key("customer_id", "region"))
+    assert keys["model.shop.d"] == CandidateKeySet.of(
+        _key("customer_id"), _key("customer_id", "region")
+    )

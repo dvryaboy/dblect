@@ -103,7 +103,7 @@ def _model_keys(*nodes: Node) -> Mapping[str, CandidateKeySet]:
         schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
     )
     graph = build_relation_graph(manifest).graph
-    anns = propagate(graph, uniqueness_property(manifest, name_to_source={}))
+    anns = propagate(graph, uniqueness_property(manifest))
     return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
 
 
@@ -129,8 +129,11 @@ def test_join_preserves_probe_key_iff_joined_side_is_unique_on_join_columns(
         f"SELECT o.id, c.tag FROM lft o LEFT JOIN rgt c ON o.fk = c.{join_col}",
     )
     keys = _model_keys(
-        left, right, _unique_test("test.shop.lid", column="id", target=left.unique_id),
-        *combo_tests, model,
+        left,
+        right,
+        _unique_test("test.shop.lid", column="id", target=left.unique_id),
+        *combo_tests,
+        model,
     )
     # A single equi-join column covers a right key only when that key is exactly
     # {join_col}; then the probe key {id} survives, otherwise no key is proven.
@@ -143,8 +146,6 @@ def test_join_preserves_probe_key_iff_joined_side_is_unique_on_join_columns(
 def test_group_by_makes_the_group_columns_a_key(group: frozenset[str]) -> None:
     src = _source("source.shop.raw.orders")
     cols = ", ".join(sorted(group))
-    model = _model(
-        "model.shop.g", f"SELECT {cols}, COUNT(*) AS n FROM orders GROUP BY {cols}"
-    )
+    model = _model("model.shop.g", f"SELECT {cols}, COUNT(*) AS n FROM orders GROUP BY {cols}")
     keys = _model_keys(src, model)
     assert keys["model.shop.g"] == CandidateKeySet.of(frozenset(group))

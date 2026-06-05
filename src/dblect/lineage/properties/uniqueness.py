@@ -42,11 +42,9 @@ from dblect.lineage.facts.model import (
     Fact,
     NativeConstraint,
     Opacity,
-    ScopeKind,
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
-from dblect.lineage.property import register_reducer
 from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
@@ -629,7 +627,6 @@ class _Projection:
 def uniqueness_property(
     manifest: Manifest,
     *,
-    name_to_source: Mapping[str, SourceRef],
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
 ) -> Property[CandidateKeySet, SourceRef]:
     """The manifest-backed uniqueness property: declared keys (unique tests,
@@ -637,14 +634,17 @@ def uniqueness_property(
     ``extra``) ground each relation, and the relation reducer infers more from the
     SQL. Declared and inferred keys both hold, so they compose by meet
     (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
-    set is empty."""
+    set is empty. The property carries its relation-algebra walk as ``reducer`` so
+    the propagator dispatches it without a global registry."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
         native_key_discoverer(manifest.adapter_type),
         *extra,
     )
-    facts = collect(manifest, discoverers, name_to_source=name_to_source)
+    # The uniqueness discoverers ground against the manifest directly, so they
+    # need no name-to-source map; pass an empty one to the shared collector.
+    facts = collect(manifest, discoverers, name_to_source={})
     return relation_property(
         name="uniqueness",
         lattice=UNIQUENESS_LATTICE,
@@ -652,11 +652,5 @@ def uniqueness_property(
         aggregates={},
         ground=grounding(facts, opaque=set(), lat=UNIQUENESS_LATTICE),
         reconcile_by_meet=True,
+        reducer=_relation_reduce,
     )
-
-
-# Relation reduction is property-specific today; register uniqueness's walk so a
-# uniqueness property propagates the moment this module is imported (which it is,
-# since ``uniqueness_property`` is the only way to obtain one). See
-# ``register_reducer`` in the propagator.
-register_reducer(ScopeKind.RELATION, _relation_reduce)

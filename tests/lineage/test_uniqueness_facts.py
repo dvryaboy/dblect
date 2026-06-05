@@ -165,7 +165,9 @@ def test_disabled_unique_test_grounds_nothing() -> None:
 def test_non_uniqueness_test_is_ignored() -> None:
     model = _model("model.shop.dim_customer")
     nn = _test(
-        "test.shop.nn", name="not_null", kwargs={"column_name": "customer_id"},
+        "test.shop.nn",
+        name="not_null",
+        kwargs={"column_name": "customer_id"},
         target=model.unique_id,
     )
     facts = list(unique_test_discoverer().discover(_manifest(model, nn), name_to_source={}))
@@ -183,7 +185,9 @@ def test_unique_combination_grounds_a_composite_key() -> None:
         kwargs={"combination_of_columns": ["order_id", "line_id"]},
         target=model.unique_id,
     )
-    facts = list(unique_combination_discoverer().discover(_manifest(model, test), name_to_source={}))
+    facts = list(
+        unique_combination_discoverer().discover(_manifest(model, test), name_to_source={})
+    )
     assert len(facts) == 1
     assert facts[0].value == CandidateKeySet.of(_key("order_id", "line_id"))
     assert facts[0].provenance == Declared(DeclaredSource.DBT_UTILS_TEST)
@@ -197,7 +201,9 @@ def test_unique_combination_without_a_column_list_grounds_nothing() -> None:
         kwargs={"combination_of_columns": "not-a-list"},
         target=model.unique_id,
     )
-    facts = list(unique_combination_discoverer().discover(_manifest(model, test), name_to_source={}))
+    facts = list(
+        unique_combination_discoverer().discover(_manifest(model, test), name_to_source={})
+    )
     assert facts == []
 
 
@@ -248,7 +254,9 @@ def test_native_key_enforcement_is_adapter_aware() -> None:
     spec = (ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("id",)),)
     duck = _model("model.shop.m", constraints=spec)
     snow = _model("model.shop.m", constraints=spec)
-    duck_fact = next(iter(native_key_discoverer("duckdb").discover(_manifest(duck), name_to_source={})))
+    duck_fact = next(
+        iter(native_key_discoverer("duckdb").discover(_manifest(duck), name_to_source={}))
+    )
     snow_fact = next(
         iter(native_key_discoverer("snowflake").discover(_manifest(snow), name_to_source={}))
     )
@@ -274,7 +282,9 @@ def test_unique_combination_fact_mirrors_its_columns(columns: list[str]) -> None
         kwargs={"combination_of_columns": list(columns)},
         target=model.unique_id,
     )
-    facts = list(unique_combination_discoverer().discover(_manifest(model, test), name_to_source={}))
+    facts = list(
+        unique_combination_discoverer().discover(_manifest(model, test), name_to_source={})
+    )
     assert len(facts) == 1
     value = facts[0].value
     assert value.keys == frozenset({frozenset(c.lower() for c in columns)})

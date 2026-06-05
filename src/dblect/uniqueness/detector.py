@@ -175,7 +175,7 @@ def make_fact_grounded_detectors(
     most once per tree no matter how many detectors consume it.
     """
     graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
-    anns = propagate(graph, uniqueness_property(manifest, name_to_source={}))
+    anns = propagate(graph, uniqueness_property(manifest))
     model_keys = _model_keys_by_name(manifest, anns)
     cache: dict[int, ScopeIndex] = {}
 
@@ -200,8 +200,15 @@ def make_fact_grounded_detectors(
 def _model_keys_by_name(
     manifest: Manifest, anns: Mapping[SourceRef, Annotation[CandidateKeySet]]
 ) -> dict[str, frozenset[Key]]:
-    """Index propagated keys by relation name. Models win over sources on a name
-    collision (applied last), matching how a ``ref`` resolves."""
+    """Index propagated keys by the relation name as it appears in compiled SQL.
+
+    A source resolves under ``identifier or name`` (dbt compiles
+    ``{{ source(...) }}`` to its ``identifier``, which can diverge from ``name``);
+    a model resolves under ``name``. This must match the relation-graph builder's
+    ``_build_name_to_source`` so a name the detectors look up by lands on the same
+    keys the propagation produced. Models win over sources on a name collision
+    (applied last), matching how a ``ref`` resolves.
+    """
     by_name: dict[str, frozenset[Key]] = {}
     models: dict[str, frozenset[Key]] = {}
     for ref, ann in anns.items():
@@ -209,7 +216,7 @@ def _model_keys_by_name(
         if node is None:
             continue
         target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.name] = ann.value.keys
+        target[node.identifier or node.name] = ann.value.keys
     by_name.update(models)
     return by_name
 
@@ -233,23 +240,27 @@ def _single_source_keys(
     """Keys for ``sel``'s single FROM source, or ``None`` if it is not a clean
     single-source scope with known keys.
 
-    A scope qualifies when FROM is a bare table and there are no JOINs. The source
-    resolves to a CTE (keys from the scope index) or a model ref (keys from the
-    per-model map). Returns ``None`` when the shape doesn't qualify or no key is
-    known, so the window detector stays silent.
+    A scope qualifies when there are no JOINs and FROM is a single source: a bare
+    table (resolving to a CTE via the scope index, or a model ref via the per-model
+    map) or an inline subquery (its keys from the scope index, which records every
+    SELECT/UNION scope). Returns ``None`` when the shape doesn't qualify or no key
+    is known, so the window detector stays silent.
     """
     from_ = sg.from_of(sel)
-    if from_ is None or not isinstance(from_.this, exp.Table):
-        return None
-    if sg.joins_of(sel):
+    if from_ is None or sg.joins_of(sel):
         return None
     target = from_.this
-    cte_body = _cte_body_for(target.name, sel)
-    if cte_body is not None:
-        keys = scope_index.get(id(cte_body), frozenset())
+    if isinstance(target, exp.Table):
+        cte_body = _cte_body_for(target.name, sel)
+        if cte_body is not None:
+            keys = scope_index.get(id(cte_body), frozenset())
+            return keys or None
+        keys = model_keys.get(target.name, frozenset())
         return keys or None
-    keys = model_keys.get(target.name, frozenset())
-    return keys or None
+    if isinstance(target, exp.Subquery) and isinstance(target.this, Expr):
+        keys = scope_index.get(id(target.this), frozenset())
+        return keys or None
+    return None
 
 
 def _resolve_target_keys(
