@@ -11,6 +11,10 @@ must never break: a ``True`` verdict is never wrong.
 
 from __future__ import annotations
 
+import itertools
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
 from hypothesis import given
 from hypothesis import strategies as st
 from sqlglot import Expr
@@ -154,57 +158,168 @@ def test_unparseable_or_empty_predicate_is_no_information() -> None:
 
 
 # --- soundness PBT: a True verdict is never wrong --------------------------------
+#
+# A generated predicate is a conjunction of clauses; each clause is a single atom or
+# a two-atom OR. An atom is ``term <op> literal`` or ``term IN (literals)``. We render
+# it to SQL, feed both sides to the engine, and only when it certifies ``strong ⟹
+# weak`` do we discharge the obligation: over every world (an independent value per
+# term), no world satisfying ``strong`` may violate ``weak``. A constrained TypeVar
+# keeps the same generators sound for both the numeric and the lexical domains.
 
-_COLS = ("a", "b", "c")
 _OPS = ("<", "<=", ">", ">=", "=")
+_V = TypeVar("_V", int, str)  # a literal: a number, or a string ordered lexically
 
 
-@st.composite
-def _atom(draw: st.DrawFn) -> tuple[str, str, int]:
-    return (draw(st.sampled_from(_COLS)), draw(st.sampled_from(_OPS)), draw(st.integers(-4, 4)))
+@dataclass(frozen=True)
+class _TermSpec:
+    """A term's SQL text paired with the world key it reads. ``date_trunc('day', a)``
+    keys a *different* world variable than ``a``: the engine treats the truncation as
+    its own opaque term and never relates it back to the column, so assigning the two
+    independently models a superset of real ``(a, trunc(a))`` worlds. Soundness over
+    that superset is the stronger claim."""
+
+    sql: str
+    key: str
 
 
-def _atom_sql(atom: tuple[str, str, int]) -> str:
-    col, op, lit = atom
-    return f"{col} {op} {lit}"
+@dataclass(frozen=True)
+class _Cmp(Generic[_V]):
+    term: _TermSpec
+    op: str
+    lit: _V
 
 
-def _conj_sql(atoms: list[tuple[str, str, int]]) -> str:
-    return " AND ".join(_atom_sql(a) for a in atoms)
+@dataclass(frozen=True)
+class _In(Generic[_V]):
+    term: _TermSpec
+    members: tuple[_V, ...]
 
 
-def _holds(atom: tuple[str, str, int], world: dict[str, int]) -> bool:
-    _col, op, lit = atom
-    v = world[atom[0]]
-    return {
-        "<": v < lit,
-        "<=": v <= lit,
-        ">": v > lit,
-        ">=": v >= lit,
-        "=": v == lit,
-    }[op]
+@dataclass(frozen=True)
+class _Or(Generic[_V]):
+    left: _Cmp[_V] | _In[_V]
+    right: _Cmp[_V] | _In[_V]
+
+
+_Clause = _Cmp[_V] | _In[_V] | _Or[_V]
+
+
+def _sql_lit(v: int | str) -> str:
+    return f"'{v}'" if isinstance(v, str) else str(v)
+
+
+def _render_leaf(leaf: _Cmp[_V] | _In[_V]) -> str:
+    if isinstance(leaf, _Cmp):
+        return f"{leaf.term.sql} {leaf.op} {_sql_lit(leaf.lit)}"
+    return f"{leaf.term.sql} IN ({', '.join(_sql_lit(m) for m in leaf.members)})"
+
+
+def _render(clauses: list[_Clause[_V]]) -> str:
+    parts = [
+        f"({_render_leaf(c.left)} OR {_render_leaf(c.right)})"
+        if isinstance(c, _Or)
+        else _render_leaf(c)
+        for c in clauses
+    ]
+    return " AND ".join(parts)
+
+
+def _cmp(v: _V, op: str, lit: _V) -> bool:
+    return {"<": v < lit, "<=": v <= lit, ">": v > lit, ">=": v >= lit, "=": v == lit}[op]
+
+
+def _holds_leaf(leaf: _Cmp[_V] | _In[_V], world: dict[str, _V]) -> bool:
+    if isinstance(leaf, _Cmp):
+        return _cmp(world[leaf.term.key], leaf.op, leaf.lit)
+    return world[leaf.term.key] in leaf.members
+
+
+def _holds(clauses: list[_Clause[_V]], world: dict[str, _V]) -> bool:
+    return all(
+        (_holds_leaf(c.left, world) or _holds_leaf(c.right, world))
+        if isinstance(c, _Or)
+        else _holds_leaf(c, world)
+        for c in clauses
+    )
+
+
+def _keys(clauses: list[_Clause[_V]]) -> set[str]:
+    ks: set[str] = set()
+    for c in clauses:
+        leaves = (c.left, c.right) if isinstance(c, _Or) else (c,)
+        ks.update(leaf.term.key for leaf in leaves)
+    return ks
+
+
+def _assert_sound(
+    strong: list[_Clause[_V]], weak: list[_Clause[_V]], domain: tuple[_V, ...]
+) -> None:
+    if not implies(_p(_render(strong)), _p(_render(weak))):
+        return  # incompleteness is allowed; only a True verdict carries an obligation
+    keys = sorted(_keys(strong) | _keys(weak))
+    for combo in itertools.product(domain, repeat=len(keys)):
+        world = dict(zip(keys, combo, strict=True))
+        if _holds(strong, world) and not _holds(weak, world):
+            raise AssertionError(
+                f"unsound: {_render(strong)!r} ⟹ {_render(weak)!r} certified but fails at {world}"
+            )
+
+
+def _leaves(leaf_st: st.SearchStrategy[_Cmp[_V] | _In[_V]]) -> st.SearchStrategy[_Clause[_V]]:
+    return st.one_of(leaf_st, st.builds(_Or, leaf_st, leaf_st))
+
+
+# Numeric fragment: columns, a monotonic truncation term, comparisons, IN, OR.
+_NUM_TERMS = (_TermSpec("a", "a"), _TermSpec("b", "b"), _TermSpec("date_trunc('day', a)", "td"))
+_INT = st.integers(-4, 4)
+_NUM_LEAF: st.SearchStrategy[_Cmp[int] | _In[int]] = st.one_of(
+    st.builds(_Cmp, st.sampled_from(_NUM_TERMS), st.sampled_from(_OPS), _INT),
+    st.builds(
+        _In,
+        st.sampled_from(_NUM_TERMS),
+        st.lists(_INT, min_size=1, max_size=3, unique=True).map(tuple),
+    ),
+)
+_NUM_CLAUSE = _leaves(_NUM_LEAF)
 
 
 @given(
-    strong=st.lists(_atom(), min_size=1, max_size=4),
-    weak=st.lists(_atom(), min_size=1, max_size=3),
+    strong=st.lists(_NUM_CLAUSE, min_size=1, max_size=3),
+    weak=st.lists(_NUM_CLAUSE, min_size=1, max_size=2),
 )
-def test_implies_is_sound_over_integer_worlds(
-    strong: list[tuple[str, str, int]], weak: list[tuple[str, str, int]]
+def test_implies_is_sound_over_term_worlds(
+    strong: list[_Clause[int]], weak: list[_Clause[int]]
 ) -> None:
-    """If the engine certifies ``strong ⟹ weak``, then every integer assignment
-    satisfying ``strong`` must satisfy ``weak``. The check samples the small
-    integer cube exhaustively, so an unsound certification cannot hide."""
-    verdict = _implies(_conj_sql(strong), _conj_sql(weak))
-    if not verdict:
-        return  # incompleteness is allowed; only a True verdict carries an obligation
-    cube = range(-6, 7)
-    for av in cube:
-        for bv in cube:
-            for cv in cube:
-                world = {"a": av, "b": bv, "c": cv}
-                if all(_holds(a, world) for a in strong):
-                    assert all(_holds(w, world) for w in weak), (
-                        f"unsound: {_conj_sql(strong)!r} ⟹ {_conj_sql(weak)!r} "
-                        f"certified but fails at {world}"
-                    )
+    """A certified ``strong ⟹ weak`` holds for every independent integer assignment
+    of the terms. Covers comparisons, ``IN``, ``OR``, and truncation terms; the cube
+    is sampled exhaustively so an unsound certification cannot hide."""
+    _assert_sound(strong, weak, tuple(range(-6, 7)))
+
+
+# Lexical fragment: one string column, so the literals exercise string ordering.
+_STR_COL = (_TermSpec("s", "s"),)
+_STR_LIT = st.sampled_from(("b", "d", "f", "h"))
+_STR_LEAF: st.SearchStrategy[_Cmp[str] | _In[str]] = st.one_of(
+    st.builds(_Cmp, st.sampled_from(_STR_COL), st.sampled_from(_OPS), _STR_LIT),
+    st.builds(
+        _In,
+        st.sampled_from(_STR_COL),
+        st.lists(_STR_LIT, min_size=1, max_size=3, unique=True).map(tuple),
+    ),
+)
+_STR_CLAUSE = _leaves(_STR_LEAF)
+# Worlds straddle the literals, including a between-value and a lexical edge case
+# (``"bb"`` sorts after ``"b"`` but before ``"c"``).
+_STR_WORLD = ("a", "b", "bb", "c", "e", "g", "i")
+
+
+@given(
+    strong=st.lists(_STR_CLAUSE, min_size=1, max_size=3),
+    weak=st.lists(_STR_CLAUSE, min_size=1, max_size=2),
+)
+def test_implies_is_sound_over_string_worlds(
+    strong: list[_Clause[str]], weak: list[_Clause[str]]
+) -> None:
+    """A certified ``strong ⟹ weak`` over string literals holds for every lexically
+    ordered world. This is the date-bound shape (ISO strings order lexically)."""
+    _assert_sound(strong, weak, _STR_WORLD)
