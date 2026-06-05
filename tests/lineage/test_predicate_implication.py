@@ -19,7 +19,14 @@ from hypothesis import given
 from hypothesis import strategies as st
 from sqlglot import Expr
 
-from dblect.lineage.predicate import implies, parse_predicate
+from dblect.lineage.predicate import (
+    Canon,
+    atoms_of,
+    entails,
+    entails_atoms,
+    implies,
+    parse_predicate,
+)
 
 _DIALECT = "duckdb"
 
@@ -155,6 +162,38 @@ def test_disjunction_in_strong_needs_every_arm() -> None:
 
 def test_unparseable_or_empty_predicate_is_no_information() -> None:
     assert parse_predicate("???", dialect=_DIALECT) is None
+
+
+# --- entails: the atom-set form, for activation ----------------------------------
+
+
+def _strong(sql: str) -> frozenset[Canon]:
+    parsed = parse_predicate(sql, dialect=_DIALECT)
+    assert parsed is not None
+    return atoms_of(parsed)
+
+
+def test_entails_proves_a_weaker_bound_from_collected_atoms() -> None:
+    assert entails(_strong("a >= 10 AND b = 3"), _p("a >= 5"))
+    assert entails(_strong("a >= 10 AND b = 3"), _p("a >= 5 AND b = 3"))
+    assert not entails(_strong("a >= 5"), _p("a >= 10"))
+
+
+def test_entails_matches_a_conjunct_syntactically() -> None:
+    assert entails(_strong("country = 'US' AND active"), _p("country = 'US'"))
+    # A bare boolean is opaque; only an exact-atom match proves it.
+    assert entails(_strong("active"), _p("active"))
+    assert not entails(_strong("active"), _p("inactive"))
+
+
+def test_entails_decomposes_weak_boolean_structure() -> None:
+    assert entails(_strong("a >= 10"), _p("a >= 5 OR z >= 100"))
+    assert not entails(_strong("a >= 10"), _p("a >= 5 AND b = 3"))
+
+
+def test_entails_atoms_is_in_subset_aware() -> None:
+    assert entails_atoms(_strong("a IN (1, 2)"), _strong("a IN (1, 2, 3)"))
+    assert not entails_atoms(_strong("a IN (1, 2, 3)"), _strong("a IN (1, 2)"))
 
 
 # --- soundness PBT: a True verdict is never wrong --------------------------------

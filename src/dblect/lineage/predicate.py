@@ -177,6 +177,33 @@ def implies(strong: Expr, weak: Expr) -> bool:
     return _entails(cmp_atoms, in_sets, weak)
 
 
+def entails(strong_atoms: frozenset[Canon], weak: Expr) -> bool:
+    """Whether the conjunction of ``strong_atoms`` implies ``weak``.
+
+    The atom-set form of :func:`implies`, for a caller (the predicate-flow activation
+    step) that already holds a relation's accumulated filter as atoms. ``strong`` is a
+    conjunction, so there is no disjunctive-strong case to distribute; ``weak`` is
+    still decomposed by its boolean structure.
+    """
+    weak = _unparen(weak)
+    if isinstance(weak, exp.And):
+        return entails(strong_atoms, weak.left) and entails(strong_atoms, weak.right)
+    if isinstance(weak, exp.Or):
+        return entails(strong_atoms, weak.left) or entails(strong_atoms, weak.right)
+    return entails_atoms(strong_atoms, frozenset({_canon(weak)}))
+
+
+def entails_atoms(strong_atoms: frozenset[Canon], weak_atoms: frozenset[Canon]) -> bool:
+    """Whether the conjunction of ``strong_atoms`` implies every atom of ``weak_atoms``.
+
+    Each weak atom is entailed when ``strong`` carries it verbatim (the syntactic case,
+    the only route for an :class:`OpaqueAtom`) or when the collected interval / ``IN``
+    constraints on its term entail it.
+    """
+    cmp_atoms, in_sets = _collect_canon(strong_atoms)
+    return all(w in strong_atoms or _entails_atom(cmp_atoms, in_sets, w) for w in weak_atoms)
+
+
 # --- atom extraction and column renaming -----------------------------------------
 #
 # The predicate-flow property carries a relation's accumulated row filter as a set
@@ -351,25 +378,55 @@ def _collect(
     return cmp_atoms, in_sets
 
 
+def _collect_canon(
+    atoms: frozenset[Canon],
+) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]]]:
+    """The same fold as :func:`_collect`, over already-canonicalised atoms. An
+    :class:`OpaqueAtom` contributes nothing to interval reasoning; it is matched only
+    syntactically by the caller."""
+    cmp_atoms: dict[Term, list[tuple[Op, Lit]]] = {}
+    in_sets: dict[Term, frozenset[Lit]] = {}
+    for atom in atoms:
+        if isinstance(atom, CmpAtom):
+            cmp_atoms.setdefault(atom.term, []).append((atom.op, atom.lit))
+        elif isinstance(atom, InAtom):
+            prior = in_sets.get(atom.term)
+            in_sets[atom.term] = atom.values if prior is None else (prior & atom.values)
+    return cmp_atoms, in_sets
+
+
 def _entails(
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
     in_sets: dict[Term, frozenset[Lit]],
     weak: Expr,
 ) -> bool:
-    atom = _as_atom(weak)
-    if atom is not None:
-        if _interval_entails(cmp_atoms.get(atom.term, []), atom.op, atom.lit):
+    atom = _as_atom(weak) or _as_in(weak)
+    return atom is not None and _entails_atom(cmp_atoms, in_sets, atom)
+
+
+def _entails_atom(
+    cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
+    in_sets: dict[Term, frozenset[Lit]],
+    weak: Canon,
+) -> bool:
+    """Whether the collected constraints entail one canonical ``weak`` atom. An
+    :class:`OpaqueAtom` is never entailed here; it only matches by membership."""
+    if isinstance(weak, CmpAtom):
+        if _interval_entails(cmp_atoms.get(weak.term, []), weak.op, weak.lit):
             return True
-        in_set = in_sets.get(atom.term)
-        return in_set is not None and _set_entails(in_set, atom.op, atom.lit)
-    in_atom = _as_in(weak)
-    if in_atom is not None:
-        have = in_sets.get(in_atom.term)
-        if have is not None and have <= in_atom.values:
+        in_set = in_sets.get(weak.term)
+        return in_set is not None and _set_entails(in_set, weak.op, weak.lit)
+    if isinstance(weak, InAtom):
+        have = in_sets.get(weak.term)
+        if have is not None and have <= weak.values:
             return True
-        iv = _interval(cmp_atoms.get(in_atom.term, []))
-        if iv is not None and _is_point(iv) and iv.lo is not None:
-            return Lit(iv.kind, iv.lo) in in_atom.values
+        iv = _interval(cmp_atoms.get(weak.term, []))
+        return (
+            iv is not None
+            and _is_point(iv)
+            and iv.lo is not None
+            and Lit(iv.kind, iv.lo) in weak.values
+        )
     return False
 
 
