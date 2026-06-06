@@ -366,3 +366,56 @@ def test_cross_model_without_the_filter_the_fanout_finding_stands() -> None:
         _unique("test.shop.region", column="region", target="model.shop.dim"),
     )
     assert FindingKind.JOIN_FANOUT in kinds
+
+
+# --- intra-model scopes: a window over a CTE that filters an upstream -------------
+#
+# The conditional ``id`` key is on the source; ``region`` is an unconditional key, so
+# a window partitioned by ``id`` is not covered unless ``id`` activates. The CTE that
+# feeds the window is where the filter is applied, so activation has to happen at that
+# *intra-model* scope, not just at the model's own boundary.
+
+
+def _window_kinds(model_sql: str, *nodes: Node) -> list[FindingKind]:
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in nodes},
+    )
+    window_keys, _fanout = make_fact_grounded_detectors(manifest)
+    return [f.kind for f in window_keys(parse_sql(model_sql, dialect="duckdb"))]
+
+
+def test_intra_model_cte_activation_covers_a_window() -> None:
+    # ``events`` has an unconditional ``region`` key (which does not cover the window)
+    # and a conditional ``id`` key. The CTE filters to ``active``, so ``id`` activates
+    # at the CTE scope and the window partitioned by ``id`` is covered.
+    sql = (
+        "WITH c AS (SELECT * FROM events WHERE active) "
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM c"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _model("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
+
+
+def test_intra_model_cte_without_filter_leaves_the_window_uncovered() -> None:
+    # Same shape, but the CTE applies no filter, so ``id`` never activates: only
+    # ``region`` is known, it does not cover the partition, and the window is flagged.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM c"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _model("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds

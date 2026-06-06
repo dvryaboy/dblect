@@ -19,17 +19,21 @@ inline-subquery scopes, which are not relations the propagator annotates.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from typing import TypeVar
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind, SourceRef
-from dblect.lineage.properties.predicate_flow import predicate_flow_property
+from dblect.lineage.properties.predicate_flow import (
+    predicate_flow_property,
+    relation_scope_filters,
+)
 from dblect.lineage.properties.uniqueness import (
-    CandidateKeySet,
     Key,
     activate_conditional,
+    activated_scope_keys,
     relation_scope_keys,
     uniqueness_property,
 )
@@ -179,17 +183,24 @@ def make_fact_grounded_detectors(
     keys = propagate(graph, uniqueness_property(manifest))
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
-    # than walking every relation in the graph.
+    # than walking every relation in the graph. The seed must stay exactly "every
+    # relation carrying a conditional key": intra-model activation reads flow at every
+    # such relation (via ``flow_by_name`` below), so narrowing the seed (e.g. to
+    # conditional *owners* only) would silently stop carriers from activating. It is
+    # the same set ``conditional_by_name`` indexes, both derived from ``keys``.
     conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
     flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
     activated = activate_conditional(keys, flow)
-    model_keys = _model_keys_by_name(manifest, activated)
+    model_keys = _by_name(manifest, activated, lambda cks: cks.keys)
+    conditional_by_name = _by_name(manifest, keys, lambda ann: ann.value.conditional)
+    flow_by_name = _by_name(manifest, flow, lambda ann: ann.value)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
         hit = cache.get(id(tree))
         if hit is None:
-            hit = relation_scope_keys(tree, model_keys)
+            scope_flow = relation_scope_filters(tree, flow_by_name)
+            hit = activated_scope_keys(tree, model_keys, conditional_by_name, scope_flow)
             cache[id(tree)] = hit
         return hit
 
@@ -204,26 +215,31 @@ def make_fact_grounded_detectors(
     return (window_keys, fanout)
 
 
-def _model_keys_by_name(
-    manifest: Manifest, anns: Mapping[SourceRef, CandidateKeySet]
-) -> dict[str, frozenset[Key]]:
-    """Index propagated keys by the relation name as it appears in compiled SQL.
+_V = TypeVar("_V")
+_R = TypeVar("_R")
+
+
+def _by_name(
+    manifest: Manifest, anns: Mapping[SourceRef, _V], extract: Callable[[_V], _R]
+) -> dict[str, _R]:
+    """Index a per-relation value by the relation name as it appears in compiled SQL.
 
     A source resolves under ``identifier or name`` (dbt compiles
     ``{{ source(...) }}`` to its ``identifier``, which can diverge from ``name``);
     a model resolves under ``name``. This must match the relation-graph builder's
     ``_build_name_to_source`` so a name the detectors look up by lands on the same
-    keys the propagation produced. Models win over sources on a name collision
-    (applied last), matching how a ``ref`` resolves.
+    relation the propagation annotated. Models win over sources on a name collision
+    (applied last), matching how a ``ref`` resolves. ``extract`` pulls the field the
+    caller wants (keys, conditional keys, or flow) from each annotation.
     """
-    by_name: dict[str, frozenset[Key]] = {}
-    models: dict[str, frozenset[Key]] = {}
-    for ref, cks in anns.items():
+    by_name: dict[str, _R] = {}
+    models: dict[str, _R] = {}
+    for ref, value in anns.items():
         node = manifest.nodes.get(ref.unique_id)
         if node is None:
             continue
         target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = cks.keys
+        target[node.identifier or node.name] = extract(value)
     by_name.update(models)
     return by_name
 
