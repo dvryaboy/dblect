@@ -35,7 +35,9 @@ def materialized(
             con.execute(f"CREATE TABLE {name} ({', '.join(f'{c} INTEGER' for c in cols)})")
             if rows:
                 placeholders = ", ".join(["?"] * len(cols))
-                con.executemany(f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows])
+                con.executemany(
+                    f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows]
+                )
         con.execute(f"CREATE TABLE _m AS {model_sql}")
         yield con
     finally:

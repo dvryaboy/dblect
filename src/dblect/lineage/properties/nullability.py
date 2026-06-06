@@ -426,19 +426,33 @@ def _conditional_columns_by_relation(
 # downstream through every consumer and a guard (COALESCE, IS NOT NULL) still clears it.
 
 
+def _relation_alias(e: Expr) -> str | None:
+    """The qualifier a FROM/JOIN source lends its columns downstream, case-folded to match
+    the graph, or ``None`` when it lends none. A table contributes its alias-or-name; an
+    aliased derived table (subquery) contributes its alias. Both are the qualifier the
+    builder stamps onto columns drawn from the source, so the taint can find them. Anything
+    else (an unaliased subquery, ``UNNEST``, a lateral) yields ``None`` and stays untainted:
+    a sound under-approximation, and lateral/unnest row-drop is a separate property's axis."""
+    if isinstance(e, (exp.Table, exp.Subquery)):
+        name = sg.name_of(e)
+        return name.lower() if name else None
+    return None
+
+
 def _optional_join_aliases(select: exp.Select) -> set[str]:
     """The FROM-clause aliases whose columns an outer join can pad with NULL: the
     joined-in side of a LEFT join, the accumulated left side of a RIGHT join, both for a
     FULL join. INNER and CROSS pad nothing. Aliases are case-folded to match the graph."""
-    from_ = select.args.get("from_") or select.args.get("from")
+    from_ = sg.from_of(select)
     left: set[str] = set()
-    if isinstance(from_, exp.From) and isinstance(from_.this, exp.Table):
-        left.add(sg.name_of(from_.this).lower())
+    if from_ is not None:
+        base = _relation_alias(from_.this)
+        if base is not None:
+            left.add(base)
     optional: set[str] = set()
     for join in sg.joins_of(select):
         side = sg.join_side_of(join)
-        target = join.this
-        alias = sg.name_of(target).lower() if isinstance(target, exp.Table) else None
+        alias = _relation_alias(join.this)
         if side is JoinSide.LEFT and alias is not None:
             optional.add(alias)
         elif side is JoinSide.RIGHT:
@@ -468,6 +482,9 @@ def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnL
     optional-side column references. Each model's top-level FROM/JOIN structure decides
     which aliases are optional; CTE-collapsed or unparseable models are left untouched
     (the taint then simply does not fire, a sound under-approximation)."""
+    refs_by_source: dict[SourceRef, list[ColumnRef]] = {}
+    for ref in graph.expressions:
+        refs_by_source.setdefault(ref.source, []).append(ref)
     new_expressions = dict(graph.expressions)
     for node in manifest.nodes.values():
         if node.resource_type is not ResourceType.MODEL:
@@ -486,9 +503,8 @@ def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnL
         if not optional:
             continue
         model_ref = SourceRef(SourceKind.MODEL, node.unique_id)
-        for ref, expr in graph.expressions.items():
-            if ref.source == model_ref:
-                new_expressions[ref] = _wrap_optional_columns(expr, optional)
+        for ref in refs_by_source.get(model_ref, ()):
+            new_expressions[ref] = _wrap_optional_columns(graph.expressions[ref], optional)
     return ColumnLineageGraph(edges=graph.edges, expressions=new_expressions)
 
 

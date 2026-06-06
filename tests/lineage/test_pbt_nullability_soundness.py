@@ -55,9 +55,7 @@ def _rows(draw: st.DrawFn) -> tuple[tuple[int, int], ...]:
     """Rows of two small non-null ints. The small domain makes the join both match and
     miss, so an outer join produces padded nulls on the optional side."""
     n = draw(st.integers(min_value=0, max_value=6))
-    return tuple(
-        (draw(st.integers(0, 3)), draw(st.integers(0, 3))) for _ in range(n)
-    )
+    return tuple((draw(st.integers(0, 3)), draw(st.integers(0, 3))) for _ in range(n))
 
 
 @st.composite
@@ -70,10 +68,7 @@ def _null_scenario(draw: st.DrawFn) -> NullScenario:
 
 
 def _null_sql(s: NullScenario) -> str:
-    return (
-        f"SELECT bt.bk, bt.bv, jt.jk, jt.jv "
-        f"FROM bt {_JOIN_SQL[s.join]} jt ON bt.bk = jt.jk"
-    )
+    return f"SELECT bt.bk, bt.bv, jt.jk, jt.jv FROM bt {_JOIN_SQL[s.join]} jt ON bt.bk = jt.jk"
 
 
 def _source(name: str) -> Node:

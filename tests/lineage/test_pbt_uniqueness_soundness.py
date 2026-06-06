@@ -39,7 +39,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import duckdb
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -53,13 +52,11 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from tests.lineage._duckdb_oracle import Table, materialized, scalar
 
 _MODEL_UID = "model.test.m"
 
 # --- shared analyzer + duckdb oracle ----------------------------------------------
-
-# A materialized table: its name, its column names, and its rows (non-null ints).
-Table = tuple[str, tuple[str, ...], tuple[tuple[int, ...], ...]]
 
 
 def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
@@ -75,31 +72,15 @@ def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
 def _assert_keys_sound(tables: Sequence[Table], model_sql: str, keys: frozenset[Key]) -> None:
     """Materialize ``tables`` and the model in duckdb; assert every key in ``keys`` has
     as many distinct key tuples as the model has rows (so it is genuinely unique)."""
-    con = duckdb.connect(":memory:")
-    try:
-        for name, cols, rows in tables:
-            con.execute(f"CREATE TABLE {name} ({', '.join(f'{c} INTEGER' for c in cols)})")
-            if rows:
-                placeholders = ", ".join(["?"] * len(cols))
-                con.executemany(
-                    f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows]
-                )
-        con.execute(f"CREATE TABLE _m AS {model_sql}")
-        total_row = con.execute("SELECT COUNT(*) FROM _m").fetchone()
-        assert total_row is not None
-        total = total_row[0]
+    with materialized(tables, model_sql) as con:
+        total = scalar(con, "SELECT COUNT(*) FROM _m")
         for key in keys:
             cols = ", ".join(sorted(key))
-            distinct_row = con.execute(
-                f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)"
-            ).fetchone()
-            assert distinct_row is not None
-            assert distinct_row[0] == total, (
-                f"unsound key {sorted(key)}: {total} rows but {distinct_row[0]} distinct tuples "
+            distinct = scalar(con, f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)")
+            assert distinct == total, (
+                f"unsound key {sorted(key)}: {total} rows but {distinct} distinct tuples "
                 f"for sql={model_sql!r} tables={tables!r}"
             )
-    finally:
-        con.close()
 
 
 def _source_node(name: str, schema: str = "raw") -> Node:
