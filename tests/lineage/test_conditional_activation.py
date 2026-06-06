@@ -172,6 +172,135 @@ def test_unconditional_unique_still_grounds_a_key() -> None:
     assert res["model.shop.dim"].keys == frozenset({_key("id")})
 
 
+# --- cross-model: the conditional fact lives upstream of the filter --------------
+
+
+def test_conditional_key_on_an_upstream_activates_at_a_filtering_consumer() -> None:
+    # The test is on the source; a downstream model applies the implying filter. The
+    # conditional key travels the walk and activates at the consumer.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
+        _model("model.shop.dim", "SELECT * FROM orders WHERE active"),
+    )
+    assert _key("id") in res["model.shop.dim"].keys
+
+
+def test_cross_model_activation_renames_predicate_columns() -> None:
+    # The consumer renames ``region`` to ``r``; the carried predicate renames with it,
+    # matching the flow (which renames the same way), so activation still fires.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
+        _model("model.shop.dim", "SELECT id, region AS r FROM orders WHERE region = 'US'"),
+    )
+    assert _key("id") in res["model.shop.dim"].keys
+
+
+def test_cross_model_conditional_is_carried_but_not_activated_without_a_filter() -> None:
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
+        _model("model.shop.dim", "SELECT * FROM orders"),
+    )
+    dim = res["model.shop.dim"]
+    assert _key("id") not in dim.keys
+    assert any(ck.key == _key("id") for ck in dim.conditional)
+
+
+def test_conditional_carries_through_a_passthrough_chain_then_activates() -> None:
+    # The fact is on the source, a staging model is a plain passthrough, and the mart
+    # applies the filter. The conditional key rides through staging and activates.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
+        _model("model.shop.stg", "SELECT * FROM orders"),
+        _model("model.shop.mart", "SELECT * FROM stg WHERE active"),
+    )
+    assert _key("id") not in res["model.shop.stg"].keys  # staging adds no filter
+    assert _key("id") in res["model.shop.mart"].keys
+
+
+def test_conditional_carries_through_a_cte_consuming_an_upstream() -> None:
+    # The fact is on the source; a model filters it inside a CTE. Flow accumulates the
+    # CTE filter and the conditional key rides through the CTE, so it activates.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
+        _model(
+            "model.shop.dim",
+            "WITH c AS (SELECT * FROM orders WHERE active) SELECT * FROM c",
+        ),
+    )
+    assert _key("id") in res["model.shop.dim"].keys
+
+
+def test_conditional_dropped_when_a_predicate_column_is_not_projected() -> None:
+    # ``region`` (the predicate column) is filtered but not projected, so neither the
+    # carried predicate nor the flow can express it: the key stays unactivated and is
+    # not even carried (its predicate could not be tracked).
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
+        _model("model.shop.dim", "SELECT id FROM orders WHERE region = 'US'"),
+    )
+    dim = res["model.shop.dim"]
+    assert _key("id") not in dim.keys
+    assert not any(ck.key == _key("id") for ck in dim.conditional)
+
+
+# --- cross-model through a join --------------------------------------------------
+#
+# A conditional key on the probe side rides through a *non-multiplying* join (the
+# joined-in side is unique on the join columns) under an explicit projection, so a
+# downstream filter still activates it. A fanning-out join, or a star over a join
+# (which could blur a predicate column across the two sources), drops it.
+
+
+def _join_then_filter(join_sql: str, *, lk_unique: bool) -> Mapping[str, CandidateKeySet]:
+    nodes = [
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
+        _source("source.shop.raw.lk"),
+        _model("model.shop.j", join_sql),
+        _model("model.shop.m", "SELECT * FROM j WHERE region = 'US'"),
+    ]
+    if lk_unique:
+        nodes.append(_unique("test.shop.lk", column="lk_id", target="source.shop.raw.lk"))
+    return _activated(*nodes)
+
+
+def test_conditional_carries_through_a_non_multiplying_join_then_activates() -> None:
+    # ``lk`` is unique on its join column, so the join cannot multiply ``orders``
+    # rows; the conditional ``id`` key (and its ``region`` predicate) ride through the
+    # explicit projection and activate at the filtering consumer.
+    res = _join_then_filter(
+        "SELECT o.id, o.region, o.lk_id FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=True,
+    )
+    assert _key("id") in res["model.shop.m"].keys
+
+
+def test_conditional_dropped_through_a_fanning_out_join() -> None:
+    # ``lk`` has no key, so the join can multiply ``orders`` rows: the conditional key
+    # cannot be trusted to survive and never reaches the consumer.
+    res = _join_then_filter(
+        "SELECT o.id, o.region, o.lk_id FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=False,
+    )
+    assert _key("id") not in res["model.shop.m"].keys
+
+
+def test_conditional_dropped_by_a_star_over_a_join() -> None:
+    # The join is non-multiplying, but ``SELECT *`` over two sources could blur the
+    # predicate column across them, so the conditional key drops rather than risk it.
+    res = _join_then_filter(
+        "SELECT * FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=True,
+    )
+    assert _key("id") not in res["model.shop.m"].keys
+
+
 # --- end to end: activation changes what the detectors see -----------------------
 
 # A consumer joins ``dim`` on ``id``. ``dim`` declares an unconditional key on
@@ -211,5 +340,29 @@ def test_without_the_filter_the_join_fanout_finding_stands() -> None:
         _model("model.shop.dim", "SELECT * FROM events"),
         _unique("test.shop.region", column="region", target="model.shop.dim"),
         _unique("test.shop.id", column="id", target="model.shop.dim", where="active"),
+    )
+    assert FindingKind.JOIN_FANOUT in kinds
+
+
+def test_cross_model_activation_suppresses_a_join_fanout_finding() -> None:
+    # The conditional ``id`` test now lives on the *source*; ``dim`` filters to
+    # ``active`` and so activates it cross-model. The join on ``id`` is covered.
+    kinds = _fanout_kinds(
+        _source("source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _model("model.shop.dim", "SELECT * FROM events WHERE active"),
+        _unique("test.shop.region", column="region", target="model.shop.dim"),
+    )
+    assert FindingKind.JOIN_FANOUT not in kinds
+
+
+def test_cross_model_without_the_filter_the_fanout_finding_stands() -> None:
+    # Source carries the conditional ``id`` test, but ``dim`` applies no filter, so it
+    # never activates; only ``region`` is a key, and the join on ``id`` fans out.
+    kinds = _fanout_kinds(
+        _source("source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _model("model.shop.dim", "SELECT * FROM events"),
+        _unique("test.shop.region", column="region", target="model.shop.dim"),
     )
     assert FindingKind.JOIN_FANOUT in kinds
