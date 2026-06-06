@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import TypeVar
 
-from dblect.lineage.predicate import Canon, entails_atoms
+from dblect.lineage.predicate import Canon, entailment_checker
 
 K = TypeVar("K")
 
@@ -32,10 +32,12 @@ def activate(
     Each conditional is a ``(value, predicate)`` pair; where the accumulated filter
     implies the predicate, the value joins ``base`` by ``meet``. A conditional whose
     predicate is not implied leaves ``base`` untouched, so activation only ever adds
-    information and never over-claims.
+    information and never over-claims. The filter's constraints are folded once for the
+    whole batch, since one relation entails its many conditionals against one flow.
     """
+    entails = entailment_checker(flow_atoms)
     result = base
     for value, predicate in conditionals:
-        if entails_atoms(flow_atoms, predicate):
+        if entails(predicate):
             result = meet(result, value)
     return result

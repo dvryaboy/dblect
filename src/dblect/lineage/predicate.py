@@ -23,6 +23,7 @@ pins it directly with PBTs that sample concrete worlds across the fragment
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -177,31 +178,32 @@ def implies(strong: Expr, weak: Expr) -> bool:
     return _entails(cmp_atoms, in_sets, weak)
 
 
-def entails(strong_atoms: frozenset[Canon], weak: Expr) -> bool:
-    """Whether the conjunction of ``strong_atoms`` implies ``weak``.
+def entailment_checker(strong_atoms: frozenset[Canon]) -> Callable[[frozenset[Canon]], bool]:
+    """A tester for "does ``strong_atoms`` entail this weak atom-set", with the strong
+    side's interval / ``IN`` constraints folded once.
 
-    The atom-set form of :func:`implies`, for a caller (the predicate-flow activation
-    step) that already holds a relation's accumulated filter as atoms. ``strong`` is a
-    conjunction, so there is no disjunctive-strong case to distribute; ``weak`` is
-    still decomposed by its boolean structure.
+    The activation step entails many conditional predicates against one relation's
+    accumulated filter, so collecting that filter's constraints per predicate is wasted
+    work. This folds the strong side once and returns a closure over many weak sets.
+    Each weak atom is entailed when ``strong`` carries it verbatim (the syntactic case,
+    the only route for an :class:`OpaqueAtom`) or when the collected constraints on its
+    term entail it.
     """
-    weak = _unparen(weak)
-    if isinstance(weak, exp.And):
-        return entails(strong_atoms, weak.left) and entails(strong_atoms, weak.right)
-    if isinstance(weak, exp.Or):
-        return entails(strong_atoms, weak.left) or entails(strong_atoms, weak.right)
-    return entails_atoms(strong_atoms, frozenset({_canon(weak)}))
+    cmp_atoms, in_sets = _collect_canon(strong_atoms)
+
+    def check(weak_atoms: frozenset[Canon]) -> bool:
+        return all(w in strong_atoms or _entails_atom(cmp_atoms, in_sets, w) for w in weak_atoms)
+
+    return check
 
 
 def entails_atoms(strong_atoms: frozenset[Canon], weak_atoms: frozenset[Canon]) -> bool:
     """Whether the conjunction of ``strong_atoms`` implies every atom of ``weak_atoms``.
 
-    Each weak atom is entailed when ``strong`` carries it verbatim (the syntactic case,
-    the only route for an :class:`OpaqueAtom`) or when the collected interval / ``IN``
-    constraints on its term entail it.
+    The one-shot form of :func:`entailment_checker`, for a caller entailing a single
+    weak set.
     """
-    cmp_atoms, in_sets = _collect_canon(strong_atoms)
-    return all(w in strong_atoms or _entails_atom(cmp_atoms, in_sets, w) for w in weak_atoms)
+    return entailment_checker(strong_atoms)(weak_atoms)
 
 
 # --- atom extraction and column renaming -----------------------------------------

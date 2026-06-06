@@ -177,7 +177,11 @@ def make_fact_grounded_detectors(
     """
     graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
     keys = propagate(graph, uniqueness_property(manifest))
-    flow = propagate(graph, predicate_flow_property())
+    # Predicate-flow is consulted only where a conditional key waits to activate, so
+    # seed the flow pass with those scopes and let it pull in their upstreams rather
+    # than walking every relation in the graph.
+    conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
+    flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
     activated = activate_conditional(keys, flow)
     model_keys = _model_keys_by_name(manifest, activated)
     cache: dict[int, ScopeIndex] = {}

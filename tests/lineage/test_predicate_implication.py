@@ -22,7 +22,7 @@ from sqlglot import Expr
 from dblect.lineage.predicate import (
     Canon,
     atoms_of,
-    entails,
+    entailment_checker,
     entails_atoms,
     implies,
     parse_predicate,
@@ -164,7 +164,7 @@ def test_unparseable_or_empty_predicate_is_no_information() -> None:
     assert parse_predicate("???", dialect=_DIALECT) is None
 
 
-# --- entails: the atom-set form, for activation ----------------------------------
+# --- entails_atoms: the atom-set form, for activation ----------------------------
 
 
 def _strong(sql: str) -> frozenset[Canon]:
@@ -173,27 +173,31 @@ def _strong(sql: str) -> frozenset[Canon]:
     return atoms_of(parsed)
 
 
-def test_entails_proves_a_weaker_bound_from_collected_atoms() -> None:
-    assert entails(_strong("a >= 10 AND b = 3"), _p("a >= 5"))
-    assert entails(_strong("a >= 10 AND b = 3"), _p("a >= 5 AND b = 3"))
-    assert not entails(_strong("a >= 5"), _p("a >= 10"))
+def test_entails_atoms_proves_a_weaker_bound_from_collected_atoms() -> None:
+    assert entails_atoms(_strong("a >= 10 AND b = 3"), _strong("a >= 5"))
+    assert entails_atoms(_strong("a >= 10 AND b = 3"), _strong("a >= 5 AND b = 3"))
+    assert not entails_atoms(_strong("a >= 5"), _strong("a >= 10"))
 
 
-def test_entails_matches_a_conjunct_syntactically() -> None:
-    assert entails(_strong("country = 'US' AND active"), _p("country = 'US'"))
+def test_entails_atoms_matches_a_conjunct_syntactically() -> None:
+    assert entails_atoms(_strong("country = 'US' AND active"), _strong("country = 'US'"))
     # A bare boolean is opaque; only an exact-atom match proves it.
-    assert entails(_strong("active"), _p("active"))
-    assert not entails(_strong("active"), _p("inactive"))
-
-
-def test_entails_decomposes_weak_boolean_structure() -> None:
-    assert entails(_strong("a >= 10"), _p("a >= 5 OR z >= 100"))
-    assert not entails(_strong("a >= 10"), _p("a >= 5 AND b = 3"))
+    assert entails_atoms(_strong("active"), _strong("active"))
+    assert not entails_atoms(_strong("active"), _strong("inactive"))
 
 
 def test_entails_atoms_is_in_subset_aware() -> None:
     assert entails_atoms(_strong("a IN (1, 2)"), _strong("a IN (1, 2, 3)"))
     assert not entails_atoms(_strong("a IN (1, 2, 3)"), _strong("a IN (1, 2)"))
+
+
+def test_entailment_checker_reuses_one_fold_across_weak_sets() -> None:
+    # A disjunctive WHERE flattens to a single opaque atom (no AND to split), so it
+    # entails only an identical atom, not its weaker arms. This is the conservative
+    # boundary the disjunction follow-up (#61) lifts; pin it so the gap is intentional.
+    check = entailment_checker(_strong("a >= 10"))
+    assert check(_strong("a >= 5"))
+    assert not check(_strong("a >= 5 OR z >= 100"))
 
 
 # --- soundness PBT: a True verdict is never wrong --------------------------------

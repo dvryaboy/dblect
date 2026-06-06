@@ -88,6 +88,7 @@ def propagate(
     prop: Property[K, S],
     *,
     dep_context: DepContext = _NULL_DEP_CONTEXT,
+    subjects: Iterable[S] | None = None,
 ) -> Mapping[S, Annotation[K]]:
     """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
@@ -99,6 +100,13 @@ def propagate(
     triggered. A property carries its own reducer (relation scope) or falls back
     to the generic column reducer. Everything else here is shared by column- and
     relation-scoped properties alike.
+
+    ``subjects`` restricts the annotated set to a seed set; memoised recursion still
+    pulls in each seed's upstreams, so the returned map covers the seeds and
+    everything they transitively read, and nothing else. A caller that needs the
+    property only at a few scopes (activation reads predicate-flow only where
+    conditional facts live) passes those to skip the rest of the graph. The default
+    annotates every subject.
 
     Memoised per subject, so each is annotated once regardless of how many
     downstream paths touch it. A defensive cycle guard returns the property's
@@ -139,7 +147,7 @@ def propagate(
         finally:
             in_progress.discard(subject)
 
-    for subject in graph.subjects():
+    for subject in graph.subjects() if subjects is None else subjects:
         annotate(subject)
     return annotations
 
