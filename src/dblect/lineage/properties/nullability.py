@@ -49,7 +49,7 @@ from dblect.lineage.facts.property import (
     column_property,
     relation_property,
 )
-from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
 from dblect.lineage.predicate import atoms_of, parse_predicate
 from dblect.lineage.properties.predicate_flow import predicate_flow_property
 from dblect.lineage.properties.uniqueness import (
@@ -62,6 +62,9 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import ConstraintType, Manifest, ResourceType, generic_test_target_uid
+from dblect.sql import SQLParseError, parse_sql
+from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import JoinSide
 
 
 class Nullability(StrEnum):
@@ -158,6 +161,27 @@ def _null_literal_rule(
     return Annotation(Nullability.NULLABLE)
 
 
+class _OuterJoinNull(exp.Expression):  # pyright: ignore[reportPrivateImportUsage]
+    """A synthetic marker wrapping a column reference drawn from an outer join's optional
+    side. The taint rewrite (:func:`_taint_outer_joins`) inserts it into the nullability
+    graph only; the rule below reads it to taint the value NULLABLE. Other properties
+    never see it, since they run over the untainted graph. It subclasses ``Expression``
+    (the concrete base) rather than ``Func`` so the standard node constructor works."""
+
+    arg_types = {"this": True}  # noqa: RUF012 (sqlglot's arg-schema contract)
+
+
+def _outer_join_null_rule(
+    _expr: Expr, kids: tuple[Annotation[Nullability], ...], _ctx: DepContext
+) -> Annotation[Nullability]:
+    """An outer join pads its optional side with NULL on unmatched rows, so a column
+    drawn from that side is nullable whatever its source nullability. This is a positive
+    structural claim (the join's semantics admit a null here), not a fallback on
+    uncertainty. A downstream guard (COALESCE, an IS NOT NULL filter) still clears it,
+    because the guard's rule runs over this tainted child."""
+    return Annotation(Nullability.NULLABLE, provisional=any(k.provisional for k in kids))
+
+
 def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotation[Nullability]:
     """COUNT returns 0 for empty groups, never NULL."""
     return Annotation(Nullability.NON_NULL, provisional=child.provisional)
@@ -171,6 +195,7 @@ NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Is: _is_not_null_rule,
     exp.Nullif: _nullif_rule,
     exp.Null: _null_literal_rule,
+    _OuterJoinNull: _outer_join_null_rule,
 }
 NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
     exp.Count: AggregateRule(core=_count_core),
@@ -389,21 +414,97 @@ def _conditional_columns_by_relation(
     return {relation: frozenset(claims) for relation, claims in out.items()}
 
 
-def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[Nullability]]:
-    """Per-column nullability with conditional NON_NULL facts activated against the
-    predicate flow.
+# --- outer-join taint --------------------------------------------------------
+#
+# An outer join pads its optional side with NULL on unmatched rows, so a column drawn
+# from that side is nullable downstream even when it is NON_NULL at its own source. The
+# taint is a fact about the join, not the column expression, so it cannot be grounded
+# (a more precise NON_NULL inference would win the reconcile) and has to enter
+# inference. We do that by rewriting the nullability graph: each optional-side column
+# reference is wrapped in an :class:`_OuterJoinNull` marker whose rule taints NULLABLE.
+# Because the marker sits in the expression the propagator walks, the taint rides
+# downstream through every consumer and a guard (COALESCE, IS NOT NULL) still clears it.
 
-    The unconditional annotations come from the column-scoped property as usual; the
-    conditional carrier flows each ``where``-filtered NON_NULL across relations, the
-    flow says which scopes satisfy the predicate, and every activated column folds
-    NON_NULL into its annotation. No detector consumes nullability yet, so this is the
-    annotation-level entry point activation is exercised through.
+
+def _optional_join_aliases(select: exp.Select) -> set[str]:
+    """The FROM-clause aliases whose columns an outer join can pad with NULL: the
+    joined-in side of a LEFT join, the accumulated left side of a RIGHT join, both for a
+    FULL join. INNER and CROSS pad nothing. Aliases are case-folded to match the graph."""
+    from_ = select.args.get("from_") or select.args.get("from")
+    left: set[str] = set()
+    if isinstance(from_, exp.From) and isinstance(from_.this, exp.Table):
+        left.add(sg.name_of(from_.this).lower())
+    optional: set[str] = set()
+    for join in sg.joins_of(select):
+        side = sg.join_side_of(join)
+        target = join.this
+        alias = sg.name_of(target).lower() if isinstance(target, exp.Table) else None
+        if side is JoinSide.LEFT and alias is not None:
+            optional.add(alias)
+        elif side is JoinSide.RIGHT:
+            optional |= left
+        elif side is JoinSide.FULL:
+            if alias is not None:
+                optional.add(alias)
+            optional |= left
+        if alias is not None:
+            left.add(alias)
+    return optional
+
+
+def _wrap_optional_columns(expr: Expr, optional: set[str]) -> Expr:
+    """A copy of ``expr`` with every column qualified by an optional-side alias wrapped in
+    :class:`_OuterJoinNull`. Unqualified columns are left alone (the side is unknown), the
+    silent-when-unsure posture that keeps the taint from over-firing."""
+    rewritten = expr.copy()
+    targets = [c for c in rewritten.find_all(exp.Column) if c.table and c.table.lower() in optional]
+    for col in targets:
+        col.replace(_OuterJoinNull(this=col.copy()))
+    return rewritten
+
+
+def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnLineageGraph:
+    """A copy of ``graph`` whose model output expressions taint their outer-join
+    optional-side column references. Each model's top-level FROM/JOIN structure decides
+    which aliases are optional; CTE-collapsed or unparseable models are left untouched
+    (the taint then simply does not fire, a sound under-approximation)."""
+    new_expressions = dict(graph.expressions)
+    for node in manifest.nodes.values():
+        if node.resource_type is not ResourceType.MODEL:
+            continue
+        sql = node.compiled_code
+        if not sql:
+            continue
+        try:
+            tree = parse_sql(sql, dialect="duckdb")
+        except SQLParseError:
+            continue
+        select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
+        if not isinstance(select, exp.Select):
+            continue
+        optional = _optional_join_aliases(select)
+        if not optional:
+            continue
+        model_ref = SourceRef(SourceKind.MODEL, node.unique_id)
+        for ref, expr in graph.expressions.items():
+            if ref.source == model_ref:
+                new_expressions[ref] = _wrap_optional_columns(expr, optional)
+    return ColumnLineageGraph(edges=graph.edges, expressions=new_expressions)
+
+
+def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[Nullability]]:
+    """Per-column nullability with outer-join optional sides tainted NULLABLE and
+    conditional NON_NULL facts activated against the predicate flow.
+
+    The base annotations come from the column-scoped property over the outer-join-tainted
+    graph, so an optional-side column reads NULLABLE even when its source is NON_NULL. On
+    top of that, the conditional carrier flows each ``where``-filtered NON_NULL across
+    relations, the flow says which scopes satisfy the predicate, and every activated
+    column folds NON_NULL into its annotation. No detector consumes nullability yet, so
+    this is the annotation-level entry point both refinements are exercised through.
     """
-    base = dict(
-        propagate(
-            build_manifest_graph(manifest).graph, nullability_property(manifest, name_to_source={})
-        )
-    )
+    tainted = _taint_outer_joins(build_manifest_graph(manifest).graph, manifest)
+    base = dict(propagate(tainted, nullability_property(manifest, name_to_source={})))
     relation_graph = build_relation_graph(manifest).graph
     carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest))
     # Flow is consulted only where a conditional claim waits to activate, so seed the
