@@ -24,11 +24,12 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.lineage.builder import build_relation_graph
-from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import SourceKind, SourceRef
+from dblect.lineage.properties.predicate_flow import predicate_flow_property
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
+    activate_conditional,
     relation_scope_keys,
     uniqueness_property,
 )
@@ -175,8 +176,14 @@ def make_fact_grounded_detectors(
     most once per tree no matter how many detectors consume it.
     """
     graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
-    anns = propagate(graph, uniqueness_property(manifest))
-    model_keys = _model_keys_by_name(manifest, anns)
+    keys = propagate(graph, uniqueness_property(manifest))
+    # Predicate-flow is consulted only where a conditional key waits to activate, so
+    # seed the flow pass with those scopes and let it pull in their upstreams rather
+    # than walking every relation in the graph.
+    conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
+    flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
+    activated = activate_conditional(keys, flow)
+    model_keys = _model_keys_by_name(manifest, activated)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -198,7 +205,7 @@ def make_fact_grounded_detectors(
 
 
 def _model_keys_by_name(
-    manifest: Manifest, anns: Mapping[SourceRef, Annotation[CandidateKeySet]]
+    manifest: Manifest, anns: Mapping[SourceRef, CandidateKeySet]
 ) -> dict[str, frozenset[Key]]:
     """Index propagated keys by the relation name as it appears in compiled SQL.
 
@@ -211,12 +218,12 @@ def _model_keys_by_name(
     """
     by_name: dict[str, frozenset[Key]] = {}
     models: dict[str, frozenset[Key]] = {}
-    for ref, ann in anns.items():
+    for ref, cks in anns.items():
         node = manifest.nodes.get(ref.unique_id)
         if node is None:
             continue
         target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = ann.value.keys
+        target[node.identifier or node.name] = cks.keys
     by_name.update(models)
     return by_name
 

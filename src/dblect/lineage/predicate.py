@@ -23,6 +23,7 @@ pins it directly with PBTs that sample concrete worlds across the fragment
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -175,6 +176,34 @@ def implies(strong: Expr, weak: Expr) -> bool:
         return True
     cmp_atoms, in_sets = _collect(conjuncts)
     return _entails(cmp_atoms, in_sets, weak)
+
+
+def entailment_checker(strong_atoms: frozenset[Canon]) -> Callable[[frozenset[Canon]], bool]:
+    """A tester for "does ``strong_atoms`` entail this weak atom-set", with the strong
+    side's interval / ``IN`` constraints folded once.
+
+    The activation step entails many conditional predicates against one relation's
+    accumulated filter, so collecting that filter's constraints per predicate is wasted
+    work. This folds the strong side once and returns a closure over many weak sets.
+    Each weak atom is entailed when ``strong`` carries it verbatim (the syntactic case,
+    the only route for an :class:`OpaqueAtom`) or when the collected constraints on its
+    term entail it.
+    """
+    cmp_atoms, in_sets = _collect_canon(strong_atoms)
+
+    def check(weak_atoms: frozenset[Canon]) -> bool:
+        return all(w in strong_atoms or _entails_atom(cmp_atoms, in_sets, w) for w in weak_atoms)
+
+    return check
+
+
+def entails_atoms(strong_atoms: frozenset[Canon], weak_atoms: frozenset[Canon]) -> bool:
+    """Whether the conjunction of ``strong_atoms`` implies every atom of ``weak_atoms``.
+
+    The one-shot form of :func:`entailment_checker`, for a caller entailing a single
+    weak set.
+    """
+    return entailment_checker(strong_atoms)(weak_atoms)
 
 
 # --- atom extraction and column renaming -----------------------------------------
@@ -351,25 +380,55 @@ def _collect(
     return cmp_atoms, in_sets
 
 
+def _collect_canon(
+    atoms: frozenset[Canon],
+) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]]]:
+    """The same fold as :func:`_collect`, over already-canonicalised atoms. An
+    :class:`OpaqueAtom` contributes nothing to interval reasoning; it is matched only
+    syntactically by the caller."""
+    cmp_atoms: dict[Term, list[tuple[Op, Lit]]] = {}
+    in_sets: dict[Term, frozenset[Lit]] = {}
+    for atom in atoms:
+        if isinstance(atom, CmpAtom):
+            cmp_atoms.setdefault(atom.term, []).append((atom.op, atom.lit))
+        elif isinstance(atom, InAtom):
+            prior = in_sets.get(atom.term)
+            in_sets[atom.term] = atom.values if prior is None else (prior & atom.values)
+    return cmp_atoms, in_sets
+
+
 def _entails(
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
     in_sets: dict[Term, frozenset[Lit]],
     weak: Expr,
 ) -> bool:
-    atom = _as_atom(weak)
-    if atom is not None:
-        if _interval_entails(cmp_atoms.get(atom.term, []), atom.op, atom.lit):
+    atom = _as_atom(weak) or _as_in(weak)
+    return atom is not None and _entails_atom(cmp_atoms, in_sets, atom)
+
+
+def _entails_atom(
+    cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
+    in_sets: dict[Term, frozenset[Lit]],
+    weak: Canon,
+) -> bool:
+    """Whether the collected constraints entail one canonical ``weak`` atom. An
+    :class:`OpaqueAtom` is never entailed here; it only matches by membership."""
+    if isinstance(weak, CmpAtom):
+        if _interval_entails(cmp_atoms.get(weak.term, []), weak.op, weak.lit):
             return True
-        in_set = in_sets.get(atom.term)
-        return in_set is not None and _set_entails(in_set, atom.op, atom.lit)
-    in_atom = _as_in(weak)
-    if in_atom is not None:
-        have = in_sets.get(in_atom.term)
-        if have is not None and have <= in_atom.values:
+        in_set = in_sets.get(weak.term)
+        return in_set is not None and _set_entails(in_set, weak.op, weak.lit)
+    if isinstance(weak, InAtom):
+        have = in_sets.get(weak.term)
+        if have is not None and have <= weak.values:
             return True
-        iv = _interval(cmp_atoms.get(in_atom.term, []))
-        if iv is not None and _is_point(iv) and iv.lo is not None:
-            return Lit(iv.kind, iv.lo) in in_atom.values
+        iv = _interval(cmp_atoms.get(weak.term, []))
+        return (
+            iv is not None
+            and _is_point(iv)
+            and iv.lo is not None
+            and Lit(iv.kind, iv.lo) in weak.values
+        )
     return False
 
 

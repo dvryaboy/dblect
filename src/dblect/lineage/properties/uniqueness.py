@@ -46,6 +46,9 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
+from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
+from dblect.lineage.properties.activation import activate
+from dblect.lineage.properties.predicate_flow import RowFilter
 from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
@@ -62,18 +65,36 @@ Key = frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
+class ConditionalKey:
+    """A candidate key that holds only over the rows matching ``predicate``.
+
+    A ``where``-filtered ``unique`` test grounds one of these rather than an
+    unconditional key. It is carried (never folded into ``keys``) until a scope's
+    flowed row filter implies ``predicate``, at which point activation promotes it.
+    ``predicate`` is the test's ``where`` parsed to the engine's atoms, so it feeds
+    :func:`~dblect.lineage.predicate.entails_atoms` directly.
+    """
+
+    key: Key
+    predicate: frozenset[Canon]
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateKeySet:
     """The set of candidate keys a relation is known to be unique on.
 
-    ``keys`` holds the known keys; the empty set is the lattice ``top`` ("no key
-    known"). ``is_bottom`` marks the formal universal element (the lattice
-    ``bottom``): it absorbs under ``meet`` and is the identity under ``join``, and
-    no resolution of real declarations reaches it, since uniqueness claims only
-    ever union. Equality is structural, so ``CandidateKeySet(frozenset())`` (top)
-    and the bottom sentinel are distinct values.
+    ``keys`` holds the unconditionally known keys; the empty set is the lattice
+    ``top`` ("no key known"). ``conditional`` carries keys that hold only over a row
+    filter, captured for activation and never counted among ``keys`` until promoted.
+    ``is_bottom`` marks the formal universal element (the lattice ``bottom``): it
+    absorbs under ``meet`` and is the identity under ``join``, and no resolution of
+    real declarations reaches it, since uniqueness claims only ever union. Equality
+    is structural, so ``CandidateKeySet(frozenset())`` (top) and the bottom sentinel
+    are distinct values.
     """
 
     keys: frozenset[Key]
+    conditional: frozenset[ConditionalKey] = frozenset()
     is_bottom: bool = False
 
     @staticmethod
@@ -92,18 +113,20 @@ ALL_KEYS: CandidateKeySet = CandidateKeySet(frozenset(), is_bottom=True)
 
 
 def _meet(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
-    """Most precise value consistent with both: union of the known keys.
+    """Most precise value consistent with both: union of the known keys (and of the
+    carried conditional keys, which also only ever accumulate).
 
     Bottom annihilates (it already "knows" every key), so a meet touching bottom
     stays bottom.
     """
     if a.is_bottom or b.is_bottom:
         return ALL_KEYS
-    return CandidateKeySet(a.keys | b.keys)
+    return CandidateKeySet(a.keys | b.keys, a.conditional | b.conditional)
 
 
 def _join(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
-    """Least precise value both refine: the keys both sides carry (intersection).
+    """Least precise value both refine: the keys both sides carry (intersection),
+    conditional keys likewise.
 
     Bottom is the identity (it refines nothing finer than the other side), so a
     join with bottom returns the other operand.
@@ -112,7 +135,7 @@ def _join(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
         return b
     if b.is_bottom:
         return a
-    return CandidateKeySet(a.keys & b.keys)
+    return CandidateKeySet(a.keys & b.keys, a.conditional & b.conditional)
 
 
 UNIQUENESS_LATTICE: Lattice[CandidateKeySet] = Lattice(
@@ -650,7 +673,79 @@ def uniqueness_property(
         lattice=UNIQUENESS_LATTICE,
         operators={},
         aggregates={},
-        ground=grounding(facts, opaque=set(), lat=UNIQUENESS_LATTICE),
+        ground=_grounding_with_conditional(facts),
         reconcile_by_meet=True,
         reducer=_relation_reduce,
     )
+
+
+def _grounding_with_conditional(
+    facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> Callable[[SourceRef], Annotation[CandidateKeySet]]:
+    """The shared grounding, extended to carry each scope's conditional keys.
+
+    The shared ``grounding`` folds only unconditional facts, so a ``where``-filtered
+    ``unique`` would ground nothing. Here those conditional facts become the value's
+    ``conditional`` payload, marked CONCRETE so reconcile keeps it (an IMPLICIT
+    grounded value is discarded in favour of the inferred one). The payload rides
+    along until activation promotes it; it never counts as an unconditional key.
+    """
+    base = grounding(facts, opaque=set(), lat=UNIQUENESS_LATTICE)
+    conditional = _conditional_by_scope(facts)
+
+    def ground(scope: SourceRef) -> Annotation[CandidateKeySet]:
+        ann = base(scope)
+        cond = conditional.get(scope)
+        if cond is None or ann.opacity is Opacity.EXPLICIT:
+            return ann
+        return Annotation(CandidateKeySet(ann.value.keys, cond), Opacity.CONCRETE, ann.provisional)
+
+    return ground
+
+
+def _conditional_by_scope(
+    facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> dict[SourceRef, frozenset[ConditionalKey]]:
+    """The conditional candidate keys captured per scope, with each test's ``where``
+    parsed to atoms. A predicate that does not parse carries no information, so its
+    key is dropped rather than activated on a guess."""
+    out: dict[SourceRef, frozenset[ConditionalKey]] = {}
+    for scope, bucket in facts.items():
+        cks: set[ConditionalKey] = set()
+        for fact in bucket:
+            if fact.condition is None:
+                continue
+            parsed = parse_predicate(fact.condition.sql)
+            if parsed is None:
+                continue
+            predicate = atoms_of(parsed)
+            cks.update(ConditionalKey(key, predicate) for key in fact.value.keys)
+        if cks:
+            out[scope] = frozenset(cks)
+    return out
+
+
+def activate_conditional(
+    keys: Mapping[SourceRef, Annotation[CandidateKeySet]],
+    flow: Mapping[SourceRef, Annotation[RowFilter]],
+) -> dict[SourceRef, CandidateKeySet]:
+    """Promote each relation's conditional keys whose predicate its flowed filter
+    implies, leaving the carried conditional payload in place for scopes downstream.
+
+    The promoted key folds in by the uniqueness ``meet`` (a union), exactly as a
+    declared key would, so a relation that defines its own filter and carries a
+    matching ``where``-filtered ``unique`` gains that key unconditionally.
+    """
+    out: dict[SourceRef, CandidateKeySet] = {}
+    for ref, ann in keys.items():
+        value = ann.value
+        flow_ann = flow.get(ref)
+        flow_atoms = flow_ann.value.atoms if flow_ann is not None else frozenset[Canon]()
+        promoted = activate(
+            value,
+            ((CandidateKeySet.of(ck.key), ck.predicate) for ck in value.conditional),
+            flow_atoms,
+            _meet,
+        )
+        out[ref] = promoted
+    return out

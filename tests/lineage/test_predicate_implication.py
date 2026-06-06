@@ -19,7 +19,14 @@ from hypothesis import given
 from hypothesis import strategies as st
 from sqlglot import Expr
 
-from dblect.lineage.predicate import implies, parse_predicate
+from dblect.lineage.predicate import (
+    Canon,
+    atoms_of,
+    entailment_checker,
+    entails_atoms,
+    implies,
+    parse_predicate,
+)
 
 _DIALECT = "duckdb"
 
@@ -155,6 +162,42 @@ def test_disjunction_in_strong_needs_every_arm() -> None:
 
 def test_unparseable_or_empty_predicate_is_no_information() -> None:
     assert parse_predicate("???", dialect=_DIALECT) is None
+
+
+# --- entails_atoms: the atom-set form, for activation ----------------------------
+
+
+def _strong(sql: str) -> frozenset[Canon]:
+    parsed = parse_predicate(sql, dialect=_DIALECT)
+    assert parsed is not None
+    return atoms_of(parsed)
+
+
+def test_entails_atoms_proves_a_weaker_bound_from_collected_atoms() -> None:
+    assert entails_atoms(_strong("a >= 10 AND b = 3"), _strong("a >= 5"))
+    assert entails_atoms(_strong("a >= 10 AND b = 3"), _strong("a >= 5 AND b = 3"))
+    assert not entails_atoms(_strong("a >= 5"), _strong("a >= 10"))
+
+
+def test_entails_atoms_matches_a_conjunct_syntactically() -> None:
+    assert entails_atoms(_strong("country = 'US' AND active"), _strong("country = 'US'"))
+    # A bare boolean is opaque; only an exact-atom match proves it.
+    assert entails_atoms(_strong("active"), _strong("active"))
+    assert not entails_atoms(_strong("active"), _strong("inactive"))
+
+
+def test_entails_atoms_is_in_subset_aware() -> None:
+    assert entails_atoms(_strong("a IN (1, 2)"), _strong("a IN (1, 2, 3)"))
+    assert not entails_atoms(_strong("a IN (1, 2, 3)"), _strong("a IN (1, 2)"))
+
+
+def test_entailment_checker_reuses_one_fold_across_weak_sets() -> None:
+    # A disjunctive WHERE flattens to a single opaque atom (no AND to split), so it
+    # entails only an identical atom, not its weaker arms. This is the conservative
+    # boundary the disjunction follow-up (#61) lifts; pin it so the gap is intentional.
+    check = entailment_checker(_strong("a >= 10"))
+    assert check(_strong("a >= 5"))
+    assert not check(_strong("a >= 5 OR z >= 100"))
 
 
 # --- soundness PBT: a True verdict is never wrong --------------------------------
