@@ -232,7 +232,9 @@ def _scenario(draw: st.DrawFn) -> Scenario:
         )
     else:  # group_by | distinct
         cols = tuple(
-            sorted(draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True)))
+            sorted(
+                draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True))
+            )
         )
         select = (*cols, "n") if shape == "group_by" else cols
         model = ModelSpec(shape=shape, select_cols=select, group_cols=cols)
