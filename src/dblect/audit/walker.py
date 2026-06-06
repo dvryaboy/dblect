@@ -25,6 +25,7 @@ from sqlglot import Expr
 
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node
+from dblect.nullability.detector import make_nullability_detectors
 from dblect.sql import (
     Finding,
     FindingKind,
@@ -108,15 +109,19 @@ def run_audit(
     Models whose ``compiled_code`` is missing or unparseable are listed in
     the report's ``skipped`` field with a reason rather than raising.
 
-    Fact-grounded detectors (window order-keys, join fanout, both grounded
-    against declared uniqueness keys on the source model) run alongside the
-    configured `detectors` list. They're silent on projects without declared
-    uniqueness facts, so they don't need an opt-in flag.
+    Fact-grounded detectors run alongside the configured `detectors` list: the
+    uniqueness window order-keys and join-fanout detectors (grounded against
+    declared keys), and the nullability GROUP-BY-on-an-inherited-nullable-key
+    detector (grounded against the propagated nullability property). All are
+    opportunistic, silent on projects that declare nothing, so they need no
+    opt-in flag. They share the audit's pre-parsed trees, so the SQL is parsed
+    once.
     """
     parsed = _parse_models_for_audit(manifest, dialect=dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
     fact_grounded = make_fact_grounded_detectors(manifest, dialect=dialect, parsed=trees)
-    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded)
+    nullability = make_nullability_detectors(manifest, dialect=dialect, parsed=trees)
+    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded, *nullability)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []

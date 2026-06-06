@@ -40,6 +40,7 @@ class FindingKind(StrEnum):
     NON_DETERMINISTIC_FUNCTION = "non_deterministic_function"
     NON_UNIQUE_WINDOW_ORDER_KEYS = "non_unique_window_order_keys"
     JOIN_FANOUT = "join_fanout"
+    NULL_GROUP_ON_NULLABLE_KEY = "null_group_on_nullable_key"
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 

@@ -477,11 +477,17 @@ def _wrap_optional_columns(expr: Expr, optional: set[str]) -> Expr:
     return rewritten
 
 
-def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnLineageGraph:
+def _taint_outer_joins(
+    graph: ColumnLineageGraph,
+    manifest: Manifest,
+    *,
+    parsed: Mapping[str, Expr] | None = None,
+) -> ColumnLineageGraph:
     """A copy of ``graph`` whose model output expressions taint their outer-join
     optional-side column references. Each model's top-level FROM/JOIN structure decides
     which aliases are optional; CTE-collapsed or unparseable models are left untouched
-    (the taint then simply does not fire, a sound under-approximation)."""
+    (the taint then simply does not fire, a sound under-approximation). ``parsed`` shares
+    the audit's already-parsed trees so the join analysis re-parses nothing."""
     refs_by_source: dict[SourceRef, list[ColumnRef]] = {}
     for ref in graph.expressions:
         refs_by_source.setdefault(ref.source, []).append(ref)
@@ -492,10 +498,12 @@ def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnL
         sql = node.compiled_code
         if not sql:
             continue
-        try:
-            tree = parse_sql(sql, dialect="duckdb")
-        except SQLParseError:
-            continue
+        tree = parsed.get(node.unique_id) if parsed is not None else None
+        if tree is None:
+            try:
+                tree = parse_sql(sql, dialect="duckdb")
+            except SQLParseError:
+                continue
         select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
         if not isinstance(select, exp.Select):
             continue
@@ -508,7 +516,9 @@ def _taint_outer_joins(graph: ColumnLineageGraph, manifest: Manifest) -> ColumnL
     return ColumnLineageGraph(edges=graph.edges, expressions=new_expressions)
 
 
-def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[Nullability]]:
+def activated_nullability(
+    manifest: Manifest, *, parsed: Mapping[str, Expr] | None = None
+) -> Mapping[ColumnRef, Annotation[Nullability]]:
     """Per-column nullability with outer-join optional sides tainted NULLABLE and
     conditional NON_NULL facts activated against the predicate flow.
 
@@ -516,12 +526,14 @@ def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[N
     graph, so an optional-side column reads NULLABLE even when its source is NON_NULL. On
     top of that, the conditional carrier flows each ``where``-filtered NON_NULL across
     relations, the flow says which scopes satisfy the predicate, and every activated
-    column folds NON_NULL into its annotation. No detector consumes nullability yet, so
-    this is the annotation-level entry point both refinements are exercised through.
+    column folds NON_NULL into its annotation. ``parsed`` shares the audit's already-parsed
+    trees so the whole pass re-parses nothing; the nullability detectors are its consumer.
     """
-    tainted = _taint_outer_joins(build_manifest_graph(manifest).graph, manifest)
+    tainted = _taint_outer_joins(
+        build_manifest_graph(manifest, parsed=parsed).graph, manifest, parsed=parsed
+    )
     base = dict(propagate(tainted, nullability_property(manifest, name_to_source={})))
-    relation_graph = build_relation_graph(manifest).graph
+    relation_graph = build_relation_graph(manifest, parsed=parsed).graph
     carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest))
     # Flow is consulted only where a conditional claim waits to activate, so seed the
     # flow pass with those scopes and let it pull in their upstreams rather than walking
