@@ -115,7 +115,7 @@ def _kinds(mart_sql: str) -> list[FindingKind]:
 # ``other.k`` are NON_NULL. Each detector fires on the nullable key and stays silent on the
 # non-null one. The local-outer-join GROUP BY is left to the structural detector, since
 # this layer reasons only about single-source, join-free scopes.
-_CASES: list[tuple[str, FindingKind, bool]] = [
+_CASES: list[tuple[str, str, bool]] = [
     ("group-by/nullable", "SELECT tag, count(*) AS n FROM stg GROUP BY tag", True),
     ("group-by/non-null", "SELECT id, count(*) AS n FROM stg GROUP BY id", False),
     (
