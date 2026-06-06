@@ -5,25 +5,33 @@ asserts the propagator agrees; the scenario tests pin specific shapes. Neither
 gives a shape-independent, ground-truth guarantee of the one invariant that must
 never break: **a promoted candidate key is genuinely unique over real rows.**
 
-This test closes that gap. It generates a small dbt-shaped scenario (sources with
-``unique`` declarations plus one model that filters, joins, groups, or
-de-duplicates), generates row data, runs the analyzer to get the model's promoted
-keys, then materializes the model against the data in duckdb and asserts every
-promoted key has no duplicate tuples. The oracle is the data, so unsoundness in
-the join, group-by, distinct, or filter rules surfaces uniformly and for free as
-new shapes are added, with no rule restated in the test.
+This test closes that gap. It generates a small dbt-shaped scenario, runs the
+analyzer to get the model's promoted keys (with conditional activation, exactly as
+the audit path derives them), then materializes the model against generated data in
+duckdb and asserts every promoted key has no duplicate tuples. The oracle is the
+data, so unsoundness in the join, group-by, distinct, filter, or conditional
+activation rules surfaces uniformly and for free as new shapes are added, with no
+rule restated in the test.
+
+Two generators feed one soundness checker:
+
+* **Unconditional shapes** (``_scenario``): one model over one or two sources with
+  ``unique`` declarations, in the filter / inner-join / left-join / group-by /
+  distinct forms.
+* **Conditional activation** (``_cond_scenario``): a ``where``-filtered ``unique``
+  on a source whose downstream model applies a filter that may or may not imply the
+  predicate. Source data honors the conditional declaration (``id`` is distinct only
+  within the predicate subset), so if activation promotes the key when the filter
+  does not actually restrict to that subset, the materialized rows carry a duplicate
+  and the check fails.
 
 This guards false positives (over-claiming a key), the soundness invariant.
-Completeness (finding the keys we should) stays the job of the analytic and
-scenario tests. The generator stays inside a grammar we control so the SQL always
-executes, following the valid-SQL discipline of ``test_pbt_lineage.py``.
-
-Scope of this first cut: single model over one or two sources, ``unique``
-single-column declarations, and the filter / inner-join / left-join / group-by /
-distinct shapes. Source data is generated non-null, so a declared-``unique``
-column is a genuine key (the ``unique``-with-nulls question, where dbt's test
-permits repeated nulls, is a separate axis left for a later extension). Conditional
-(``where``-filtered) declarations and their activation are the next extension.
+Completeness (finding the keys we should) stays the job of the analytic and scenario
+tests. Generators stay inside a grammar we control so the SQL always executes,
+following the valid-SQL discipline of ``test_pbt_lineage.py``. Source data is
+non-null, so a declared-``unique`` column is a genuine key (the ``unique``-with-nulls
+question, where dbt's test permits repeated nulls, is a separate axis left for
+later). Multi-model chains are the next extension.
 """
 
 from __future__ import annotations
@@ -37,15 +45,115 @@ from hypothesis import strategies as st
 
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind, SourceRef
-from dblect.lineage.properties.uniqueness import Key, uniqueness_property
+from dblect.lineage.properties.predicate_flow import predicate_flow_property
+from dblect.lineage.properties.uniqueness import (
+    Key,
+    activate_conditional,
+    uniqueness_property,
+)
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 
-# Two sources, each a key column (declared unique) plus two plain columns. The
-# plain columns range over a small domain so joins both match and miss and the
-# joined side can carry duplicates on a non-key column.
-_KEY_DOMAIN = 64  # distinct key values to draw from; large enough to stay unique
-_PLAIN_DOMAIN = 4  # small, to force join matches, misses, and duplicates
+_MODEL_UID = "model.test.m"
+
+# --- shared analyzer + duckdb oracle ----------------------------------------------
+
+# A materialized table: its name, its column names, and its rows (non-null ints).
+Table = tuple[str, tuple[str, ...], tuple[tuple[int, ...], ...]]
+
+
+def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
+    """The model's promoted candidate keys, exactly as the audit path derives them:
+    propagate uniqueness and predicate-flow, then activate conditional keys."""
+    graph = build_relation_graph(manifest).graph
+    keys = propagate(graph, uniqueness_property(manifest))
+    flow = propagate(graph, predicate_flow_property())
+    activated = activate_conditional(keys, flow)
+    return activated[SourceRef(SourceKind.MODEL, _MODEL_UID)].keys
+
+
+def _assert_keys_sound(tables: Sequence[Table], model_sql: str, keys: frozenset[Key]) -> None:
+    """Materialize ``tables`` and the model in duckdb; assert every key in ``keys`` has
+    as many distinct key tuples as the model has rows (so it is genuinely unique)."""
+    con = duckdb.connect(":memory:")
+    try:
+        for name, cols, rows in tables:
+            con.execute(f"CREATE TABLE {name} ({', '.join(f'{c} INTEGER' for c in cols)})")
+            if rows:
+                placeholders = ", ".join(["?"] * len(cols))
+                con.executemany(
+                    f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows]
+                )
+        con.execute(f"CREATE TABLE _m AS {model_sql}")
+        total_row = con.execute("SELECT COUNT(*) FROM _m").fetchone()
+        assert total_row is not None
+        total = total_row[0]
+        for key in keys:
+            cols = ", ".join(sorted(key))
+            distinct_row = con.execute(
+                f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)"
+            ).fetchone()
+            assert distinct_row is not None
+            assert distinct_row[0] == total, (
+                f"unsound key {sorted(key)}: {total} rows but {distinct_row[0]} distinct tuples "
+                f"for sql={model_sql!r} tables={tables!r}"
+            )
+    finally:
+        con.close()
+
+
+def _source_node(name: str, schema: str = "raw") -> Node:
+    return Node(
+        unique_id=f"source.test.{schema}.{name}",
+        name=name,
+        resource_type=ResourceType.SOURCE,
+        fqn=("test", name),
+        package_name="test",
+        schema=schema,
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+    )
+
+
+def _unique_test(source_name: str, *, column: str, where: str | None = None) -> Node:
+    target = f"source.test.raw.{source_name}"
+    suffix = "_cond" if where is not None else ""
+    return Node(
+        unique_id=f"test.test.{source_name}_{column}_unique{suffix}",
+        name=f"{source_name}_{column}_unique{suffix}",
+        resource_type=ResourceType.OTHER,
+        fqn=("test", f"{source_name}_{column}_unique"),
+        package_name="test",
+        schema=None,
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
+        attached_node=target,
+    )
+
+
+def _model_node(sql: str, *, depends_on: frozenset[str]) -> Node:
+    return Node(
+        unique_id=_MODEL_UID,
+        name="m",
+        resource_type=ResourceType.MODEL,
+        fqn=("test", "m"),
+        package_name="test",
+        schema="analytics",
+        raw_code=sql,
+        compiled_code=sql,
+        original_file_path=None,
+        columns={},
+        depends_on=depends_on,
+    )
+
+
+# --- unconditional shapes ---------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -61,18 +169,12 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """One generated model. ``shape`` selects the SQL form; the remaining fields
-    carry the choices that shape needs (a join column, a group-by set, etc.)."""
-
     shape: str  # filter | inner_join | left_join | group_by | distinct
-    select_cols: tuple[str, ...]  # output columns (bare, unqualified across sources)
-    # join shapes:
+    select_cols: tuple[str, ...]
     left_join_col: str | None = None
     right_join_col: str | None = None
-    # filter shape:
     filter_col: str | None = None
     filter_threshold: int | None = None
-    # group_by / distinct shapes:
     group_cols: tuple[str, ...] | None = None
 
 
@@ -80,25 +182,23 @@ class ModelSpec:
 class Scenario:
     sources: tuple[SourceSpec, ...]
     model: ModelSpec
-    # Row data per source name, each row a tuple aligned with source.columns.
     data: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...]
 
 
 _S0 = SourceSpec(name="s0", key_col="k0", plain_cols=("a0", "b0"))
 _S1 = SourceSpec(name="s1", key_col="k1", plain_cols=("a1", "b1"))
+_KEY_DOMAIN = 64
+_PLAIN_DOMAIN = 4
 
 
 @st.composite
 def _rows(draw: st.DrawFn, source: SourceSpec) -> tuple[tuple[int, ...], ...]:
-    """Generate rows for a source: the key column is a distinct non-null int (so the
-    ``unique`` declaration is a true key), every other column a small-domain int."""
+    """Rows for a source: the key column is distinct non-null (so ``unique`` is a true
+    key), every other column a small-domain int (to force join matches and duplicates)."""
     n = draw(st.integers(min_value=0, max_value=8))
     keys = draw(
         st.lists(
-            st.integers(min_value=0, max_value=_KEY_DOMAIN - 1),
-            min_size=n,
-            max_size=n,
-            unique=True,
+            st.integers(min_value=0, max_value=_KEY_DOMAIN - 1), min_size=n, max_size=n, unique=True
         )
     )
     rows: list[tuple[int, ...]] = []
@@ -117,16 +217,11 @@ def _scenario(draw: st.DrawFn) -> Scenario:
     sources = (_S0, _S1) if is_join else (_S0,)
 
     if is_join:
-        # Join an s0 column to an s1 column. Coverage (and thus key survival) holds
-        # only when the right side is its key; the generator picks freely so the
-        # analyzer's coverage logic is what is under test, and the data is the judge.
-        left_join_col = draw(st.sampled_from(_S0.columns))
-        right_join_col = draw(st.sampled_from(_S1.columns))
         model = ModelSpec(
             shape=shape,
             select_cols=("k0", "a1"),
-            left_join_col=left_join_col,
-            right_join_col=right_join_col,
+            left_join_col=draw(st.sampled_from(_S0.columns)),
+            right_join_col=draw(st.sampled_from(_S1.columns)),
         )
     elif shape == "filter":
         model = ModelSpec(
@@ -135,22 +230,18 @@ def _scenario(draw: st.DrawFn) -> Scenario:
             filter_col=draw(st.sampled_from(_S0.columns)),
             filter_threshold=draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN)),
         )
-    elif shape == "group_by":
-        group_cols = tuple(
-            sorted(draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True)))
-        )
-        model = ModelSpec(shape=shape, select_cols=(*group_cols, "n"), group_cols=group_cols)
-    else:  # distinct
+    else:  # group_by | distinct
         cols = tuple(
             sorted(draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True)))
         )
-        model = ModelSpec(shape=shape, select_cols=cols, group_cols=cols)
+        select = (*cols, "n") if shape == "group_by" else cols
+        model = ModelSpec(shape=shape, select_cols=select, group_cols=cols)
 
     data = tuple((s.name, draw(_rows(s))) for s in sources)
     return Scenario(sources=sources, model=model, data=data)
 
 
-def _model_sql(m: ModelSpec) -> str:
+def _scenario_sql(m: ModelSpec) -> str:
     if m.shape in ("inner_join", "left_join"):
         join = "INNER JOIN" if m.shape == "inner_join" else "LEFT JOIN"
         return (
@@ -159,135 +250,118 @@ def _model_sql(m: ModelSpec) -> str:
         )
     if m.shape == "filter":
         return f"SELECT k0, a0 FROM s0 WHERE {m.filter_col} >= {m.filter_threshold}"
-    if m.shape == "group_by":
-        assert m.group_cols is not None
-        cols = ", ".join(m.group_cols)
-        return f"SELECT {cols}, COUNT(*) AS n FROM s0 GROUP BY {cols}"
-    # distinct
     assert m.group_cols is not None
-    return f"SELECT DISTINCT {', '.join(m.group_cols)} FROM s0"
+    cols = ", ".join(m.group_cols)
+    if m.shape == "group_by":
+        return f"SELECT {cols}, COUNT(*) AS n FROM s0 GROUP BY {cols}"
+    return f"SELECT DISTINCT {cols} FROM s0"
 
 
-def _source_node(s: SourceSpec) -> Node:
-    return Node(
-        unique_id=f"source.test.raw.{s.name}",
-        name=s.name,
-        resource_type=ResourceType.SOURCE,
-        fqn=("test", s.name),
-        package_name="test",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _unique_test(s: SourceSpec) -> Node:
-    target = f"source.test.raw.{s.name}"
-    return Node(
-        unique_id=f"test.test.{s.name}_{s.key_col}_unique",
-        name=f"{s.name}_{s.key_col}_unique",
-        resource_type=ResourceType.OTHER,
-        fqn=("test", f"{s.name}_{s.key_col}_unique"),
-        package_name="test",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-        depends_on=frozenset({target}),
-        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": s.key_col}),
-        attached_node=target,
-    )
-
-
-def _model_node(s: Scenario) -> Node:
-    sql = _model_sql(s.model)
-    return Node(
-        unique_id="model.test.m",
-        name="m",
-        resource_type=ResourceType.MODEL,
-        fqn=("test", "m"),
-        package_name="test",
-        schema="analytics",
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        depends_on=frozenset(f"source.test.raw.{src.name}" for src in s.sources),
-    )
-
-
-def _manifest(s: Scenario) -> Manifest:
+def _scenario_manifest(s: Scenario) -> Manifest:
     nodes: list[Node] = []
     for src in s.sources:
-        nodes.append(_source_node(src))
-        nodes.append(_unique_test(src))
-    nodes.append(_model_node(s))
+        nodes.append(_source_node(src.name))
+        nodes.append(_unique_test(src.name, column=src.key_col))
+    nodes.append(
+        _model_node(
+            _scenario_sql(s.model),
+            depends_on=frozenset(f"source.test.raw.{src.name}" for src in s.sources),
+        )
+    )
     return Manifest(
         schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
     )
 
 
-def _promoted_keys(s: Scenario) -> frozenset[Key]:
-    """The model's promoted candidate keys, exactly as the analyzer derives them."""
-    manifest = _manifest(s)
-    graph = build_relation_graph(manifest).graph
-    anns = propagate(graph, uniqueness_property(manifest))
-    model_ref = SourceRef(SourceKind.MODEL, "model.test.m")
-    return anns[model_ref].value.keys
-
-
-def _materialize_counts(s: Scenario, keys: Sequence[Key]) -> tuple[int, dict[frozenset[str], int]]:
-    """Create the sources in duckdb, materialize the model, and return its total row
-    count plus, per key, the count of distinct key tuples."""
-    con = duckdb.connect(":memory:")
-    try:
-        for src in s.sources:
-            cols_ddl = ", ".join(f"{c} INTEGER" for c in src.columns)
-            con.execute(f"CREATE TABLE {src.name} ({cols_ddl})")
-        for name, rows in s.data:
-            if not rows:
-                continue
-            placeholders = ", ".join(["?"] * len(rows[0]))
-            con.executemany(f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows])
-        con.execute(f"CREATE TABLE _m AS {_model_sql(s.model)}")
-        total = con.execute("SELECT COUNT(*) FROM _m").fetchone()
-        assert total is not None
-        distinct_counts: dict[frozenset[str], int] = {}
-        for key in keys:
-            cols = ", ".join(sorted(key))
-            row = con.execute(f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)").fetchone()
-            assert row is not None
-            distinct_counts[key] = row[0]
-        return total[0], distinct_counts
-    finally:
-        con.close()
-
-
 @given(_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_promoted_keys_are_truly_unique_over_materialized_rows(s: Scenario) -> None:
-    """Every key the analyzer promotes for the model is genuinely unique over the
-    rows duckdb materializes from the generated data.
-
-    The test never recomputes which keys *should* survive; it takes whatever the
-    analyzer promotes and checks it against the data. A key whose columns repeat a
-    tuple in the materialized output is an unsound promotion (a false positive),
-    which is the invariant this guards.
-    """
-    keys = _promoted_keys(s)
+def test_unconditional_promoted_keys_are_unique_over_materialized_rows(s: Scenario) -> None:
+    """Every key the analyzer promotes for a filter/join/group/distinct model is
+    genuinely unique over the duckdb-materialized rows. The test never recomputes
+    which keys should survive; the data is the judge."""
+    keys = _promoted_keys(_scenario_manifest(s))
     output_cols = {c.lower() for c in s.model.select_cols}
     for key in keys:
-        assert key <= output_cols, (
-            f"promoted key {sorted(key)} is not a subset of output columns "
-            f"{sorted(output_cols)} for sql={_model_sql(s.model)!r}"
-        )
+        assert key <= output_cols, f"key {sorted(key)} not in outputs {sorted(output_cols)}"
+    data_by_name = dict(s.data)
+    tables: list[Table] = [(src.name, src.columns, data_by_name[src.name]) for src in s.sources]
+    _assert_keys_sound(tables, _scenario_sql(s.model), keys)
 
-    total, distinct_counts = _materialize_counts(s, list(keys))
-    for key, distinct in distinct_counts.items():
-        assert distinct == total, (
-            f"unsound key {sorted(key)}: {total} rows but {distinct} distinct key tuples "
-            f"for sql={_model_sql(s.model)!r} data={s.data!r}"
+
+# --- conditional activation -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CondScenario:
+    """A ``where``-filtered ``unique(id) where g > test_threshold`` on the source, and a
+    downstream model ``SELECT id, g FROM orders WHERE g > model_threshold``.
+
+    ``rows`` honors the conditional declaration: ``id`` is distinct among rows where
+    ``g > test_threshold`` (the predicate subset) and free to repeat elsewhere. So when
+    the model filter implies the predicate (``model_threshold >= test_threshold``) the
+    activated key is genuinely unique; when it does not, the output can carry duplicate
+    ids, which the data catches if activation wrongly fires.
+    """
+
+    test_threshold: int
+    model_threshold: int
+    rows: tuple[tuple[int, int], ...]  # (id, g)
+
+
+_G_MAX = 4
+_ID_POOL = 10
+
+
+@st.composite
+def _cond_scenario(draw: st.DrawFn) -> CondScenario:
+    b = draw(st.integers(min_value=0, max_value=_G_MAX))
+    a = draw(st.integers(min_value=0, max_value=_G_MAX))
+
+    high_g_choices = list(range(b + 1, _G_MAX + 1))  # g values that satisfy g > b
+    n_high = draw(st.integers(min_value=0, max_value=5)) if high_g_choices else 0
+    high_ids = draw(
+        st.lists(
+            st.integers(min_value=0, max_value=_ID_POOL - 1),
+            min_size=n_high,
+            max_size=n_high,
+            unique=True,
         )
+    )
+    rows: list[tuple[int, int]] = [
+        (i, draw(st.sampled_from(high_g_choices))) for i in high_ids
+    ]  # distinct ids within the predicate subset
+
+    n_low = draw(st.integers(min_value=0, max_value=5))
+    rows.extend(  # g <= b, ids unconstrained (may repeat)
+        (draw(st.integers(0, _ID_POOL - 1)), draw(st.integers(min_value=0, max_value=b)))
+        for _ in range(n_low)
+    )
+
+    return CondScenario(test_threshold=b, model_threshold=a, rows=tuple(rows))
+
+
+def _cond_sql(s: CondScenario) -> str:
+    return f"SELECT id, g FROM orders WHERE g > {s.model_threshold}"
+
+
+def _cond_manifest(s: CondScenario) -> Manifest:
+    nodes = [
+        _source_node("orders"),
+        _unique_test("orders", column="id", where=f"g > {s.test_threshold}"),
+        _model_node(_cond_sql(s), depends_on=frozenset({"source.test.raw.orders"})),
+    ]
+    return Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+
+@given(_cond_scenario())
+@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_conditionally_activated_keys_are_unique_over_materialized_rows(s: CondScenario) -> None:
+    """A conditional ``unique`` key promoted by activation is genuinely unique over the
+    materialized rows. The source data honors the conditional declaration, so an
+    over-eager activation (promoting the key when the model filter does not restrict to
+    the predicate subset) surfaces as a duplicate the data check catches."""
+    keys = _promoted_keys(_cond_manifest(s))
+    tables: list[Table] = [("orders", ("id", "g"), s.rows)]
+    _assert_keys_sound(tables, _cond_sql(s), keys)
