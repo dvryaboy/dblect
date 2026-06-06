@@ -1,23 +1,25 @@
-"""The nullability-consuming detector: GROUP BY on an inherited-nullable key.
+"""The nullability-consuming detectors: a NULL-sensitive construct on an
+inherited-nullable column.
 
-The detector fires when a model groups by a column that the nullability property
-proved NULLABLE upstream, so the unmatched rows collapse into a phantom NULL group
-the consumer rarely models. It is the cross-model complement to the structural
-``null_group_after_outer_join``: that one needs the outer join in the same SELECT,
-this one fires when the nullability was inherited from an upstream model, which the
-local AST cannot see. The two do not overlap, because this detector only looks at
-single-source, join-free scopes (so any nullability in the group key came from
-upstream, never from a join in the scope itself).
+Three detectors share one shape: they fire when a column the nullability property
+proved NULLABLE *upstream* sits in a position where the null silently changes the
+result (a GROUP BY phantom bucket, a join key that never matches, a NOT IN that goes
+empty). They are the cross-model complement to the structural detectors: those need
+the outer join in the same SELECT, these fire on nullability inherited from an
+upstream model, which the local AST cannot see. They never double-flag the structural
+layer, because they read the *upstream* relation's nullability rather than anything a
+join in the local scope introduces.
 
-These pin the contract by example: a cross-model nullable key fires, a non-null key
-stays silent, and a local outer join in the same scope is left to the structural
-detector. One empirical check materializes the chain in duckdb and confirms the
-flagged group key really does carry a NULL bucket.
+The contract is one parametrized table (each construct fires on the nullable key and
+stays silent on the non-null one), so a new construct is a new row rather than a new
+pair of near-identical tests. One empirical check materializes the chain in duckdb and
+confirms the flagged group key really carries a NULL bucket.
 """
 
 from __future__ import annotations
 
 import duckdb
+import pytest
 
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import make_nullability_detectors
@@ -83,11 +85,19 @@ def _manifest(mart_sql: str) -> Manifest:
     nodes = [
         _source("base"),
         _source("lkp"),
+        _source("other"),
         _not_null("base", "id"),
         _not_null("lkp", "id"),
         _not_null("lkp", "tag"),
-        _model("stg", _STG_SQL, depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"})),
-        _model("mart", mart_sql, depends_on=frozenset({"model.shop.stg"})),
+        _not_null("other", "k"),
+        _model(
+            "stg", _STG_SQL, depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"})
+        ),
+        _model(
+            "mart",
+            mart_sql,
+            depends_on=frozenset({"model.shop.stg", "source.shop.raw.other"}),
+        ),
     ]
     return Manifest(
         schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
@@ -95,33 +105,45 @@ def _manifest(mart_sql: str) -> Manifest:
 
 
 def _kinds(mart_sql: str) -> list[FindingKind]:
-    manifest = _manifest(mart_sql)
-    (detector,) = make_nullability_detectors(manifest)
-    return [f.kind for f in detector(parse_sql(mart_sql, dialect="duckdb"))]
+    """Every nullability finding the detectors raise on ``mart``."""
+    detectors = make_nullability_detectors(_manifest(mart_sql))
+    tree = parse_sql(mart_sql, dialect="duckdb")
+    return [f.kind for detector in detectors for f in detector(tree)]
 
 
-def test_group_by_inherited_nullable_key_fires() -> None:
-    # ``stg.tag`` is nullable because ``stg`` left-joined it. Grouping by it downstream
-    # collapses unmatched rows into a phantom NULL group.
-    kinds = _kinds("SELECT tag, count(*) AS n FROM stg GROUP BY tag")
-    assert FindingKind.NULL_GROUP_ON_NULLABLE_KEY in kinds
+# ``stg.tag`` is nullable upstream (the optional side of stg's LEFT JOIN); ``stg.id`` and
+# ``other.k`` are NON_NULL. Each detector fires on the nullable key and stays silent on the
+# non-null one. The local-outer-join GROUP BY is left to the structural detector, since
+# this layer reasons only about single-source, join-free scopes.
+_CASES: list[tuple[str, FindingKind, bool]] = [
+    ("group-by/nullable", "SELECT tag, count(*) AS n FROM stg GROUP BY tag", True),
+    ("group-by/non-null", "SELECT id, count(*) AS n FROM stg GROUP BY id", False),
+    (
+        "group-by/local-join",
+        "SELECT b.tag AS tag, count(*) AS n FROM base a LEFT JOIN lkp b ON a.fk = b.id GROUP BY b.tag",
+        False,
+    ),
+    ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
+    ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
+    ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
+    ("not-in/non-null", "SELECT id FROM stg WHERE id NOT IN (SELECT id FROM stg)", False),
+]
+_KIND_OF = {
+    "group-by": FindingKind.NULL_GROUP_ON_NULLABLE_KEY,
+    "join": FindingKind.JOIN_ON_NULLABLE_KEY,
+    "not-in": FindingKind.NOT_IN_NULLABLE_SUBQUERY,
+}
 
 
-def test_group_by_non_null_key_stays_silent() -> None:
-    # ``stg.id`` rode in from the required side of the join, so it is NON_NULL: no group
-    # hazard.
-    kinds = _kinds("SELECT id, count(*) AS n FROM stg GROUP BY id")
-    assert FindingKind.NULL_GROUP_ON_NULLABLE_KEY not in kinds
-
-
-def test_local_outer_join_group_by_is_left_to_the_structural_detector() -> None:
-    # The outer join and the GROUP BY are in the same scope, which the structural
-    # ``null_group_after_outer_join`` detector owns. This detector only reasons about
-    # single-source, join-free scopes, so it stays silent here (no double-flagging).
-    kinds = _kinds(
-        "SELECT b.tag AS tag, count(*) AS n FROM base a LEFT JOIN lkp b ON a.fk = b.id GROUP BY b.tag"
-    )
-    assert FindingKind.NULL_GROUP_ON_NULLABLE_KEY not in kinds
+@pytest.mark.parametrize(
+    ("sql", "kind", "fires"),
+    [(sql, _KIND_OF[name.split("/")[0]], fires) for name, sql, fires in _CASES],
+    ids=[name for name, _sql, _fires in _CASES],
+)
+def test_detector_fires_only_on_an_inherited_nullable_key(
+    sql: str, kind: FindingKind, fires: bool
+) -> None:
+    assert (kind in _kinds(sql)) is fires
 
 
 def test_flagged_group_key_really_carries_a_null_bucket() -> None:

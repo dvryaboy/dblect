@@ -8,11 +8,15 @@ GROUP BY on an inherited-nullable key).
 """
 
 from dblect.nullability.detector import (
+    detect_join_on_nullable_key,
+    detect_not_in_nullable_subquery,
     detect_null_group_on_nullable_key,
     make_nullability_detectors,
 )
 
 __all__ = [
+    "detect_join_on_nullable_key",
+    "detect_not_in_nullable_subquery",
     "detect_null_group_on_nullable_key",
     "make_nullability_detectors",
 ]

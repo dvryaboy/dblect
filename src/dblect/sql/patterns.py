@@ -41,6 +41,8 @@ class FindingKind(StrEnum):
     NON_UNIQUE_WINDOW_ORDER_KEYS = "non_unique_window_order_keys"
     JOIN_FANOUT = "join_fanout"
     NULL_GROUP_ON_NULLABLE_KEY = "null_group_on_nullable_key"
+    JOIN_ON_NULLABLE_KEY = "join_on_nullable_key"
+    NOT_IN_NULLABLE_SUBQUERY = "not_in_nullable_subquery"
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 

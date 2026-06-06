@@ -74,10 +74,105 @@ def detect_null_group_on_nullable_key(
     return tuple(out)
 
 
+def detect_join_on_nullable_key(
+    tree: Expr, *, nullable_by_name: NullableByName
+) -> tuple[Finding, ...]:
+    """Flag a JOIN whose equality key is a column nullable in its upstream relation.
+
+    NULL never equals NULL, so rows with a NULL join key never match: an inner join
+    silently drops them and an outer join leaves them unmatched. As with the group-by
+    detector, the nullability is read from the upstream relation, so this fires on an
+    inherited-nullable key the local SQL gives no hint about, complementing the
+    structural ``coalesce_on_join_key`` and ``where_on_outer_joined_nullable``. Only
+    bare-column equality keys are reasoned about.
+    """
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(tree):
+        alias_to_rel = _alias_to_relation(sel)
+        for join in sg.joins_of(sel):
+            on = sg.on_of(join)
+            if on is None:
+                continue
+            for alias, relation in alias_to_rel.items():
+                nullable = nullable_by_name.get(relation)
+                if not nullable:
+                    continue
+                cols = sg.equality_cols_on_alias(on, alias)
+                if not cols:
+                    continue
+                out.extend(
+                    _join_finding(join, source=relation, column=column)
+                    for column in sorted(cols & nullable)
+                )
+    return tuple(out)
+
+
+def detect_not_in_nullable_subquery(
+    tree: Expr, *, nullable_by_name: NullableByName
+) -> tuple[Finding, ...]:
+    """Flag ``x NOT IN (SELECT col FROM rel)`` where ``col`` is nullable in ``rel``.
+
+    A single NULL among the subquery's values makes ``x NOT IN (...)`` evaluate to NULL
+    for every ``x``, so the predicate is never true and the result is silently empty:
+    the canonical three-valued-logic footgun. Only the single-bare-column, single-source
+    subquery shape is reasoned about; anything else is left alone.
+    """
+    out: list[Finding] = []
+    for in_node in tree.find_all(exp.In):
+        query = in_node.args.get("query")
+        if query is None or not isinstance(in_node.parent, exp.Not):
+            continue
+        resolved = _single_projected_column(query)
+        if resolved is None:
+            continue
+        relation, column = resolved
+        nullable = nullable_by_name.get(relation)
+        if nullable and column in nullable:
+            out.append(_not_in_finding(in_node, source=relation, column=column))
+    return tuple(out)
+
+
+def _alias_to_relation(sel: exp.Select) -> dict[str, str]:
+    """Map each FROM/JOIN alias to its bare table name. Subquery and CTE sources are
+    skipped (their per-scope nullability is a later increment)."""
+    out: dict[str, str] = {}
+    from_ = sg.from_of(sel)
+    if from_ is not None and isinstance(from_.this, exp.Table):
+        out[from_.this.alias_or_name] = from_.this.name
+    for join in sg.joins_of(sel):
+        target = join.this
+        if isinstance(target, exp.Table):
+            out[target.alias_or_name] = target.name
+    return out
+
+
+def _single_projected_column(query: Expr) -> tuple[str, str] | None:
+    """The ``(relation, column)`` a subquery projects, when it is a single bare column
+    over a single bare-table FROM with no joins; else ``None``."""
+    select = query.this if isinstance(query, exp.Subquery) else query
+    if not isinstance(select, exp.Select) or sg.joins_of(select):
+        return None
+    projections = select.selects
+    if len(projections) != 1:
+        return None
+    proj = projections[0]
+    column = proj.this if isinstance(proj, exp.Alias) else proj
+    if not isinstance(column, exp.Column):
+        return None
+    from_ = sg.from_of(select)
+    if from_ is None or not isinstance(from_.this, exp.Table):
+        return None
+    return (from_.this.name, sg.column_name(column).lower())
+
+
+def _at(node: Expr) -> tuple[int, int]:
+    span = sg.line_range(node)
+    return span if span is not None else (0, 0)
+
+
 def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
     rendered = sg.render_sql(grp_expr)
-    span = sg.line_range(grp_expr)
-    line_start, line_end = span if span is not None else (0, 0)
+    line_start, line_end = _at(grp_expr)
     return Finding(
         kind=FindingKind.NULL_GROUP_ON_NULLABLE_KEY,
         message=(
@@ -85,6 +180,39 @@ def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
             f"{source!r}; rows with a NULL {column} collapse into a single phantom group "
             f"that downstream code rarely accounts for. Filter the nulls before grouping, "
             f"or make the orphan-handling intent explicit."
+        ),
+        sql_snippet=rendered,
+        line_start=line_start,
+        line_end=line_end,
+    )
+
+
+def _join_finding(join: exp.Join, *, source: str, column: str) -> Finding:
+    rendered = sg.render_sql(join)
+    line_start, line_end = _at(join)
+    return Finding(
+        kind=FindingKind.JOIN_ON_NULLABLE_KEY,
+        message=(
+            f"JOIN keys on {column}, which is nullable upstream in {source!r}; NULL never "
+            f"equals NULL, so rows with a NULL {column} never match and are silently dropped "
+            f"(inner join) or left unmatched (outer join). Filter the nulls or COALESCE to a "
+            f"sentinel if the match was intended."
+        ),
+        sql_snippet=rendered,
+        line_start=line_start,
+        line_end=line_end,
+    )
+
+
+def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
+    rendered = sg.render_sql(in_node)
+    line_start, line_end = _at(in_node)
+    return Finding(
+        kind=FindingKind.NOT_IN_NULLABLE_SUBQUERY,
+        message=(
+            f"NOT IN over a subquery projecting {column}, which is nullable upstream in "
+            f"{source!r}; one NULL makes the whole predicate never true, so the result is "
+            f"silently empty. Use NOT EXISTS, or filter the NULLs from the subquery."
         ),
         sql_snippet=rendered,
         line_start=line_start,
@@ -130,4 +258,10 @@ def make_nullability_detectors(
     def group_by_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_null_group_on_nullable_key(tree, nullable_by_name=nullable_by_name)
 
-    return (group_by_nullable,)
+    def join_on_nullable(tree: Expr) -> tuple[Finding, ...]:
+        return detect_join_on_nullable_key(tree, nullable_by_name=nullable_by_name)
+
+    def not_in_nullable(tree: Expr) -> tuple[Finding, ...]:
+        return detect_not_in_nullable_subquery(tree, nullable_by_name=nullable_by_name)
+
+    return (group_by_nullable, join_on_nullable, not_in_nullable)
