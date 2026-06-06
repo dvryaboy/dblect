@@ -3,8 +3,9 @@
 The nullability *property* (per-column tri-state, with outer-join taint and conditional
 NON_NULL activation) lives on the lineage.facts substrate as
 ``dblect.lineage.properties.nullability``. This package is the audit-facing consumer:
-detectors that read the proven nullability and flag NULL-sensitive constructs (today, a
-GROUP BY on an inherited-nullable key).
+detectors that read the proven nullability and flag NULL-sensitive constructs where the
+null silently changes the result: a GROUP BY on an inherited-nullable key, a join keyed
+on one, and a ``NOT IN`` over a subquery that projects one.
 """
 
 from dblect.nullability.detector import (

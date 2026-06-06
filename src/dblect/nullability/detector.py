@@ -28,7 +28,7 @@ from dblect.lineage.graph import ColumnRef, SourceKind
 from dblect.lineage.properties import Nullability
 from dblect.lineage.properties.nullability import activated_nullability
 from dblect.manifest import Manifest
-from dblect.sql import Finding, FindingKind
+from dblect.sql import Finding, FindingKind, finding_at
 from dblect.sql import _sqlglot as sg
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
@@ -165,58 +165,41 @@ def _single_projected_column(query: Expr) -> tuple[str, str] | None:
     return (from_.this.name, sg.column_name(column).lower())
 
 
-def _at(node: Expr) -> tuple[int, int]:
-    span = sg.line_range(node)
-    return span if span is not None else (0, 0)
-
-
 def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
-    rendered = sg.render_sql(grp_expr)
-    line_start, line_end = _at(grp_expr)
-    return Finding(
-        kind=FindingKind.NULL_GROUP_ON_NULLABLE_KEY,
+    return finding_at(
+        FindingKind.NULL_GROUP_ON_NULLABLE_KEY,
         message=(
-            f"GROUP BY {rendered} groups on a column that is nullable upstream in "
+            f"GROUP BY {sg.render_sql(grp_expr)} groups on a column that is nullable upstream in "
             f"{source!r}; rows with a NULL {column} collapse into a single phantom group "
             f"that downstream code rarely accounts for. Filter the nulls before grouping, "
             f"or make the orphan-handling intent explicit."
         ),
-        sql_snippet=rendered,
-        line_start=line_start,
-        line_end=line_end,
+        node=grp_expr,
     )
 
 
 def _join_finding(join: exp.Join, *, source: str, column: str) -> Finding:
-    rendered = sg.render_sql(join)
-    line_start, line_end = _at(join)
-    return Finding(
-        kind=FindingKind.JOIN_ON_NULLABLE_KEY,
+    return finding_at(
+        FindingKind.JOIN_ON_NULLABLE_KEY,
         message=(
             f"JOIN keys on {column}, which is nullable upstream in {source!r}; NULL never "
             f"equals NULL, so rows with a NULL {column} never match and are silently dropped "
             f"(inner join) or left unmatched (outer join). Filter the nulls or COALESCE to a "
             f"sentinel if the match was intended."
         ),
-        sql_snippet=rendered,
-        line_start=line_start,
-        line_end=line_end,
+        node=join,
     )
 
 
 def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
-    rendered = sg.render_sql(in_node)
-    line_start, line_end = _at(in_node)
-    return Finding(
-        kind=FindingKind.NOT_IN_NULLABLE_SUBQUERY,
+    return finding_at(
+        FindingKind.NOT_IN_NULLABLE_SUBQUERY,
         message=(
             f"NOT IN over a subquery projecting {column}, which is nullable upstream in "
             f"{source!r}; one NULL makes the whole predicate never true, so the result is "
             f"silently empty. Use NOT EXISTS, or filter the NULLs from the subquery."
         ),
-        sql_snippet=rendered,
-        line_start=line_start,
-        line_end=line_end,
+        node=in_node,
     )
 
 
@@ -226,7 +209,8 @@ def _nullable_by_name(
     """Index the proven-NULLABLE columns by the relation name as it appears in compiled
     SQL, mirroring the uniqueness detector's name resolution: a source resolves under
     ``identifier or name``, a model under ``name``, and a model wins on a name collision
-    (as a ``ref`` would)."""
+    (as a ``ref`` would). Column names are lowercased so the index matches the detectors'
+    lowercased AST keys on a dialect that case-folds bare identifiers."""
     sources: dict[str, set[str]] = {}
     models: dict[str, set[str]] = {}
     for col_ref, ann in anns.items():
@@ -236,7 +220,7 @@ def _nullable_by_name(
         if node is None:
             continue
         bucket = models if col_ref.source.kind is SourceKind.MODEL else sources
-        bucket.setdefault(node.identifier or node.name, set()).add(col_ref.column)
+        bucket.setdefault(node.identifier or node.name, set()).add(col_ref.column.lower())
     merged: dict[str, set[str]] = {name: set(cols) for name, cols in sources.items()}
     merged.update(models)  # a model wins on a name collision, as a ref would
     return {name: frozenset(cols) for name, cols in merged.items()}
@@ -249,9 +233,10 @@ def make_nullability_detectors(
 
     Runs one cross-model nullability propagation (outer-join taint plus conditional
     activation, via ``activated_nullability``), indexes the proven-NULLABLE columns by
-    relation name, and currys the GROUP BY detector. ``dialect`` and ``parsed`` are
-    accepted for symmetry with ``make_fact_grounded_detectors`` (the walker passes the
-    pre-parsed trees); this detector reads only the per-relation index.
+    relation name, and curries the GROUP BY, join-key, and NOT-IN detectors against that
+    index. ``dialect`` and ``parsed`` are accepted for symmetry with
+    ``make_fact_grounded_detectors`` (the walker passes the pre-parsed trees); the
+    detectors read only the per-relation index.
     """
     nullable_by_name = _nullable_by_name(manifest, activated_nullability(manifest, parsed=parsed))
 

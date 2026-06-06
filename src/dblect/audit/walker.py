@@ -111,11 +111,11 @@ def run_audit(
 
     Fact-grounded detectors run alongside the configured `detectors` list: the
     uniqueness window order-keys and join-fanout detectors (grounded against
-    declared keys), and the nullability GROUP-BY-on-an-inherited-nullable-key
-    detector (grounded against the propagated nullability property). All are
-    opportunistic, silent on projects that declare nothing, so they need no
-    opt-in flag. They share the audit's pre-parsed trees, so the SQL is parsed
-    once.
+    declared keys), and the nullability hazard detectors (GROUP BY, join key, and
+    NOT IN on an inherited-nullable column, grounded against the propagated
+    nullability property). All are opportunistic, silent on projects that declare
+    nothing, so they need no opt-in flag. They share the audit's pre-parsed trees,
+    so the SQL is parsed once.
     """
     parsed = _parse_models_for_audit(manifest, dialect=dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}

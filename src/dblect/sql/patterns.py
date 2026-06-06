@@ -158,7 +158,7 @@ _NON_DETERMINISTIC_NAMES: frozenset[str] = frozenset(
 )
 
 
-def _finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
+def finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
     """Build a Finding whose snippet and source span both come from `node`."""
     span = sg.line_range(node)
     line_start, line_end = span if span is not None else (0, 0)
@@ -268,7 +268,7 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
             if risky:
                 tables = ", ".join(sorted(risky))
                 out.append(
-                    _finding_at(
+                    finding_at(
                         FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
                         message=(
                             f"GROUP BY {sg.render_sql(grp_expr)} references column(s) from "
@@ -303,7 +303,7 @@ def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
                 continue
             if (sg.column_table(first), sg.column_name(first)) in keys:
                 out.append(
-                    _finding_at(
+                    finding_at(
                         FindingKind.COALESCE_ON_JOIN_KEY,
                         message=(
                             f"COALESCE on join key {sg.render_sql(first)} masks NULLs that "
@@ -330,7 +330,7 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
         order = sg.order_of(w)
         if order is None or not order.expressions:
             out.append(
-                _finding_at(
+                finding_at(
                     FindingKind.UNORDERED_RANKING_WINDOW,
                     message=(
                         f"{type(fn).__name__.upper()} window function has no ORDER BY; "
@@ -352,7 +352,7 @@ def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
         if isinstance(inner, exp.Order):
             continue
         out.append(
-            _finding_at(
+            finding_at(
                 FindingKind.UNORDERED_AGGREGATE,
                 message=(
                     f"{type(node).__name__.upper()} has no ORDER BY; "
@@ -396,7 +396,7 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
             if risky_tables:
                 tables = ", ".join(sorted(risky_tables))
                 out.append(
-                    _finding_at(
+                    finding_at(
                         FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
                         message=(
                             f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
@@ -440,7 +440,7 @@ def detect_non_deterministic_function(tree: Expr) -> tuple[Finding, ...]:
             for call in calls:
                 func_name = _non_deterministic_name(call)
                 out.append(
-                    _finding_at(
+                    finding_at(
                         FindingKind.NON_DETERMINISTIC_FUNCTION,
                         message=(
                             f"{func_name} appears in {label}; this position is "
