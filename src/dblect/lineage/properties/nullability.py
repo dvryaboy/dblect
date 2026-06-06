@@ -142,6 +142,22 @@ def _is_not_null_rule(
     return Annotation(Nullability.NON_NULL, provisional=provisional)
 
 
+def _nullif_rule(
+    _expr: Expr, kids: tuple[Annotation[Nullability], ...], _ctx: DepContext
+) -> Annotation[Nullability]:
+    """``NULLIF(a, b)`` returns NULL when ``a = b``, so it admits a null by construction
+    whatever its inputs are. This is a positive structural claim (the local twin of the
+    outer-join optional side), not a fallback on uncertainty, so it grounds NULLABLE."""
+    return Annotation(Nullability.NULLABLE, provisional=any(k.provisional for k in kids))
+
+
+def _null_literal_rule(
+    _expr: Expr, _kids: tuple[Annotation[Nullability], ...], _ctx: DepContext
+) -> Annotation[Nullability]:
+    """A bare ``NULL`` literal is null."""
+    return Annotation(Nullability.NULLABLE)
+
+
 def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotation[Nullability]:
     """COUNT returns 0 for empty groups, never NULL."""
     return Annotation(Nullability.NON_NULL, provisional=child.provisional)
@@ -153,6 +169,8 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotatio
 NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Coalesce: _coalesce_rule,
     exp.Is: _is_not_null_rule,
+    exp.Nullif: _nullif_rule,
+    exp.Null: _null_literal_rule,
 }
 NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
     exp.Count: AggregateRule(core=_count_core),
