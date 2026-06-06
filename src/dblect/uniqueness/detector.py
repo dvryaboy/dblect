@@ -183,7 +183,11 @@ def make_fact_grounded_detectors(
     keys = propagate(graph, uniqueness_property(manifest))
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
-    # than walking every relation in the graph.
+    # than walking every relation in the graph. The seed must stay exactly "every
+    # relation carrying a conditional key": intra-model activation reads flow at every
+    # such relation (via ``flow_by_name`` below), so narrowing the seed (e.g. to
+    # conditional *owners* only) would silently stop carriers from activating. It is
+    # the same set ``conditional_by_name`` indexes, both derived from ``keys``.
     conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
     flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
     activated = activate_conditional(keys, flow)

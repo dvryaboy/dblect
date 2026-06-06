@@ -457,6 +457,12 @@ def activated_scope_keys(
     walk.scope_keys(tree, cte_scope={})
     out: dict[int, frozenset[Key]] = {}
     for node_id, carried in walk.scopes.items():
+        # The flow walk does not record every scope this key walk does: it stops at a
+        # join rather than recursing into it, so a scope nested inside a joined
+        # subquery has no recorded flow. ``scope_flow.get`` defaults such a scope to
+        # the empty filter, which implies nothing and so activates nothing. That is
+        # the safe direction (a conditional key stays conditional), and it matches the
+        # flow's own posture of dropping at a join.
         promoted = activate(
             CandidateKeySet(carried.keys),
             ((CandidateKeySet.of(ck.key), ck.predicate) for ck in carried.conditional),
