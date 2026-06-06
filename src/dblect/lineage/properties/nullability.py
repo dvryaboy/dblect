@@ -315,7 +315,17 @@ def nullability_property(
 
 def _conditional_notnull_carrier(manifest: Manifest) -> Property[CandidateKeySet, SourceRef]:
     """A relation-scoped carrier for conditional NON_NULL columns, grounded from the
-    ``where``-filtered ``not_null`` tests and flowed across model boundaries."""
+    ``where``-filtered ``not_null`` tests and flowed across model boundaries.
+
+    The value type is uniqueness's :class:`CandidateKeySet` because the relation-algebra
+    carrying it needs (rename columns and predicates through each projection, drop on a
+    join / group / computed projection) is property-agnostic; only the *meaning* of the
+    payload differs, and a one-column key reads here as "this column is non-null under
+    the predicate". The borrow is the pragmatic reuse for the second axis. If a third
+    axis wants the same carrying, lift this into a generic
+    ``conditional_carrier(claims, lattice)`` rather than reaching further into
+    uniqueness, so the shared mechanism stops depending on one property's value type.
+    """
     facts = collect(
         manifest,
         (not_null_test_discoverer(), native_not_null_discoverer(manifest.adapter_type)),
@@ -378,7 +388,14 @@ def activated_nullability(manifest: Manifest) -> Mapping[ColumnRef, Annotation[N
     )
     relation_graph = build_relation_graph(manifest).graph
     carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest))
-    flow = propagate(relation_graph, predicate_flow_property())
+    # Flow is consulted only where a conditional claim waits to activate, so seed the
+    # flow pass with those scopes and let it pull in their upstreams rather than walking
+    # every relation. ``activate_conditional`` reads flow only at carrier scopes whose
+    # value carries a conditional payload, so a scope left out of the seed activates
+    # nothing it would have otherwise (the same seeding invariant the uniqueness
+    # detector relies on).
+    conditional_scopes = [ref for ref, ann in carrier.items() if ann.value.conditional]
+    flow = propagate(relation_graph, predicate_flow_property(), subjects=conditional_scopes)
     for ref, activated in activate_conditional(carrier, flow).items():
         for key in activated.keys:
             for column in key:
