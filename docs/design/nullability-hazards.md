@@ -67,6 +67,10 @@ The two layers are complementary, and the split is clean.
 
 The de-duplication rule keeps them from talking over each other: a property-based detector fires only when the nullability is introduced non-locally, leaving the same-`SELECT` cases to the structural detector that already owns them. Over time some structural detectors may retire into their property-based generalization, but the broad net stays valuable on projects that declare little, where the property has little to prove from.
 
+## Adjacent hazards this property does not own
+
+Flattening an array with an inner lateral (`FROM t, UNNEST(t.arr)`, `CROSS JOIN UNNEST(...)`, `CROSS JOIN LATERAL ...`) silently drops the parent row whenever the array is empty or null. That looks like a nullability bug and is worth catching, but it is a row-preservation (cardinality) hazard, the deflation twin of join fanout: fanout multiplies rows, this annihilates them. The nullability property can prove only the null-array half of it and structurally misses the more common empty-array half (`[]` is a non-null, zero-length value), so it stays out of scope here and lives as a structural detector instead. A future collection-emptiness property could gate it precisely, reusing this engine's existential shape, once the static introducers for "can be empty" are rich enough to clear the firewall. Tracked separately as a `sql/patterns.py` detector.
+
 ## Implementation sketch
 
 Grounded in the current code, the work is three slices that can land in order, each independently useful.
