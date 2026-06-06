@@ -134,11 +134,13 @@ def build_manifest_graph(
     manifest: Manifest,
     *,
     dialect: str | None = "duckdb",
+    parsed: Mapping[str, Expr] | None = None,
 ) -> BuildResult:
     """Build the cross-model ``ColumnLineageGraph`` for every model in ``manifest``.
 
     Walks the manifest DAG in topological order. Models without compiled
-    SQL are skipped and reported in ``BuildResult.issues``.
+    SQL are skipped and reported in ``BuildResult.issues``. ``parsed`` lets a caller
+    share already-parsed trees so the SQL is parsed once (the audit walker does).
     """
     name_to_source = _build_name_to_source(manifest)
     schema = _build_schema(manifest)
@@ -159,6 +161,7 @@ def build_manifest_graph(
                 name_to_source=name_to_source,
                 schema=schema,
                 dialect=dialect,
+                tree=parsed.get(uid) if parsed is not None else None,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -183,12 +186,17 @@ def build_model_graph(
     name_to_source: Mapping[str, SourceRef],
     schema: Mapping[str, Mapping[str, str]] | None = None,
     dialect: str | None = "duckdb",
+    tree: Expr | None = None,
 ) -> ColumnLineageGraph:
     """Build the lineage graph entries for one model: top-level output columns
     plus all materialised intermediates (CTEs, derived tables, UNION outputs).
+
+    ``tree`` lets a caller share an already-parsed tree (the audit walker does) so the
+    SQL is parsed once. It is copied before qualification, which mutates in place, so
+    the caller's tree is left untouched.
     """
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
-    expression: Expr = sqlglot.parse_one(sql, dialect=dialect)
+    expression: Expr = tree.copy() if tree is not None else sqlglot.parse_one(sql, dialect=dialect)
     expression = qualify(
         expression,
         dialect=dialect,
