@@ -435,9 +435,11 @@ class _RelationWalk:
 
     ``base_resolve`` resolves a base (non-CTE) table to what it carries; CTEs and
     inline subqueries are resolved structurally within the walk. Conditional keys
-    ride through a single-source, no-join, no-group scope, renamed onto its output
-    columns; a JOIN / UNION / GROUP BY drops them, exactly where the predicate flow
-    also drops, so a carried key could never activate there. With ``record`` set,
+    ride through, renamed onto a scope's output columns, wherever the row set is not
+    multiplied and their columns stay disambiguated: a single source, or a
+    non-multiplying join under a star-free projection. A GROUP BY, a UNION, a
+    fanning-out join, or a star over a join drops them, so a carried key only ever
+    survives where it could still soundly activate downstream. With ``record`` set,
     every SELECT/UNION scope's output is kept in ``scopes`` keyed by ``id(node)`` so
     a detector can read intermediate-scope keys.
     """
@@ -478,8 +480,11 @@ class _RelationWalk:
         # WHERE filters cannot add duplicates, so keys (and conditional keys) are
         # preserved across it; the WHERE is the predicate flow's concern, not ours.
         joins = sg.joins_of(sel)
+        joins_preserve = True
         for j in joins:
-            combined = self._apply_join(j, combined, cte_scope=local)
+            preserved = self._join_preserves(j, cte_scope=local)
+            combined = combined if preserved else frozenset[_QKey]()
+            joins_preserve = joins_preserve and preserved
 
         group = sg.group_of(sel)
         grouped = group is not None and bool(group.expressions)
@@ -490,7 +495,13 @@ class _RelationWalk:
         projection = _Projection.build(sel, from_alias=from_alias)
         keys = _project(sel, combined, projection)
         conditional: frozenset[ConditionalKey] = frozenset()
-        if not joins and not grouped:
+        # Conditional keys ride through only where the row set is not multiplied and
+        # their columns stay disambiguated: a single source, or a non-multiplying join
+        # under a star-free projection (every output column then resolves to one
+        # source by alias). A star over a join could blur a from-side column with the
+        # joined-in side, so it drops, matching the predicate flow's own caution.
+        star_free = not (projection.unrestricted or projection.star_aliases)
+        if not grouped and (not joins or (joins_preserve and star_free)):
             conditional = _carry_conditional(from_carried.conditional, projection, from_alias)
         return _Carried(keys, conditional)
 
@@ -527,31 +538,33 @@ class _RelationWalk:
             return alias, self.scope_keys(inner, cte_scope=cte_scope)
         return None
 
-    def _apply_join(
-        self, j: exp.Join, combined: frozenset[_QKey], *, cte_scope: Mapping[str, _Carried]
-    ) -> frozenset[_QKey]:
+    def _join_preserves(self, j: exp.Join, *, cte_scope: Mapping[str, _Carried]) -> bool:
+        """Whether ``j`` cannot multiply the probe side's rows, so the probe side's
+        keys (and any conditional keys riding with them) carry through unchanged.
+
+        The joined-in side cannot multiply probe rows exactly when its join columns
+        cover one of its keys. A CROSS join, an unresolved target, a keyless joined-in
+        side, or a missing / non-covering ON all leave fanout possible, so none of the
+        probe side's keys can be trusted to survive.
+        """
         if sg.join_side_of(j) is JoinSide.CROSS:
-            return frozenset()  # explicit cartesian product: no key survives
+            return False  # explicit cartesian product: no key survives
         target = j.this
         if not isinstance(target, Expr):
-            return frozenset()
+            return False
         resolved = self._resolve_source(target, cte_scope=cte_scope)
         if resolved is None:
-            return frozenset()
+            return False
         r_alias, r_carried = resolved
         if not r_carried.keys:
-            return frozenset()  # joined-in side has no known key: can't rule out fanout
+            return False  # joined-in side has no known key: can't rule out fanout
         on = sg.on_of(j)
         if on is None:
-            return frozenset()
+            return False
         right_join_cols = sg.equality_cols_on_alias(on, r_alias)
         if right_join_cols is None:
-            return frozenset()
-        # The joined-in side cannot multiply probe rows when its join columns cover
-        # one of its keys, so the probe side's keys carry through unchanged.
-        if not any(k <= right_join_cols for k in r_carried.keys):
-            return frozenset()
-        return combined
+            return False
+        return any(k <= right_join_cols for k in r_carried.keys)
 
 
 def _qualify(alias: str, keys: frozenset[Key]) -> frozenset[_QKey]:
@@ -648,6 +661,10 @@ def _carry_predicate(
         names = projection.names_for((from_alias, col))
         if not names:
             return None
+        # A column may project to several output names. The predicate flow emits the
+        # renamed atom under *every* one of them, so a single representative here is
+        # always a member of the flow's atom set and activation's entailment matches
+        # it regardless of which we pick; ``min`` just keeps the choice deterministic.
         out.add(rename_atom(atom, min(names)))
     return frozenset(out)
 

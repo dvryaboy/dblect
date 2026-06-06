@@ -249,6 +249,58 @@ def test_conditional_dropped_when_a_predicate_column_is_not_projected() -> None:
     assert not any(ck.key == _key("id") for ck in dim.conditional)
 
 
+# --- cross-model through a join --------------------------------------------------
+#
+# A conditional key on the probe side rides through a *non-multiplying* join (the
+# joined-in side is unique on the join columns) under an explicit projection, so a
+# downstream filter still activates it. A fanning-out join, or a star over a join
+# (which could blur a predicate column across the two sources), drops it.
+
+
+def _join_then_filter(join_sql: str, *, lk_unique: bool) -> Mapping[str, CandidateKeySet]:
+    nodes = [
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
+        _source("source.shop.raw.lk"),
+        _model("model.shop.j", join_sql),
+        _model("model.shop.m", "SELECT * FROM j WHERE region = 'US'"),
+    ]
+    if lk_unique:
+        nodes.append(_unique("test.shop.lk", column="lk_id", target="source.shop.raw.lk"))
+    return _activated(*nodes)
+
+
+def test_conditional_carries_through_a_non_multiplying_join_then_activates() -> None:
+    # ``lk`` is unique on its join column, so the join cannot multiply ``orders``
+    # rows; the conditional ``id`` key (and its ``region`` predicate) ride through the
+    # explicit projection and activate at the filtering consumer.
+    res = _join_then_filter(
+        "SELECT o.id, o.region, o.lk_id FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=True,
+    )
+    assert _key("id") in res["model.shop.m"].keys
+
+
+def test_conditional_dropped_through_a_fanning_out_join() -> None:
+    # ``lk`` has no key, so the join can multiply ``orders`` rows: the conditional key
+    # cannot be trusted to survive and never reaches the consumer.
+    res = _join_then_filter(
+        "SELECT o.id, o.region, o.lk_id FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=False,
+    )
+    assert _key("id") not in res["model.shop.m"].keys
+
+
+def test_conditional_dropped_by_a_star_over_a_join() -> None:
+    # The join is non-multiplying, but ``SELECT *`` over two sources could blur the
+    # predicate column across them, so the conditional key drops rather than risk it.
+    res = _join_then_filter(
+        "SELECT * FROM orders o JOIN lk ON o.lk_id = lk.lk_id",
+        lk_unique=True,
+    )
+    assert _key("id") not in res["model.shop.m"].keys
+
+
 # --- end to end: activation changes what the detectors see -----------------------
 
 # A consumer joins ``dim`` on ``id``. ``dim`` declares an unconditional key on
