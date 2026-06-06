@@ -163,6 +163,43 @@ def test_scalar_expression_nullable_input_taints_unknown() -> None:
     assert anns[out].value is Nullability.NULLABLE
 
 
+def test_nullif_introduces_nullable_from_non_null_inputs() -> None:
+    """NULLIF(a, b) admits NULL by construction (it returns NULL when a == b), so the
+    result is NULLABLE even when both inputs are proven NON_NULL. This is a positive
+    structural claim, the local twin of the outer-join optional side: the operator's
+    semantics permit a null regardless of the data."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT NULLIF(t.a, t.b) AS out FROM t",
+        name_to_source={"t": _source("t")},
+        schema={"t": {"a": "INT", "b": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        return Nullability.NON_NULL if c.source.kind is SourceKind.SOURCE else Nullability.UNKNOWN
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
+def test_null_literal_is_nullable() -> None:
+    """A bare NULL literal projects a NULLABLE column."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT NULL AS out FROM t",
+        name_to_source={"t": _source("t")},
+        schema={"t": {"a": "INT"}},
+    )
+
+    def src_rule(c: ColumnRef) -> Nullability:
+        return Nullability.NON_NULL if c.source.kind is SourceKind.SOURCE else Nullability.UNKNOWN
+
+    anns = propagate(graph, _with_source_rule(src_rule))
+    out = ColumnRef(_model("model.test.m"), "out")
+    assert anns[out].value is Nullability.NULLABLE
+
+
 @given(_nullabilities, _nullabilities, _nullabilities)
 def test_nullability_lattice_laws(a: Nullability, b: Nullability, c: Nullability) -> None:
     """The nullability lattice is a bounded distributive chain, so it satisfies the
