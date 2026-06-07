@@ -43,7 +43,17 @@ Class-shaped declarations, type-annotated fields, `Field(...)` metadata, the cla
 
 One honest caveat, stated up front because it is the only place a Pydantic reader's instinct needs adjusting:
 
-> **dblect declarations look like Pydantic, but they are never instantiated.** `DomainType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. The next section is the one idea that follows from that.
+> **dblect declarations look like Pydantic, but they are never instantiated.** `DomainType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. What follows is the two kinds of class you write, and the one idea about how their fields become columns.
+
+## Two kinds of class: types and contracts
+
+dblect declarations come in two kinds.
+
+A **`DomainType`** is a type. It gives a value a meaning, the way `Decimal` or `Currency` does, and you build richer ones from fields: a `Money` is an `amount` and a `currency`. You use a `DomainType` by putting it on a column.
+
+A **`ModelContract`** is the schema of one dbt model. Its fields are the model's columns, and each gives its column a `DomainType`: `order_total: RevenueNet` gives the `order_total` column the type `RevenueNet`. A contract lists only the columns you care about. Columns you leave out still flow through the framework's structural analysis, they just carry no domain type, so you type a column the day its meaning starts to matter and leave the rest alone.
+
+The two compose the way types and tables always have. `DomainType`s are the vocabulary; a `ModelContract` is a model's schema written in that vocabulary. `Money`'s `amount` and `currency` are the parts of the `Money` type, and they become columns when a `ModelContract` gives some column that type.
 
 ## The one idea: every field is a column, and its value comes from the data or the type
 
@@ -66,14 +76,29 @@ class Money(dblect.DomainType):
     currency: Currency
 ```
 
-`Money` has two fields. Where their values come from depends on the project, not on the type:
+`Money` has two fields, and where each value comes from is decided where the type is used, not in the type. Put it on a model in a single-currency project and you fix the currency in the type:
 
-- **Single-currency project.** Every monetary column is dollars. You fix `currency` in the type: `Money(currency=Currency.USD)`. Now `amount` is a physical column and `currency` is a logical column the framework carries. There may be no `currency` column in the warehouse anywhere, and that is correct.
-- **Multi-currency project.** Currency varies per row. You leave `currency` open, so both fields are physical columns (`amount` and `currency`). A `Money` value is now genuinely a pair of columns that travel together.
+```python
+class StgSales(dblect.ModelContract):
+    dbt_model = "stg_sales"
+    sale: Money(currency=Currency.USD)
+```
 
-The same field, `currency`, is a logical column in one project and a physical column in the next. Nothing in the type marks it as special; whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*. This is exactly why the model has no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
+`sale`'s `amount` is a **physical column** of `stg_sales`; `currency` is a **logical column**, fixed to USD by the type, with nothing stored. There may be no `currency` column in `stg_sales` at all, and that is correct.
 
-The same idea explains a field whose value the warehouse, in practice, never stores:
+In a multi-currency project the same type, left open, makes both fields physical:
+
+```python
+class StgSales(dblect.ModelContract):
+    dbt_model = "stg_sales"
+    sale: Money
+```
+
+Now `amount` and `currency` are both **physical columns** of `stg_sales` that travel together. (How the pair is named is the multi-column convention, covered under [ModelContract](#modelcontract-binding-types-to-a-models-columns).)
+
+So the same field, `currency`, is a logical column in one project's contract and a physical column in the next. Whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*, which is why the model needs no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
+
+The same idea explains a field whose value the warehouse never stores. Take revenue, where what the number includes is part of its meaning:
 
 ```python
 class Revenue(dblect.DomainType):
@@ -84,9 +109,17 @@ class Revenue(dblect.DomainType):
     currency:          Currency
 ```
 
-No warehouse stores a per-row `contains_tax` boolean; it is the same value on row 1 and row 1,000,000. So in every real project `contains_tax` is a logical column: its value comes from the type, recorded so the framework can reason about it. It is not a special kind of field, just an ordinary one whose value the warehouse never stores. The reasoning is the whole point: `contains_tax=True` and `contains_tax=False` are different quantities, and the bugs dblect targets are the ones where one is used where the other was assumed.
+No warehouse stores a per-row `contains_tax` boolean; it is the same value on row 1 and row 1,000,000. So on a model you fix it in the type, and it rides along as a logical column:
 
-A field whose value has no source, neither fixed in the type nor present as a physical column, is the one error here, and it surfaces as a finding, not a crash: *"`Revenue.contains_tax` on `fct_orders.order_total` has no value: fix it in the type or map it to a column."* The framework will not guess what your revenue includes.
+```python
+class FctOrders(dblect.ModelContract):
+    dbt_model = "marts.fct_orders"
+    net_revenue: Revenue(contains_tax=False, contains_discount=True, currency=Currency.USD)
+```
+
+`net_revenue`'s `amount` is a physical column of `fct_orders`; `contains_tax`, `contains_discount`, and `currency` are logical columns the framework carries so it can reason about them. `contains_tax=True` and `contains_tax=False` are different quantities, and the bugs dblect targets are the ones where one is used where the other was assumed.
+
+A field whose value has no source, neither fixed in the type nor present as a physical column, is the one error here. Type a column `Revenue` but leave `contains_tax` open with no `contains_tax` column to back it, and it surfaces as a finding rather than a crash: *"`Revenue.contains_tax` on `fct_orders.revenue` has no value: fix it in the type or map it to a column."* The framework will not guess what your revenue includes.
 
 ## Refinement: fixing fields to specific values
 
@@ -113,6 +146,16 @@ from dblect.types import Money, Currency
 MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
 ```
+
+Put a refinement on a model and it reads as the plain Pydantic line, the meaning already in the name:
+
+```python
+class FctOrders(dblect.ModelContract):
+    dbt_model = "marts.fct_orders"
+    order_total: MoneyUSD
+```
+
+`order_total` is a physical column carrying the amount; `currency` rides along as a logical column, fixed to USD by `MoneyUSD`. Naming the refinement once beats fixing the fields at every column that uses it.
 
 Refinement and fixing-a-field are the same operation seen from two distances: `.refine()` names a reusable refined type, and inline `Field(...)` (below) fixes a field at one binding site. Both produce a type with fewer open fields.
 
