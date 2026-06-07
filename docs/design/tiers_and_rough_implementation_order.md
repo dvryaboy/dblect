@@ -7,7 +7,7 @@ This document covers what dblect does, at each level of developer investment fro
 dblect operates at three layers of developer investment, each independently useful:
 
 - **The audit** (no declarations): runs against the existing dbt project and reports real bugs. The day-one experience.
-- **Semantic types on selected columns**: typed generators, cross-model tag tracking, type checking at model boundaries.
+- **Domain types on selected columns**: typed generators, cross-model tag tracking, type checking at model boundaries.
 - **Focused contracts on critical chains**: compositional verification across a chain of dbt models, change-impact analysis at PR time, flag-flip preflight.
 
 A team can stop at the audit and get value. A team can advance to typed columns on a single pipeline without committing to declare anything else. Focused contracts are opt-in per chain.
@@ -67,16 +67,16 @@ Internally, dblect does the following:
 
 ---
 
-## Semantic types on selected columns
+## Domain types on selected columns
 
-The user declares semantic types in Python files under a `dblect/` directory in their dbt project:
+The user declares domain types in Python files under a `dblect/` directory in their dbt project:
 
 ```python
 # dblect/types.py
-from dblect import SemanticType
+from dblect import DomainType
 from dblect.types import Decimal
 
-class Revenue(SemanticType):
+class Revenue(DomainType):
     amount: Decimal(18, 2)
     currency: str
     contains_tax: bool
@@ -102,14 +102,14 @@ class StgOrders(ModelContract):
     revenue:     t.RevenuePreTax = Field(non_negative=True)
 ```
 
-Flag-conditional refinement is declared via the `SemanticFlag` system (the canonical flag/type composition pattern, where the flag knows the type and declares its effect via `affects = RefinementEffect(...)`):
+Flag-conditional refinement is declared via the `DomainFlag` system (the canonical flag/type composition pattern, where the flag knows the type and declares its effect via `affects = RefinementEffect(...)`):
 
 ```python
 # dblect/flags.py
-from dblect import SemanticFlag, RefinementEffect
+from dblect import DomainFlag, RefinementEffect
 from .types import Revenue
 
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """When set, revenue values include sales tax."""
     dbt_var = "include_tax_in_revenue"
     type = bool
@@ -125,7 +125,7 @@ See [flags_and_configs_as_types.md](flags_and_configs_as_types.md) for the full 
 
 Internally, dblect adds the following on top of the audit:
 
-**Type-driven generators.** When generating test data for a column with a declared semantic type, use the type's generator method instead of the default. Generators carry constraints (positive, currency context, value ranges) and produce more realistic data. This catches bugs random data wouldn't trigger.
+**Type-driven generators.** When generating test data for a column with a declared domain type, use the type's generator method instead of the default. Generators carry constraints (positive, currency context, value ranges) and produce more realistic data. This catches bugs random data wouldn't trigger.
 
 **Cross-model tag tracking.** When a downstream model references a typed column:
 - Parse the SQL to determine if the column is passed through, transformed, or aggregated
@@ -143,7 +143,7 @@ Internally, dblect adds the following on top of the audit:
 
 **Improved counterexamples.** Generated test data uses domain-aware types, so failures are reproduced with realistic-looking values. Pre-tax revenue values look like plausible pre-tax revenue, not random decimals.
 
-**What semantic types catch additionally:**
+**What domain types catch additionally:**
 - Type mismatches at model boundaries (consumer expects pre-tax, producer changed to post-tax)
 - Flag-conditional inconsistencies (some flag worlds break, others don't)
 - Arithmetic on typed columns that doesn't preserve the declared type
@@ -196,7 +196,7 @@ class FctAttributedRevenue(ModelContract):
 
 Contracts are decorated methods whose bodies build expressions over column proxies. `Requires(...)` entries declare the consumer's expectations on upstream columns. They act as a pressure mechanism for upstreams that haven't been typed yet, and a way to make semantic dependencies explicit where the expression body doesn't force them. Checks run statically (AST walk + type-registry lookup), no PBT needed.
 
-Internally, dblect adds on top of the semantic-types layer:
+Internally, dblect adds on top of the domain-types layer:
 
 **Backward inference.** Given a contract on a target model, walk the DAG backward and determine what each upstream model must satisfy. Generate proposed declarations for upstreams; the developer reviews and accepts. The `focus` interaction is largely automated drafting with human review.
 
@@ -240,7 +240,7 @@ Internally, dblect adds on top of the semantic-types layer:
 
 A few capabilities apply across all layers rather than belonging to one:
 
-**Static SQL analysis (via sqlglot).** Parsing, AST traversal, pattern recognition. Used by the audit for ambiguous-ordering and fanout detection; by the semantic-types layer for tag-propagation pattern recognition; by the focused-contracts layer for dependency tracking and change-impact propagation. One shared substrate; each layer consumes more of its output.
+**Static SQL analysis (via sqlglot).** Parsing, AST traversal, pattern recognition. Used by the audit for ambiguous-ordering and fanout detection; by the domain-types layer for tag-propagation pattern recognition; by the focused-contracts layer for dependency tracking and change-impact propagation. One shared substrate; each layer consumes more of its output.
 
 **Equivalence-aware diffing.** Outputs are compared under appropriate equivalence relations rather than byte-exact. Multiset by default. Order-up-to-ties when `ORDER BY` is present. Set equivalence for set-aggregations. Custom equivalences declarable per contract. Used everywhere outputs are compared (replay determinism, differential PR mode, contract verification).
 
@@ -278,15 +278,15 @@ Order respects dependencies. Each milestone ends in a state where dblect does so
 
 **Milestone:** `dblect init` ships against real dbt projects, finds real bugs end-to-end.
 
-### DSL and semantic types
+### DSL and domain types
 
-11. **DSL implementation.** Semantic types as Python classes (scalar, B1 syntax), refinements, string-reference resolution. The single design-heaviest piece; budget for a throwaway first version.
+11. **DSL implementation.** Domain types as Python classes (scalar, B1 syntax), refinements, string-reference resolution. The single design-heaviest piece; budget for a throwaway first version.
 12. **Type registry and resolution.** Flag registry, world enumeration, per-contract relevant-flag-subspace pruning.
-13. **Type-driven generators.** Semantic types compile to Hypothesis generators with constraints.
+13. **Type-driven generators.** Domain types compile to Hypothesis generators with constraints.
 14. **Cross-model tag tracking.** Type propagation through SQL pass-through via sqlglot column-level lineage; transformation rules for known operations; literals opaque-by-default with `dblect: preserves` / `dblect: discount(N)` / `dblect: tax(rate)` / `dblect: currency(from, to)` annotations.
 15. **Boundary type checking.** Producer/consumer compatibility verification at every model boundary, per-flag-world.
 
-**Milestone:** the semantic-types layer ships; users can declare types on critical columns and catch meaning shifts.
+**Milestone:** the domain-types layer ships; users can declare types on critical columns and catch meaning shifts.
 
 ### Coordinated generation and intent catalog
 
@@ -325,4 +325,4 @@ Order respects dependencies. Each milestone ends in a state where dblect does so
 - Mutation-based generation (v2-full): seed-mutation operators behind the intent catalog, with synthesis as fallback. Replaces v1-medium's synthesis-only path for realism.
 - Demo walkthrough, MCP schemas, findings/SARIF format, counterexample persistence migration: figure out as they come up.
 
-The longest single sub-task is multi-table coordinated generation with the intent catalog; it's where most of the implementation difficulty actually lives. The audit milestone is the shortest path to a shippable artifact and the earliest point at which the project provides verifiable value against a real dbt project. The audit, semantic-types, and focused-contracts milestones are the major capability landmarks; foundation, coordinated generation, and the release polish earn their keep by enabling the capability milestones.
+The longest single sub-task is multi-table coordinated generation with the intent catalog; it's where most of the implementation difficulty actually lives. The audit milestone is the shortest path to a shippable artifact and the earliest point at which the project provides verifiable value against a real dbt project. The audit, domain types, and focused-contracts milestones are the major capability landmarks; foundation, coordinated generation, and the release polish earn their keep by enabling the capability milestones.

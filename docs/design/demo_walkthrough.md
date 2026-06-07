@@ -81,10 +81,10 @@ Create `dblect/types.py`:
 
 ```python
 # dblect/types.py
-from dblect import SemanticType
+from dblect import DomainType
 from dblect.types import Decimal
 
-class Money(SemanticType):
+class Money(DomainType):
     """A monetary amount in a specified currency."""
     amount: Decimal(18, 2)
     currency: str
@@ -161,7 +161,7 @@ Run the check:
 
 ```bash
 $ dblect check
-[dblect] Loaded 5 model contracts, 1 SemanticType (Money), 0 flags
+[dblect] Loaded 5 model contracts, 1 DomainType (Money), 0 flags
 [dblect] Type propagation across DAG... clean (no mismatches)
 [dblect] No contracts declared yet; type-propagation only
 
@@ -202,7 +202,7 @@ No annotation changes. Run the check:
 
 ```bash
 $ dblect check
-[dblect] Loaded 5 model contracts, 1 SemanticType (Money), 0 flags
+[dblect] Loaded 5 model contracts, 1 DomainType (Money), 0 flags
 [dblect] Type propagation across DAG...
 
   FAIL  stg_payments.amount [type mismatch]
@@ -245,9 +245,9 @@ A dev wants to support excluding returned/returning-pending orders from CLV for 
 
 ```python
 # dblect/flags.py
-from dblect import SemanticFlag
+from dblect import DomainFlag
 
-class ExcludeReturnsFromCLV(SemanticFlag):
+class ExcludeReturnsFromCLV(DomainFlag):
     """When set, returned/return_pending orders are excluded from CLV."""
     dbt_var = "exclude_returns_from_clv"
     type = bool
@@ -306,7 +306,7 @@ Run the check:
 
 ```bash
 $ dblect check
-[dblect] Loaded 5 model contracts, 1 SemanticType (Money), 1 flag (ExcludeReturnsFromCLV)
+[dblect] Loaded 5 model contracts, 1 DomainType (Money), 1 flag (ExcludeReturnsFromCLV)
 [dblect] Type propagation across DAG... clean
 [dblect] Enumerating flag worlds: 2 worlds (per the boolean domain)
 [dblect] Running contracts against intent-driven fixtures...
@@ -391,7 +391,7 @@ Run the check:
 
 ```bash
 $ dblect check
-[dblect] Loaded 5 model contracts, 1 SemanticType (Money), 1 flag
+[dblect] Loaded 5 model contracts, 1 DomainType (Money), 1 flag
 [dblect] Type propagation across DAG... clean
 [dblect] Enumerating flag worlds: 2 worlds
 [dblect] Running contracts against intent-driven fixtures...
@@ -472,7 +472,7 @@ dblect/
 .dblect/                 # gitignored: counterexample DB, parsed-manifest cache
 ```
 
-About 80 lines of Python total. Three contracts. One semantic type. One flag. That's the standing investment that catches the three bug classes above and any future variant of them.
+About 80 lines of Python total. Three contracts. One domain type. One flag. That's the standing investment that catches the three bug classes above and any future variant of them.
 
 ## What to add to the demo next
 

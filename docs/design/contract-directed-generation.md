@@ -4,7 +4,7 @@
 
 ## Where this fits in dblect
 
-dblect's value is spread across three layers: static analysis (ordering hazards, type propagation, change-impact at PR time), declared semantic types (typecheck for data pipelines), and property-based verification against user-declared contracts. The first two do useful work without generating any data. The third is where the generator earns its keep.
+dblect's value is spread across three layers: static analysis (ordering hazards, type propagation, change-impact at PR time), declared domain types (typecheck for data pipelines), and property-based verification against user-declared contracts. The first two do useful work without generating any data. The third is where the generator earns its keep.
 
 The point worth being upfront about: the generator does not have to carry the entire differentiated-value story. It has to carry the contract-verification layer specifically. That is a more bounded problem than "build a great general-purpose data generator," and the architecture in this doc is calibrated to that scope.
 
@@ -34,7 +34,7 @@ The proposed generator architecture has three layers.
 
 **Intents.** A small library of generator templates, each parameterized by the contract type and the columns and grain involved. Each intent produces a structural shape known to stress a contract category. The v1 catalog is nine intents (Fanout, Orphan, NullKey, EmptyGroup, OrderingTie, ReplayShuffle, Duplicate, LateRow, Boundary), enumerated in detail below. Each contract category lights up a subset of these: conservation contracts get Fanout/Orphan/NullKey/EmptyGroup, cardinality gets Fanout/Orphan/Boundary, and so on. The catalog is deliberately finite and small; bug classes that aren't captured by the v1 intents are explicitly deferred to v2 (see below).
 
-**Fill.** Once an intent fixes the structural shape on the contract-relevant columns, the rest of the schema is filled in with cheap defaults respecting foreign keys and declared semantic types. The fill layer uses a Hegel state-machine-style construction (the approach is right for foreign-key integrity by construction) but pulls values from small palettes rather than trying to match production distributions. The fill exists to make dbt run without complaining, and that is enough.
+**Fill.** Once an intent fixes the structural shape on the contract-relevant columns, the rest of the schema is filled in with cheap defaults respecting foreign keys and declared domain types. The fill layer uses a Hegel state-machine-style construction (the approach is right for foreign-key integrity by construction) but pulls values from small palettes rather than trying to match production distributions. The fill exists to make dbt run without complaining, and that is enough.
 
 **Profile overlay (optional).** When a profile is available from production sampling, the fill palettes get swapped for profile-derived strategies. Cardinality distributions on join keys, null rates, and time ranges come from real data. The intents still drive the structural shape; the profile adjusts the residual distributions toward realism. This is the layer that lets the OSS zero-declaration case ship a credible default without making the user write generator code.
 
@@ -130,7 +130,7 @@ The architecture pulls from several existing lines of work.
 
 **Hypothesis and Hegel** provide the underlying PBT machinery. The state-machine fixture construction, the shrinking philosophy, the example database, and the generator-as-strategy mental model all come from here. dblect's contribution is the layer above: contract-directed intents that decide what to generate, with Hegel handling how to generate and how to shrink.
 
-**Pandera** demonstrated that schema-as-strategy works for DataFrame-shaped data. The unification of declaration and generation is directly transferable, and dblect's semantic types lean on the same pattern. Pandera's `@check` decorator pattern also informs how contracts attach to models.
+**Pandera** demonstrated that schema-as-strategy works for DataFrame-shaped data. The unification of declaration and generation is directly transferable, and dblect's domain types lean on the same pattern. Pandera's `@check` decorator pattern also informs how contracts attach to models.
 
 **SQLancer and SQLsmith** are the closest prior art for multi-table adversarial generation. Their foreign-key-honoring construction techniques inform the fill layer, and their treatment of dialect-specific edge cases is instructive for the validation-mode story of running samples against the real warehouse periodically.
 

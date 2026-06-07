@@ -8,7 +8,7 @@ Scope: v1 of var handling, covering `var()` and `env_var()` only
 
 dblect needs a way to discover the feature flags and configuration variables a dbt project uses, infer enough about each one (type, domain, default) to enumerate worlds for type propagation, and produce scaffolding that the user reviews and completes.
 
-The user-facing surface is a single command, `dblect scaffold flags`, that walks a dbt project, identifies every `var()` and `env_var()` reference, performs static analysis to infer the type and value domain of each, and writes a Python file of draft `SemanticFlag` classes alongside a diagnostic report. The user reviews the draft, fills in the semantic effect of each flag (the `affects` clause that the static analysis cannot determine), and accepts the scaffold into the project.
+The user-facing surface is a single command, `dblect scaffold flags`, that walks a dbt project, identifies every `var()` and `env_var()` reference, performs static analysis to infer the type and value domain of each, and writes a Python file of draft `DomainFlag` classes alongside a diagnostic report. The user reviews the draft, fills in the semantic effect of each flag (the `affects` clause that the static analysis cannot determine), and accepts the scaffold into the project.
 
 This document specifies the algorithm, the output format, and the implementation phasing.
 
@@ -17,7 +17,7 @@ This document specifies the algorithm, the output format, and the implementation
 1. Discover all `var()` and `env_var()` references across the dbt project, including those reached through macros.
 2. Infer the type of each variable (boolean, enum, integer, string, etc.) where the source SQL gives sufficient static evidence.
 3. Infer the value domain (set of possible values) where evidence supports it.
-4. Produce draft `SemanticFlag` classes the user can review and complete.
+4. Produce draft `DomainFlag` classes the user can review and complete.
 5. Report unfollowed usages and incomplete inferences clearly so the user knows where manual work is needed.
 
 ## Non-goals
@@ -43,7 +43,7 @@ This document specifies the algorithm, the output format, and the implementation
 
 ## Outputs
 
-1. **Generated Python file** (default `dblect/flags/discovered.py`) containing one `SemanticFlag` subclass per discovered variable. Each class includes:
+1. **Generated Python file** (default `dblect/flags/discovered.py`) containing one `DomainFlag` subclass per discovered variable. Each class includes:
    - The dbt var or env_var name
    - The inferred type
    - The inferred domain (where applicable)
@@ -126,7 +126,7 @@ class DiscoveredVar:
 
 ### Output generation
 
-1. Render each `DiscoveredVar` as a Python `SemanticFlag` class (template below).
+1. Render each `DiscoveredVar` as a Python `DomainFlag` class (template below).
 2. Sort classes alphabetically and write to the output file.
 3. Generate the diagnostic report.
 
@@ -242,7 +242,7 @@ Packages like `dbt-utils` and `dbt-expectations` register custom Jinja extension
 The scaffolded file is written to `dblect/flags/discovered.py` by default (overridable). Each variable produces a class:
 
 ```python
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """
     Auto-discovered from dbt var. TODO: describe what this flag controls.
     """
@@ -260,7 +260,7 @@ class IncludeTaxInRevenue(SemanticFlag):
 For enum-typed variables with inferred finite domains:
 
 ```python
-class Environment(SemanticFlag):
+class Environment(DomainFlag):
     """
     Auto-discovered from dbt var. TODO: describe what this flag controls.
     """
@@ -279,7 +279,7 @@ class Environment(SemanticFlag):
 For variables whose type was inferred but whose domain remains open:
 
 ```python
-class Limit(SemanticFlag):
+class Limit(DomainFlag):
     """
     Auto-discovered from dbt var. TODO: describe what this flag controls.
     """
@@ -297,7 +297,7 @@ class Limit(SemanticFlag):
 For variables that could not be inferred at all:
 
 ```python
-class CustomPath(SemanticFlag):
+class CustomPath(DomainFlag):
     """
     Auto-discovered from dbt var. TODO: declare type, domain, and affects.
     """
@@ -425,7 +425,7 @@ As we encounter dbt projects in the wild that trigger new patterns, add minimize
 
 2. **Closed-world vs open-world default for inferred domains:** Currently the spec marks inferred enum domains as "tentative." Is this strong enough, or should we surface a more explicit confirmation step before treating the inferred domain as authoritative for world enumeration?
 
-3. **Vars declared in dbt_project.yml but never used:** Should the scaffold emit a `SemanticFlag` class anyway (since the var is declared), or skip it with a note? Argument for emitting: the var may be used in the future. Argument for skipping: noise reduction.
+3. **Vars declared in dbt_project.yml but never used:** Should the scaffold emit a `DomainFlag` class anyway (since the var is declared), or skip it with a note? Argument for emitting: the var may be used in the future. Argument for skipping: noise reduction.
 
 4. **Per-package var inference:** Some vars are declared by installed packages (e.g., `dbt-utils:dispatch_list`). Should these be included in the scaffold output, or filtered out as "not the user's vars"? Probably filter, but worth confirming.
 
@@ -435,10 +435,10 @@ As we encounter dbt projects in the wild that trigger new patterns, add minimize
 
 ## Appendix: Reference types
 
-`SemanticFlag` is defined in `dblect/types/flag.py` (specification elsewhere). For this spec, the relevant interface is:
+`DomainFlag` is defined in `dblect/types/flag.py` (specification elsewhere). For this spec, the relevant interface is:
 
 ```python
-class SemanticFlag:
+class DomainFlag:
     dbt_var: str | None         # the dbt var name (None for env_vars)
     env_var: str | None         # the env_var name (None for dbt vars)
     type: type | EnumType       # the inferred or declared type
@@ -447,7 +447,7 @@ class SemanticFlag:
     affects: RefinementEffect   # the semantic effect (user-declared)
 ```
 
-`RefinementEffect` is defined in `dblect/types/effect.py`. It expresses how the flag's value maps to refinement axis values on declared semantic types.
+`RefinementEffect` is defined in `dblect/types/effect.py`. It expresses how the flag's value maps to refinement axis values on declared domain types.
 
 `Domain` for finite domains is a list of literal values; for branch-point partitioned numeric domains, it's a list of intervals.
 
@@ -455,9 +455,9 @@ class SemanticFlag:
 
 - **var**: a dbt variable declared via `{{ var('name') }}` or in `dbt_project.yml`
 - **env_var**: an environment variable accessed via `{{ env_var('NAME') }}`
-- **flag**: a typed wrapper around a var or env_var with declared semantic effect; a `SemanticFlag` subclass
+- **flag**: a typed wrapper around a var or env_var with declared semantic effect; a `DomainFlag` subclass
 - **scaffold**: the generated draft Python file produced by inference
 - **world**: a specific assignment of values to flags, used during type propagation
 - **domain**: the set of possible values a variable can take
-- **refinement effect**: how a flag's value modifies the refinements on semantic types
+- **refinement effect**: how a flag's value modifies the refinements on domain types
 - **opaque usage**: a var usage we could not statically resolve (typically inside an unfollowable macro)

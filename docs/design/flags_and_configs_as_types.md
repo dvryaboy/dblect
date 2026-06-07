@@ -2,7 +2,7 @@
 
 This document introduces dblect's flag system: how dbt vars and env_vars become typed configuration that dblect can reason about, how to declare and use flags, and what the framework does with them at PR time.
 
-Audience: someone who has read the introductory dblect material, gets the pitch (static and runtime correctness checks for analytics pipelines, declared semantic types, contracts that survive refactors), and wants the next level of detail on the flag side without diving into implementation internals.
+Audience: someone who has read the introductory dblect material, gets the pitch (static and runtime correctness checks for analytics pipelines, declared domain types, contracts that survive refactors), and wants the next level of detail on the flag side without diving into implementation internals.
 
 ## The problem flags solve
 
@@ -12,7 +12,7 @@ Two problems with flags as they exist today:
 
 The data your pipeline produces depends on flag values, but your code only runs one configuration at a time. If you change a flag, you don't know what breaks until you actually run with the new value. A flag change can silently invalidate downstream assumptions for months until the affected configuration is finally exercised in production.
 
-Flags interact with semantic types. If `include_tax_in_revenue` is True, your `revenue` column means something different than when it's False. Downstream models built against one meaning will break when it changes. The bug class is invisible to value-level diff tools when the flag hasn't actually been flipped yet, because the data looks identical until the configuration is exercised.
+Flags interact with domain types. If `include_tax_in_revenue` is True, your `revenue` column means something different than when it's False. Downstream models built against one meaning will break when it changes. The bug class is invisible to value-level diff tools when the flag hasn't actually been flipped yet, because the data looks identical until the configuration is exercised.
 
 dblect's flag system addresses both: it lifts flags into the type system so they can be reasoned about statically, and it checks every configuration of your flags at PR time without running any of them.
 
@@ -24,14 +24,14 @@ A dblect flag is a Python class that represents a single piece of configuration.
 - A **type** (bool, enum, integer, string)
 - A **domain** (the set of values the flag can take)
 - A **default** (the value used when nothing else specifies)
-- An **effect** (how the flag's value modifies refinement axes on semantic types)
+- An **effect** (how the flag's value modifies refinement axes on domain types)
 
 Together these tell the framework what the flag is and what it does. The link, type, domain, and default come from your dbt project; dblect can typically infer them. The effect is the part you write, because it expresses what the flag *means* for your data.
 
 The simplest flag looks like this:
 
 ```python
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """When set, revenue values include sales tax."""
     dbt_var = "include_tax_in_revenue"
     type = bool
@@ -53,7 +53,7 @@ You usually don't write flag classes from scratch. You run:
 dblect scaffold flags
 ```
 
-The framework walks your dbt project, reads the manifest, and finds every `var()` and `env_var()` reference, including those reached through macros. For each one, it produces a draft `SemanticFlag` class. The draft has:
+The framework walks your dbt project, reads the manifest, and finds every `var()` and `env_var()` reference, including those reached through macros. For each one, it produces a draft `DomainFlag` class. The draft has:
 
 - The link to the dbt var pre-filled
 - The type inferred from how the var is used in your SQL
@@ -66,7 +66,7 @@ Your job is to review the drafts, write the docstrings and `affects` clauses, an
 A scaffolded boolean flag looks like:
 
 ```python
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """TODO: describe what this flag controls."""
     dbt_var = "include_tax_in_revenue"
     type = bool
@@ -84,7 +84,7 @@ You see the source locations the inference relied on, so you can verify the fram
 A scaffolded enum flag looks like:
 
 ```python
-class Environment(SemanticFlag):
+class Environment(DomainFlag):
     """TODO: describe what this flag controls."""
     dbt_var = "environment"
     type = Enum["dev", "prod", "staging"]
@@ -98,7 +98,7 @@ The "tentative" note on the domain is important. The framework infers the value 
 When inference fails entirely, you get a flag with placeholder TODOs and a diagnostic comment explaining why:
 
 ```python
-class CustomPath(SemanticFlag):
+class CustomPath(DomainFlag):
     """TODO: declare type, domain, and affects."""
     dbt_var = "custom_path"
     type = ...  # TODO: inference failed
@@ -114,7 +114,7 @@ In practice, inference works for the great majority of vars in typical dbt proje
 
 ## The `affects` clause: what your flag does
 
-The `affects` clause is the load-bearing part of a flag declaration, and the one piece dblect can't infer for you. It says how the flag's value maps to refinements on your semantic types.
+The `affects` clause is the load-bearing part of a flag declaration, and the one piece dblect can't infer for you. It says how the flag's value maps to refinements on your domain types.
 
 The simplest case is a boolean flag that maps directly to a single refinement axis on a single type:
 
@@ -131,7 +131,7 @@ Read this as: "When the flag is True, any `Revenue` column produced by code that
 For enum flags that affect a single axis, the mapping is a dictionary:
 
 ```python
-class TaxJurisdiction(SemanticFlag):
+class TaxJurisdiction(DomainFlag):
     dbt_var = "tax_jurisdiction"
     type = Enum["US", "EU", "JP"]
     affects = RefinementEffect(
@@ -143,7 +143,7 @@ class TaxJurisdiction(SemanticFlag):
 For flags that affect multiple axes or multiple types, you combine effects:
 
 ```python
-class StrictDeduplication(SemanticFlag):
+class StrictDeduplication(DomainFlag):
     dbt_var = "strict_deduplication"
     type = bool
     affects = CompositeEffect(
@@ -269,7 +269,7 @@ For everyday use, the implication is straightforward: declare the columns you ca
 
 ### Switch types as an optional convenience
 
-An alternative authoring surface (a `Revenue.switch(on=flag, cases={True: ..., False: ...})` shorthand on the type itself) was considered as an early-iteration design. The canonical surface is the `SemanticFlag` class with `affects = RefinementEffect(...)` shown throughout this document, because it scales cleanly to flags that target multiple axes or multiple types (`CompositeEffect`, `ConditionalEffect`) and keeps the registry of flag effects in one place. A `switch()` shorthand may still ship as a thin convenience that produces the same registry entry as a single-axis `RefinementEffect`, if the engineering cost is small. Whether to bother is unsettled; nothing in the rest of the design depends on it.
+An alternative authoring surface (a `Revenue.switch(on=flag, cases={True: ..., False: ...})` shorthand on the type itself) was considered as an early-iteration design. The canonical surface is the `DomainFlag` class with `affects = RefinementEffect(...)` shown throughout this document, because it scales cleanly to flags that target multiple axes or multiple types (`CompositeEffect`, `ConditionalEffect`) and keeps the registry of flag effects in one place. A `switch()` shorthand may still ship as a thin convenience that produces the same registry entry as a single-axis `RefinementEffect`, if the engineering cost is small. Whether to bother is unsettled; nothing in the rest of the design depends on it.
 
 ## What's coming, what's deferred
 
