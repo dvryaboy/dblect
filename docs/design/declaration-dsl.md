@@ -313,8 +313,8 @@ class FctOrders(ModelContract):
     order_id:    OrderId
     customer_id: dblect.ForeignKey("dim_customers.customer_id")
     order_date:  Date
-    order_total: RevenueNet = dblect.Field(non_negative=True)
-    tax_paid:    TaxAmount  = dblect.Field(non_negative=True)
+    order_total: RevenueNet = dblect.Field(ge=0)
+    tax_paid:    TaxAmount  = dblect.Field(ge=0)
 
     @contract.conservation(tolerance=0.01)
     def total_matches_line_items(self):
@@ -443,7 +443,7 @@ class StgPayments(ModelContract):
     payment_id:     t.PrimaryKey
     order_id:       ForeignKey("stg_orders.order_id")
     payment_method: t.Varchar
-    amount:         RevenueNet = Field(non_negative=True)
+    amount:         RevenueNet = Field(ge=0)
 ```
 
 ```python
@@ -501,7 +501,7 @@ The genuinely unsettled parts of the authoring surface. None blocks a working fi
 
 - **Multi-column binding convention.** When a multi-field type spans columns, the default mapping (shown here as `{contract_field}_{field}`) needs to be pinned down, along with how aggressively `.columns(...)` overrides interact with the generated stubs and with dbt `relationships` tests already present. The single-open-field case (column == contract field name) is settled; the multi-field case is where a real schema should decide the convention.
 - **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
-- **How visible the trust split in `Field` should be.** `Field(non_negative=True)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched pin) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
+- **How visible the trust split in `Field` should be.** `Field(ge=0)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched pin) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
 - **Detecting the unsound aggregate versus the unsound assignment.** When `sum(amount)` mixes currencies and the result is also assigned to a `MoneyUSD` column, there are two true statements: the aggregation is not well-typed, and the declared output type is wrong. Whether to report one finding or two, and which to make primary, is a diagnostics call that wants real output in front of real users before it is fixed. The same question applies to the cascade in the currency-creep scenario.
 - **Call-syntax sugar for refinement.** `Money(currency=Currency.USD)` reads as shorthand for `Money.refine(currency=Currency.USD)` and is used throughout this doc for the pinning-at-use case. `.refine()` is canonical for naming a reusable type; whether the call form is exactly equivalent sugar or reserved for inline use is a small consistency call.
 - **String literals on enum fields.** Accepting `currency="USD"` and validating against the `Currency` enum is friendlier at the call site; requiring `Currency.USD` keeps the surface free of stringly-typed values. A reasonable resolution accepts both and treats an out-of-domain literal as a finding, but the default the docs should teach is unsettled.

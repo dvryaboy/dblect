@@ -156,10 +156,10 @@ All three authoring channels reduce to a `Fact`, and a developer writing a decla
 |---|---|---|
 | `not_null` / `unique` test, native constraint, column `data_type` | dbt manifest | structural grounding fact (`Declared(DBT_GENERIC_TEST)`, `NativeConstraint`, `Declared(COLUMN_METADATA)`) |
 | `meta.dblect.*` in `schema.yml` | manifest meta (read-only in v1) | bridge fact (`Declared(DBT_META)`) |
-| `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract` | Python declaration registry | user-domain fact (`Declared(USER_ASSERTED)`) |
+| `order_total: RevenueNet = Field(ge=0)` on a `ModelContract` | Python declaration registry | user-domain fact (`Declared(USER_ASSERTED)`) |
 | `DomainFlag.affects` resolved under a world | flag world enumerator | `CompileValue` fact scoped to that world |
 
-A worked example, the user-domain channel. A developer writes a Pandera-shaped declaration `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract`, and a discoverer reading the declaration registry returns one fact:
+A worked example, the user-domain channel. A developer writes a Pandera-shaped declaration `order_total: RevenueNet = Field(ge=0)` on a `ModelContract`, and a discoverer reading the declaration registry returns one fact:
 
 ```python
 Fact(

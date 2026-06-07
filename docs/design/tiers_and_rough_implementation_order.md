@@ -99,7 +99,7 @@ class StgOrders(ModelContract):
 
     order_id:    t.PrimaryKey
     user_id:     ForeignKey("dim_users.user_id")
-    revenue:     t.RevenuePreTax = Field(non_negative=True)
+    revenue:     t.RevenuePreTax = Field(ge=0)
 ```
 
 Flag-conditional refinement is declared via the `DomainFlag` system (the canonical flag/type composition pattern, where the flag knows the type and declares its effect via `affects = RefinementEffect(...)`):

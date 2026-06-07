@@ -73,8 +73,8 @@ class FctOrders(ModelContract):
     order_id: OrderId
     customer_id: dblect.ForeignKey("dim_customers.customer_id")
     order_date: OrderDate
-    order_total: RevenueNet = Field(non_negative=True)
-    tax_paid: TaxAmount = Field(non_negative=True)
+    order_total: RevenueNet = Field(ge=0)
+    tax_paid: TaxAmount = Field(ge=0)
     
     # contract methods
     @contract.conservation(tolerance=0.01)
@@ -396,8 +396,8 @@ Model: marts.fct_orders
     order_id: OrderId
     customer_id: ForeignKey(dim_customers.customer_id)
     order_date: OrderDate
-    order_total: RevenueNet [non_negative=True]
-    tax_paid: TaxAmount [non_negative=True]
+    order_total: RevenueNet [ge=0]
+    tax_paid: TaxAmount [ge=0]
   Contracts:
     order_total_matches_line_items [conservation, tolerance=0.01]
     one_row_per_order [cardinality, 1:1 on order_id]

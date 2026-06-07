@@ -121,7 +121,7 @@ class StgPayments(ModelContract):
     payment_id:      t.PrimaryKey
     order_id:        ForeignKey("stg_orders.order_id")
     payment_method:  t.Varchar
-    amount:          MoneyUSD = Field(non_negative=True)
+    amount:          MoneyUSD = Field(ge=0)
 ```
 
 Create `dblect/contracts/marts.py`:
@@ -139,11 +139,11 @@ class Orders(ModelContract):
     customer_id:          ForeignKey("customers.customer_id")
     order_date:           t.Date
     status:               t.Varchar
-    credit_card_amount:   MoneyUSD = Field(non_negative=True)
-    coupon_amount:        MoneyUSD = Field(non_negative=True)
-    bank_transfer_amount: MoneyUSD = Field(non_negative=True)
-    gift_card_amount:     MoneyUSD = Field(non_negative=True)
-    amount:               MoneyUSD = Field(non_negative=True)
+    credit_card_amount:   MoneyUSD = Field(ge=0)
+    coupon_amount:        MoneyUSD = Field(ge=0)
+    bank_transfer_amount: MoneyUSD = Field(ge=0)
+    gift_card_amount:     MoneyUSD = Field(ge=0)
+    amount:               MoneyUSD = Field(ge=0)
 
 class Customers(ModelContract):
     dbt_model = "customers"
