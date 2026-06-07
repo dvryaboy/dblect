@@ -1,4 +1,4 @@
-# The algebra of semantic types: which operations are safe, and what you declare to get them
+# The algebra of domain types: which operations are safe, and what you declare to get them
 
 *Status: design notes, theoretical foundation. This document answers one question the [declaration DSL](declaration-dsl.md) raises and does not settle: when SQL combines typed values, how does the framework know which combinations are meaningful, and what does the author have to write to make that work? The short answer is that the rules are read off the algebra of the field types the author already declares, so the surface stays small. This note grounds that claim in the literature and works it through the currency example end to end. Where a primary is present in the local paper corpus it is cited by filename; where the canonical reference sits outside that corpus it is named as an external reference.*
 
@@ -9,7 +9,7 @@ A meaning-preserving type system for SQL has to keep two separate questions apar
 - **Validity.** Is `sum(amount) group by country` a *meaningful* operation on these values? This is what produces a finding.
 - **Decomposability.** Can the result be computed from partial results, so the property propagates model-to-model along the DAG rather than being re-derived globally? This is what makes the check tractable.
 
-They are orthogonal and we need both. The distributive/algebraic/holistic classification of Gray et al. (`1996_cs_0701155_Data_Cube_A_Relational_Aggregation_Operator_Generalizing_Gro.pdf`) is the decomposability axis: `SUM`, `COUNT`, `MIN`, `MAX` are distributive (`F({Xij}) = G({F(...)})`), `AVG` is algebraic (carry a fixed-size summary, here sum and count), `MEDIAN`/`MODE`/`RANK` are holistic. Distributivity is exactly why a semantic-type obligation on a `SUM` can be checked as a local propagation rule: the super-aggregate is the aggregate of partial aggregates, so the type that flows out of one model is enough to reason about the next. Validity is the rest of this note.
+They are orthogonal and we need both. The distributive/algebraic/holistic classification of Gray et al. (`1996_cs_0701155_Data_Cube_A_Relational_Aggregation_Operator_Generalizing_Gro.pdf`) is the decomposability axis: `SUM`, `COUNT`, `MIN`, `MAX` are distributive (`F({Xij}) = G({F(...)})`), `AVG` is algebraic (carry a fixed-size summary, here sum and count), `MEDIAN`/`MODE`/`RANK` are holistic. Distributivity is exactly why a domain-type obligation on a `SUM` can be checked as a local propagation rule: the super-aggregate is the aggregate of partial aggregates, so the type that flows out of one model is enough to reason about the next. Validity is the rest of this note.
 
 ## What the author declares: magnitudes and tags, inferred from field algebra
 
@@ -20,7 +20,7 @@ A field is a **magnitude** when its type is additive: its values form a commutat
 A field is a **tag** when its type supports equality but no meaningful addition: a closed enumeration, a boolean, an identifier.
 
 ```python
-class Money(dblect.SemanticType):
+class Money(dblect.DomainType):
     amount:   Decimal(18, 2)   # Decimal adds and scales -> magnitude
     currency: Currency         # enum, equality only      -> tag
 ```
@@ -119,7 +119,7 @@ Tag coherence and grain are the two preconditions for a sound `sum`: every contr
 
 ## The lattice underneath
 
-All of the above is one structure: a lattice of tag knowledge attached to a base type, with operations stated as require/produce over that lattice and safety decided by the lattice order. This is the type-qualifier view (Foster, Fahndrich & Aiken, *A Theory of Type Qualifiers*, PLDI 1999; external) resting on Denning's lattice model of information flow (1976; external), and it is the same meet-semilattice machinery the substrate already runs for nullability and uniqueness, which is why semantic type drops in as one more property over [lineage-facts.md](lineage-facts.md) rather than a separate engine. For currency the qualifier lattice is
+All of the above is one structure: a lattice of tag knowledge attached to a base type, with operations stated as require/produce over that lattice and safety decided by the lattice order. This is the type-qualifier view (Foster, Fahndrich & Aiken, *A Theory of Type Qualifiers*, PLDI 1999; external) resting on Denning's lattice model of information flow (1976; external), and it is the same meet-semilattice machinery the substrate already runs for nullability and uniqueness, which is why domain type drops in as one more property over [lineage-facts.md](lineage-facts.md) rather than a separate engine. For currency the qualifier lattice is
 
 ```
         T   (unknown or mixed)        <- detached, or summed across currencies

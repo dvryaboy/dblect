@@ -1,12 +1,12 @@
-# The declaration DSL: authoring semantic types and model contracts
+# The declaration DSL: authoring domain types and model contracts
 
-*Status: design notes, consumer-experience focused. This document fixes the authoring surface a dblect user actually writes and reads: semantic types, refinements, and the model contracts that bind them to dbt models. It sits above the substrate ([lineage-facts.md](lineage-facts.md)) and is a companion to the broader [technical intro](dblect_technical_intro.md), narrowed to one question: what does it feel like to declare meaning in dblect, and watch the framework catch where that meaning stops composing? Syntax shown is the target; the genuinely unsettled surface details are listed at the end.*
+*Status: design notes, consumer-experience focused. This document fixes the authoring surface a dblect user actually writes and reads: domain types, refinements, and the model contracts that bind them to dbt models. It sits above the substrate ([lineage-facts.md](lineage-facts.md)) and is a companion to the broader [technical intro](dblect_technical_intro.md), narrowed to one question: what does it feel like to declare meaning in dblect, and watch the framework catch where that meaning stops composing? Syntax shown is the target; the genuinely unsettled surface details are listed at the end.*
 
 ## The promise this surface keeps
 
 A dbt project encodes meaning in SQL and in the analysts' heads, and almost nowhere a tool can read. `order_total` is net of discounts and gross of tax; `revenue` switched from accrual to cash basis last quarter; `amount` is dollars until the day someone adds a EUR row. None of that is written down, so when one of these meanings shifts the build stays green and the dashboards drift.
 
-dblect's declaration layer is where you write the meaning down, once, in Python that sits beside your dbt project and never touches your models. You declare what a column *means* (a semantic type), bind it to the dbt model that produces it (a model contract), and the framework propagates those meanings along the dbt DAG. The payoff is not the declaration; it is the moment the framework flags the place where two meanings collide or an operation stops making sense, at PR review time, before any data runs.
+dblect's declaration layer is where you write the meaning down, once, in Python that sits beside your dbt project and never touches your models. You declare what a column *means* (a domain type), bind it to the dbt model that produces it (a model contract), and the framework propagates those meanings along the dbt DAG. The payoff is not the declaration; it is the moment the framework flags the place where two meanings collide or an operation stops making sense, at PR review time, before any data runs.
 
 This document is about the writing of it, and about the two collisions that motivate the whole surface. The companion docs cover what the framework does mechanically with what you write.
 
@@ -36,11 +36,11 @@ Class-shaped declarations, type-annotated fields, `Field(...)` metadata, the cla
 
 One honest caveat, stated up front because it is the only place a Pydantic reader's instinct needs adjusting:
 
-> **dblect declarations look like Pydantic, but they are never instantiated.** `SemanticType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. The next section is the one idea that follows from that.
+> **dblect declarations look like Pydantic, but they are never instantiated.** `DomainType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. The next section is the one idea that follows from that.
 
 ## The one idea: a field lands in a column, or it is pinned to a constant
 
-A Pydantic model is a record of fields, and so is a dblect `SemanticType`. The single move to learn is what a field maps onto.
+A Pydantic model is a record of fields, and so is a dblect `DomainType`. The single move to learn is what a field maps onto.
 
 Pydantic gives every field a value, one record per row, when the program runs. dblect never runs the record. It maps each field onto the relation, and a field lands in one of exactly two places:
 
@@ -53,7 +53,7 @@ That single degree of freedom is the entire conceptual delta, and it is what let
 import dblect
 from dblect.types import Decimal, Currency   # Currency is the ISO 4217 enum
 
-class Money(dblect.SemanticType):
+class Money(dblect.DomainType):
     """An amount of money in some currency."""
     amount:   Decimal(18, 2)
     currency: Currency
@@ -69,7 +69,7 @@ class Money(dblect.SemanticType):
 The same mechanism explains a field that, in practice, never lands in a column at all:
 
 ```python
-class Revenue(dblect.SemanticType):
+class Revenue(dblect.DomainType):
     """A revenue amount, with what it includes recorded as part of the type."""
     amount:            Decimal(18, 2)
     contains_tax:      bool
@@ -113,7 +113,7 @@ Refinement and pinning-a-field are the same operation seen from two distances: `
 
 Declaring types is setup. The return comes when SQL folds several typed values into one and the framework checks that the fold is meaningful. There is one principle, and it shows up as two everyday operations:
 
-> When an operation combines several values of a semantic type into one result, the type's meaning-bearing fields must stay coherent: anything pinned must agree, and anything per-row must be held constant across what is being combined.
+> When an operation combines several values of a domain type into one result, the type's meaning-bearing fields must stay coherent: anything pinned must agree, and anything per-row must be held constant across what is being combined.
 
 "Combining" happens two ways in SQL, and each is one of the scenarios that motivates this whole layer.
 
@@ -153,7 +153,7 @@ The rule that decides agreement is the one your intuition supplies: two refineme
 | `RevenueNet` | `RevenueGross` | **conflict** (`contains_discount` disagrees) |
 | `MoneyEUR` | `MoneyUSD` | **conflict** (`currency` disagrees) |
 
-Under the hood this is a lattice meet on the substrate (see [lineage-facts.md](lineage-facts.md)); you never see the lattice, only a type that flowed down the DAG, a type you declared, and a finding where they collide. It is the same engine that already propagates nullability and uniqueness, with the semantic type as one more property over it.
+Under the hood this is a lattice meet on the substrate (see [lineage-facts.md](lineage-facts.md)); you never see the lattice, only a type that flowed down the DAG, a type you declared, and a finding where they collide. It is the same engine that already propagates nullability and uniqueness, with the domain type as one more property over it.
 
 ### Combining values across rows: the sum that quietly stops making sense
 
@@ -202,10 +202,10 @@ That is the demo's strongest beat: a single declaration on a source illuminates 
 The finding lands on an undeclared model because propagation does not depend on declarations. Three moves get it there:
 
 - **The declaration is a relational fact, not a per-column label.** `charge_amount: Money` with `currency` open binds two columns into one value: *"`charge_amount` is the `amount` field of a `Money` whose `currency` field is the column `currency`."* The companion link is part of the fact, the same way a uniqueness fact ranges over a key tuple rather than a single column.
-- **The fact rides column-level lineage across the whole DAG.** Semantic type is one more property over the substrate ([column-level-lineage.md](column-level-lineage.md)), the engine that already moves nullability and uniqueness cross-model. It propagates through every model that selects `charge_amount`, contract or no contract, so the downstream reference arrives carrying "I am `Money.amount`, and my companion is the `currency` that traveled with me."
+- **The fact rides column-level lineage across the whole DAG.** Domain type is one more property over the substrate ([column-level-lineage.md](column-level-lineage.md)), the engine that already moves nullability and uniqueness cross-model. It propagates through every model that selects `charge_amount`, contract or no contract, so the downstream reference arrives carrying "I am `Money.amount`, and my companion is the `currency` that traveled with me."
 - **The aggregation check is conservative.** To *permit* `sum(charge_amount) group by country`, the framework must *prove* the companion `currency` is constant within each group: present in the `GROUP BY`, pinned in the type, narrowed by a `WHERE currency = ...`, or fixed by a declared functional dependency `country -> currency`. Absent a proof, it flags. It fires here not because dblect knows the currencies are mixed, but because every path to proving they are not is closed: `currency` was projected away before the rollup, and upstream it is per-row.
 
-The general rule: an arithmetic reduction (`sum`, `avg`, and friends) over one field of a multi-field semantic type is well-typed only when the type's other fields are provably constant across the reduced set. The framework reads the grouping keys from the query and checks them against the companion fields; the machinery lives with the substrate (see [propagation-soundness.md](propagation-soundness.md)).
+The general rule: an arithmetic reduction (`sum`, `avg`, and friends) over one field of a multi-field domain type is well-typed only when the type's other fields are provably constant across the reduced set. The framework reads the grouping keys from the query and checks them against the companion fields; the machinery lives with the substrate (see [propagation-soundness.md](propagation-soundness.md)).
 
 #### Telling dblect the sum is fine
 
@@ -245,7 +245,7 @@ join {{ ref('dim_country') }} d using (country)   -- d.currency is a function of
 group by c.country
 ```
 
-A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by pinning the tag. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [semantic-type-algebra.md](semantic-type-algebra.md).
+A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by pinning the tag. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
 
 ### Joining values: the total that gets counted twice
 
@@ -284,11 +284,11 @@ FAIL  marts.order_revenue.revenue [aggregation over a fanned-out magnitude]
       models/marts/order_revenue.sql:2
 ```
 
-The declared `ForeignKey` is what makes the grain explicit: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. An existing dbt `relationships` test is read the same way, so a project that already tests its keys gets this finding without new declarations. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the tags to agree. The full treatment of grain alongside tag coherence is in [semantic-type-algebra.md](semantic-type-algebra.md).
+The declared `ForeignKey` is what makes the grain explicit: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. An existing dbt `relationships` test is read the same way, so a project that already tests its keys gets this finding without new declarations. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the tags to agree. The full treatment of grain alongside tag coherence is in [domain-type-algebra.md](domain-type-algebra.md).
 
 ## ModelContract: binding types to a model's columns
 
-A `ModelContract` binds semantic types to one dbt model's columns and is the unit a reader opens to ask "what is this model supposed to be?"
+A `ModelContract` binds domain types to one dbt model's columns and is the unit a reader opens to ask "what is this model supposed to be?"
 
 ```python
 # dblect/contracts/marts.py
@@ -346,7 +346,7 @@ The convention degrades to the scalar case cleanly: with exactly one open field,
 
 ### Registration and resolution: a typo is a finding, not a crash
 
-Classes register on definition through `__init_subclass__`, the import-time discovery pytest and Pydantic use. The framework scans `dblect/`, imports every module, and every `ModelContract` and `SemanticType` lands in a registry. Resolution against the manifest (does `marts.fct_orders` exist? does `dim_customers.customer_id`?) runs *after* the whole scan completes, so a misspelled `dbt_model` or a renamed column surfaces as a finding in the report alongside the others, rather than as an `ImportError` that blinds the analyzer to the rest of the project. One broken contract file does not take down the audit.
+Classes register on definition through `__init_subclass__`, the import-time discovery pytest and Pydantic use. The framework scans `dblect/`, imports every module, and every `ModelContract` and `DomainType` lands in a registry. Resolution against the manifest (does `marts.fct_orders` exist? does `dim_customers.customer_id`?) runs *after* the whole scan completes, so a misspelled `dbt_model` or a renamed column surfaces as a finding in the report alongside the others, rather than as an `ImportError` that blinds the analyzer to the rest of the project. One broken contract file does not take down the audit.
 
 ### The editor experience: `models` and generated stubs
 
@@ -374,10 +374,10 @@ A dbt `var()` changes what your models produce, and when it gates a branch that 
 ```python
 # dblect/flags.py
 import dblect
-from dblect import SemanticFlag, RefinementEffect
+from dblect import DomainFlag, RefinementEffect
 from .types import Revenue
 
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """When set, revenue values include sales tax."""
     dbt_var = "include_tax_in_revenue"
     type    = bool
@@ -413,7 +413,7 @@ The authored surface assembled, the parts this document covered shown together:
 import dblect
 from dblect.types import Decimal, Currency
 
-class Revenue(dblect.SemanticType):
+class Revenue(dblect.DomainType):
     """Revenue, with what it includes and its currency recorded as fields."""
     amount:            Decimal(18, 2)
     contains_tax:      bool
@@ -441,10 +441,10 @@ class StgPayments(ModelContract):
 
 ```python
 # dblect/flags.py
-from dblect import SemanticFlag, RefinementEffect
+from dblect import DomainFlag, RefinementEffect
 from .types import Revenue
 
-class IncludeTaxInRevenue(SemanticFlag):
+class IncludeTaxInRevenue(DomainFlag):
     """When set, revenue values include sales tax."""
     dbt_var = "include_tax_in_revenue"
     type    = bool
@@ -459,8 +459,8 @@ my_dbt_project/
 ├── models/                 # your dbt models, untouched
 └── dblect/
     ├── __init__.py
-    ├── types.py            # SemanticType definitions and refinements
-    ├── flags.py            # SemanticFlag declarations
+    ├── types.py            # DomainType definitions and refinements
+    ├── flags.py            # DomainFlag declarations
     ├── contracts/
     │   ├── staging.py      # ModelContract per staging model
     │   └── marts.py        # ModelContract per mart
@@ -476,8 +476,8 @@ For the reader placing this against what they already know:
 
 | Pydantic | dblect | What is the same | What differs |
 |---|---|---|---|
-| `class X(BaseModel)` | `class X(SemanticType)` / `class X(ModelContract)` | class-as-declaration, annotated fields | own metaclass, never instantiated to validate a row |
-| a field holds one row's value | a `SemanticType` field lands in a column or is pinned to a constant | the field/record shape | a field can be per-row here and a fixed constant there; `currency` is the example |
+| `class X(BaseModel)` | `class X(DomainType)` / `class X(ModelContract)` | class-as-declaration, annotated fields | own metaclass, never instantiated to validate a row |
+| a field holds one row's value | a `DomainType` field lands in a column or is pinned to a constant | the field/record shape | a field can be per-row here and a fixed constant there; `currency` is the example |
 | a field holds one row's value | a `ModelContract` field names a SQL column (or several) | annotation syntax, field naming | the field name is the column name; a multi-field type spans several columns |
 | `Field(gt=0)` | `dblect.Field(non_negative=True)` | `Field(...)` metadata role | also pins a field inline (a vouched meaning) |
 | `Annotated[int, Gt(0)]` | `Annotated[Decimal, NonNegative]` | the `Annotated` constraint idiom | constraints are checked against data, not on assignment |
@@ -493,11 +493,11 @@ The one row to internalize is the second: a field lands in a column or is pinned
 The genuinely unsettled parts of the authoring surface. None blocks a working first version; each is best settled when a real declaration forces it.
 
 - **Multi-column binding convention.** When a multi-field type spans columns, the default mapping (shown here as `{contract_field}_{field}`) needs to be pinned down, along with how aggressively `.columns(...)` overrides interact with the generated stubs and with dbt `relationships` tests already present. The single-open-field case (column == contract field name) is settled; the multi-field case is where a real schema should decide the convention.
-- **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [semantic-type-algebra.md](semantic-type-algebra.md); only the authoring spelling is open.
+- **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
 - **How visible the trust split in `Field` should be.** `Field(non_negative=True)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched pin) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
 - **Detecting the unsound aggregate versus the unsound assignment.** When `sum(amount)` mixes currencies and the result is also assigned to a `MoneyUSD` column, there are two true statements: the aggregation is not well-typed, and the declared output type is wrong. Whether to report one finding or two, and which to make primary, is a diagnostics call that wants real output in front of real users before it is fixed. The same question applies to the cascade in the currency-creep scenario.
 - **Call-syntax sugar for refinement.** `Money(currency=Currency.USD)` reads as shorthand for `Money.refine(currency=Currency.USD)` and is used throughout this doc for the pinning-at-use case. `.refine()` is canonical for naming a reusable type; whether the call form is exactly equivalent sugar or reserved for inline use is a small consistency call.
 - **String literals on enum fields.** Accepting `currency="USD"` and validating against the `Currency` enum is friendlier at the call site; requiring `Currency.USD` keeps the surface free of stringly-typed values. A reasonable resolution accepts both and treats an out-of-domain literal as a finding, but the default the docs should teach is unsettled.
 - **Eager versus lazy registration.** Import-time `__init_subclass__` registration is simple and matches Pydantic and Pandera. For projects with hundreds of contracts a lazy `dblect.scan(path)` may be warranted. The crossover point is unknown until a large real project exists to measure.
 
-The deeper theory under the aggregation rule (why magnitudes and tags are inferred from field algebra rather than annotated, which reductions are well-typed over which fields, how unit conversion fits, summability and coherence in general) is worked out in [semantic-type-algebra.md](semantic-type-algebra.md). The authoring surface here rests on it but stays small because of it: the author declares ordinary typed fields, and the magnitude/tag classification and the composition rules fall out of the types' algebra.
+The deeper theory under the aggregation rule (why magnitudes and tags are inferred from field algebra rather than annotated, which reductions are well-typed over which fields, how unit conversion fits, summability and coherence in general) is worked out in [domain-type-algebra.md](domain-type-algebra.md). The authoring surface here rests on it but stays small because of it: the author declares ordinary typed fields, and the magnitude/tag classification and the composition rules fall out of the types' algebra.

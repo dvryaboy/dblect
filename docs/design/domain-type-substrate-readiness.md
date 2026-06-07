@@ -1,6 +1,6 @@
-# Substrate readiness for semantic-type propagation
+# Substrate readiness for domain-type propagation
 
-*Status: design notes, engineering assessment. This records what the lineage/facts substrate already provides for a semantic-type property (the [declaration DSL](declaration-dsl.md) surface and the [algebra](semantic-type-algebra.md) it rests on), what genuinely needs building, and how joins reuse machinery that already exists. The findings come from a read of the substrate as it stands; file references are pointers to the code that backs each claim and should be re-checked as the substrate evolves.*
+*Status: design notes, engineering assessment. This records what the lineage/facts substrate already provides for a domain-type property (the [declaration DSL](declaration-dsl.md) surface and the [algebra](domain-type-algebra.md) it rests on), what genuinely needs building, and how joins reuse machinery that already exists. The findings come from a read of the substrate as it stands; file references are pointers to the code that backs each claim and should be re-checked as the substrate evolves.*
 
 ## The precondition holds
 
@@ -8,7 +8,7 @@ The capability the whole approach depends on, propagating a declared meaning fro
 
 A new property is a clean extension: a `Lattice` plus an optional `Semiring`, a set of fact discoverers, and per-operator and per-aggregate transfer rules, assembled through `column_property()` or `relation_property()` (`lineage/facts/property.py`). Nullability and uniqueness are worked examples to follow.
 
-## What is already in place for the semantic-type checks
+## What is already in place for the domain-type checks
 
 Several ingredients we expected to build turn out to exist:
 
@@ -21,7 +21,7 @@ Several ingredients we expected to build turn out to exist:
 
 ## The two builds that are genuinely needed
 
-**The multi-column companion binding.** Column-scoped properties today carry a single column's value; tuple awareness lives only at relation scope (uniqueness keys). A `Money` value spans `amount` and `currency`, so the semantic-type value on the `amount` column must carry its tag bindings as references to peer columns (the `currency` column, or a literal when the currency is pinned). The framework permits this, because the property value type is generic, so the work is writing a lattice and transfer rules over a structured value rather than adding substrate plumbing. A useful property falls out for free: when `amount` flows to a model where the currency column was projected away, that peer reference no longer resolves, the binding degrades to top, and the coherence guard blocks a downstream sum until a dependency discharges it. That is the naked-amount taint, obtained from lineage resolution rather than special-cased.
+**The multi-column companion binding.** Column-scoped properties today carry a single column's value; tuple awareness lives only at relation scope (uniqueness keys). A `Money` value spans `amount` and `currency`, so the domain-type value on the `amount` column must carry its tag bindings as references to peer columns (the `currency` column, or a literal when the currency is pinned). The framework permits this, because the property value type is generic, so the work is writing a lattice and transfer rules over a structured value rather than adding substrate plumbing. A useful property falls out for free: when `amount` flows to a model where the currency column was projected away, that peer reference no longer resolves, the binding degrades to top, and the coherence guard blocks a downstream sum until a dependency discharges it. That is the naked-amount taint, obtained from lineage resolution rather than special-cased.
 
 **A first-class functional-dependency property.** The coherence guard reads an `fd`; nothing currently produces one. A functional-dependency property would ground from a `@contract.functional_dependency` declaration, infer from a key lookup (a key on the joined-in side of a dimension entails that its other columns are determined by that key), and propagate through joins. Uniqueness is both the template and a partial source, since a key is a determination of every other column.
 
@@ -33,10 +33,10 @@ A join pairs rows rather than adding magnitudes, so its obligations are about ke
 
 | Join concern | Reuses | New work |
 |---|---|---|
-| `ON`-clause key type compatibility | join key extraction (`_sqlglot`) plus the comparison rule on the semantic-type property | a transfer rule for equality in join context |
+| `ON`-clause key type compatibility | join key extraction (`_sqlglot`) plus the comparison rule on the domain-type property | a transfer rule for equality in join context |
 | fan-out double counting | uniqueness join-preservation (`uniqueness.py`) plus column lineage to a magnitude's origin key | read uniqueness at the sum via a cross-property dependency, and flag a sum whose origin key was not preserved |
 | dependency flow and creation through joins | uniqueness-style join transfer | the functional-dependency property (the second build above) |
-| outer-join NULL tags | outer-join nullability taint (`nullability.py`) | declare the semantic-type property dependent on nullability and treat a possibly-null tag as top |
+| outer-join NULL tags | outer-join nullability taint (`nullability.py`) | declare the domain-type property dependent on nullability and treat a possibly-null tag as top |
 
 Fan-out is the highest-value of these and rests almost entirely on uniqueness, which already reasons about whether a side's key survives a join. Outer-join null tags are nearly free through a cross-property dependency. Key-type compatibility is a small transfer rule. Dependency-through-join rides on the functional-dependency build.
 
