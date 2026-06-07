@@ -28,7 +28,7 @@ class Order(BaseModel):
 # 1. Define what a column means. A DomainType is a record of fields; here, one.
 #    (CustomerId and RevenueNet, used below, are defined the same way.)
 class OrderId(dblect.DomainType):
-    value: int                              # the single field lands in the column
+    value: int                              # the one field maps to the column
 
 # 2. Bind those types to a dbt model's columns. This is a ModelContract.
 class FctOrders(dblect.ModelContract):
@@ -45,14 +45,14 @@ One honest caveat, stated up front because it is the only place a Pydantic reade
 
 > **dblect declarations look like Pydantic, but they are never instantiated.** `DomainType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. The next section is the one idea that follows from that.
 
-## The one idea: a field lands in a column, or it is pinned to a constant
+## The one idea: every field is a column, and its value comes from the data or the type
 
-A Pydantic model is a record of fields, and so is a dblect `DomainType`. The single move to learn is what a field maps onto.
+A Pydantic model is a record of fields, and so is a dblect `DomainType`. The single thing to learn is where each field's value comes from.
 
-Pydantic gives every field a value, one record per row, when the program runs. dblect never runs the record. It maps each field onto the relation, and a field lands in one of exactly two places:
+Pydantic gives every field a value, one record per row, when the program runs. dblect never runs the record; it reads the fields as a schema over a SQL relation. Every field is a column of that relation, and a column's value comes from one of exactly two places:
 
-- a **physical column**, when the field's value varies row to row, or
-- a **pinned constant**, when the field's value is fixed for the whole column.
+- a **physical column**, when the value varies row to row and is stored in the warehouse, or
+- a **logical column**, when the value is the same for the whole column in a given build and comes from your declarations (fixed in the type, or chosen by a dbt var), so the warehouse stores nothing for it.
 
 That single degree of freedom is the entire conceptual delta, and it is what lets one type describe different shapes in different projects. Take money:
 
@@ -66,14 +66,14 @@ class Money(dblect.DomainType):
     currency: Currency
 ```
 
-`Money` has two fields. How they land depends on the project, not on the type:
+`Money` has two fields. Where their values come from depends on the project, not on the type:
 
-- **Single-currency project.** Every monetary column is dollars. You pin `currency`: `Money(currency=Currency.USD)`. Now `amount` lands in a column and `currency` is a constant the framework carries. There may be no `currency` column anywhere, and that is correct.
-- **Multi-currency project.** Currency varies per row. You leave `currency` open, and both fields land in columns (`amount` and `currency`). A `Money` value is now genuinely a pair of columns that travel together.
+- **Single-currency project.** Every monetary column is dollars. You fix `currency` in the type: `Money(currency=Currency.USD)`. Now `amount` is a physical column and `currency` is a logical column the framework carries. There may be no `currency` column in the warehouse anywhere, and that is correct.
+- **Multi-currency project.** Currency varies per row. You leave `currency` open, so both fields are physical columns (`amount` and `currency`). A `Money` value is now genuinely a pair of columns that travel together.
 
-`currency` is the field that flips. Nothing about it is declared as "the flippable one"; it flips because pinning is a property of how a type is *used*, not of how it is *defined*. This is exactly why the model has no separate concept for column-fields versus constant-fields: there is one concept, a field, and two places it can land.
+The same field, `currency`, is a logical column in one project and a physical column in the next. Nothing in the type marks it as special; whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*. This is exactly why the model has no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
 
-The same mechanism explains a field that, in practice, never lands in a column at all:
+The same idea explains a field whose value the warehouse, in practice, never stores:
 
 ```python
 class Revenue(dblect.DomainType):
@@ -84,13 +84,13 @@ class Revenue(dblect.DomainType):
     currency:          Currency
 ```
 
-No warehouse stores a per-row `contains_tax` boolean; it is the same value on row 1 and row 1,000,000. So in every real project `contains_tax` is pinned. It is not a special kind of field. It is an ordinary field whose value happens to be fixed, recorded in the type so the framework can reason about it. The reasoning is the whole point: `contains_tax=True` and `contains_tax=False` are different quantities, and the bugs dblect targets are the ones where one is used where the other was assumed.
+No warehouse stores a per-row `contains_tax` boolean; it is the same value on row 1 and row 1,000,000. So in every real project `contains_tax` is a logical column: its value comes from the type, recorded so the framework can reason about it. It is not a special kind of field, just an ordinary one whose value the warehouse never stores. The reasoning is the whole point: `contains_tax=True` and `contains_tax=False` are different quantities, and the bugs dblect targets are the ones where one is used where the other was assumed.
 
-A field that is neither pinned nor mapped to a column is the one error here, and it surfaces as a finding, not a crash: *"`Revenue.contains_tax` on `fct_orders.order_total` is unbound; pin it or map it to a column."* The framework will not guess what your revenue includes.
+A field whose value has no source, neither fixed in the type nor present as a physical column, is the one error here, and it surfaces as a finding, not a crash: *"`Revenue.contains_tax` on `fct_orders.order_total` has no value: fix it in the type or map it to a column."* The framework will not guess what your revenue includes.
 
-## Refinement: pinning fields to specific meanings
+## Refinement: fixing fields to specific values
 
-`Revenue` with everything open is the general type. The useful, checkable types are its **refinements**: the same fields, with some pinned to specific values.
+`Revenue` with everything open is the general type. The useful, checkable types are its **refinements**: the same fields, with some fixed to specific values.
 
 ```python
 RevenueGross = Revenue.refine(contains_tax=False, contains_discount=False)
@@ -114,19 +114,19 @@ MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
 ```
 
-Refinement and pinning-a-field are the same operation seen from two distances: `.refine()` names a reusable refined type, and inline `Field(...)` (below) pins a field at one binding site. Both produce a type with fewer open fields.
+Refinement and fixing-a-field are the same operation seen from two distances: `.refine()` names a reusable refined type, and inline `Field(...)` (below) fixes a field at one binding site. Both produce a type with fewer open fields.
 
 ## Composition: where the types earn their keep
 
 Declaring types is setup. The return comes when SQL folds several typed values into one and the framework checks that the fold is meaningful. There is one principle, and it shows up as two everyday operations:
 
-> When an operation combines several values of a domain type into one result, the type's meaning-bearing fields must stay coherent: anything pinned must agree, and anything per-row must be held constant across what is being combined.
+> When an operation combines several values of a domain type into one result, the type's meaning-bearing fields must stay coherent: anything fixed in the type must agree, and anything per-row must be held constant across what is being combined.
 
 "Combining" happens two ways in SQL, and each is one of the scenarios that motivates this whole layer.
 
 ### Combining values across columns: tax meets no-tax
 
-Adding a taxed revenue to an untaxed one, or unioning them, or coalescing one into the other, produces a quantity whose `contains_tax` is genuinely undefined. The type system already knows the two inputs disagree on a pinned field, so it refuses the combination.
+Adding a taxed revenue to an untaxed one, or unioning them, or coalescing one into the other, produces a quantity whose `contains_tax` is genuinely undefined. The type system already knows the two inputs disagree on a field fixed in the type, so it refuses the combination.
 
 ```python
 class FctOrders(ModelContract):
@@ -151,7 +151,7 @@ FAIL  marts.fct_orders.grand_total [types do not combine]
       models/marts/fct_orders.sql:4
 ```
 
-The rule that decides agreement is the one your intuition supplies: two refinements combine when every field they both pin agrees, and an open field meets anything.
+The rule that decides agreement is the one your intuition supplies: two refinements combine when every field they both fix agrees, and an open field meets anything.
 
 | One side | Other side | Result |
 |---|---|---|
@@ -210,7 +210,7 @@ The finding lands on an undeclared model because propagation does not depend on 
 
 - **The declaration is a relational fact, not a per-column label.** `charge_amount: Money` with `currency` open binds two columns into one value: *"`charge_amount` is the `amount` field of a `Money` whose `currency` field is the column `currency`."* The companion link is part of the fact, the same way a uniqueness fact ranges over a key tuple rather than a single column.
 - **The fact rides column-level lineage across the whole DAG.** Domain type is one more property over the substrate ([column-level-lineage.md](column-level-lineage.md)), the engine that already moves nullability and uniqueness cross-model. It propagates through every model that selects `charge_amount`, contract or no contract, so the downstream reference arrives carrying "I am `Money.amount`, and my companion is the `currency` that traveled with me."
-- **The aggregation check is conservative.** To *permit* `sum(charge_amount) group by country`, the framework must *prove* the companion `currency` is constant within each group: present in the `GROUP BY`, pinned in the type, narrowed by a `WHERE currency = ...`, or fixed by a declared functional dependency `country -> currency`. Absent a proof, it flags. It fires here not because dblect knows the currencies are mixed, but because every path to proving they are not is closed: `currency` was projected away before the rollup, and upstream it is per-row.
+- **The aggregation check is conservative.** To *permit* `sum(charge_amount) group by country`, the framework must *prove* the companion `currency` is constant within each group: present in the `GROUP BY`, fixed in the type, narrowed by a `WHERE currency = ...`, or fixed by a declared functional dependency `country -> currency`. Absent a proof, it flags. It fires here not because dblect knows the currencies are mixed, but because every path to proving they are not is closed: `currency` was projected away before the rollup, and upstream it is per-row.
 
 The general rule: an arithmetic reduction (`sum`, `avg`, and friends) over one field of a multi-field domain type is well-typed only when the type's other fields are provably constant across the reduced set. The framework reads the grouping keys from the query and checks them against the companion fields; the machinery lives with the substrate (see [propagation-soundness.md](propagation-soundness.md)).
 
@@ -226,7 +226,7 @@ from {{ ref('stg_charges') }}
 group by country, currency
 ```
 
-**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already pins the currency down, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape the `ModelContract` contract methods use (the conservation method shown later under [ModelContract](#modelcontract-binding-types-to-a-models-columns)). The same `StgCharges` contract is spelled out in full here, with `country` and `currency` declared and `charge_amount` bound explicitly, so the dependency has named proxies to range over:
+**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already determines the currency, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape the `ModelContract` contract methods use (the conservation method shown later under [ModelContract](#modelcontract-binding-types-to-a-models-columns)). The same `StgCharges` contract is spelled out in full here, with `country` and `currency` declared and `charge_amount` bound explicitly, so the dependency has named proxies to range over:
 
 ```python
 class StgCharges(ModelContract):
@@ -252,7 +252,7 @@ join {{ ref('dim_country') }} d using (country)   -- d.currency is a function of
 group by c.country
 ```
 
-A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by pinning the tag. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
+A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by fixing the tag. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
 
 ### Joining values: the total that gets counted twice
 
@@ -329,7 +329,7 @@ class FctOrders(ModelContract):
 The moving parts, each keeping its Pydantic or dbt instinct:
 
 - **`dbt_model = "marts.fct_orders"`** binds the class to a manifest entity, resolved with the rules dbt uses for `{{ ref() }}`: bare names resolve locally then in packages, ambiguous ones demand qualification.
-- **Field name equals column name** in the common case. `order_total: RevenueNet` says the model's `order_total` column has type `RevenueNet`. Because `RevenueNet` has exactly one open field (`amount`), that field lands in the `order_total` column and the reading is the plain Pydantic one.
+- **Field name equals column name** in the common case. `order_total: RevenueNet` says the model's `order_total` column has type `RevenueNet`. Because `RevenueNet` has exactly one open field (`amount`), that field maps to the `order_total` column and the reading is the plain Pydantic one.
 - **`dblect.Field(...)`** carries column-level metadata, the same role as Pydantic's `Field(...)`. Its two jobs are below.
 - **`dblect.ForeignKey("dim_customers.customer_id")`** is a parameterized type naming another model's column. It doubles as the edge the fixture builder uses to coordinate multi-table generation. An existing dbt `relationships` test is read as a foreign key for free, so you do not restate it.
 - **Contract methods** decorate functions that build symbolic expressions over column proxies (`self.order_total`, `models.stg_order_items.subtotal`). They are runtime-checkable invariants, covered in the [technical intro](dblect_technical_intro.md). A contract with only column declarations and no methods is valid and already buys type propagation.
@@ -359,24 +359,24 @@ Classes register on definition through `__init_subclass__`, the import-time disc
 
 Contract bodies reference other models through `models.stg_order_items.subtotal`. By default `models` is a lazy proxy: `__getattr__` all the way down, capturing symbolic references the framework validates later, with zero setup and zero codegen. For the full editor experience, `dblect init` reads the manifest and writes `dblect/_stubs/models.py` with a concrete class per dbt model; you `from dblect._stubs import models` and get autocomplete, type-checking, and refactor-rename across contracts. The stubs regenerate when the manifest changes. This is the Prisma and dlt generated-client pattern: the generated file lives in its own package, is gitignored, and is never hand-edited. The editor experience is the reason this surface is Python, so it gets first-class treatment.
 
-## `Field`: constraints and inline pinning
+## `Field`: constraints and inline fixing
 
 `dblect.Field(...)` does two jobs, and seeing the split keeps the trust model honest.
 
 ```python
 order_total: RevenueNet = dblect.Field(gt=0)                     # a constraint
-discounted:  Revenue    = dblect.Field(contains_tax=False,       # inline pinning
+discounted:  Revenue    = dblect.Field(contains_tax=False,       # inline fixing
                                        contains_discount=True)
 ```
 
 - **Constraints** like `gt=0` are *checkable* claims about the column's values. `dblect.Field` accepts Pydantic's constraint vocabulary directly (`gt`, `ge`, `lt`, `le`, `multiple_of`, `min_length`, and the rest), so the muscle memory transfers, with a few readable aliases on top (`non_negative=True` for `ge=0`). The framework can prove or refute them against generated or real data, and trusts them the way it trusts anything it can verify.
-- **Inline pinning** like `contains_tax=False` fixes a field right at the binding site, exactly equivalent to annotating the column with `RevenueNet`. It is a *vouched* meaning: a thing you assert about what the column means, which the framework propagates and reconciles but cannot independently prove from the SQL.
+- **Inline fixing** like `contains_tax=False` fixes a field right at the binding site, exactly equivalent to annotating the column with `RevenueNet`. It is a *vouched* meaning: a thing you assert about what the column means, which the framework propagates and reconciles but cannot independently prove from the SQL.
 
 Both ride one `Field` surface because that matches the Pydantic instinct, and the framework tags them by trust class internally (checkable constraint versus asserted meaning). Prefer a named refined type (`RevenueNet`) when the meaning recurs; reach for inline `Field(...)` for the one-off.
 
-## Flags: pinning a field per configuration world
+## Flags: a logical column whose value a dbt var selects
 
-A dbt `var()` changes what your models produce, and when it gates a branch that changes a column's meaning, it pins a field to one value in one configuration and another value in another. Flags are declarations too, and they look like every other class here. The full surface, discovery, and world enumeration live in [flags_and_configs_as_types.md](flags_and_configs_as_types.md); this is just enough to place them in the authoring story.
+A dbt `var()` changes what your models produce, and when it gates a branch that changes a column's meaning, it fixes a field to one value in one configuration world and another in the next. This is the logical column at its most dynamic: the value still comes from your declarations rather than the data, but which value depends on the build. Flags are declarations too, and they look like every other class here. The full surface, discovery, and world enumeration live in [flags_and_configs_as_types.md](flags_and_configs_as_types.md); this is just enough to place them in the authoring story.
 
 ```python
 # dblect/flags.py
@@ -396,7 +396,7 @@ class IncludeTaxInRevenue(DomainFlag):
     )
 ```
 
-A flag carries its link to the dbt var, its type and domain, its default, and an `affects` clause naming which field on which type it pins. The flag knowing the type is what lets one flag target several fields or several types and keeps all flag effects in one registry. `dblect init` scaffolds draft flag classes from the vars it finds in your SQL, pre-filling everything it can infer and leaving the `affects` clause for you, since the meaning of the flag is the one thing the framework cannot read off the Jinja.
+A flag carries its link to the dbt var, its type and domain, its default, and an `affects` clause naming which field on which type it fixes. The flag knowing the type is what lets one flag target several fields or several types and keeps all flag effects in one registry. `dblect init` scaffolds draft flag classes from the vars it finds in your SQL, pre-filling everything it can infer and leaving the `affects` clause for you, since the meaning of the flag is the one thing the framework cannot read off the Jinja.
 
 With that declaration, a column whose SQL branches on the var has a type per flag world, and the framework checks every world:
 
@@ -484,26 +484,26 @@ For the reader placing this against what they already know:
 | Pydantic | dblect | What is the same | What differs |
 |---|---|---|---|
 | `class X(BaseModel)` | `class X(DomainType)` / `class X(ModelContract)` | class-as-declaration, annotated fields | own metaclass, never instantiated to validate a row |
-| a field holds one row's value | a `DomainType` field lands in a column or is pinned to a constant | the field/record shape | a field can be per-row here and a fixed constant there; `currency` is the example |
+| a field holds one row's value | a `DomainType` field is a physical column or a logical column | the field/record shape | a field can be physical (from the data) here and logical (from the type) there; `currency` is the example |
 | a field holds one row's value | a `ModelContract` field names a SQL column (or several) | annotation syntax, field naming | the field name is the column name; a multi-field type spans several columns |
-| `Field(gt=0)` | `dblect.Field(gt=0)` | the same constraint vocabulary (`gt`/`ge`/`lt`/`le`/...), plus aliases like `non_negative=True` | `Field` also pins a field inline (a vouched meaning) |
+| `Field(gt=0)` | `dblect.Field(gt=0)` | the same constraint vocabulary (`gt`/`ge`/`lt`/`le`/...), plus aliases like `non_negative=True` | `Field` also fixes a field inline (a vouched meaning) |
 | `Annotated[int, Gt(0)]` | `Annotated[Decimal, Gt(0)]` | the `Annotated` constraint idiom | constraints are checked against data, not on assignment |
-| `Literal["a", "b"]` narrowing | `T.refine(field=value)` | narrowing a type to a specific case | narrows by pinning a field; partial and chainable |
+| `Literal["a", "b"]` narrowing | `T.refine(field=value)` | narrowing a type to a specific case | narrows by fixing a field; partial and chainable |
 | `model_config` class attribute | `dbt_model = "..."` class attribute | class-level config attribute | binds to a dbt manifest entity |
 | `@field_validator` | `@contract.conservation(...)` etc. | decorated methods on the class | builds a symbolic expression AST, checked statically or by PBT |
 | generated client (Prisma/dlt) | `dblect/_stubs/models.py` | regenerate-on-schema-change typed client | generated from the dbt manifest |
 
-The one row to internalize is the second: a field lands in a column or is pinned to a constant. Every collision the framework reports is a consequence of that and of keeping the meaning-bearing fields coherent when SQL folds values together.
+The one row to internalize is the second: every field is a column, and its value comes from the data (physical) or the type (logical). Every collision the framework reports is a consequence of that and of keeping the meaning-bearing fields coherent when SQL folds values together.
 
 ## Open questions
 
 The genuinely unsettled parts of the authoring surface. None blocks a working first version; each is best settled when a real declaration forces it.
 
-- **Multi-column binding convention.** When a multi-field type spans columns, the default mapping (shown here as `{contract_field}_{field}`) needs to be pinned down, along with how aggressively `.columns(...)` overrides interact with the generated stubs and with dbt `relationships` tests already present. The single-open-field case (column == contract field name) is settled; the multi-field case is where a real schema should decide the convention.
+- **Multi-column binding convention.** When a multi-field type spans columns, the default mapping (shown here as `{contract_field}_{field}`) needs to be settled, along with how aggressively `.columns(...)` overrides interact with the generated stubs and with dbt `relationships` tests already present. The single-open-field case (column == contract field name) is settled; the multi-field case is where a real schema should decide the convention.
 - **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
-- **How visible the trust split in `Field` should be.** `Field(ge=0)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched pin) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
+- **How visible the trust split in `Field` should be.** `Field(ge=0)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched value) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
 - **Detecting the unsound aggregate versus the unsound assignment.** When `sum(amount)` mixes currencies and the result is also assigned to a `MoneyUSD` column, there are two true statements: the aggregation is not well-typed, and the declared output type is wrong. Whether to report one finding or two, and which to make primary, is a diagnostics call that wants real output in front of real users before it is fixed. The same question applies to the cascade in the currency-creep scenario.
-- **Call-syntax sugar for refinement.** `Money(currency=Currency.USD)` reads as shorthand for `Money.refine(currency=Currency.USD)` and is used throughout this doc for the pinning-at-use case. `.refine()` is canonical for naming a reusable type; whether the call form is exactly equivalent sugar or reserved for inline use is a small consistency call.
+- **Call-syntax sugar for refinement.** `Money(currency=Currency.USD)` reads as shorthand for `Money.refine(currency=Currency.USD)` and is used throughout this doc for fixing a field at use. `.refine()` is canonical for naming a reusable type; whether the call form is exactly equivalent sugar or reserved for inline use is a small consistency call.
 - **String literals on enum fields.** Accepting `currency="USD"` and validating against the `Currency` enum is friendlier at the call site; requiring `Currency.USD` keeps the surface free of stringly-typed values. A reasonable resolution accepts both and treats an out-of-domain literal as a finding, but the default the docs should teach is unsettled.
 - **Eager versus lazy registration.** Import-time `__init_subclass__` registration is simple and matches Pydantic and Pandera. For projects with hundreds of contracts a lazy `dblect.scan(path)` may be warranted. The crossover point is unknown until a large real project exists to measure.
 
