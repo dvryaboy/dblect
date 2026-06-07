@@ -86,15 +86,17 @@ class StgSales(dblect.ModelContract):
 
 `sale`'s `amount` is a **physical column** of `stg_sales`; `currency` is a **logical column**, fixed to USD by the type, with nothing stored. There may be no `currency` column in `stg_sales` at all, and that is correct.
 
-In a multi-currency project the same type, left open, makes both fields physical:
+In a multi-currency project the same type, left open, makes both fields physical. Name the warehouse column behind each field:
 
 ```python
 class StgSales(dblect.ModelContract):
     dbt_model = "stg_sales"
-    sale: Money
+    sale: Money.columns(amount="sale_value", currency="sale_currency_code")
+    # shorthand when the columns follow the naming convention (sale_amount, sale_currency):
+    #   sale: Money
 ```
 
-Now `amount` and `currency` are both **physical columns** of `stg_sales` that travel together. (How the pair is named is the multi-column convention, covered under [ModelContract](#modelcontract-binding-types-to-a-models-columns).)
+Now `amount` lives in `sale_value` and `currency` in `sale_currency_code`, both **physical columns** of `stg_sales` that travel together. Spelling the mapping out always works; the shorter `sale: Money` is available when the columns follow the naming convention, which the [ModelContract](#modelcontract-binding-types-to-a-models-columns) section covers.
 
 So the same field, `currency`, is a logical column in one project's contract and a physical column in the next. Whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*, which is why the model needs no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
 
