@@ -10,56 +10,28 @@ dblect's declaration layer is where you write the meaning down, once, in Python 
 
 This document is about the writing of it, and about the collisions that motivate the whole surface: meanings that fail to combine across columns or across rows, and a magnitude a join quietly double counts. The companion docs cover what the framework does mechanically with what you write.
 
-## Why it looks like Pydantic
+## Domain types and model contracts
 
-If you have written a Pydantic model, you can read every declaration here on first sight. That is deliberate, and it is the whole reason the surface is Python rather than YAML.
+If you know Pydantic, this should look familiar: classes with type-annotated fields and `Field(...)` metadata, the class serving as both code and structured data. We borrow that shape. We do not borrow the runtime, though: these classes are never instantiated to validate a row, so the framework reads them as a schema and maps them onto SQL statically.
 
-```python
-# This is Pydantic. You already know how to read it.
-class Order(BaseModel):
-    order_id: int
-    customer_id: int
-    total: Decimal = Field(gt=0)
-```
+A **`DomainType`** is what it sounds like, a type that carries domain meaning. You build one from fields, so a `Money` is an `amount` *and* a `currency`, and a `Revenue` is an amount together with what it includes. It is a type you put on a column, the way `Decimal` is, except it also knows what the number means.
+
+A **`ModelContract`** uses those types to describe a dbt model in domain language. Each field is a column, and each column gets a `DomainType`:
 
 ```python
-# This is dblect. Same shape, same instincts.
-
-# 1. Define what a column means. A DomainType is a record of fields; here, one.
-#    (CustomerId and RevenueNet, used below, are defined the same way.)
-class OrderId(dblect.DomainType):
-    value: int                              # the one field maps to the column
-
-# 2. Bind those types to a dbt model's columns. This is a ModelContract.
 class FctOrders(dblect.ModelContract):
     dbt_model = "marts.fct_orders"
 
-    order_id:    OrderId                            # mirrors `order_id: int`
+    order_id:    OrderId
     customer_id: CustomerId
-    order_total: RevenueNet = dblect.Field(gt=0)    # mirrors `total: Decimal = Field(gt=0)`
+    order_total: RevenueNet = dblect.Field(ge=0)
 ```
 
-Class-shaped declarations, type-annotated fields, `Field(...)` metadata, the class as both the thing you author and the structured data the framework introspects. That pattern is Pydantic's gift to the Python ecosystem, refined over years of production use, and an entire generation of data tools (Pandera, SQLAlchemy, Ibis, dlt, Prisma) has inherited it. dblect stands in that lineage on purpose: autocomplete, type-checking, jump-to-definition, and refactor-rename all come for free because your editor already understands classes and annotations.
-
-One honest caveat, stated up front because it is the only place a Pydantic reader's instinct needs adjusting:
-
-> **dblect declarations look like Pydantic, but they are never instantiated.** `DomainType` and `ModelContract` use their own metaclass and carry none of Pydantic's per-value validation machinery. We borrow the *shape* (annotated fields, `Field` metadata, `Annotated` constraints, class-as-data), not the runtime. Pydantic fills a model's fields with one row's values at runtime; dblect reads the fields as a schema and maps them onto a SQL relation, statically. What follows is the two kinds of class you write, and the one idea about how their fields become columns.
-
-## Two kinds of class: types and contracts
-
-dblect declarations come in two kinds.
-
-A **`DomainType`** is a type. It gives a value a meaning, the way `Decimal` or `Currency` does, and you build richer ones from fields: a `Money` is an `amount` and a `currency`. You use a `DomainType` by putting it on a column.
-
-A **`ModelContract`** is the schema of one dbt model. Its fields are the model's columns, and each gives its column a `DomainType`: `order_total: RevenueNet` gives the `order_total` column the type `RevenueNet`. A contract lists only the columns you care about. Columns you leave out still flow through the framework's structural analysis, they just carry no domain type, so you type a column the day its meaning starts to matter and leave the rest alone.
-
-The two compose the way types and tables always have. `DomainType`s are the vocabulary; a `ModelContract` is a model's schema written in that vocabulary. `Money`'s `amount` and `currency` are the parts of the `Money` type, and they become columns when a `ModelContract` gives some column that type.
+That reads as "this model's `order_total` is net revenue, its `customer_id` is a customer id." You declare only the columns you care about; columns you leave out still flow through the framework's structural analysis, they just carry no domain type. So you type a column the day its meaning starts to matter and leave the rest alone.
 
 ## The one idea: every field is a column, and its value comes from the data or the type
 
-A Pydantic model is a record of fields, and so is a dblect `DomainType`. The single thing to learn is where each field's value comes from.
-
-Pydantic gives every field a value, one record per row, when the program runs. dblect never runs the record; it reads the fields as a schema over a SQL relation. Every field is a column of that relation, and a column's value comes from one of exactly two places:
+A `DomainType` is a record of fields, and the single thing to learn is where each field's value comes from. The framework reads the fields as a schema over a SQL relation: every field is a column of that relation, and a column's value comes from one of exactly two places:
 
 - a **physical column**, when the value varies row to row and is stored in the warehouse, or
 - a **logical column**, when the value is the same for the whole column in a given build and comes from your declarations (fixed in the type, or chosen by a dbt var), so the warehouse stores nothing for it.
@@ -159,6 +131,31 @@ class FctOrders(dblect.ModelContract):
 `order_total` is a physical column carrying the amount; `currency` rides along as a logical column, fixed to USD by `MoneyUSD`. Naming the refinement once beats fixing the fields at every column that uses it.
 
 Refinement and fixing-a-field are the same operation seen from two distances: `.refine()` names a reusable refined type, and inline `Field(...)` (below) fixes a field at one binding site. Both produce a type with fewer open fields.
+
+## Extension: adding and combining facets
+
+Refinement narrows facets a type already has. Adding one is the other direction, and it matters because a `DomainType` declares only the facets you care about. A facet a type does not declare is one it makes no claim about: `Revenue` tracks tax and discount because this project cares, it says nothing about shipping, and a leaner project's revenue might track neither, just `amount` and `currency`. You add a facet the day it starts to matter.
+
+Subclassing does both jobs. A subclass adds new fields, and it fixes inherited ones by giving them a value, the class-level twin of `.refine()`:
+
+```python
+class TaxedRevenue(Revenue):
+    contains_tax: bool = True        # fix a facet Revenue already has
+
+class ShippedRevenue(Revenue):
+    contains_shipping: bool = True   # add a facet Revenue did not have
+```
+
+A plain `Revenue` still makes no claim about shipping, so every model that never ships anything is untouched by `ShippedRevenue`.
+
+Combining facets is multiple inheritance:
+
+```python
+class TaxedShippedRevenue(TaxedRevenue, ShippedRevenue):
+    pass    # contains_tax=True, contains_shipping=True; discount still open
+```
+
+The result carries the union of facets. Where two of them fix the same field they must agree, the same meet that governs combining values; where they fix different fields the result simply carries both. So a revenue that is both taxed and shipped is not a special construct, it is the two facets met.
 
 ## Composition: where the types earn their keep
 

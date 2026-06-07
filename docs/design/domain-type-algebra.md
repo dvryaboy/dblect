@@ -44,7 +44,8 @@ The lineage from refinement types (Rondon, Kawaguchi & Jhala, *Liquid Types*, PL
 Two type evolutions move between these, and they are genuinely different operations:
 
 - **refine** pins a field value (`Money` to `MoneyUSD`): a subtype with fewer open tags.
-- **extend** adds a field (`Money{amount}` to `Money{amount, currency}`): a richer type whose tag set grows, which activates coherence obligations that were previously vacuous.
+- **extend** adds a field (`Money{amount}` to `Money{amount, currency}`): a richer type whose tag set grows, which activates coherence obligations that were previously vacuous. An absent field is the unrefined supertype, the type making no claim about that facet, so extension is how a claim first appears.
+- **compose** unions two extensions (`Revenue{amount, contains_tax}` with `Revenue{amount, contains_shipping}` gives `Revenue{amount, contains_tax, contains_shipping}`): a field both fix must agree, the same meet the operation rules use, and a field only one carries is simply taken on. So a type that is both taxed and shipped needs no new operator.
 
 The tag set is part of the type's identity and travels with the column through column-level lineage. That is the whole mechanism behind a declaration on one model lighting up a finding on a model nobody touched: extending the type grows the tag set, the larger tag set propagates, and an aggregation downstream that was vacuously fine now carries a live obligation.
 
