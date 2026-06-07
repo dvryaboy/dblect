@@ -24,12 +24,19 @@ class Order(BaseModel):
 
 ```python
 # This is dblect. Same shape, same instincts.
+
+# 1. Define what a column means. A DomainType is a record of fields; here, one.
+#    (CustomerId and RevenueNet, used below, are defined the same way.)
+class OrderId(dblect.DomainType):
+    value: int                              # the single field lands in the column
+
+# 2. Bind those types to a dbt model's columns. This is a ModelContract.
 class FctOrders(dblect.ModelContract):
     dbt_model = "marts.fct_orders"
 
-    order_id:    OrderId
-    customer_id: dblect.ForeignKey("dim_customers.customer_id")
-    order_total: RevenueNet = dblect.Field(non_negative=True)
+    order_id:    OrderId                            # mirrors `order_id: int`
+    customer_id: CustomerId
+    order_total: RevenueNet = dblect.Field(gt=0)    # mirrors `total: Decimal = Field(gt=0)`
 ```
 
 Class-shaped declarations, type-annotated fields, `Field(...)` metadata, the class as both the thing you author and the structured data the framework introspects. That pattern is Pydantic's gift to the Python ecosystem, refined over years of production use, and an entire generation of data tools (Pandera, SQLAlchemy, Ibis, dlt, Prisma) has inherited it. dblect stands in that lineage on purpose: autocomplete, type-checking, jump-to-definition, and refactor-rename all come for free because your editor already understands classes and annotations.
@@ -357,12 +364,12 @@ Contract bodies reference other models through `models.stg_order_items.subtotal`
 `dblect.Field(...)` does two jobs, and seeing the split keeps the trust model honest.
 
 ```python
-order_total: RevenueNet = dblect.Field(non_negative=True)        # a constraint
+order_total: RevenueNet = dblect.Field(gt=0)                     # a constraint
 discounted:  Revenue    = dblect.Field(contains_tax=False,       # inline pinning
                                        contains_discount=True)
 ```
 
-- **Constraints** like `non_negative=True` are *checkable* claims about the column's values. The framework can prove or refute them against generated or real data, and trusts them the way it trusts anything it can verify.
+- **Constraints** like `gt=0` are *checkable* claims about the column's values. `dblect.Field` accepts Pydantic's constraint vocabulary directly (`gt`, `ge`, `lt`, `le`, `multiple_of`, `min_length`, and the rest), so the muscle memory transfers, with a few readable aliases on top (`non_negative=True` for `ge=0`). The framework can prove or refute them against generated or real data, and trusts them the way it trusts anything it can verify.
 - **Inline pinning** like `contains_tax=False` fixes a field right at the binding site, exactly equivalent to annotating the column with `RevenueNet`. It is a *vouched* meaning: a thing you assert about what the column means, which the framework propagates and reconciles but cannot independently prove from the SQL.
 
 Both ride one `Field` surface because that matches the Pydantic instinct, and the framework tags them by trust class internally (checkable constraint versus asserted meaning). Prefer a named refined type (`RevenueNet`) when the meaning recurs; reach for inline `Field(...)` for the one-off.
@@ -479,8 +486,8 @@ For the reader placing this against what they already know:
 | `class X(BaseModel)` | `class X(DomainType)` / `class X(ModelContract)` | class-as-declaration, annotated fields | own metaclass, never instantiated to validate a row |
 | a field holds one row's value | a `DomainType` field lands in a column or is pinned to a constant | the field/record shape | a field can be per-row here and a fixed constant there; `currency` is the example |
 | a field holds one row's value | a `ModelContract` field names a SQL column (or several) | annotation syntax, field naming | the field name is the column name; a multi-field type spans several columns |
-| `Field(gt=0)` | `dblect.Field(non_negative=True)` | `Field(...)` metadata role | also pins a field inline (a vouched meaning) |
-| `Annotated[int, Gt(0)]` | `Annotated[Decimal, NonNegative]` | the `Annotated` constraint idiom | constraints are checked against data, not on assignment |
+| `Field(gt=0)` | `dblect.Field(gt=0)` | the same constraint vocabulary (`gt`/`ge`/`lt`/`le`/...), plus aliases like `non_negative=True` | `Field` also pins a field inline (a vouched meaning) |
+| `Annotated[int, Gt(0)]` | `Annotated[Decimal, Gt(0)]` | the `Annotated` constraint idiom | constraints are checked against data, not on assignment |
 | `Literal["a", "b"]` narrowing | `T.refine(field=value)` | narrowing a type to a specific case | narrows by pinning a field; partial and chainable |
 | `model_config` class attribute | `dbt_model = "..."` class attribute | class-level config attribute | binds to a dbt manifest entity |
 | `@field_validator` | `@contract.conservation(...)` etc. | decorated methods on the class | builds a symbolic expression AST, checked statically or by PBT |
