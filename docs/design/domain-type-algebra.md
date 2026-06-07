@@ -1,6 +1,6 @@
 # The algebra of domain types: which operations are safe, and what you declare to get them
 
-*Status: design notes, theoretical foundation. This document answers one question the [declaration DSL](declaration-dsl.md) raises and does not settle: when SQL combines typed values, how does the framework know which combinations are meaningful, and what does the author have to write to make that work? The short answer is that the rules are read off the algebra of the field types the author already declares, so the surface stays small. This note grounds that claim in the literature and works it through the currency example end to end. Where a primary is present in the local paper corpus it is cited by filename; where the canonical reference sits outside that corpus it is named as an external reference.*
+*Status: design notes, theoretical foundation. This document answers one question the [declaration DSL](declaration-dsl.md) raises and does not settle: when SQL combines typed values, how does the framework know which combinations are meaningful, and what does the author have to write to make that work? The short answer is that the rules are read off the algebra of the field types the author already declares, so the surface stays small. This note grounds that claim in the literature and works it through the currency example end to end. Citations are to the primary literature; full references are listed at the end.*
 
 ## Two axes that are easy to conflate
 
@@ -9,13 +9,13 @@ A meaning-preserving type system for SQL has to keep two separate questions apar
 - **Validity.** Is `sum(amount) group by country` a *meaningful* operation on these values? This is what produces a finding.
 - **Decomposability.** Can the result be computed from partial results, so the property propagates model-to-model along the DAG rather than being re-derived globally? This is what makes the check tractable.
 
-They are orthogonal and we need both. The distributive/algebraic/holistic classification of Gray et al. (`1996_cs_0701155_Data_Cube_A_Relational_Aggregation_Operator_Generalizing_Gro.pdf`) is the decomposability axis: `SUM`, `COUNT`, `MIN`, `MAX` are distributive (`F({Xij}) = G({F(...)})`), `AVG` is algebraic (carry a fixed-size summary, here sum and count), `MEDIAN`/`MODE`/`RANK` are holistic. Distributivity is exactly why a domain-type obligation on a `SUM` can be checked as a local propagation rule: the super-aggregate is the aggregate of partial aggregates, so the type that flows out of one model is enough to reason about the next. Validity is the rest of this note.
+They are orthogonal and we need both. The distributive/algebraic/holistic classification of Gray et al. (*Data Cube*, 1997) is the decomposability axis: `SUM`, `COUNT`, `MIN`, `MAX` are distributive (`F({Xij}) = G({F(...)})`), `AVG` is algebraic (carry a fixed-size summary, here sum and count), `MEDIAN`/`MODE`/`RANK` are holistic. Distributivity is exactly why a domain-type obligation on a `SUM` can be checked as a local propagation rule: the super-aggregate is the aggregate of partial aggregates, so the type that flows out of one model is enough to reason about the next. Validity is the rest of this note.
 
 ## What the author declares: magnitudes and tags, inferred from field algebra
 
-The central design choice is that the author does **not** annotate which fields are quantities and which are labels. That distinction is carried by the algebra of each field's type, in the spirit of dimension types (Kennedy, *Dimension Types*, ESOP 1994; external to this corpus) and of the much earlier observation in Galileo (`1985_958b42ead9beb89134fd5191635c72dd5c58c9fb_GALILEO_a_strongly-typed_interactive_conceptual_language.pdf`) that two values isomorphic to numbers, a weight and an age, should be made non-interchangeable by giving them distinct types with distinct operators.
+The central design choice is that the author does **not** annotate which fields are quantities and which are labels. That distinction is carried by the algebra of each field's type, in the spirit of dimension types (Kennedy, *Dimension Types*, ESOP 1994) and of the much earlier observation in Galileo (Albano, Cardelli & Orsini, TODS 1985) that two values isomorphic to numbers, a weight and an age, should be made non-interchangeable by giving them distinct types with distinct operators.
 
-A field is a **magnitude** when its type is additive: its values form a commutative monoid under `+` (a group, with negatives) and can be scaled by dimensionless numbers. This is the semimodule structure that aggregation rides (Amsterdamer, Deutch & Tannen, *Provenance for Aggregate Queries*, PODS 2011; external).
+A field is a **magnitude** when its type is additive: its values form a commutative monoid under `+` (a group, with negatives) and can be scaled by dimensionless numbers. This is the semimodule structure that aggregation rides (Amsterdamer, Deutch & Tannen, *Provenance for Aggregate Queries*, PODS 2011).
 
 A field is a **tag** when its type supports equality but no meaningful addition: a closed enumeration, a boolean, an identifier.
 
@@ -31,7 +31,7 @@ The classification lives with the type, so the standard library carries it: `Mon
 
 ## A tag has three states, and two of them are not the same
 
-The lineage from refinement types (`2008_285bd55c6a7f4a1e829ecf5cd380900070ca6223_Liquid_types.pdf`, where constants carry predicates such as `3 :: {nu:int | nu = 3}`) gives the natural model: pinning a tag is narrowing a refinement, and an absent tag is the unrefined supertype. The three states an author can produce, and what each means for `sum(amount)`:
+The lineage from refinement types (Rondon, Kawaguchi & Jhala, *Liquid Types*, PLDI 2008, where constants carry predicates such as `3 :: {nu:int | nu = 3}`) gives the natural model: pinning a tag is narrowing a refinement, and an absent tag is the unrefined supertype. The three states an author can produce, and what each means for `sum(amount)`:
 
 | State | How it arises | Tag set | `sum(amount)` obligation |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Three kinds of reduction over a tagged magnitude behave differently, and the dif
 
 The additive rules (`+` needs equal tag, `/` cancels) are the single-tag fragment of units-of-measure arithmetic. Currency is a nominal tag rather than a full multiplicative dimension because `USD^2` and `USD * EUR` are meaningless: only exponents zero (dimensionless, after a ratio) and one (an amount) ever occur. The one place the full multiplicative group reappears is conversion: an `ExchangeRate` typed as `EUR/USD` multiplied by a `MoneyUSD` yields `MoneyEUR`, with the tag exponents combining as `usd^-1 * usd^1 -> 1`. So the model degrades to a tag for everyday arithmetic and recovers the group exactly where conversion needs it.
 
-The aggregation rule is summarizability (Lenz & Shoshani, *Summarizability in OLAP and Statistical Data Bases*, SSDBM 1997; external): the validity of `sum ... group by` rests on the aggregation function being type-compatible with the measure and with the category aggregated over. Summing a magnitude across a varying tag is the type-incompatible case. The `country -> currency` discharge is reasoning about summarizability under a declared dimension dependency (Hurtado & Mendelzon, ICDT 2001; external).
+The aggregation rule is summarizability (Lenz & Shoshani, *Summarizability in OLAP and Statistical Data Bases*, SSDBM 1997): the validity of `sum ... group by` rests on the aggregation function being type-compatible with the measure and with the category aggregated over. Summing a magnitude across a varying tag is the type-incompatible case. The `country -> currency` discharge is reasoning about summarizability under a declared dimension dependency (Hurtado & Mendelzon, ICDT 2001).
 
 ## How it lands on the charge example
 
@@ -84,7 +84,7 @@ An aggregation obligation has exactly three discharge paths, and they are worth 
 - `t` is pinned in the type, so it is constant everywhere, or
 - `G` functionally determines `t` (`G -> t`), so each group, fixed on `G`, admits one value of `t`.
 
-The third path is the interesting one, because it licenses summing a tagged magnitude without carrying the tag at all. `country -> currency` means equal `country` implies equal `currency`: each country uses one currency. The groups in `sum(charge_amount) group by country` are keyed by `country`, so within any group the currency is single-valued, and the sum stays within one currency even though the `currency` column was projected away upstream. The group key recovers the constancy the dropped column would have supplied. This is summarizability under a dimension dependency (Hurtado & Mendelzon, ICDT 2001; external).
+The third path is the interesting one, because it licenses summing a tagged magnitude without carrying the tag at all. `country -> currency` means equal `country` implies equal `currency`: each country uses one currency. The groups in `sum(charge_amount) group by country` are keyed by `country`, so within any group the currency is single-valued, and the sum stays within one currency even though the `currency` column was projected away upstream. The group key recovers the constancy the dropped column would have supplied. This is summarizability under a dimension dependency (Hurtado & Mendelzon, ICDT 2001).
 
 The discharge is local and the tag survives. Each group's result is a `Money` whose currency is the currency of that country, so the output is not globally single-currency; its `currency` is now functionally determined by `country`. A later `sum(total_amount)` across countries lights up again, correctly, since that aggregation has its own undischarged obligation. A functional dependency buys one sound aggregation, not blanket permission.
 
@@ -92,7 +92,7 @@ A functional dependency is a checkable claim, so it sits in the stronger trust c
 
 ## Semi-additive magnitudes: the third aggregation hazard
 
-Tag coherence and grain are two preconditions for a sound `sum`. A third applies to a particular kind of magnitude. A flow, such as revenue or quantity sold, is additive over every dimension: it makes sense to sum it across customers, across products, and across time. A level, such as an account balance, inventory on hand, or headcount, is additive over entity dimensions but not over time, because summing balances across months adds snapshots of the same stock and produces a figure that means nothing. This is the additive, semi-additive, and non-additive taxonomy of dimensional modeling (Kimball; external), and it is the measure-versus-category type compatibility of summarizability (Lenz & Shoshani; external) seen from the measure side rather than the tag side.
+Tag coherence and grain are two preconditions for a sound `sum`. A third applies to a particular kind of magnitude. A flow, such as revenue or quantity sold, is additive over every dimension: it makes sense to sum it across customers, across products, and across time. A level, such as an account balance, inventory on hand, or headcount, is additive over entity dimensions but not over time, because summing balances across months adds snapshots of the same stock and produces a figure that means nothing. This is the additive, semi-additive, and non-additive taxonomy of dimensional modeling (Kimball), and it is the measure-versus-category type compatibility of summarizability (Lenz & Shoshani) seen from the measure side rather than the tag side.
 
 The obligation has the same shape as the others. A `sum(m) group by G` reduces over every dimension absent from `G`, so summing a semi-additive magnitude over a dimension it is not additive along is the violation. A monthly balance summed without `month` in the group key collapses time and adds snapshots. The discharges are to keep that dimension in the grain, or to use the reduction the measure actually supports along it, such as last-value or average over time rather than `sum`.
 
@@ -102,9 +102,9 @@ The difference from currency is what the author must declare. A tag needs nothin
 
 A join pairs rows; it does not add magnitudes. So a join carries no tag-coherence obligation of its own, and the arithmetic that follows a join reuses the rules above. What a join does change is which rows exist and how many times each magnitude appears, and that introduces a second integrity axis alongside tag coherence.
 
-**Grain.** The grain of a relation is what one row stands for, identified by its key. A magnitude is summable only when the rows being folded are distinct at the grain that produced it, so that each underlying value is counted once. This is the disjointness condition of summarizability (Lenz & Shoshani; external) read through the key.
+**Grain.** The grain of a relation is what one row stands for, identified by its key. A magnitude is summable only when the rows being folded are distinct at the grain that produced it, so that each underlying value is counted once. This is the disjointness condition of summarizability (Lenz & Shoshani) read through the key.
 
-**Fan-out is the grain hazard.** Joining a one-row-per-order table that carries `order_total` to a many-rows-per-order line-items table replicates each `order_total` once per line item. A later `sum(order_total)` then counts each order's total several times. This is the fan trap of dimensional modeling (Kimball; external), and it is a grain violation rather than a tag violation: the currencies all agree, but the values have been duplicated. The rule: `sum(m)` is sound only when `m`'s origin key is still a key of the relation being summed. A join that does not preserve that key has fanned the magnitude out, and summing it double counts.
+**Fan-out is the grain hazard.** Joining a one-row-per-order table that carries `order_total` to a many-rows-per-order line-items table replicates each `order_total` once per line item. A later `sum(order_total)` then counts each order's total several times. This is the fan trap of dimensional modeling (Kimball), and it is a grain violation rather than a tag violation: the currencies all agree, but the values have been duplicated. The rule: `sum(m)` is sound only when `m`'s origin key is still a key of the relation being summed. A join that does not preserve that key has fanned the magnitude out, and summing it double counts.
 
 The four obligations a join raises, and the integrity axis each serves:
 
@@ -119,7 +119,7 @@ Tag coherence and grain are the two preconditions for a sound `sum`: every contr
 
 ## The lattice underneath
 
-All of the above is one structure: a lattice of tag knowledge attached to a base type, with operations stated as require/produce over that lattice and safety decided by the lattice order. This is the type-qualifier view (Foster, Fahndrich & Aiken, *A Theory of Type Qualifiers*, PLDI 1999; external) resting on Denning's lattice model of information flow (1976; external), and it is the same meet-semilattice machinery the substrate already runs for nullability and uniqueness, which is why domain type drops in as one more property over [lineage-facts.md](lineage-facts.md) rather than a separate engine. For currency the qualifier lattice is
+All of the above is one structure: a lattice of tag knowledge attached to a base type, with operations stated as require/produce over that lattice and safety decided by the lattice order. This is the type-qualifier view (Foster, Fähndrich & Aiken, *A Theory of Type Qualifiers*, PLDI 1999) resting on Denning's lattice model of information flow (Denning, CACM 1976), and it is the same meet-semilattice machinery the substrate already runs for nullability and uniqueness, which is why domain type drops in as one more property over [lineage-facts.md](lineage-facts.md) rather than a separate engine. For currency the qualifier lattice is
 
 ```
         T   (unknown or mixed)        <- detached, or summed across currencies
@@ -129,7 +129,7 @@ All of the above is one structure: a lattice of tag knowledge attached to a base
         _|_ (dimensionless)           <- a ratio where the currency cancelled
 ```
 
-A detached amount (projected away from its currency) is the same base type at qualifier `T`; an operation is safe exactly when the operand qualifiers meet its requirement. The modern algebraic backbone for the aggregation case is semiring annotation and its semimodule extension for aggregates; the corpus carries this line through `2015_1504.04044_FAQ_Questions_Asked_Frequently.pdf`, whose mutually-commutative-aggregate condition states precisely when stacked aggregations may be interchanged, and through `2007_7aaa09842e45abf0b35eee655fea299d95b3ffa0_Update_Exchange_with_Mappings_and_Provenance.pdf`. The originating provenance-semiring paper (Green, Karvounarakis & Tannen, PODS 2007) is external to this corpus.
+A detached amount (projected away from its currency) is the same base type at qualifier `T`; an operation is safe exactly when the operand qualifiers meet its requirement. The modern algebraic backbone for the aggregation case is semiring annotation (Green, Karvounarakis & Tannen, *Provenance Semirings*, PODS 2007) and its semimodule extension for aggregates (Amsterdamer, Deutch & Tannen, PODS 2011). The mutually-commutative-aggregate condition of Abo Khamis, Ngo & Rudra (*FAQ: Questions Asked Frequently*, PODS 2016) states precisely when stacked aggregations may be interchanged, and the same provenance line carries into update exchange (Green, Karvounarakis, Ives & Tannen, *Update Exchange with Mappings and Provenance*, VLDB 2007).
 
 ## What this commits the design to
 
@@ -143,3 +143,19 @@ A detached amount (projected away from its currency) is the same base type at qu
 - **Tag-blind comparison and ordering.** The working resolution above treats `min`, `max`, and ordering as value-selecting rather than value-combining: the result is a real value, its tag widens to top when the inputs disagree, and the widened tag is caught later where a definite tag is required, consistent with the naked-amount taint. This keeps the operation quiet and reuses existing machinery. The residual blind spot is the same as elsewhere, a top-tagged value that flows only into further untagged computation and never reaches a typed column, a combine, or an exposure. Whether some uses (a definitive "cheapest charge" surfaced directly to a user) deserve an eager finding rather than the lazy taint is the part left open.
 - **Semi-additivity surface.** The hazard is stated above as the third aggregation precondition, and the obligation and discharges follow the same shape as the others. What stays open is only the authoring surface: how a magnitude declares the dimensions it is additive over (the dimension-scoped general form, of which a bare `summable` flag is the degenerate case). This should be designed against a real level measure rather than invented ahead of one.
 - **How far to take the multiplicative fragment.** Currency-as-nominal-tag covers arithmetic and aggregation. Full units-of-measure (rates, rate-of-rate) is reachable but only justified once conversion and derived rates appear in a real project.
+
+## References
+
+- Albano, A., Cardelli, L., & Orsini, R. (1985). Galileo: A Strongly-Typed, Interactive Conceptual Language. *ACM Transactions on Database Systems*, 10(2), 230-260.
+- Amsterdamer, Y., Deutch, D., & Tannen, V. (2011). Provenance for Aggregate Queries. *PODS*.
+- Abo Khamis, M., Ngo, H. Q., & Rudra, A. (2016). FAQ: Questions Asked Frequently. *PODS*.
+- Denning, D. E. (1976). A Lattice Model of Secure Information Flow. *Communications of the ACM*, 19(5), 236-243.
+- Foster, J. S., Fähndrich, M., & Aiken, A. (1999). A Theory of Type Qualifiers. *PLDI*.
+- Gray, J., Chaudhuri, S., Bosworth, A., Layman, A., Reichart, D., Venkatrao, M., Pellow, F., & Pirahesh, H. (1997). Data Cube: A Relational Aggregation Operator Generalizing Group-By, Cross-Tab, and Sub-Totals. *Data Mining and Knowledge Discovery*, 1(1), 29-53.
+- Green, T. J., Karvounarakis, G., & Tannen, V. (2007). Provenance Semirings. *PODS*.
+- Green, T. J., Karvounarakis, G., Ives, Z. G., & Tannen, V. (2007). Update Exchange with Mappings and Provenance. *VLDB*.
+- Hurtado, C. A., & Mendelzon, A. O. (2001). Reasoning about Summarizability in Heterogeneous Multidimensional Schemas. *ICDT*.
+- Kennedy, A. J. (1994). Dimension Types. *ESOP*. See also Kennedy, A. J. (1996), *Programming Languages and Dimensions* (PhD thesis, University of Cambridge), and Kennedy, A. J. (2009), Types for Units-of-Measure: Theory and Practice, *CEFP*.
+- Kimball, R., & Ross, M. (2013). *The Data Warehouse Toolkit: The Definitive Guide to Dimensional Modeling* (3rd ed.). Wiley. (Additive, semi-additive, and non-additive measures.)
+- Lenz, H.-J., & Shoshani, A. (1997). Summarizability in OLAP and Statistical Data Bases. *SSDBM*.
+- Rondon, P. M., Kawaguchi, M., & Jhala, R. (2008). Liquid Types. *PLDI*.
