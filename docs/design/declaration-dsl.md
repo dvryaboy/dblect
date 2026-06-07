@@ -91,12 +91,11 @@ In a multi-currency project the same type, left open, makes both fields physical
 ```python
 class StgSales(dblect.ModelContract):
     dbt_model = "stg_sales"
-    sale: Money.columns(amount="sale_value", currency="sale_currency_code")
-    # shorthand when the columns follow the naming convention (sale_amount, sale_currency):
-    #   sale: Money
+    sale: Money.columns(amount="sale_amount", currency="currency_code")
+    # if the columns were named `amount` and `currency`, `sale: Money` would do
 ```
 
-Now `amount` lives in `sale_value` and `currency` in `sale_currency_code`, both **physical columns** of `stg_sales` that travel together. Spelling the mapping out always works; the shorter `sale: Money` is available when the columns follow the naming convention, which the [ModelContract](#modelcontract-binding-types-to-a-models-columns) section covers.
+Now `amount` lives in `sale_amount` and `currency` in `currency_code`, both **physical columns** of `stg_sales` that travel together. Binding the columns by hand is the normal way to place a multi-field type, since warehouses name money columns every which way; the short `sale: Money` is the lucky path, for when each field already has a column of its own name. The [ModelContract](#modelcontract-binding-types-to-a-models-columns) section covers both.
 
 So the same field, `currency`, is a logical column in one project's contract and a physical column in the next. Whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*, which is why the model needs no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
 
@@ -381,20 +380,19 @@ The moving parts, each keeping its Pydantic or dbt instinct:
 
 ### When a type spans more than one column
 
-A field typed with a multi-open-field type maps onto more than one physical column. The default is a name convention, with an explicit override when the warehouse disagrees:
+A field typed with a multi-open-field type maps onto more than one physical column, and binding those columns by hand with `.columns(...)` is the normal way to do it. Warehouses name money columns inconsistently, and they usually carry a single currency column that covers every amount in the row, so several amount fields point their `currency` at the same column:
 
 ```python
-class StgSales(ModelContract):
-    dbt_model = "stg_sales"
+class FctOrders(ModelContract):
+    dbt_model = "marts.fct_orders"
 
-    # convention: an open field f of Money maps to column {contract_field}_{f}
-    sale: Money                                   # -> columns sale_amount, sale_currency
-
-    # explicit, when the columns are not named by convention
-    refund: Money.columns(amount="refund_value", currency="refund_ccy")
+    net_revenue: Money.columns(amount="net_amount", currency="currency_code")
+    tax:         Money.columns(amount="tax_amount", currency="currency_code")  # same currency column
 ```
 
-The convention degrades to the scalar case cleanly: with exactly one open field, the column is just the contract field name (`order_total`, not `order_total_amount`). This is the same flattening every nested-record-to-table mapper performs, so the instinct carries; the open question at the end is whether the convention should be `{field}_{subfield}` or something the framework infers from the manifest.
+A single shared currency column is the common shape, and only `.columns(...)` can express it; no positional convention can. A single-currency project sidesteps the question entirely: fix the currency in the type (`Money(currency=Currency.USD)`) and there is no currency column to bind. That is the shape the canonical jaffle shop project shows, where `amount` stands alone and the currency is implicit.
+
+A short form is available when each open field already has a column of its own name (`amount`, `currency`), which staging models off a source sometimes have. With exactly one open field the column is simply the contract field name (`order_total: RevenueNet` binds the `order_total` column, not `order_total_amount`), so the scalar case needs nothing spelled out. How far an inferred shorthand should reach past those cases is left to the open questions.
 
 ### Registration and resolution: a typo is a finding, not a crash
 
@@ -544,7 +542,7 @@ The one row to internalize is the second: every field is a column, and its value
 
 The genuinely unsettled parts of the authoring surface. None blocks a working first version; each is best settled when a real declaration forces it.
 
-- **Multi-column binding convention.** When a multi-field type spans columns, the default mapping (shown here as `{contract_field}_{field}`) needs to be settled, along with how aggressively `.columns(...)` overrides interact with the generated stubs and with dbt `relationships` tests already present. The single-open-field case (column == contract field name) is settled; the multi-field case is where a real schema should decide the convention.
+- **Multi-column binding shorthand.** Explicit `.columns(...)` is the normal way to bind a multi-field type, and it is the only form that expresses the common shape where several amount columns share one currency column. The single-open-field case (column == contract field name) is settled. What stays open is how far, if at all, an inferred shorthand should reach: matching each open field to a like-named column covers some staging models but not the shared-currency mart, and how such inference interacts with the generated stubs and with dbt `relationships` tests already present wants a real schema to decide.
 - **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
 - **How visible the trust split in `Field` should be.** `Field(ge=0)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched value) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
 - **Detecting the unsound aggregate versus the unsound assignment.** When `sum(amount)` mixes currencies and the result is also assigned to a `MoneyUSD` column, there are two true statements: the aggregation is not well-typed, and the declared output type is wrong. Whether to report one finding or two, and which to make primary, is a diagnostics call that wants real output in front of real users before it is fixed. The same question applies to the cascade in the currency-creep scenario.
