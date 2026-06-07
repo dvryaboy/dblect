@@ -17,17 +17,19 @@ The central design choice is that the author does **not** annotate which fields 
 
 A field is a **magnitude** when its values are a *quantity*: they form a commutative monoid under `+` and are scaled by a numeric scalar domain (the naturals for a count, the rationals or reals for money). This is the semimodule structure that aggregation rides (Amsterdamer, Deutch & Tannen, *Provenance for Aggregate Queries*, PODS 2011): `SUM` accumulates the `+`, `*` applies the scaling, and it is between magnitudes that tag coherence has to hold.
 
-A field is a **tag** when its values are used by *identity* rather than as a quantity: equality is the operation that matters, and there is no numeric scalar domain (naturals, integers, rationals, reals) under which folding its values reads as a measured total. A tag type may still carry algebraic structure, since a boolean is a monoid under AND or OR and a group under XOR, and a string is a monoid under concatenation, but a logical or modular fold is not a measure, so currency-style coherence and summability never attach to it. Closed enumerations, booleans, and identifiers are tags.
+A field is a **tag** when its values are used by *identity* rather than as a quantity: equality is the operation that matters, and there is no numeric scalar domain (naturals, integers, rationals, reals) under which folding its values reads as a measured total. A tag type may still carry algebraic structure, since a boolean is a monoid under AND or OR and a group under XOR, and a string is a monoid under concatenation, but a logical or modular fold is not a measure, so summability never attaches to it.
+
+Tags come in two kinds, and the difference shows up only under multiplication. A **dimensional tag** is a unit the magnitude is measured in, currency being the example: it behaves multiplicatively, so `*` and `/` do arithmetic on it (a ratio of two same-currency amounts cancels it, an exchange rate converts it). A **nominal tag** is a pure category, `contains_tax` or fiscal entity: it carries equality only, with no `contains_tax^2`. Under `+` and `sum` the two kinds behave identically (they must agree, or be held constant per group), so the coherence story below is uniform and reads "tag" for both; they part ways only when something is multiplied. Closed enumerations, booleans, and identifiers are nominal tags; currency and units of measure are dimensional.
 
 ```python
 class Money(dblect.DomainType):
-    amount:   Decimal(18, 2)   # Decimal adds and scales -> magnitude
-    currency: Currency         # enum, equality only      -> tag
+    amount:   Decimal(18, 2)   # Decimal adds and scales      -> magnitude
+    currency: Currency         # the unit it is measured in    -> dimensional tag
 ```
 
-`Decimal` adds, so `amount` is the magnitude. `Currency` is a closed enum with no addition, so `currency` is a tag the magnitude must stay coherent with. `contains_tax: bool` is a tag for the same reason, which is why adding a taxed revenue to an untaxed one is the same class of error as adding USD to EUR. The author writes ordinary typed fields; the classification falls out.
+`Decimal` adds, so `amount` is the magnitude. `Currency` is the unit it is measured in, a dimensional tag. `contains_tax: bool` would be a nominal tag, which is why adding a taxed revenue to an untaxed one is the same class of error as adding USD to EUR: under `+`, both kinds of tag demand agreement. The author writes ordinary typed fields; the classification falls out.
 
-The classification lives with the type, so the standard library carries it: `Money`, `Count`, `Probability` are magnitudes; `Currency`, `Country`, `Identifier`, `Year` are tags. A raw numeric SQL type defaults to magnitude and a raw enum to tag. The algebra is a strong default rather than a decision procedure, though: an integer is algebraically a perfect quantity even when it is really an identifier or a calendar year, both of which are tags by role, so the declared library type carries the final classification (`Identifier` and `Year` over a bare `Integer` it would be meaningless to sum). For the common cases, a `Decimal` measure or an enum label, the default is simply right, with no per-field annotation.
+The classification lives with the type, so the standard library carries it: `Money`, `Count`, `Probability` are magnitudes; `Currency` and units of measure are dimensional tags; `Country`, `Identifier`, `Year`, and `contains_tax` are nominal tags. A raw numeric SQL type defaults to magnitude and a raw enum to nominal tag. The algebra is a strong default rather than a decision procedure, though: an integer is algebraically a perfect quantity even when it is really an identifier or a calendar year, both of which are tags by role, so the declared library type carries the final classification (`Identifier` and `Year` over a bare `Integer` it would be meaningless to sum). For the common cases, a `Decimal` measure or an enum label, the default is simply right, with no per-field annotation.
 
 ## A tag has three states, and two of them are not the same
 
@@ -48,25 +50,61 @@ The tag set is part of the type's identity and travels with the column through c
 
 ## The operation rules
 
-For a magnitude `m` carrying tag set `T`, where each tag is nominal (equality, and cancels against itself under division):
+For a magnitude `m` carrying a set of tags, where a dimensional tag (a unit) does exponent arithmetic under `*` and `/`, and a nominal tag carries equality only:
 
 | SQL | requires | produces |
 |---|---|---|
-| `m1 + m2`, `m1 - m2` | tags agree pairwise | same tags |
-| `sum(m) group by G` | every tag in `T` constant within each group (present in `G`, pinned, or functionally determined by `G`) | same tags, now constant per group |
+| `m1 + m2`, `m1 - m2` | every tag agrees (units and categories) | same tags |
+| `sum(m) group by G` | every tag constant within each group (present in `G`, pinned, or functionally determined by `G`) | same tags, now constant per group |
 | `avg(m) group by G` | same as `sum` (algebraic: carry sum and count) | same tags |
-| `m * k`, `m / k` with `k` dimensionless | nothing | same tags |
-| `m1 / m2`, same type | tags agree | tags cancel to dimensionless (a Ratio or Percentage) |
+| `m * k`, `m / k` with `k` dimensionless | nothing | dimensions and tags unchanged |
+| `m1 * m2` | nothing forced | dimensions multiply (`money * money` is `money^2`); a nominal tag survives only if the other side lacks it, else widens to top |
+| `m1 / m2` | nothing forced | dimensions divide (equal units cancel to dimensionless, a Ratio or Percentage); nominal tags as for `*` |
 | `count(m)` | nothing (values are not inspected) | a tag-free `Count` |
 | `m1 < m2` as a predicate | tags agree, for the comparison to mean anything | boolean |
-| `min(m)`, `max(m)`, `order by m`, top-n windows | nothing forced | a real value of the type, but its tag widens to the join of the inputs (`T` when they differ) |
+| `min(m)`, `max(m)`, `order by m`, top-n windows | nothing forced | a real value of the type, but its tag widens to the join of the inputs (top when they differ) |
 | render as money at an exposure | every tag present and single-valued | leaves the typed world |
 
 Three kinds of reduction over a tagged magnitude behave differently, and the difference is whether the operation inspects, combines, or selects values. `count` ignores values, so it is always safe regardless of tags. `sum` and `avg` combine values into a new one, so they take the hard rule above: a varying tag corrupts the magnitude (dollars added to euros are in no currency), which is why they must be discharged. `min`, `max`, ordering, and top-n selection pick an existing value rather than synthesizing one, so the magnitude they return is real; only its tag is uncertain, because the comparison that chose it was tag-blind. They therefore widen the result tag to the join of the inputs (top when the inputs disagree) rather than failing at the operation, and that widened tag is caught by the ordinary checks wherever a definite tag is later required: assignment to a typed column, a later combine, or rendering at an exposure. The same discharges that make a `sum` sound (the tag in the group key, pinned, or functionally determined) make the selection meaningful too, since they hold the tag constant across what is compared.
 
-The additive rules (`+` needs equal tag, `/` cancels) are the single-tag fragment of units-of-measure arithmetic. Currency is a nominal tag rather than a full multiplicative dimension because `USD^2` and `USD * EUR` are meaningless: only exponents zero (dimensionless, after a ratio) and one (an amount) ever occur. The one place the full multiplicative group reappears is conversion: an `ExchangeRate` typed as `EUR/USD` multiplied by a `MoneyUSD` yields `MoneyEUR`, with the tag exponents combining as `usd^-1 * usd^1 -> 1`. So the model degrades to a tag for everyday arithmetic and recovers the group exactly where conversion needs it.
+Multiplication and division are the generic part, and they are why a dimensional tag is worth separating from a nominal one. They are the operations of the free abelian group of units (Kennedy): `*` adds unit exponents and `/` subtracts them, with no per-case knowledge beyond the operands' own dimensions. `money<usd> / money<usd>` cancels to a dimensionless ratio; an `ExchangeRate` typed `eur/usd` times a `MoneyUSD` gives `MoneyEUR`, the `usd` exponents cancelling; and `money * money` is `usd^2`, which is not an error at the multiply but a well-typed value nobody usually wants, flagged only where a `usd^2` is later used as money. A reversed conversion is caught for free this way: multiplying by a rate typed the wrong direction (`usd/eur`) yields `usd^2 eur^-1`, which the same downstream check flags. A nominal tag has no exponents, so it simply rides through a scalar multiply (`revenue * 0.9` keeps its tax status) and widens to top if two nominally-tagged operands are multiplied together.
 
 The aggregation rule is summarizability (Lenz & Shoshani, *Summarizability in OLAP and Statistical Data Bases*, SSDBM 1997): the validity of `sum ... group by` rests on the aggregation function being type-compatible with the measure and with the category aggregated over. Summing a magnitude across a varying tag is the type-incompatible case. The `country -> currency` discharge is reasoning about summarizability under a declared dimension dependency (Hurtado & Mendelzon, ICDT 2001).
+
+## What holds a dimension
+
+A dimension is an element of the free abelian group over units: a normalized map from unit to integer exponent, with zero exponents dropped so the empty map is dimensionless and equality is map equality.
+
+```python
+Unit      = Concrete[str] | PerRow[ColumnRef]   # "USD", or the currency column travelling with this amount
+Dimension = FrozenMap[Unit, int]                # {USD: 1}; money^2 is {USD: 2}; a rate is {EUR: 1, USD: -1}; {} is dimensionless
+```
+
+`money^2` needs no special type; it is the point `{USD: 2}`, held by the same structure that holds `money` (`{USD: 1}`), a per-dollar rate (`{USD: -1}`), and the variance of money (`{USD: 2}`). The operations are the group operations: `*` merges the maps adding exponents then drops zeros, `/` subtracts, `==` is map equality.
+
+The one twist past textbook units is that a unit's *identity* can be per-row. A single-currency amount is `{Concrete("USD"): 1}`; a per-row multi-currency amount is `{PerRow(currency_col): 1}`. Cancellation then works by identity: `PerRow(c) / PerRow(c)` cancels because it is the same column reference, while two different currency columns do not. And summing across a `PerRow(c)` unit is sound only when `c` is constant over each group, which is exactly the coherence obligation discharged by the group key or a functional dependency. So the dimensional representation and the coherence rule are one thing: a per-row unit must stay invariant wherever values are folded, or it stops being a single unit.
+
+The full value attached to an amount column is three parts, since nominal tags do not belong in the group (there is no `contains_tax^2`):
+
+```python
+@dataclass(frozen=True)
+class MagnitudeType:
+    base:      SqlType                       # Decimal(18, 2)
+    dimension: Dimension | Top               # {USD: 1}; money^2 is {USD: 2}; Top if mixed or unknown
+    nominal:   FrozenMap[str, object | Top]  # {contains_tax: False, ...}  -- categorical, equality only
+```
+
+`Top` is reached when a dimension stops being single-valued: summing across currencies, unioning `{USD: 1}` with `{EUR: 1}`, a min or max across differing units, or passing through an opaque function. So the lattice the substrate runs is flat over the group: each distinct known monomial is its own incomparable point, all under `Top`, with `*` and `/` operating inside a known value and `meet`/`join` working over the knowledge (equal dimensions agree, unequal join to `Top` or conflict on grounding). A literal sits at bottom, polymorphic, until context fixes it.
+
+## Functions and UDFs
+
+Operators (`+ - * /`, comparison, the standard aggregates) carry fixed transfer rules and need no per-case knowledge, so they are generic. Everything else is a function with a dimensional signature, and signatures come from three places.
+
+Built-in functions are a finite, closed set, so the framework ships a catalog classifying each by what it does to dimensions: most preserve the argument's dimension (`ABS`, `ROUND`, `CEIL`, `GREATEST`, `LEAST`, `COALESCE`, `NULLIF`, `LAG`, `MIN`, `MAX`, `AVG`); a few scale exponents in known ways (`VARIANCE` squares them, `SQRT` halves them, `POWER(x, n)` multiplies them by `n`); and some require a dimensionless argument and flag otherwise (`EXP`, `LN`, `SIN`), since `exp(money)` is meaningless. These slot into the substrate's existing per-operator and per-aggregate transfer catalogs.
+
+dbt macros expand to SQL before analysis, so they are transparent: the framework propagates through the expanded text like any model and needs no signature for them. The genuine boundary is an opaque warehouse UDF (a registered, Python, or native function), which is a black box. There the result defaults to `Top`, which is sound but launders the dimension and drops checking through that call, unless the author declares the function's signature, exactly as one would type any foreign boundary.
+
+So power users get one hook with two uses: annotate a built-in the shipped catalog missed or got wrong, and declare the signature of a custom UDF. A declared signature is the same kind of small statement as a domain type on a column, for example `convert(Money[c1], Rate[c1/c2]) -> Money[c2]`. The catalog covers the common surface out of the box; the hook covers the long tail.
 
 ## How it lands on the charge example
 
@@ -129,20 +167,23 @@ All of the above is one structure: a lattice of tag knowledge attached to a base
         _|_ (dimensionless)           <- a ratio where the currency cancelled
 ```
 
-A detached amount (projected away from its currency) is the same base type at qualifier `T`; an operation is safe exactly when the operand qualifiers meet its requirement. The modern algebraic backbone for the aggregation case is semiring annotation (Green, Karvounarakis & Tannen, *Provenance Semirings*, PODS 2007) and its semimodule extension for aggregates (Amsterdamer, Deutch & Tannen, PODS 2011). The mutually-commutative-aggregate condition of Abo Khamis, Ngo & Rudra (*FAQ: Questions Asked Frequently*, PODS 2016) states precisely when stacked aggregations may be interchanged, and the same provenance line carries into update exchange (Green, Karvounarakis, Ives & Tannen, *Update Exchange with Mappings and Provenance*, VLDB 2007).
+That picture is the single-unit slice. The general structure is the flat lattice over the free abelian group of units described in "What holds a dimension": each known monomial is its own point, all under `T`, which carries `usd^2`, `eur/usd`, and the rest without enumerating them. A detached amount (projected away from its currency) is the same base type at qualifier `T`; an operation is safe exactly when the operand qualifiers meet its requirement. The modern algebraic backbone for the aggregation case is semiring annotation (Green, Karvounarakis & Tannen, *Provenance Semirings*, PODS 2007) and its semimodule extension for aggregates (Amsterdamer, Deutch & Tannen, PODS 2011). The mutually-commutative-aggregate condition of Abo Khamis, Ngo & Rudra (*FAQ: Questions Asked Frequently*, PODS 2016) states precisely when stacked aggregations may be interchanged, and the same provenance line carries into update exchange (Green, Karvounarakis, Ives & Tannen, *Update Exchange with Mappings and Provenance*, VLDB 2007).
 
 ## What this commits the design to
 
 - The author declares fields with their natural types and nothing else for the common case. Magnitude versus tag is inferred from field algebra, so there is no `axis` or `tag` keyword.
 - Absence and presence of currency are the absent / pinned / per-row states of the `currency` field. The before-and-after of the example is the extend operation growing the tag set, which is why the obligation is retroactive and reaches undeclared models.
 - The only extra declarations the author ever adds are functional dependencies to discharge an aggregation (`country -> currency`) and, for the separate semi-additive-measure problem a balance over time would raise, the dimensions a magnitude is additive over. Currency needs neither.
+- Multiplication and division are generic group arithmetic on units, so they need no per-expression semantics. Functions get their dimensions from a shipped catalog of built-ins, transparently from expanded macros, and from a declared signature (or a conservative `Top`) at an opaque UDF, with one power-user hook to annotate a built-in or a custom function.
 
 ## Open questions
 
 - **Inference overrides.** The magnitude/tag inference is right when the right library types are used, and the `Year`- or identifier-as-`Integer` trap shows raw numeric types can mislead it (both are algebraically quantities but tags by role). Whether the framework should warn on summing a bare `Integer` dimension, or require dimensions and identifiers to be tag-typed, wants a real schema to decide.
 - **Tag-blind comparison and ordering.** The working resolution above treats `min`, `max`, and ordering as value-selecting rather than value-combining: the result is a real value, its tag widens to top when the inputs disagree, and the widened tag is caught later where a definite tag is required, consistent with the naked-amount taint. This keeps the operation quiet and reuses existing machinery. The residual blind spot is the same as elsewhere, a top-tagged value that flows only into further untagged computation and never reaches a typed column, a combine, or an exposure. Whether some uses (a definitive "cheapest charge" surfaced directly to a user) deserve an eager finding rather than the lazy taint is the part left open.
 - **Semi-additivity surface.** The hazard is stated above as the third aggregation precondition, and the obligation and discharges follow the same shape as the others. What stays open is only the authoring surface: how a magnitude declares the dimensions it is additive over (the dimension-scoped general form, of which a bare `summable` flag is the degenerate case). This should be designed against a real level measure rather than invented ahead of one.
-- **How far to take the multiplicative fragment.** Currency-as-nominal-tag covers arithmetic and aggregation. Full units-of-measure (rates, rate-of-rate) is reachable but only justified once conversion and derived rates appear in a real project.
+- **Built-in catalog coverage and the UDF hook.** The dimensional signatures of built-ins are a finite catalog to ship and maintain, and the power-user hook for annotating built-ins and custom UDFs needs a concrete surface. Both are bounded work, but the exact catalog scope (which warehouses' function sets) and the hook's spelling want a real project to settle.
+- **Dimensionless is coarse.** A tax rate and an unrelated ratio are both dimensionless, so the unit layer accepts `money * either`. Catching a wrong dimensionless factor is the refinement and nominal-tag layer's job, not the unit layer's, and how much to invest there is open.
+- **Fractional exponents.** `SQRT` of a non-square dimension produces a half-integer exponent the integer-exponent group cannot hold. Whether to widen such results to `Top`, carry rationals, or flag them is unsettled and waits on a real case.
 
 ## References
 
