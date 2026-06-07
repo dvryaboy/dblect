@@ -13,7 +13,7 @@ Everything else people say about function dimensions is a special case. "Preserv
 
 ## Authoring a signature
 
-The signature is unit-polymorphic, which is parametric polymorphism over units (Kennedy 1994), so the natural Python surface is a generic over a unit variable, and we lean on Pydantic's generics rather than reinventing them. A domain type is generic over its unit, and a unit variable plays the role a `TypeVar` plays for ordinary generics:
+The signature is unit-polymorphic, which is parametric polymorphism over units (Kennedy 1994), so the natural Python surface is a generic over a unit variable. We borrow the *shape* of Pydantic's generics, the parameterized-class syntax and the editor support that rides on it, and interpret the unit algebra ourselves: a `unit_var` is our own object, and an annotation like `Quantity[U ** 2]` is read as a unit monomial rather than evaluated by Python's type system. The borrowed surface keeps the authoring experience familiar; the interpretation layer is where the dimensional reasoning lives. A domain type is generic over its unit, and a unit variable plays the role a `TypeVar` plays for ordinary generics:
 
 ```python
 from dblect import unit_var
@@ -71,7 +71,7 @@ Nominal tags are governed separately from this catalog: a structure-preserving f
 
 This surface sits in a well-developed neighborhood, and we are happy to borrow.
 
-- **Pydantic generics** give us `Money[U]` directly. Parameterizing a model over a variable and reading those annotations back is exactly what Pydantic already does well, so the unit variable rides Python's own generic machinery rather than a bespoke parser.
+- **Pydantic generics** give us the `Money[U]` surface directly. Parameterizing a model over a variable and reading those annotations back is exactly what Pydantic already does well, so the authoring syntax and editor support come for free; the unit algebra those annotations carry is then ours to interpret.
 - **Pandera** has two registry mechanics worth knowing: `register_check_method` (Bantilan 2020), a decorator that registers a named check into a global registry for later use by name, and its pluggable dtype `Engine`, where a user registers a custom logical dtype with equivalence and coercion. Both are clean models for a single-decorator extension point feeding one registry. We take that spirit. Our entries are richer than a named check, since they carry a unit-polymorphic signature, so we do not hold to Pandera's exact mechanics, but its developer experience is the bar to clear.
 - **sqlglot's `annotate_types`** is the closest in-stack precedent for the catalog itself, a function-to-return-type table keyed by expression class, and our dimension catalog is the same shape one level up.
 - **Pint** (the Python units library) and the units-of-measure tradition (Kennedy; the Frink language) are where the dimensional algebra and unit unification come from.

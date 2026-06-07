@@ -8,7 +8,7 @@ A dbt project encodes meaning in SQL and in the analysts' heads, and almost nowh
 
 dblect's declaration layer is where you write the meaning down, once, in Python that sits beside your dbt project and never touches your models. You declare what a column *means* (a domain type), bind it to the dbt model that produces it (a model contract), and the framework propagates those meanings along the dbt DAG. The payoff is not the declaration; it is the moment the framework flags the place where two meanings collide or an operation stops making sense, at PR review time, before any data runs.
 
-This document is about the writing of it, and about the two collisions that motivate the whole surface. The companion docs cover what the framework does mechanically with what you write.
+This document is about the writing of it, and about the collisions that motivate the whole surface: meanings that fail to combine across columns or across rows, and a magnitude a join quietly double counts. The companion docs cover what the framework does mechanically with what you write.
 
 ## Why it looks like Pydantic
 
@@ -219,7 +219,7 @@ from {{ ref('stg_charges') }}
 group by country, currency
 ```
 
-**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already pins the currency down, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape as the conservation contract above:
+**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already pins the currency down, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape the `ModelContract` contract methods use (the conservation method shown later under [ModelContract](#modelcontract-binding-types-to-a-models-columns)). The same `StgCharges` contract is spelled out in full here, with `country` and `currency` declared and `charge_amount` bound explicitly, so the dependency has named proxies to range over:
 
 ```python
 class StgCharges(ModelContract):
