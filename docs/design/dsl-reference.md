@@ -91,10 +91,13 @@ column proxies. What the contract *does* is decided by the type of value it retu
 is also the line between what the analyzer reasons with and what it only runs.
 See [dblect_technical_intro.md](dblect_technical_intro.md), [propagation-soundness.md](propagation-soundness.md).
 
-**Return a fact, and the analyzer reads it.** A fact is trusted at analysis time to
-discharge obligations and propagate, and verified against data, so a violation becomes its
-own finding. Facts are a closed vocabulary, exactly the structural properties the substrate
-propagates ([lineage-facts.md](lineage-facts.md)), built from column proxies.
+**Return a fact, and the analyzer reads it.** A fact is a vouched assertion: the analyzer
+trusts it to discharge obligations and propagate, rather than proving it. It surfaces a
+finding only when the fact contradicts something, another declared fact, or a data-level
+guard that checks it (a generated assertion run against materialized data, the way a
+declared key is, per [propagation-soundness.md](propagation-soundness.md)). Facts are a
+closed vocabulary, exactly the structural properties the substrate propagates
+([lineage-facts.md](lineage-facts.md)), built from column proxies.
 
 - `self.key(self.a, self.b)`. The columns are unique together.
 - `self.col.references(models.dim.key)`. A referencing edge into another relation.
@@ -107,11 +110,12 @@ shape as the rest of the proxy API. The single-column facts have field-marker su
 (`order_id: PrimaryKey`, `customer_id: ForeignKey("dim.key")`) that desugars to `key` and
 `references`.
 
-**Return a predicate, and the analyzer only verifies it.** An equality or boolean over
-aggregates is run but never reasoned with. Tolerance lives in the expression, not in a
-decorator argument: `(a.sum() == b.sum()).within(0.01)`, optionally `.relative_to(ref)`. A
-predicate written over materialized frames rather than proxies is the escape hatch,
-verify-only by construction because the analyzer cannot read it symbolically.
+**Return a predicate, and it is checked by running, not reasoned about.** An equality or
+boolean over aggregates is executed against data and never used in propagation. Tolerance
+lives in the expression, not in a decorator argument: `(a.sum() == b.sum()).within(0.01)`,
+optionally `.relative_to(ref)`. A predicate written over materialized frames rather than
+proxies is the escape hatch, check-only by construction because the analyzer cannot read it
+symbolically.
 
 Join cardinality is not asserted. It follows from grain, keys, and foreign keys (the
 cardinality-reads-uniqueness path in [propagation-soundness.md](propagation-soundness.md)),
@@ -121,7 +125,7 @@ so you state the grain and let the rest follow.
 
 Modifiers narrow where a contract applies and compose with any contract above.
 
-- `@contract(when=predicate)`. The contract runs only where a structural or runtime
+- `@contract(when=predicate)`. The contract runs only where a structural or data-level
   precondition holds (`@contract(when=models.fct_returns.row_count() > 0)`).
 - `self.where(predicate)`. Restricts to matching rows.
 - `requires_flags = {...}`. Restricts to named flag worlds.
@@ -149,6 +153,9 @@ See [dblect_technical_intro.md](dblect_technical_intro.md) and [domain-type-alge
   group (see `determines` and `group_by`); `count` is always safe.
 - `agg.group_by(*cols)`. Makes the aggregation per-group. The grouping keys are what the
   framework checks a companion tag against.
+- `agg.joined_on(predicate)`. Names the join an aggregation ranges over when it spans
+  relations, so a sum on one model can be grouped by a key from another:
+  `payments.amount.sum().group_by(orders.customer_id).joined_on(payments.order_id == orders.order_id)`.
 - `self.a.determines(self.b)`. Builds the functional-dependency fact `a -> b`. The fact
   vocabulary (`determines`, `references`, `key`, `grain`) is defined under Contracts.
 - Arithmetic `+`, `-`, `*`, `/`. Builds value expressions. Magnitudes combine by the

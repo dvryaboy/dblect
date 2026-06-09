@@ -11,7 +11,7 @@ Five steps, each ending in a finding the existing toolchain (dbt tests + data-di
 | # | What we do | What dblect catches | What data-diff would show |
 |---|---|---|---|
 | 0 | `dblect init` (no declarations) | Latent NULL-group risk in `customers.sql` (zero-declaration static finding) | n/a, no PR yet |
-| 1 | Annotate `Money(currency="USD")` on the critical chain | Nothing yet, types align | n/a, no SQL change |
+| 1 | Annotate `Money(currency=Currency.USD)` on the critical chain | Nothing yet, types align | n/a, no SQL change |
 | 2 | Plant **currency creep** | Type mismatch at PR time, no execution | Scattered CLV value drift, cause invisible |
 | 3 | Plant **returns-from-CLV flag** | Conservation contract fails in the flag's True world | Nothing; default unchanged |
 | 4 | Plant **apple_pay payment method** | Conservation contract fails under Fanout intent, with shrunk counterexample | The new rows' totals don't reconcile, *if those rows are in the snapshot* |
@@ -82,14 +82,14 @@ Create `dblect/types.py`:
 ```python
 # dblect/types.py
 from dblect import DomainType
-from dblect.types import Decimal
+from dblect.types import Decimal, Currency
 
 class Money(DomainType):
     """A monetary amount in a specified currency."""
     amount: Decimal(18, 2)
-    currency: str
+    currency: Currency
 
-MoneyUSD = Money.refine(currency="USD")
+MoneyUSD = Money.refine(currency=Currency.USD)
 ```
 
 Create `dblect/contracts/staging.py`:
@@ -139,10 +139,10 @@ class Orders(ModelContract):
     customer_id:          ForeignKey("customers.customer_id")
     order_date:           t.Date
     status:               t.Varchar
-    credit_card_amount:   MoneyUSD = Field(ge=0)
-    coupon_amount:        MoneyUSD = Field(ge=0)
-    bank_transfer_amount: MoneyUSD = Field(ge=0)
-    gift_card_amount:     MoneyUSD = Field(ge=0)
+    credit_card_amount:   MoneyUSD(amount="credit_card_amount")   = Field(ge=0)
+    coupon_amount:        MoneyUSD(amount="coupon_amount")        = Field(ge=0)
+    bank_transfer_amount: MoneyUSD(amount="bank_transfer_amount") = Field(ge=0)
+    gift_card_amount:     MoneyUSD(amount="gift_card_amount")     = Field(ge=0)
     amount:               MoneyUSD = Field(ge=0)
 
 class Customers(ModelContract):
@@ -154,7 +154,7 @@ class Customers(ModelContract):
     first_order:             t.Date
     most_recent_order:       t.Date
     number_of_orders:        t.Integer
-    customer_lifetime_value: MoneyUSD
+    customer_lifetime_value: MoneyUSD(amount="customer_lifetime_value")
 ```
 
 Run the check:
@@ -168,7 +168,7 @@ $ dblect check
 [dblect] No findings.
 ```
 
-The chain is consistent: `Money(currency="USD")` flows from `stg_payments.amount` through `orders.amount` and the per-method columns, and through `customer_payments` into `customers.customer_lifetime_value`. Nothing is wrong yet. We've installed the immune system; now we'll demonstrate what it sees.
+The chain is consistent: `Money(currency=Currency.USD)` flows from `stg_payments.amount` through `orders.amount` and the per-method columns, and through `customer_payments` into `customers.customer_lifetime_value`. Nothing is wrong yet. We've installed the immune system; now we'll demonstrate what it sees.
 
 ## Step 2: plant currency creep (semantic-meaning correctness)
 
@@ -206,7 +206,7 @@ $ dblect check
 [dblect] Type propagation across DAG...
 
   FAIL  stg_payments.amount [type mismatch]
-        Declared: MoneyUSD  (Money refined to currency="USD")
+        Declared: MoneyUSD  (Money refined to currency=Currency.USD)
         Inferred: Money     (currency varies per row; not unifiable with MoneyUSD)
         Reason:   column `currency` on raw_payments observed with values
                   {"USD", "EUR", "GBP"}; `amount` is no longer a single-currency
