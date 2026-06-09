@@ -1,14 +1,16 @@
 # The declaration DSL: authoring domain types and model contracts
 
-*Status: design notes, consumer-experience focused. This document fixes the authoring surface a dblect user actually writes and reads: domain types, refinements, and the model contracts that bind them to dbt models. It sits above the substrate ([lineage-facts.md](lineage-facts.md)) and is a companion to the broader [technical intro](dblect_technical_intro.md), narrowed to one question: what does it feel like to declare meaning in dblect, and watch the framework catch where that meaning stops composing? Syntax shown is the target; the genuinely unsettled surface details are listed at the end.*
+*Status*: design notes, consumer-experience focused.
+
+This document fixes the authoring surface a dblect user actually writes and reads: domain types, refinements, and the model contracts that bind them to dbt models. It sits above the substrate ([lineage-facts.md](lineage-facts.md)) and is a companion to the broader [technical intro](dblect_technical_intro.md), narrowed to one question: what does it feel like to declare meaning in dblect, and watch the framework catch where that meaning stops composing? Syntax shown is the target; the genuinely unsettled surface details are listed at the end.
 
 ## The promise this surface keeps
 
-A dbt project encodes meaning in SQL and in the analysts' heads, and almost nowhere a tool can read. `order_total` is net of discounts and gross of tax; `revenue` switched from accrual to cash basis last quarter; `amount` is dollars until the day someone adds a EUR row. None of that is written down, so when one of these meanings shifts the build stays green and the dashboards drift.
+A dbt project encodes meaning in SQL and in the analysts' heads, some comments if you are unusually diligent which are even sometimes up to date, and almost nowhere a tool can read. `order_total` is net of discounts and gross of tax; `revenue` switched from accrual to cash basis last quarter; `amount` is dollars until the day someone adds a `currency` column and a row with EUR. A rich and endless source of subtle bugs, in other words.
 
-dblect's declaration layer is where you write the meaning down, once, in Python that sits beside your dbt project and never touches your models. You declare what a column *means* (a domain type), bind it to the dbt model that produces it (a model contract), and the framework propagates those meanings along the dbt DAG. The payoff is not the declaration; it is the moment the framework flags the place where two meanings collide or an operation stops making sense, at PR review time, before any data runs.
+dblect's declaration layer is where you write the meaning down, once, in Python that sits beside your dbt project and never touches your models. You declare higher-level domain types built up from your SQL primitives. You bind those meaningful types to the dbt model that produces it, and optionally declare invariants over them through a model contract. You can do this gradually, only bothering with this in the places that matter - no need to strongly type every single model. The framework propagates the types along the dbt DAG. The payoff is the moment the framework flags the place where a code change altered things, and you are summing up money without accounting for different currencies, and an operation stops making sense. dblect flags subtle logical errors at PR review time, before any data runs.
 
-This document is about the writing of it, and about the collisions that motivate the whole surface: meanings that fail to combine across columns or across rows, and a magnitude a join quietly double counts. The companion docs cover what the framework does mechanically with what you write.
+This document is about the writing of it, and about the collisions that motivate the whole surface: meanings that fail to combine across columns or across rows, and an amount a join quietly double counts. The companion docs cover what the framework does mechanically with what you write.
 
 ## Domain types and model contracts
 
@@ -19,24 +21,31 @@ A **`DomainType`** is what it sounds like, a type that carries domain meaning. Y
 A **`ModelContract`** uses those types to describe a dbt model in domain language. Each field is a column, and each column gets a `DomainType`:
 
 ```python
+class OrderId(dblect.DomainType):
+    order_id: Int_64
+
+# ...
+
 class FctOrders(dblect.ModelContract):
     dbt_model = "marts.fct_orders"
 
     order_id:    OrderId
     customer_id: CustomerId
-    order_total: RevenueNet = dblect.Field(ge=0)
+    order_total: RevenueNet(amount="order_total") = dblect.Field(ge=0)
 ```
 
 That reads as "this model's `order_total` is net revenue, its `customer_id` is a customer id." You declare only the columns you care about; columns you leave out still flow through the framework's structural analysis, they just carry no domain type. So you type a column the day its meaning starts to matter and leave the rest alone.
 
-## The one idea: every field is a column, and its value comes from the data or the type
 
-A `DomainType` is a record of fields, and the single thing to learn is where each field's value comes from. The framework reads the fields as a schema over a SQL relation: every field is a column of that relation, and a column's value comes from one of exactly two places:
+## Model fields are real or "logical" columns
+
+A `ModelContract` uses `DomainTypes` to layer in semantics on top of the real dbt model / SQL table.
+ The framework reads the fields as a schema over a SQL relation: every field is a column of that relation, and a column's value comes from one of exactly two places:
 
 - a **physical column**, when the value varies row to row and is stored in the warehouse, or
 - a **logical column**, when the value is the same for the whole column in a given build and comes from your declarations (fixed in the type, or chosen by a dbt var), so the warehouse stores nothing for it.
 
-That single degree of freedom is the entire conceptual delta, and it is what lets one type describe different shapes in different projects. Take money:
+This lets one type describe different shapes in different projects or even differnt models in the same projects. Consider money:
 
 ```python
 import dblect
@@ -48,17 +57,19 @@ class Money(dblect.DomainType):
     currency: Currency
 ```
 
-`Money` has two fields, and where each value comes from is decided where the type is used, not in the type. Put it on a model in a single-currency project and you fix the currency in the type:
+`Money` has two fields, amount and currency. Put it on a model in a single-currency project and you fix the currency in the type:
 
 ```python
 class StgSales(dblect.ModelContract):
     dbt_model = "stg_sales"
-    sale: Money(currency=Currency.USD)
+    sale: Money(amount="sale_amount", currency=Currency.USD)
 ```
 
-`sale`'s `amount` is a **physical column** of `stg_sales`; `currency` is a **logical column**, fixed to USD by the type, with nothing stored. There may be no `currency` column in `stg_sales` at all, and that is correct.
+`sale`'s `amount` is a **physical column** of `stg_sales` called `sale_amount`; `currency` is a **logical column**, fixed to USD by the type, with nothing stored. There may be no `currency` column in `stg_sales` at all, and that is correct.
 
 In a multi-currency project the same type, left open, makes both fields physical. Name the warehouse column behind each field:
+
+Quick note: dblect generally avoids surprises through convention, but you can omit the column mappings ("`amount="sale_amount"`") if the dbt model's column name matches the DomainType's field name exactly. You only need to specify the mapping `amount="sale_amount"` when the DomainType field is named something different than the column is. This is handy for type reuse, or times when you might have multiple `Money`s in the same relation - tax_amount, total_amount, shipping_amount, etc. You could reuse the same Money type to describe them and map columns accordingly. You can read more about this in the [ModelContract](#modelcontract-binding-types-to-a-models-columns) section.
 
 ```python
 class StgSales(dblect.ModelContract):
@@ -67,19 +78,17 @@ class StgSales(dblect.ModelContract):
     # if the columns were named `amount` and `currency`, `sale: Money` would do
 ```
 
-Now `amount` lives in `sale_amount` and `currency` in `currency_code`, both **physical columns** of `stg_sales` that travel together. Binding the columns by hand is the normal way to place a multi-field type, since warehouses name money columns every which way; the short `sale: Money` is the lucky path, for when each field already has a column of its own name. The [ModelContract](#modelcontract-binding-types-to-a-models-columns) section covers both.
+Now `amount` lives in `sale_amount` and `currency` in `currency_code`, both **physical columns** of `stg_sales` that travel together.
 
-So the same field, `currency`, is a logical column in one project's contract and a physical column in the next. Whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*, which is why the model needs no separate concept for value-fields versus label-fields: there is one concept, a column, and two sources for its value.
+So the same field, `currency`, is a logical column in one project's contract and a physical column in the next. Whether a field's value comes from the data or from the type is a property of how the type is *used*, not of how it is *defined*.
 
 The same idea explains a field whose value the warehouse never stores. Take revenue, where what the number includes is part of its meaning:
 
 ```python
-class Revenue(dblect.DomainType):
+class Revenue(Money):
     """A revenue amount, with what it includes recorded as part of the type."""
-    amount:            Decimal(18, 2)
     contains_tax:      bool
     contains_discount: bool
-    currency:          Currency
 ```
 
 No warehouse stores a per-row `contains_tax` boolean; it is the same value on row 1 and row 1,000,000. So on a model you fix it in the type, and it rides along as a logical column:
@@ -87,7 +96,7 @@ No warehouse stores a per-row `contains_tax` boolean; it is the same value on ro
 ```python
 class FctOrders(dblect.ModelContract):
     dbt_model = "marts.fct_orders"
-    net_revenue: Revenue(contains_tax=False, contains_discount=True, currency=Currency.USD)
+    net_revenue: Revenue(amount="net_revenue", contains_tax=False, contains_discount=True, currency=Currency.USD)
 ```
 
 `net_revenue`'s `amount` is a physical column of `fct_orders`; `contains_tax`, `contains_discount`, and `currency` are logical columns the framework carries so it can reason about them. `contains_tax=True` and `contains_tax=False` are different quantities, and the bugs dblect targets are the ones where one is used where the other was assumed.
@@ -111,7 +120,7 @@ RevenueCollected = Revenue.refine(contains_tax=True, contains_discount=True)
 
 If you have used `typing.Literal` to narrow a type, this is the same move: `Revenue.refine(contains_tax=False)` is `Revenue` with `contains_tax` narrowed from "either" to exactly `False`. Refinement is partial and chainable: the three types above each leave `currency` open, so each is a family over every currency, and `RevenueNet.refine(currency=Currency.USD)` narrows one further.
 
-`Money` refines the same way; the canonical pair the demo turns on:
+`Money` refines the same way:
 
 ```python
 from dblect.types import Money, Currency
@@ -120,21 +129,21 @@ MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
 ```
 
-Put a refinement on a model and it reads as the plain Pydantic line, the meaning already in the name:
+Put a refinement on a model and the meaning is already in the name; you point it at its column:
 
 ```python
 class FctOrders(dblect.ModelContract):
     dbt_model = "marts.fct_orders"
-    order_total: MoneyUSD
+    order_total: MoneyUSD(amount="order_total")
 ```
 
-`order_total` is a physical column carrying the amount; `currency` rides along as a logical column, fixed to USD by `MoneyUSD`. Naming the refinement once beats fixing the fields at every column that uses it.
+`order_total` is a physical column carrying the amount; `currency` rides along as a logical column, fixed to USD by `MoneyUSD`. Naming the refinement once beats fixing the fields at every column that uses it, and communicates the meaning of what is in the dbt model more clearly.
 
-Refinement and fixing-a-field are the same operation seen from two distances: `.refine()` names a reusable refined type, and inline `Field(...)` (below) fixes a field at one binding site. Both produce a type with fewer open fields.
+Refinement and fixing-a-field are the same thing: `.refine()` names a reusable refined type, and inline `Field(...)` fixes a field at one binding site. Both produce a type with fewer open fields.
 
 ## Extension: adding and combining facets
 
-Refinement narrows facets a type already has. Adding one is the other direction, and it matters because a `DomainType` declares only the facets you care about. A facet a type does not declare is one it makes no claim about: `Revenue` tracks tax and discount because this project cares, it says nothing about shipping, and a leaner project's revenue might track neither, just `amount` and `currency`. You add a facet the day it starts to matter.
+Refinement narrows facets a type already has. Adding one is the other direction. A facet a type does not declare is one it makes no claim about: `Revenue` tracks tax and discount because this project cares, it says nothing about shipping, and a leaner project's revenue might track neither, just `amount` and `currency`. You add a facet the day it starts to matter.
 
 Subclassing does both jobs. A subclass adds new fields, and it fixes inherited ones by giving them a value, the class-level twin of `.refine()`:
 
@@ -157,42 +166,64 @@ class TaxedShippedRevenue(TaxedRevenue, ShippedRevenue):
 
 The result carries the union of facets. Where two of them fix the same field they must agree, the same meet that governs combining values; where they fix different fields the result simply carries both. So a revenue that is both taxed and shipped is not a special construct, it is the two facets met.
 
-## Composition: where the types earn their keep
+## Composition
 
-Declaring types is setup. The return comes when SQL folds several typed values into one and the framework checks that the fold is meaningful. There is one principle, and it shows up as two everyday operations:
+Declaring types is setup. The return comes when SQL folds several typed values into one and the framework checks that the fold is meaningful.
 
 > When an operation combines several values of a domain type into one result, the type's meaning-bearing fields must stay coherent: anything fixed in the type must agree, and anything per-row must be held constant across what is being combined.
 
-"Combining" happens two ways in SQL, and each is one of the scenarios that motivates this whole layer.
+"Combining" happens two ways in SQL, and each is a place bugs hide. Several values can be reconciled into one, by a `+` within a row, a `UNION` across branches, or a `COALESCE` over a fallback. Or many rows can be reduced into one, by a `sum`.
 
-### Combining values across columns: tax meets no-tax
+### When values combine: net meets gross
 
-Adding a taxed revenue to an untaxed one, or unioning them, or coalescing one into the other, produces a quantity whose `contains_tax` is genuinely undefined. The type system already knows the two inputs disagree on a field fixed in the type, so it refuses the combination.
+This is best illustrated by example. Consider a business that sells through its own website and through a marketplace like Amazon.com. Its internal reporting has a model called `fct_all_revenue`, which provides a cross-channel view into the company's revenue. The developers used dblect to faithfully describe what their input data contains. dblect figures out the types for the `fct_all_revenue` table through propagation, no additional work is necessary.
 
 ```python
-class FctOrders(ModelContract):
-    dbt_model = "marts.fct_orders"
-    subtotal: RevenueNet                 # contains_tax=False
-    tax:      TaxAmount
-    total:    RevenueCollected           # contains_tax=True
+class StgWebRevenue(ModelContract):
+    dbt_model = "stg_web_revenue"
+    revenue: Revenue(amount="revenue", contains_tax=False)          # net
+
+class StgMarketplaceRevenue(ModelContract):
+    dbt_model = "stg_marketplace_revenue"
+    revenue: Revenue(amount="revenue", contains_tax=False)          # net, today
 ```
 
 ```sql
--- models/marts/fct_orders.sql, a refactor that looks harmless
-select order_id,
-       subtotal + tax  as total,        -- fine: a net revenue plus its tax is a collected revenue
-       subtotal + total as grand_total  -- wrong: adds an untaxed and a taxed revenue
-from ...
+-- models/marts/fct_all_revenue.sql   (no contract; just stacks the channels)
+select revenue from {{ ref('stg_web_revenue') }}
+union all
+select revenue from {{ ref('stg_marketplace_revenue') }}
 ```
 
-```
-FAIL  marts.fct_orders.grand_total [types do not combine]
-      subtotal + total adds Revenue(contains_tax=False) and Revenue(contains_tax=True).
-      The sum's contains_tax is undefined; these are different quantities.
-      models/marts/fct_orders.sql:4
+This all works. Both arms are `contains_tax=False`, so the union is unambiguously net and the audit is quiet.
+
+Then a PR reworks the marketplace model to record the full buyer-paid amount, tax included, because a new payout report needs the gross figure. This is a real change to the SQL, and the author updates the contract to match what the column now carries:
+
+```sql
+-- models/staging/stg_marketplace_revenue.sql
+-    select order_id, item_amount as revenue
++    select order_id, item_amount + tax_amount as revenue
 ```
 
-The rule that decides agreement is the one your intuition supplies: two refinements combine when every field they both fix agrees, and an open field meets anything.
+```python
+ class StgMarketplaceRevenue(ModelContract):
+     dbt_model = "stg_marketplace_revenue"
+-    revenue: Revenue(amount="revenue", contains_tax=False)          # net
++    revenue: Revenue(amount="revenue", contains_tax=True)           # now the buyer-paid, tax-inclusive amount
+```
+
+A nice, surgical change that looks pretty reasonable to any reviewer. But there is a bug, of course: the union now stacks a tax-inclusive arm on top of a net one, and all-channels `revenue` becomes part gross and part net. The build stays green, the number looks plausible, and dblect flags it on the PR:
+
+```
+FAIL  models/marts/fct_all_revenue.sql:1 [types do not combine]
+      union of stg_web_revenue.revenue and stg_marketplace_revenue.revenue mixes
+      Revenue(contains_tax=False) and Revenue(contains_tax=True); the result's
+      contains_tax is undefined.  
+```
+
+This type of thing is tricky to catch in practice, when you are dealing with hundreds of models. The change and the break are in different files, and the marketplace change was a sound one; the bug is its non-local consequence at the union, exactly what a reviewer reading the marketplace diff would miss. The finding lands on `fct_all_revenue`, a model with no contract at all and not part of a PR. Note that nobody had to type `fct_all_revenue`. Typing the two sources was enough, because the new meaning rode the union down the DAG and collided there on its own.
+
+The same rule governs a `+` within a row and a `COALESCE` over a fallback, and every field a type fixes, not just `contains_tax`: two values combine only when every field they both fix agrees, and an open field meets anything.
 
 | One side | Other side | Result |
 |---|---|---|
@@ -201,11 +232,9 @@ The rule that decides agreement is the one your intuition supplies: two refineme
 | `RevenueNet` | `RevenueGross` | **conflict** (`contains_discount` disagrees) |
 | `MoneyEUR` | `MoneyUSD` | **conflict** (`currency` disagrees) |
 
-Under the hood this is a lattice meet on the substrate (see [lineage-facts.md](lineage-facts.md)); you never see the lattice, only a type that flowed down the DAG, a type you declared, and a finding where they collide. It is the same engine that already propagates nullability and uniqueness, with the domain type as one more property over it.
+If you want to nerd out on the technical details, this is a lattice meet on the substrate (see [lineage-facts.md](lineage-facts.md)). But you don't really need to know what any of that means to use dblect.  As the user, you should never see the lattice, only a type that flowed down the DAG, a type you declared, and a finding where they collide.
 
 ### Combining values across rows: the sum that quietly stops making sense
-
-This is the scenario that shows why the record-of-fields model matters, and the one that makes the case for building on lineage rather than on annotations alone, because the model that breaks is one nobody annotated.
 
 Start with an ordinary, untyped project. A charges source has the columns it has always had, and somewhere downstream a mart rolls them up by country. No `dblect/` declarations exist for either:
 
@@ -226,24 +255,33 @@ Then a dev adds international charges. The PR grows a per-row `currency` column 
 # dblect/contracts/staging.py    (the only thing the dev adds)
 class StgCharges(ModelContract):
     dbt_model = "stg_charges"
-    charge_amount: Money           # currency open: amount and currency are now a pair of columns
+    charge_amount: Money(amount="charge_amount", currency="currency")
 ```
 
-The dev has never opened `revenue_by_country.sql` and does not know it exists. The next check flags it anyway:
+The dev has never opened `revenue_by_country.sql` and does not know it exists.
+
+You see the problem, of course, because we laid it out and shined a light on the downstream dependency: not having accounted for currencies in revenue_by_country, the developer who introduced currencies is now quietly causing the aggregation mart to add up numbers that should not sum. Some orders in the same country might be in different currencies.
+
+With various lineage tools and perusal of the dbt dependency graph, one can imagine a diligent developer could have discovered this by themselves; but that's a ton of work and we all know this sort of thing slips through all the time, anyway.
+
+dblect flags it right away:
 
 ```
 FAIL  marts.revenue_by_country.total_charges [aggregation not well-typed]
       sum(charge_amount) groups by {country}; charge_amount is Money.amount and its
-      companion currency is not provably constant per group (currency was dropped in
-      stg_charges -> revenue_by_country, and is per-row upstream).
-      Summing Money across currencies is undefined: add currency to GROUP BY, filter to
-      one currency, or convert to a common currency before summing.
-      Introduced by: you declared `charge_amount: Money` over (charge_amount, currency)
-                     in dblect/contracts/staging.py:StgCharges
-      models/marts/revenue_by_country.sql:3
+      companion field currency is not provably constant per group, so reducing it is
+      not well-typed. (currency was dropped on the path stg_charges ->
+      revenue_by_country and is per-row upstream, so no group key, refinement, WHERE,
+      or declared dependency pins it.)
+      To discharge, make currency constant across each group: add it to GROUP BY,
+      filter to one value, convert to a common one before summing, or declare a
+      country -> currency dependency where it holds.
+      Type in play: charge_amount: Money over (charge_amount, currency),
+                    from dblect/contracts/staging.py:StgCharges
+      Conflict at:  models/marts/revenue_by_country.sql:3
 ```
 
-That is the demo's strongest beat: a single declaration on a source illuminates its entire blast radius, including a consumer the author never knew about, with cause and effect on screen, before any row of data runs.
+A single declaration on a source illuminates its entire blast radius, including a consumer the author never knew about, naming the declaration the type travelled from and the aggregation where it lands, before any row of data runs. 
 
 #### How the type reaches a model with no contract
 
@@ -259,7 +297,7 @@ The general rule: an arithmetic reduction (`sum`, `avg`, and friends) over one f
 
 Conservatism cuts both ways, so the ways to discharge an obligation are part of the contract, not afterthoughts. There are three, and each says something true about the data. The author reaches for whichever matches reality.
 
-**Fix the SQL: group by the tag.** Adding `currency` to the grouping makes it constant per group by construction, and the result is honestly per-currency:
+**Fix the SQL: group by the currency.** Adding `currency` to the grouping makes it constant per group by construction, and the result is honestly per-currency:
 
 ```sql
 select country, currency, sum(charge_amount) as total_charges
@@ -267,7 +305,7 @@ from {{ ref('stg_charges') }}
 group by country, currency
 ```
 
-**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already determines the currency, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape the `ModelContract` contract methods use (the conservation method shown later under [ModelContract](#modelcontract-binding-types-to-a-models-columns)). The same `StgCharges` contract is spelled out in full here, with `country` and `currency` declared and `charge_amount` bound explicitly, so the dependency has named proxies to range over:
+**Assert a functional dependency, when one genuinely holds.** If each country bills in exactly one currency, the group key already determines the currency, and you can keep summing by country alone. You state that fact on the contract for the relation where it holds, as a symbolic expression over column proxies, the same shape the `ModelContract` contract methods use (the contract method shown later under [ModelContract](#modelcontract-binding-types-to-a-models-columns)). The same `StgCharges` contract is spelled out in full here, with `country` and `currency` declared and `charge_amount` bound explicitly, so the dependency has named proxies to range over:
 
 ```python
 class StgCharges(ModelContract):
@@ -277,12 +315,12 @@ class StgCharges(ModelContract):
     currency:      Currency
     charge_amount: Money.columns(amount="charge_amount", currency="currency")
 
-    @contract.functional_dependency
+    @contract
     def country_sets_currency(self):
         return self.country.determines(self.currency)   # each country uses one currency
 ```
 
-With that, `sum(charge_amount) group by country` checks clean, because `country -> currency` lets the framework conclude the currency is single-valued in each country group even though the `currency` column was projected away before the rollup. The result keeps its tag: `total_charges` is a `Money` whose currency is now determined by `country`, so a later `sum` across countries lights up again on its own. A functional dependency buys one sound aggregation, not a blanket exemption. And because it is a checkable claim rather than a bare assertion, the runtime check verifies it against data; a country that turns out to bill in two currencies becomes its own finding rather than silently licensing the mix.
+With that, `sum(charge_amount) group by country` checks clean, because `country -> currency` lets the framework conclude the currency is single-valued in each country group even though the `currency` column was projected away before the rollup. The result keeps its currency: `total_charges` is a `Money` whose currency is now determined by `country`, so a later `sum` across countries lights up again on its own. A functional dependency buys one sound aggregation, not a blanket exemption. And because it is a checkable claim rather than a bare assertion, the runtime check verifies it against data; a country that turns out to bill in two currencies becomes its own finding rather than silently licensing the mix.
 
 **Let the join speak for itself.** When `currency` arrives by a lookup against a dimension keyed on `country`, the dependency is structural and the framework infers it, with no declaration at all, the way an existing `relationships` test is already read as a foreign key:
 
@@ -293,17 +331,17 @@ join {{ ref('dim_country') }} d using (country)   -- d.currency is a function of
 group by c.country
 ```
 
-A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by fixing the tag. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
+A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by fixing the currency. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
 
 ### Joining values: the total that gets counted twice
 
-A join pairs rows, so it does not combine magnitudes the way `+` or `sum` do, but it changes how many times each magnitude appears, and that is its own class of finding. The classic case is the fan-out, where a one-row-per-order total is replicated by a join to a many-rows-per-order child and then summed.
+A join pairs rows, so it does not combine amounts the way `+` or `sum` do, but it changes how many times each amount appears, and that is its own class of finding. The classic case is the fan-out, where a one-row-per-order total is replicated by a join to a many-rows-per-order child and then summed.
 
 ```python
 class FctOrders(ModelContract):
     dbt_model = "marts.fct_orders"
     order_id:    PrimaryKey
-    order_total: Money(currency=Currency.USD)
+    order_total: Money(amount="order_total", currency=Currency.USD)
 
 class StgOrderItems(ModelContract):
     dbt_model = "stg_order_items"
@@ -320,10 +358,10 @@ join {{ ref('stg_order_items') }} i using (order_id)   -- one row per item, not 
 group by o.order_id
 ```
 
-The join replicates each `order_total` once per line item, so `sum(o.order_total)` counts a three-item order's total three times. The currencies all agree, so this is not a tag conflict; it is a grain violation, and the framework catches it because it knows `fct_orders.order_id` is the key of the order total's origin and that the join did not preserve it:
+The join replicates each `order_total` once per line item, so `sum(o.order_total)` counts a three-item order's total three times. The currencies all agree, so this is not a currency conflict; it is a grain violation, and the framework catches it because it knows `fct_orders.order_id` is the key of the order total's origin and that the join did not preserve it:
 
 ```
-FAIL  marts.order_revenue.revenue [aggregation over a fanned-out magnitude]
+FAIL  marts.order_revenue.revenue [aggregation over a fanned-out amount]
       sum(order_total) sums a Money whose origin key fct_orders.order_id is not
       preserved through the join to stg_order_items (one row per item, many per order).
       Each order_total is replicated per line item and counted more than once.
@@ -332,7 +370,7 @@ FAIL  marts.order_revenue.revenue [aggregation over a fanned-out magnitude]
       models/marts/order_revenue.sql:2
 ```
 
-The declared `ForeignKey` is what makes the grain explicit: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. An existing dbt `relationships` test is read the same way, so a project that already tests its keys gets this finding without new declarations. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the tags to agree. The full treatment of grain alongside tag coherence is in [domain-type-algebra.md](domain-type-algebra.md).
+The declared `ForeignKey` is what makes the grain explicit: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. An existing dbt `relationships` test is read the same way, so a project that already tests its keys gets this finding without new declarations. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the types to agree. The full treatment of grain alongside type coherence is in [domain-type-algebra.md](domain-type-algebra.md).
 
 ## ModelContract: binding types to a model's columns
 
@@ -350,27 +388,27 @@ class FctOrders(ModelContract):
 
     dbt_model = "marts.fct_orders"
 
-    # field name == SQL column name, for the common single-column case
+    # scalar types bind by name; money columns map their amount field to the column
     order_id:    OrderId
     customer_id: dblect.ForeignKey("dim_customers.customer_id")
     order_date:  Date
-    order_total: RevenueNet = dblect.Field(ge=0)
-    tax_paid:    TaxAmount  = dblect.Field(ge=0)
+    order_total: RevenueNet(amount="order_total") = dblect.Field(ge=0)
+    tax_paid:    TaxAmount(amount="tax_paid")     = dblect.Field(ge=0)
 
-    @contract.conservation(tolerance=0.01)
+    @contract
     def total_matches_line_items(self):
         """Order header total reconciles to the sum of line-item subtotals."""
         return (
             self.order_total.sum().group_by(self.order_id)
             == models.stg_order_items.subtotal.sum()
                  .group_by(models.stg_order_items.order_id)
-        )
+        ).within(0.01)
 ```
 
 The moving parts, each keeping its Pydantic or dbt instinct:
 
 - **`dbt_model = "marts.fct_orders"`** binds the class to a manifest entity, resolved with the rules dbt uses for `{{ ref() }}`: bare names resolve locally then in packages, ambiguous ones demand qualification.
-- **Field name equals column name** in the common case. `order_total: RevenueNet` says the model's `order_total` column has type `RevenueNet`. Because `RevenueNet` has exactly one open field (`amount`), that field maps to the `order_total` column and the reading is the plain Pydantic one.
+- **A field binds to the column of the same name, and nothing else is inferred.** A type's physical field binds to the warehouse column whose name matches it exactly, so `order_id: OrderId` types the `order_id` column and a `Money`'s `amount` field binds a column named `amount`. When a column is named differently, you map it (`order_total: Money(amount="order_total", currency=Currency.USD)`), as the next section shows. The framework does not infer a binding from a type happening to have a single open field.
 - **`dblect.Field(...)`** carries column-level metadata, the same role as Pydantic's `Field(...)`. Its two jobs are below.
 - **`dblect.ForeignKey("dim_customers.customer_id")`** is a parameterized type naming another model's column. It doubles as the edge the fixture builder uses to coordinate multi-table generation. An existing dbt `relationships` test is read as a foreign key for free, so you do not restate it.
 - **Contract methods** decorate functions that build symbolic expressions over column proxies (`self.order_total`, `models.stg_order_items.subtotal`). They are runtime-checkable invariants, covered in the [technical intro](dblect_technical_intro.md). A contract with only column declarations and no methods is valid and already buys type propagation.
@@ -389,7 +427,7 @@ class FctOrders(ModelContract):
 
 A single shared currency column is the common shape, and only `.columns(...)` can express it; no positional convention can. A single-currency project sidesteps the question entirely: fix the currency in the type (`Money(currency=Currency.USD)`) and there is no currency column to bind. That is the shape the canonical jaffle shop project shows, where `amount` stands alone and the currency is implicit.
 
-A short form is available when each open field already has a column of its own name (`amount`, `currency`), which staging models off a source sometimes have. With exactly one open field the column is simply the contract field name (`order_total: RevenueNet` binds the `order_total` column, not `order_total_amount`), so the scalar case needs nothing spelled out. How far an inferred shorthand should reach past those cases is left to the open questions.
+A short form is available when a field already carries a column of its own name (`amount`, `currency`), which staging models off a source sometimes have: write the bare type and each field matches the like-named column. When a column is named differently, you map it explicitly. Matching is on exact field names, with nothing inferred beyond them. How far an inferred shorthand should reach past exact names is left to the open questions.
 
 ### Registration and resolution: a typo is a finding, not a crash
 
@@ -413,6 +451,10 @@ discounted:  Revenue    = dblect.Field(contains_tax=False,       # inline fixing
 - **Inline fixing** like `contains_tax=False` fixes a field right at the binding site, exactly equivalent to annotating the column with `RevenueNet`. It is a *vouched* meaning: a thing you assert about what the column means, which the framework propagates and reconciles but cannot independently prove from the SQL.
 
 Both ride one `Field` surface because that matches the Pydantic instinct, and the framework tags them by trust class internally (checkable constraint versus asserted meaning). Prefer a named refined type (`RevenueNet`) when the meaning recurs; reach for inline `Field(...)` for the one-off.
+
+## Aggregate conservation
+
+A natural extension of this surface is a contract over aggregates: that the revenue rolled up by zip in `rev_by_zip` equals the revenue in the `orders` it came from. The motivating failure is a nullability bug wearing a conservation costume, where a nullable `zip_code` quarantines rows into a NULL group that a downstream join drops, so the per-zip total stops tying out to its source. That case needs very little new authoring surface, because conservation is not a new primitive: it is a theorem whose side conditions (a total partition, no fan-out, agreeing filters, consistent units) are properties the substrate already propagates, and the headline bug is a nullability-through-aggregation hazard the framework already raises with no contract written at all, through the cross-model nullable-group-by-key detector. The provability story, what is proven statically today versus demonstrated in the property-based testing loop, and where an authored contract would still earn its place, is worked through in [cross-model-contracts.md](cross-model-contracts.md), alongside the general question of how much cross-model contract dblect can support and keep rigorous.
 
 ## Flags: a logical column whose value a dbt var selects
 
@@ -530,7 +572,7 @@ For the reader placing this against what they already know:
 | `Annotated[int, Gt(0)]` | `Annotated[Decimal, Gt(0)]` | the `Annotated` constraint idiom | constraints are checked against data, not on assignment |
 | `Literal["a", "b"]` narrowing | `T.refine(field=value)` | narrowing a type to a specific case | narrows by fixing a field; partial and chainable |
 | `model_config` class attribute | `dbt_model = "..."` class attribute | class-level config attribute | binds to a dbt manifest entity |
-| `@field_validator` | `@contract.conservation(...)` etc. | decorated methods on the class | builds a symbolic expression AST, checked statically or by PBT |
+| `@field_validator` | `@contract` methods | decorated methods on the class | builds a symbolic expression AST, checked statically or by PBT |
 | generated client (Prisma/dlt) | `dblect/_stubs/models.py` | regenerate-on-schema-change typed client | generated from the dbt manifest |
 
 The one row to internalize is the second: every field is a column, and its value comes from the data (physical) or the type (logical). Every collision the framework reports is a consequence of that and of keeping the meaning-bearing fields coherent when SQL folds values together.
@@ -539,8 +581,8 @@ The one row to internalize is the second: every field is a column, and its value
 
 The genuinely unsettled parts of the authoring surface. None blocks a working first version; each is best settled when a real declaration forces it.
 
-- **Multi-column binding shorthand.** Explicit `.columns(...)` is the normal way to bind a multi-field type, and it is the only form that expresses the common shape where several amount columns share one currency column. The single-open-field case (column == contract field name) is settled. What stays open is how far, if at all, an inferred shorthand should reach: matching each open field to a like-named column covers some staging models but not the shared-currency mart, and how such inference interacts with the generated stubs and with dbt `relationships` tests already present wants a real schema to decide.
-- **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract.functional_dependency` method returning `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
+- **Multi-column binding shorthand.** Explicit `.columns(...)` is the normal way to bind a multi-field type, and it is the only form that expresses the common shape where several amount columns share one currency column. Binding by exact field-name match (each field to its like-named column, an explicit map otherwise) is settled. What stays open is how far, if at all, an inferred shorthand should reach past exact names: it covers some staging models but not the shared-currency mart, and how any such inference interacts with the generated stubs and with dbt `relationships` tests already present wants a real schema to decide.
+- **Functional-dependency surface.** Discharging an aggregation with `country -> currency` is shown here as a `@contract` method returning the fact `self.country.determines(self.currency)`. The operator spelling (`determines(...)` versus a `>>` sugar), whether a dependency can be declared across models rather than only on the relation where it holds, and how far the substrate propagates a declared dependency through joins and unions before it must be restated, all want a real multi-currency project to settle. The semantics and the three discharge paths are fixed in [domain-type-algebra.md](domain-type-algebra.md); only the authoring spelling is open.
 - **How visible the trust split in `Field` should be.** `Field(ge=0)` (a checkable constraint) and `Field(contains_tax=False)` (a vouched value) ride one surface. Whether the author should see the trust distinction (a separate keyword or call) or have it stay internal is open. One surface matches the Pydantic instinct; a visible split matches the framework's own provenance model.
 - **Detecting the unsound aggregate versus the unsound assignment.** When `sum(amount)` mixes currencies and the result is also assigned to a `MoneyUSD` column, there are two true statements: the aggregation is not well-typed, and the declared output type is wrong. Whether to report one finding or two, and which to make primary, is a diagnostics call that wants real output in front of real users before it is fixed. The same question applies to the cascade in the currency-creep scenario.
 - **Call-syntax sugar for refinement.** `Money(currency=Currency.USD)` reads as shorthand for `Money.refine(currency=Currency.USD)` and is used throughout this doc for fixing a field at use. `.refine()` is canonical for naming a reusable type; whether the call form is exactly equivalent sugar or reserved for inline use is a small consistency call.

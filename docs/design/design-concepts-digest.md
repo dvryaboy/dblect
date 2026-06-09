@@ -34,7 +34,7 @@ The framework gives useful output at every level of declaration investment. Thre
 - *Typed critical chain:* Declare domain types on the critical chain (revenue, customer_id, order_date). Run propagation. Most projects find at least one real bug within the first hour.
 - *Focused contracts:* Add conservation and cardinality contracts on the few joins where fanout matters. The PBT runtime half engages with the intent catalog. Hours-to-days commitment.
 
-A future layer (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is the `@contract.check` decorator plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
+A future layer (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is a materialized `@contract` (a predicate over DataFrames) plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
 
 No layer requires the next. A team that stops at the typed-critical-chain layer has a working domain typecheck and never sees the words "lattice" or "operator signature." This gradient is the answer to the recurring tension between formal rigor underneath and practical adoption on top.
 

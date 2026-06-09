@@ -265,7 +265,7 @@ from dblect import contract, models
 class Customers(ModelContract):
     # ... (existing fields) ...
 
-    @contract.conservation(tolerance=0.01)
+    @contract
     def clv_equals_sum_of_payments(self):
         """CLV reconciles to the sum of all payments for that customer."""
         return (
@@ -277,7 +277,7 @@ class Customers(ModelContract):
                 .joined_on(models.stg_payments.order_id
                           == models.stg_orders.order_id)
             )
-        )
+        ).within(0.01)
 ```
 
 **Change 3.** `models/customers.sql`, to gate the `customer_payments` calculation on the flag:
@@ -373,7 +373,7 @@ A new payment method joins the platform. The product team adds rows to the sourc
 class Orders(ModelContract):
     # ... (existing fields and contracts) ...
 
-    @contract.conservation(tolerance=0.01)
+    @contract
     def per_method_amounts_sum_to_total(self):
         """Per-method amounts reconcile to the order's total amount."""
         return (
@@ -382,7 +382,7 @@ class Orders(ModelContract):
             + self.bank_transfer_amount
             + self.gift_card_amount
             == self.amount
-        )
+        ).within(0.01)
 ```
 
 Note we deliberately don't change `orders.sql`. The Jinja list still has only the original four methods. dbt's accepted_values test passes (because we updated it). dbt builds successfully. The bug is invisible to dbt.

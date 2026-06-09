@@ -77,18 +77,18 @@ class FctOrders(ModelContract):
     tax_paid: TaxAmount = Field(ge=0)
     
     # contract methods
-    @contract.conservation(tolerance=0.01)
+    @contract
     def order_total_matches_line_items(self):
         """Order header total reconciles to sum of line item subtotals."""
         return (
             self.order_total.sum().group_by(self.order_id)
             == models.stg_order_items.subtotal.sum()
                 .group_by(models.stg_order_items.order_id)
-        )
+        ).within(0.01)
     
-    @contract.cardinality(relation="1:1", on="order_id")
+    @contract
     def one_row_per_order(self):
-        return self
+        return self.grain(per=self.order_id)
     
     @contract.replay_class("deterministic")
     def deterministic_under_inputs(self): ...
@@ -99,8 +99,10 @@ A few features earning their place:
 - `dbt_model = "marts.fct_orders"` binds the class to a specific dbt manifest entity. Resolution happens at framework-load time rather than at class-definition time, so circular references and missing models surface as findings rather than import errors.
 - Column annotations are domain types from your project's type registry. `Field(...)` adds refinements and column-level constraints.
 - `dblect.ForeignKey("dim_customers.customer_id")` is a parameterized type referencing another model's column. The FK-aware fixture builder uses this to construct coordinated multi-table inputs.
-- Contract decorators wrap methods. The method body builds an AST via operator-overloaded column proxies, with column references like `self.order_total` and `models.stg_order_items.subtotal` returning symbolic placeholders rather than actual values. The framework introspects the AST to do static analysis, change-impact, and Hegel compilation.
-- `self.where(...)` scopes a contract to rows matching a predicate. Composes with any contract decorator.
+- The `@contract` marker wraps a method. The method body builds an AST via operator-overloaded column proxies, with column references like `self.order_total` and `models.stg_order_items.subtotal` returning symbolic placeholders rather than actual values. The framework introspects the AST to do static analysis, change-impact, and Hegel compilation.
+- `self.where(...)` scopes a contract to rows matching a predicate. Composes with any contract.
+
+> Note: `replay_class` above, and the late-arrival contracts in the same family, are the least developed part of the contract surface. They reach into replay determinism and temporal consistency, work that is not underway yet, so their spelling is provisional and will be reworked once that work begins rather than treated as settled.
 
 ### Standalone contracts
 
@@ -109,8 +111,7 @@ Some contracts don't belong on a single model. Cross-model contracts without a c
 ```python
 from dblect import contract, models
 
-@contract.when(models.fct_revenue_by_store.exists())
-@contract.numerical
+@contract(when=models.fct_revenue_by_store.exists())
 def store_breakdown_reconciles_to_total():
     """If we have a per-store revenue breakdown, its total matches the company-wide total."""
     return (
@@ -121,7 +122,7 @@ def store_breakdown_reconciles_to_total():
 
 This is the reconciliation pattern: a breakdown table whose total should match a non-broken-down version of the same underlying fact. Universal across analytics shops. Sources of bugs include filter drift (the breakdown table filters out something the total doesn't), double counting (a join in the breakdown fanout-multiplies rows), and stale incremental refresh (one table updates, the other doesn't).
 
-- `@contract.when(...)` is a precondition. Here it's a structural predicate (does the model exist in the manifest?), and it can also be a runtime predicate over generated data.
+- `@contract(when=...)` is a precondition. Here it's a structural predicate (does the model exist in the manifest?), and it can also be a runtime predicate over generated data.
 - The contract is a function rather than a method, because it isn't naturally attached to any one model.
 - `.within(0.001).relative_to(...)` is the relative-tolerance idiom, expressed as method chaining on the column proxy.
 
@@ -135,7 +136,7 @@ class ReturnReconciliation(dblect.ContractGroup):
     
     when = models.fct_returns.row_count() > 0
     
-    @contract.numerical
+    @contract
     def refunds_never_exceed_originals(self):
         """You can't refund more than was originally charged."""
         return (
@@ -143,7 +144,7 @@ class ReturnReconciliation(dblect.ContractGroup):
             <= models.fct_orders.order_total.sum()
         )
     
-    @contract.numerical
+    @contract
     def returned_quantity_at_most_sold(self):
         """For any product, returns can't exceed sales (per all-time)."""
         return (
@@ -234,15 +235,15 @@ This list is *finite by design*. The set grows only when a real contract can't b
 When the proxy API genuinely can't express a contract, typically because the predicate needs custom logic over the materialized data, a contract can drop into a runtime function:
 
 ```python
-@contract.check
+@contract
 def stock_levels_consistent(df_orders, df_inventory, df_returns):
     """
     Per product, expected on-hand stock = initial - sold + returned.
 
-    Uses @contract.check rather than a specific verb because the relation
-    spans three models with multi-step arithmetic the declarative verbs
-    don't express. Receives materialized DataFrames from Hegel-generated
-    inputs and returns a boolean.
+    Takes materialized DataFrames rather than column proxies, because the
+    relation spans three models with multi-step arithmetic the symbolic form
+    doesn't express. The analyzer cannot read it, so it is verify-only: it
+    receives Hegel-generated inputs and returns a boolean.
     """
     sold = df_orders.groupby('product_id')['quantity'].sum()
     returned = df_returns.groupby('product_id')['quantity'].sum()
@@ -255,7 +256,7 @@ def stock_levels_consistent(df_orders, df_inventory, df_returns):
     return (actual == expected).all()
 ```
 
-The framework loses static analysis on these (it can't propagate types through arbitrary Python), and it can still run them inside the PBT loop and report failures with shrunk counterexamples. The escape hatch is meant to be rare and visible; a project with many `@contract.check` declarations is signaling that the proxy API is missing a useful primitive that should be added. Prefer the specific verbs (`@contract.conservation`, `@contract.cardinality`, and so on) when they fit; reach for `@contract.check` when the declarative shape doesn't capture the relation.
+The framework loses static analysis on these (it can't propagate types through arbitrary Python), and it can still run them inside the PBT loop and report failures with shrunk counterexamples. The escape hatch is meant to be rare and visible; a project with many materialized `@contract` declarations is signaling that the proxy API is missing a useful primitive that should be added. Prefer the symbolic form, a `@contract` returning a fact or a proxy predicate, when it fits; reach for the materialized form over DataFrames when the declarative shape doesn't capture the relation.
 
 This is the same `@check` decorator pattern Pandera uses, applied at the contract layer.
 
@@ -566,7 +567,7 @@ Hypothesis is the canonical Python property-based testing library, with a years-
 
 Hegel descends from Hypothesis (same authors, same core engine, same shrinking philosophy) with extensions for the stateful and multi-table scenarios PBT against data pipelines particularly wants. dblect treats Hegel as the longer-term target: if and when it's available as a callable Python dependency, the swap from Hypothesis to Hegel is mechanical because the conceptual vocabulary is the same. Until then, the v1 build uses Hypothesis with dblect-side machinery filling in the FK-aware fixture and multi-table shrinking pieces.
 
-What dblect takes specifically: the entire mental model of generators-as-types, the shrinking-to-minimal-counterexample workflow (made FK-aware for multi-table fixtures), the idea that the framework picks generators automatically from type information, and the `@given` pattern itself, even though dblect hides it from users behind the contract decorators. The dblect user never types `@given`; the framework supplies it.
+What dblect takes specifically: the entire mental model of generators-as-types, the shrinking-to-minimal-counterexample workflow (made FK-aware for multi-table fixtures), the idea that the framework picks generators automatically from type information, and the `@given` pattern itself, even though dblect hides it from users behind the `@contract` marker. The dblect user never types `@given`; the framework supplies it.
 
 ### SQLAlchemy
 
@@ -588,7 +589,7 @@ What dblect takes specifically: the contemporary method-chain idiom for expressi
 
 Pandera applies the Pydantic class-based pattern to DataFrame schemas. The result is the closest precedent for the schema-is-generator architectural move dblect needs. The crucial feature is `schema.strategy()`, which returns a Hypothesis strategy from a schema declaration, unifying the declaration and the generator into a single object. Pandera also pioneered the `@check` decorator pattern for custom predicates the declarative system can't express, lazy validation as a first-class mode (collecting all errors rather than failing on the first), and an `example()` method for materializing schema instances.
 
-dblect's `MyContract.fixture()` is the direct descendant of Pandera's `MySchema.strategy()`, scaled up for FK-respecting multi-table generation. The `@contract.check` escape hatch follows Pandera's `@check` pattern directly, including the name. Lazy validation is the default mode in dblect, just as it is in Pandera. The "scaffold and refine" workflow for flag discovery is modeled on Pandera's schema inference workflow.
+dblect's `MyContract.fixture()` is the direct descendant of Pandera's `MySchema.strategy()`, scaled up for FK-respecting multi-table generation. The materialized-frame escape hatch follows Pandera's `@check` pattern directly. Lazy validation is the default mode in dblect, just as it is in Pandera. The "scaffold and refine" workflow for flag discovery is modeled on Pandera's schema inference workflow.
 
 What dblect takes specifically: the schema-yields-a-generator unification (this is the single most important pattern we take from Pandera), lazy validation as the default mode, the `@check` escape hatch for predicates the declarative system can't express, the `example()` method for materialization, and the scaffold-and-refine workflow for inferring declarations from existing artifacts.
 

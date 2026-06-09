@@ -177,15 +177,16 @@ class FctAttributedRevenue(ModelContract):
         Requires("dim_users",  "user_id", property="unique"),
     ]
 
-    @contract.cardinality(relation="1:1", on="conversion_id")
-    def one_row_per_conversion(self): ...
+    @contract
+    def one_row_per_conversion(self):
+        return self.grain(per=self.conversion_id)
 
-    @contract.conservation(tolerance=0.01)
+    @contract
     def attribution_conserves_revenue(self):
         return (
             self.attributed_revenue.sum().group_by(self.event_date)
             == models.stg_orders.revenue.sum().group_by(models.stg_orders.event_date)
-        )
+        ).within(0.01)
 
     @contract.replay_class("deterministic")
     def deterministic_given_inputs(self): ...
