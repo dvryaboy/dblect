@@ -322,14 +322,16 @@ class StgCharges(ModelContract):
 
 With that, `sum(charge_amount) group by country` checks clean, because `country -> currency` lets the framework conclude the currency is single-valued in each country group even though the `currency` column was projected away before the rollup. The result keeps its currency: `total_charges` is a `Money` whose currency is now determined by `country`, so a later `sum` across countries lights up again on its own. A functional dependency buys one sound aggregation, not a blanket exemption. The dependency is a vouched claim the framework trusts to discharge the sum, not one it proves. Because it is checkable, a guard that runs against data, the same kind of assertion that backs a declared key, can contradict it: a country that turns out to bill in two currencies surfaces as its own finding rather than silently licensing the mix. Where no such guard runs, the discharge is flagged as resting on an unverified dependency.
 
-**Let the join speak for itself.** When `currency` arrives by a lookup against a dimension keyed on `country`, the dependency is structural and the framework infers it, with no declaration at all, the way an existing `relationships` test is already read as a foreign key:
+**Let the join speak for itself.** When `currency` arrives by a lookup against a dimension whose key is `country`, the dependency is structural and the framework infers it with no declaration, reading the dimension's key the way it reads a `unique` test or primary key. The inference rests on that key: `dim_country` being unique on `country` means one currency per country, so the join neither fans out nor leaves the currency ambiguous.
 
 ```sql
 select c.country, sum(c.charge_amount) as total_charges
 from {{ ref('stg_charges') }} c
-join {{ ref('dim_country') }} d using (country)   -- d.currency is a function of country
+join {{ ref('dim_country') }} d using (country)   -- dim_country keyed on country: one currency per country
 group by c.country
 ```
+
+A dimension carrying several rows per country instead (a row per currency) is not keyed on `country`; the join fans each charge across currencies and the grouped sum over-counts. That is not an inferred dependency but the fan-out the cardinality check already flags, the same shape as [the total that gets counted twice](#joining-values-the-total-that-gets-counted-twice) below.
 
 A single-currency mart that filters `where currency = 'USD'` discharges the obligation the same way, by fixing the currency. These recognizers are what keep a sound-by-default check from crying wolf, and the full set of discharge paths and their grounding lives in [domain-type-algebra.md](domain-type-algebra.md).
 
