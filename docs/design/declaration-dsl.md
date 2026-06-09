@@ -415,7 +415,7 @@ The moving parts, each keeping its Pydantic or dbt instinct:
 - **A field binds to the column of the same name, and nothing else is inferred.** A type's physical field binds to the warehouse column whose name matches it exactly, so `order_id: OrderId` types the `order_id` column and a `Money`'s `amount` field binds a column named `amount`. When a column is named differently, you map it (`order_total: Money(amount="order_total", currency=Currency.USD)`), as the next section shows. The framework does not infer a binding from a type happening to have a single open field.
 - **`dblect.Field(...)`** carries column-level metadata, the same role as Pydantic's `Field(...)`. Its two jobs are below.
 - **`dblect.ForeignKey("dim_customers.customer_id")`** is a parameterized type naming another model's column. It doubles as the edge the fixture builder uses to coordinate multi-table generation. An existing dbt `relationships` test is read as a foreign key for free, so you do not restate it.
-- **Contract methods** decorate functions that build symbolic expressions over column proxies (`self.order_total`, `models.stg_order_items.subtotal`). They are runtime-checkable invariants, covered in the [technical intro](dblect_technical_intro.md). A contract with only column declarations and no methods is valid and already buys type propagation.
+- **Contract methods** decorate functions that build symbolic expressions over column proxies (`self.order_total`, `models.stg_order_items.subtotal`), covered in the [technical intro](dblect_technical_intro.md). They are the relationship surface: where a `Field` constraint bounds one column's own values, a contract relates several columns, rows, or models (a sum reconciling to a total, a key, a grain). Same kind of claim, wider scope. A contract with only column declarations and no methods is valid and already buys type propagation.
 
 ### When a type spans more than one column
 
@@ -455,6 +455,8 @@ discounted:  Revenue    = dblect.Field(contains_tax=False,       # inline fixing
 - **Inline fixing** like `contains_tax=False` fixes a field right at the binding site, exactly equivalent to annotating the column with `RevenueNet`. It is a *vouched* meaning: a thing you assert about what the column means, which the framework propagates and reconciles but cannot independently prove from the SQL.
 
 Both ride one `Field` surface because that matches the Pydantic instinct, and the framework tags them by trust class internally (checkable constraint versus asserted meaning). Prefer a named refined type (`RevenueNet`) when the meaning recurs; reach for inline `Field(...)` for the one-off.
+
+The same split runs through contracts: a fact is vouched the way inline fixing is, a predicate is checked the way a constraint is. Scope picks the surface, a `Field` for one column or a `@contract` for a relationship; the vouched-versus-checkable trust class is orthogonal and shared by both.
 
 ## Aggregate conservation
 
