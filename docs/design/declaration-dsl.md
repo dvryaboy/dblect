@@ -339,6 +339,8 @@ A single-currency mart that filters `where currency = 'USD'` discharges the obli
 
 A join pairs rows, so it does not combine amounts the way `+` or `sum` do, but it changes how many times each amount appears, and that is its own class of finding. The classic case is the fan-out, where a one-row-per-order total is replicated by a join to a many-rows-per-order child and then summed.
 
+The reasoning runs on keys: the order's grain (one row per `order_id`) and the items-to-orders foreign key. dblect would rather not be told these. It infers a key where the SQL makes one (a `GROUP BY` or `DISTINCT`), and it reads an existing dbt `unique` or `relationships` test, or a warehouse constraint, as the same fact. But warehouses are full of join keys that nothing formally tags, so when the fact is absent you state it in the contract, which is all the `PrimaryKey` and `ForeignKey` lines below do. A key declared this way is vouched: dblect trusts it for the finding, and if it proves load-bearing with nothing testing it, says so, which is the nudge to promote it to a real test.
+
 ```python
 class FctOrders(ModelContract):
     dbt_model = "marts.fct_orders"
@@ -372,7 +374,7 @@ FAIL  marts.order_revenue.revenue [aggregation over a fanned-out amount]
       models/marts/order_revenue.sql:2
 ```
 
-The declared `ForeignKey` is what makes the grain explicit: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. An existing dbt `relationships` test is read the same way, so a project that already tests its keys gets this finding without new declarations. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the types to agree. The full treatment of grain alongside type coherence is in [domain-type-algebra.md](domain-type-algebra.md).
+The `ForeignKey` is what makes the grain explicit here: it tells the framework that `stg_order_items` is the many side, so the join fans the order out. The companion check at the join's `ON` clause is type compatibility: joining on two columns whose types do not unify, an ISO-2 `Country` against an ISO-3 one, or a `MoneyUSD` amount against a `MoneyEUR` one, is itself a finding, because a join predicate is a comparison and a comparison requires the types to agree. The full treatment of grain alongside type coherence is in [domain-type-algebra.md](domain-type-algebra.md).
 
 ## ModelContract: binding types to a model's columns
 
