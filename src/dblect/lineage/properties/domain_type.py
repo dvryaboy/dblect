@@ -64,9 +64,13 @@ from dblect.lineage.properties.functional_dependency import FDSet, determines
 class Concrete:
     """A pinned unit or category identity: a literal currency ``"usd"``, a literal
     ``contains_tax`` value. Case-folded so identities line up the way the graph
-    folds column names."""
+    folds column names: a ``usd`` declared on one model agrees with a ``USD``
+    declared on another rather than silently conflicting at their confluence."""
 
     name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", self.name.casefold())
 
 
 @final
@@ -140,6 +144,29 @@ class Dimension:
 Nominal = Concrete | PerRow
 
 
+# --- the polymorphic literal -------------------------------------------------
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _Polymorphic:
+    """The dimension of a bare numeric literal: no fixed unit, but not a no-claim
+    unknown either. It adopts the other operand's unit under ``+``/``-`` (so
+    ``amount + 5`` stays the amount's currency rather than conflicting on a scalar)
+    and acts as dimensionless under ``*``/``/`` (so ``amount * 0.9`` keeps it). This
+    is the "a literal sits at bottom, polymorphic, until context fixes it" reading of
+    the algebra doc, kept distinct from ``None`` (an unknown magnitude, which absorbs
+    under every operator) and from the empty monomial (a *certified* dimensionless
+    value, which conflicts when added to a unit). A singleton; carries no payload."""
+
+
+POLYMORPHIC: Final[_Polymorphic] = _Polymorphic()
+
+# A column's dimensional claim: a known monomial, no claim (``None``), or the
+# polymorphic literal that takes its unit from context.
+DimClaim = Dimension | None | _Polymorphic
+
+
 # --- the per-column value ----------------------------------------------------
 
 
@@ -148,13 +175,15 @@ Nominal = Concrete | PerRow
 class Tagged:
     """A known domain tagging on a magnitude column.
 
-    ``dimension`` is the dimensional monomial (currency and units), or ``None`` when
-    the column makes no dimensional claim (a plain magnitude, or one whose dimension
-    widened away at a confluence). ``nominal`` holds the categorical bindings keyed
-    by tag name. ``NAKED`` is ``Tagged(None, {})``, the lattice top.
+    ``dimension`` is the dimensional monomial (currency and units), ``None`` when the
+    column makes no dimensional claim (a plain magnitude, or one whose dimension
+    widened away at a confluence or a no-claim addend), or :data:`POLYMORPHIC` for a
+    bare numeric literal that takes its unit from context. ``nominal`` holds the
+    categorical bindings keyed by tag name. ``NAKED`` is ``Tagged(None, {})``, the
+    lattice top.
     """
 
-    dimension: Dimension | None
+    dimension: DimClaim
     nominal: frozenset[tuple[str, Nominal]]
 
     def nominal_map(self) -> dict[str, Nominal]:
@@ -190,12 +219,13 @@ def tagged(*, dimension: Dimension | None = None, nominal: Mapping[str, Nominal]
 # --- the lattice -------------------------------------------------------------
 
 
-def _meet_dimension(a: Dimension | None, b: Dimension | None) -> Dimension | None | _Conflict:
-    """``None`` is the no-claim identity. Two known, equal monomials agree; two known,
+def _meet_dimension(a: DimClaim, b: DimClaim) -> DimClaim | _Conflict:
+    """``None`` (no claim) and the polymorphic literal are both identities here, so a
+    known monomial on either side wins. Two known, equal monomials agree; two known,
     unequal monomials are a contradiction on the same column."""
-    if a is None:
+    if a is None or a is POLYMORPHIC:
         return b
-    if b is None:
+    if b is None or b is POLYMORPHIC:
         return a
     return a if a == b else CONFLICT
 
@@ -263,17 +293,65 @@ def _annotate(value: DomainTag, kids: tuple[Annotation[DomainTag], ...]) -> Anno
 # --- operator transfers ------------------------------------------------------
 
 
+def _additive_combine(values: tuple[DomainTag, ...]) -> DomainTag:
+    """The produce rule for the operands of one ``+`` or ``-`` node: Kennedy's
+    same-dimension requirement lifted to the no-claim top and the conflict bottom.
+
+    This is *not* the lattice ``meet``. ``meet`` combines several claims about one
+    column and so treats the no-claim top as its identity (a silent source does not
+    erase a known tag). Addition combines the dimensions of distinct values being
+    summed, where a no-claim operand is an addend of *unknown* dimension that
+    destroys the claim, so the top is absorbing here, not identity. A genuine
+    disagreement among the *known* operands at this node is the mixed-magnitude
+    finding (``CONFLICT``); a no-claim operand alongside agreeing knowns widens the
+    result to no-claim, per coordinate (the dimension, and each nominal key). This
+    is the lenient resolution of the top; strict mode would flag it (see
+    ``docs/design/domain-type-algebra.md``).
+
+    The conflict is per node, between operands actually summed there. ``sqlglot``
+    builds an ``a + b + c`` chain as nested binary nodes, so a no-claim addend
+    between two disagreeing currencies (``(usd + naked) + eur``) widens the inner
+    sum to no-claim and the outer node sees no disagreement. That is sound: the
+    intermediate sum genuinely has unknown dimension, so there is no conflict left
+    to find. A disagreement is reported only where two known, differing dimensions
+    meet directly (``(usd + eur) + naked`` conflicts, and the conflict rides on)."""
+    if any(isinstance(v, _Conflict) for v in values):
+        return CONFLICT
+    taggeds = [v for v in values if isinstance(v, Tagged)]
+    known_dims = {t.dimension for t in taggeds if isinstance(t.dimension, Dimension)}
+    if len(known_dims) > 1:
+        return CONFLICT  # a real currency mix, checked before any widening can mask it
+    any_naked_dim = any(t.dimension is None for t in taggeds)
+    any_poly = any(t.dimension is POLYMORPHIC for t in taggeds)
+    # A known unit, if present, is the result unless a no-claim operand widens it
+    # away; a polymorphic literal adopts the unit and so neither widens nor conflicts.
+    # With no unit at all, a sum of only literals stays polymorphic.
+    dim: DimClaim
+    if known_dims:
+        dim = None if any_naked_dim else next(iter(known_dims))
+    elif any_naked_dim:
+        dim = None
+    elif any_poly:
+        dim = POLYMORPHIC
+    else:
+        dim = None
+    nominal: dict[str, Nominal] = {}
+    for key in {name for t in taggeds for name in t.nominal_map()}:
+        bindings = [t.nominal_map().get(key) for t in taggeds]
+        known = {b for b in bindings if b is not None}
+        if len(known) > 1:
+            return CONFLICT
+        if None not in bindings:  # every operand pins this category, and they agree
+            nominal[key] = next(iter(known))
+    return Tagged(dim, _froze(nominal))
+
+
 def _additive_rule(
     _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
-    """``+`` and ``-`` require every tag to agree (the same currency, the same
-    categories), producing that tag. Disagreement meets to ``CONFLICT``, which a
-    detector reads as a mixed-magnitude addition. A naked operand carries no claim,
-    so it composes onto the other side rather than tainting it."""
     if not kids:
         return Annotation(NAKED, Opacity.IMPLICIT)
-    value = reduce(_meet, (k.value for k in kids))
-    return _annotate(value, kids)
+    return _annotate(_additive_combine(tuple(k.value for k in kids)), kids)
 
 
 def _multiply_tags(a: DomainTag, b: DomainTag) -> DomainTag:
@@ -290,15 +368,17 @@ def _divide_tags(a: DomainTag, b: DomainTag) -> DomainTag:
 
 def _dimensional_combine(a: Tagged, b: Tagged, *, multiply: bool) -> Tagged:
     """The Kennedy multiplicative fragment: dimensions compose by adding (``*``) or
-    subtracting (``/``) exponents, treating a no-claim operand as dimensionless so a
-    scalar factor leaves a magnitude's currency intact. Two no-claim operands stay
-    no-claim rather than minting a spurious dimensionless ratio. A nominal tag rides
-    through when only one side carries it and widens away when both do."""
-    if a.dimension is None and b.dimension is None:
-        dim: Dimension | None = None
+    subtracting (``/``) exponents. A no-claim operand is an *unknown* factor (it may
+    carry hidden units, as a widened sum like ``c0 + c1`` does), so it is absorbing
+    here: the product's dimension is unknown too. A polymorphic literal, by contrast,
+    is a dimensionless scalar factor and leaves the other operand's currency intact
+    (``amount * 0.9``). A nominal tag rides through when only one side carries it and
+    widens away when both do."""
+    if a.dimension is None or b.dimension is None:
+        dim: DimClaim = None  # an unknown factor leaves the product's dimension unknown
     else:
-        da = a.dimension if a.dimension is not None else Dimension.dimensionless()
-        db = b.dimension if b.dimension is not None else Dimension.dimensionless()
+        da = a.dimension if isinstance(a.dimension, Dimension) else Dimension.dimensionless()
+        db = b.dimension if isinstance(b.dimension, Dimension) else Dimension.dimensionless()
         dim = da.multiply(db) if multiply else da.divide(db)
     am, bm = a.nominal_map(), b.nominal_map()
     nominal = {name: binding for name, binding in am.items() if name not in bm}
@@ -329,7 +409,19 @@ def _comparison_rule(
     return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
 
 
+def _literal_rule(
+    expr: Expr, _kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
+) -> Annotation[DomainTag]:
+    """A bare numeric literal is polymorphic: it has no unit of its own but takes one
+    from context (a scalar factor under ``*``, the other addend's unit under ``+``).
+    A string literal makes no magnitude claim and stays naked."""
+    if isinstance(expr, exp.Literal) and not expr.is_string:
+        return Annotation(Tagged(POLYMORPHIC, frozenset()), Opacity.IMPLICIT)
+    return Annotation(NAKED, Opacity.IMPLICIT)
+
+
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
+    exp.Literal: _literal_rule,
     exp.Add: _additive_rule,
     exp.Sub: _additive_rule,
     exp.Mul: _multiplicative_rule(_multiply_tags),
@@ -377,7 +469,7 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
     if isinstance(tag, _Conflict):
         return frozenset()
     out: set[ColumnRef] = set()
-    if tag.dimension is not None:
+    if isinstance(tag.dimension, Dimension):
         out.update(unit.column for unit, _ in tag.dimension.exponents if isinstance(unit, PerRow))
     out.update(binding.column for _, binding in tag.nominal if isinstance(binding, PerRow))
     return frozenset(out)

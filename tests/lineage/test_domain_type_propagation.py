@@ -113,6 +113,35 @@ def test_mixed_currency_addition_is_a_conflict() -> None:
     assert ann.value is CONFLICT
 
 
+def test_adding_a_naked_operand_widens_to_naked() -> None:
+    """A magnitude added to a column that makes no dimensional claim can no longer be
+    claimed to carry the magnitude's unit: the unknown addend could be anything, so the
+    sum widens to ``NAKED`` rather than inheriting the currency (the lenient resolution;
+    strict mode would call the untagged addend a finding). ``amount`` is left ungrounded,
+    so it grounds naked."""
+    ann = _run("SELECT c.a + c.amount AS total FROM charges c", _facts(a=_USD), out="total")
+    assert ann.value == NAKED
+
+
+def test_mixed_currency_conflict_survives_a_later_naked_addend() -> None:
+    """The currency mix is the finding even when a no-claim addend follows it: the
+    ``c.a + c.b`` node conflicts on the spot, and adding the naked ``amount`` cannot
+    launder that conflict back to a clean tag."""
+    ann = _run(
+        "SELECT c.a + c.b + c.amount AS total FROM charges c", _facts(a=_USD, b=_EUR), out="total"
+    )
+    assert ann.value is CONFLICT
+
+
+def test_literal_added_to_money_keeps_currency() -> None:
+    """A bare numeric literal is polymorphic: it takes the unit of what it is added to,
+    so ``amount + 5`` stays the amount's currency rather than conflicting on a scalar.
+    This is what keeps the additive no-claim rule from firing on a literal, which is a
+    no-claim value of a different kind (a known scalar) than an untagged column."""
+    ann = _run("SELECT c.a + 5 AS total FROM charges c", _facts(a=_USD), out="total")
+    assert ann.value == _USD
+
+
 # --- multiplicative arithmetic -----------------------------------------------
 
 
@@ -130,6 +159,16 @@ def test_scalar_multiply_keeps_currency() -> None:
 def test_money_times_money_is_squared() -> None:
     ann = _run("SELECT c.a * c.b AS prod FROM charges c", _facts(a=_USD, b=_USD), out="prod")
     assert ann.value == tagged(dimension=Dimension.of(Concrete("usd"), 2))
+
+
+def test_multiplying_by_a_naked_value_does_not_remint_a_tag() -> None:
+    """A no-claim operand is an *unknown* factor, not a dimensionless scalar: it may
+    carry hidden units. ``(a + b)`` with ``b`` typed and ``a`` untagged widens to
+    naked, and multiplying that by the typed ``b`` must stay naked rather than
+    re-claiming the currency. The empirical-soundness PBT is what surfaced this: the
+    rescaling law fails if the product claims a clean dimension here."""
+    ann = _run("SELECT (c.a + c.b) * c.b AS prod FROM charges c", _facts(b=_USD), out="prod")
+    assert ann.value == NAKED
 
 
 # --- confluence --------------------------------------------------------------

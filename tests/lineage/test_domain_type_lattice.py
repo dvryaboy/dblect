@@ -97,6 +97,17 @@ def test_meet_composes_agreeing_tags() -> None:
     )
 
 
+def test_concrete_identities_are_case_folded() -> None:
+    """A currency declared ``usd`` on one model and ``USD`` on another names the
+    same unit, so the identities fold together rather than meeting to a spurious
+    conflict (or widening away at a confluence)."""
+    assert Concrete("USD") == Concrete("usd")
+    lower = tagged(dimension=Dimension.of(Concrete("usd")))
+    upper = tagged(dimension=Dimension.of(Concrete("USD")))
+    assert DOMAIN_TYPE_LATTICE.meet(lower, upper) == lower
+    assert DOMAIN_TYPE_LATTICE.join(lower, upper) == lower
+
+
 def test_meet_of_disagreeing_currencies_is_conflict() -> None:
     usd = tagged(dimension=Dimension.of(Concrete("usd")))
     eur = tagged(dimension=Dimension.of(Concrete("eur")))
