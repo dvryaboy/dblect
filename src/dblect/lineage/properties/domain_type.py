@@ -422,21 +422,37 @@ def _literal_rule(
     return Annotation(NAKED, Opacity.IMPLICIT)
 
 
+def _widen_per_row_coordinates(tag: DomainTag) -> DomainTag:
+    """The tag with every ``PerRow``-bound coordinate widened away: a dimension carrying
+    a per-row unit drops to no-claim, a per-row nominal binding is removed. Pinned
+    (``Concrete``) coordinates survive untouched."""
+    if isinstance(tag, _Conflict):
+        return tag
+    dim = tag.dimension
+    if isinstance(dim, Dimension) and any(isinstance(u, PerRow) for u, _ in dim.exponents):
+        dim = None
+    nominal = {n: b for n, b in tag.nominal_map().items() if not isinstance(b, PerRow)}
+    return Tagged(dim, _froze(nominal))
+
+
 def _outer_join_null_rule(
     _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
     """A column drawn from an outer join's optional side is NULL on unmatched rows, and a
     NULL pads the whole row: a per-row companion travelling with the magnitude (its unit)
-    is NULL too, so the unit is unknown there and the tag widens to ``NAKED``. A tag with
-    no per-row companion (a pinned currency, or none) is unaffected: a NULL amount is still
-    of its declared unit. Reads the same ``OuterJoinNull`` taint nullability inserts, so it
-    fires only when the domain-type property runs over the outer-join-tainted graph."""
+    is NULL too, so anything that companion vouched for is unknown there. The widening is
+    per coordinate: each ``PerRow``-bound piece of the tag drops while a pinned piece
+    survives (a NULL amount is still of its declared unit), so an all-pinned tag is
+    unaffected and an all-per-row tag widens to ``NAKED``. Reads the same
+    ``OuterJoinNull`` taint nullability inserts, so it fires only when the domain-type
+    property runs over the outer-join-tainted graph."""
     if not kids:
         return Annotation(NAKED, Opacity.IMPLICIT)
     (child,) = kids
-    if companion_columns(child.value):
-        return Annotation(NAKED, Opacity.IMPLICIT, provisional=child.provisional)
-    return child
+    widened = _widen_per_row_coordinates(child.value)
+    if widened == child.value:
+        return child
+    return _annotate(widened, kids)
 
 
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {

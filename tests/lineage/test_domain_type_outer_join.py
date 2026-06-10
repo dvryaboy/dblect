@@ -2,10 +2,12 @@
 
 An outer join pads its optional side with NULL on unmatched rows, and a NULL pads the
 whole row: a per-row companion travelling with the magnitude (a ``Money`` whose unit is
-a companion ``currency`` column) is NULL too, so the unit is unknown there and the tag
-can no longer be claimed. It widens to ``NAKED``. A pinned-unit magnitude is unaffected
-(a NULL amount is still of its declared currency), and an inner join, or the kept side of
-an outer join, pads nothing.
+a companion ``currency`` column) is NULL too, so the unit is unknown there and that
+claim can no longer be made. The widening is per coordinate: each ``PerRow``-bound
+piece of the tag (a dimension unit, a nominal binding) is dropped, while a pinned
+``Concrete`` piece survives (a NULL amount is still of its declared currency). A tag
+that was all per-row widens to ``NAKED``; an inner join, or the kept side of an outer
+join, pads nothing.
 
 The domain-type property reads the same ``OuterJoinNull`` taint the nullability property
 inserts, by running over the outer-join-tainted graph. The taint marks exactly the
@@ -112,3 +114,24 @@ def test_per_row_companion_on_kept_side_is_preserved() -> None:
 
 def test_inner_join_does_not_widen() -> None:
     assert _run(_INNER) == _PER_ROW
+
+
+def test_widening_is_per_coordinate_pinned_dimension_survives() -> None:
+    """A tag mixing a pinned dimension with a per-row nominal binding loses only the
+    per-row piece: the amount is still USD on a padded row, while whether it contains
+    tax (read from a NULL-padded neighbour) is unknown there."""
+    mixed = tagged(
+        dimension=Dimension.of(Concrete("usd")),
+        nominal={"contains_tax": PerRow(ColumnRef(_PAYMENTS, "tax_flag"))},
+    )
+    assert _run(_OPTIONAL, amount=mixed) == _USD
+
+
+def test_widening_is_per_coordinate_pinned_nominal_survives() -> None:
+    """The converse mix: a per-row currency unit is dropped while a pinned nominal
+    binding rides through."""
+    mixed = tagged(
+        dimension=Dimension.of(PerRow(ColumnRef(_PAYMENTS, "currency"))),
+        nominal={"country": Concrete("us")},
+    )
+    assert _run(_OPTIONAL, amount=mixed) == tagged(nominal={"country": Concrete("us")})
