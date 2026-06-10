@@ -20,6 +20,7 @@ ground their facts. The discoverers wrap this for the substrate's
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
@@ -37,7 +38,8 @@ from dblect.lineage.properties.domain_type import (
     tagged,
 )
 from dblect.lineage.properties.uniqueness import CandidateKeySet
-from dblect.manifest import Manifest, ResourceType
+from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest.parse import generic_test_target_uid
 from dblect.types.contract import (
     Constraints,
     ContractRegistry,
@@ -122,6 +124,10 @@ _KIND_OF_RESOURCE: Mapping[ResourceType, SourceKind] = {
 }
 
 
+def _source_of(node: Node) -> SourceRef:
+    return SourceRef(_KIND_OF_RESOURCE.get(node.resource_type, SourceKind.MODEL), node.unique_id)
+
+
 def _resolve_model(manifest: Manifest, ref: str) -> tuple[SourceRef | None, IssueCode | None]:
     """Resolve a ``dbt_model`` reference the way dbt resolves ``{{ ref() }}``:
     match the tail of a node's fqn, so a bare name matches by name and a dotted
@@ -136,9 +142,7 @@ def _resolve_model(manifest: Manifest, ref: str) -> tuple[SourceRef | None, Issu
         return None, IssueCode.UNRESOLVED_MODEL
     if len(candidates) > 1:
         return None, IssueCode.AMBIGUOUS_MODEL
-    node = candidates[0]
-    kind = _KIND_OF_RESOURCE.get(node.resource_type, SourceKind.MODEL)
-    return SourceRef(kind, node.unique_id), None
+    return _source_of(candidates[0]), None
 
 
 def _literal(value: object) -> str:
@@ -392,6 +396,82 @@ def _resolve_foreign_key(
         child=ColumnRef(child_src, fname),
         parent=ColumnRef(parent_src, column),
     )
+
+
+# --- foreign keys from dbt relationships tests ----------------------------------
+
+
+def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
+    """The foreign-key edges a project's dbt ``relationships`` tests already
+    state, read the way a ``unique`` test is read as a key.
+
+    The test is attached to the child model and carries the child column
+    (``column_name``) and parent column (``field``); the parent relation is the
+    other data-flow node the test depends on. A test whose parent cannot be
+    pinned that way is skipped rather than guessed.
+    """
+    edges: list[ForeignKeyEdge] = []
+    for node in manifest.nodes.values():
+        tm = node.test_metadata
+        if tm is None or not tm.enabled or tm.name != "relationships":
+            continue
+        child_col = tm.kwargs.get("column_name")
+        parent_col = tm.kwargs.get("field")
+        if not isinstance(child_col, str) or not child_col:
+            continue
+        if not isinstance(parent_col, str) or not parent_col:
+            continue
+        child_uid = generic_test_target_uid(node)
+        if child_uid is None or child_uid not in manifest.nodes:
+            continue
+        parent_uid = _relationship_parent(manifest, node, child_uid, tm.kwargs.get("to"))
+        if parent_uid is None:
+            continue
+        edges.append(
+            ForeignKeyEdge(
+                child=ColumnRef(_source_of(manifest.nodes[child_uid]), child_col),
+                parent=ColumnRef(_source_of(manifest.nodes[parent_uid]), parent_col),
+            )
+        )
+    return tuple(edges)
+
+
+def _relationship_parent(manifest: Manifest, node: Node, child_uid: str, to: object) -> str | None:
+    """The parent relation a relationships test points at: the one other
+    data-flow node it depends on, or (if that is ambiguous) the node the ``to``
+    ref names."""
+    candidates = [
+        dep
+        for dep in node.depends_on
+        if dep != child_uid and dep in manifest.nodes and manifest.nodes[dep].is_data_flow
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if isinstance(to, str):
+        name = _ref_name(to)
+        if name is not None:
+            named = [uid for uid in candidates if manifest.nodes[uid].name == name]
+            if len(named) == 1:
+                return named[0]
+    return None
+
+
+def _ref_name(to: str) -> str | None:
+    """The model name inside a ``ref('...')`` / ``source('...', 'name')`` string,
+    or ``None`` if it does not parse. The last quoted token is the relation name."""
+    quoted = re.findall(r"'([^']+)'", to)
+    return quoted[-1] if quoted else None
+
+
+def foreign_key_edges(
+    manifest: Manifest, *, registry: ContractRegistry | None = None
+) -> tuple[ForeignKeyEdge, ...]:
+    """Every foreign-key edge the project declares: contract ``ForeignKey``
+    markers merged with dbt ``relationships`` tests, de-duplicated so an edge
+    stated both ways appears once. The merge point a future fan-out finding or
+    fixture generator reads from."""
+    contract_edges = resolve_contracts(manifest, registry=registry).foreign_keys
+    return tuple(dict.fromkeys((*contract_edges, *dbt_relationship_edges(manifest))))
 
 
 # --- discoverers ----------------------------------------------------------------

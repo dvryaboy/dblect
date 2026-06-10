@@ -19,7 +19,9 @@ from dblect.types.bridge import (
     ResolvedContracts,
     contract_key_discoverer,
     contract_tag_discoverer,
+    dbt_relationship_edges,
     domain_tag,
+    foreign_key_edges,
     resolve_contracts,
 )
 from dblect.types.contract import (
@@ -81,7 +83,9 @@ __all__ = [
     "active_registry",
     "contract_key_discoverer",
     "contract_tag_discoverer",
+    "dbt_relationship_edges",
     "domain_tag",
+    "foreign_key_edges",
     "isolated_registry",
     "resolve_contracts",
 ]
