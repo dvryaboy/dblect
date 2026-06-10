@@ -196,8 +196,9 @@ class _FdWalk:
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):
             return frozenset()
-        if sg.joins_of(sel):
-            return frozenset()  # a join can pair determinant values across sources
+        joins = sg.joins_of(sel)
+        if joins:
+            return self._join_select(sel, from_.this, joins, cte_scope=local)
         base = self._resolve_source(from_.this, cte_scope=local)
         if base is None:
             return frozenset()
@@ -259,6 +260,69 @@ class _FdWalk:
             return _Base(self.scope_fds(inner, cte_scope=cte_scope))
         return None
 
+    def _join_select(
+        self,
+        sel: exp.Select,
+        from_node: Expr,
+        joins: list[exp.Join],
+        *,
+        cte_scope: Mapping[str, frozenset[FD]],
+    ) -> frozenset[FD]:
+        """Dependencies an inner join carries to the projection.
+
+        An FD that holds on one joined relation holds on the inner join: two output
+        rows agreeing on its determinant come from that relation's rows agreeing on it,
+        and a join only filters or duplicates rows (a duplicate still agrees on the
+        dependent). So each source's dependencies carry, the ``ON`` equalities add a
+        mutual determination between the joined columns, and an equality filter pins its
+        column. Everything is tracked qualified by source alias (a join can expose two
+        ``country`` columns), then projected onto the output names.
+
+        Only inner joins carry: an outer join pads its optional side with NULL and a
+        cross join multiplies rows, so both prove nothing here. Aggregation over a join
+        is deferred (the FD scope a downstream guard would read is not a single source),
+        and a candidate-key-derived dependency is not minted across a join (sound to omit;
+        the key path stays single-source for now)."""
+        if any(sg.join_side_of(j) is not sg.JoinSide.INNER for j in joins):
+            return frozenset()
+        group = sg.group_of(sel)
+        if group is not None and group.expressions:
+            return frozenset()
+
+        sources: list[tuple[str, _Base]] = []
+        for node in (from_node, *(j.this for j in joins)):
+            if not isinstance(node, Expr):
+                return frozenset()
+            base = self._resolve_source(node, cte_scope=cte_scope)
+            if base is None:
+                return frozenset()
+            sources.append((node.alias_or_name.lower(), base))
+
+        qfds: set[tuple[frozenset[_QCol], _QCol]] = set()
+        for alias, base in sources:
+            for fd in base.fds:
+                qfds.add((frozenset((alias, d) for d in fd.determinant), (alias, fd.dependent)))
+        for j in joins:
+            on = sg.on_of(j)
+            if on is None:
+                continue
+            for left, right in sg.equality_column_pairs(on):
+                ql, qr = _qcol(left), _qcol(right)
+                if ql is not None and qr is not None:
+                    qfds.add((frozenset({ql}), qr))
+                    qfds.add((frozenset({qr}), ql))
+        where = sg.where_of(sel)
+        if where is not None and isinstance(where.this, Expr):
+            for col in sg.equality_literal_columns(where.this):
+                qc = _qcol(col)
+                if qc is not None:
+                    qfds.add((frozenset(), qc))
+
+        qrename, star = _qualified_rename(sel)
+        if star:
+            return frozenset()  # a star over a join leaves the output universe ambiguous
+        return _project_qualified(qfds, qrename)
+
 
 def _group_columns(group: exp.Group) -> frozenset[str] | None:
     """The group key as case-folded input column names, or ``None`` for a shape we
@@ -308,6 +372,64 @@ def _named_outputs(sel: exp.Select) -> frozenset[str]:
         elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
             names.add(sg.column_name(proj).lower())
     return frozenset(names)
+
+
+# --- qualified projection (the join case) ----------------------------------------
+#
+# A join can expose two columns of the same name (``payments.country`` and
+# ``customers.country``), so dependencies under a join are tracked qualified by source
+# alias, ``(alias, column)``, and projected onto bare output names only at the end.
+
+_QCol = tuple[str, str]
+
+
+def _qcol(col: exp.Column) -> _QCol | None:
+    """A column as ``(alias, name)``, or ``None`` when it carries no table qualifier
+    (ambiguous under a join, so not attributable to a side)."""
+    table = sg.column_table(col)
+    if not table:
+        return None
+    return (table.lower(), sg.column_name(col).lower())
+
+
+def _qualified_rename(sel: exp.Select) -> tuple[dict[_QCol, tuple[str, ...]], bool]:
+    """Map each qualified input column to the output names it appears under, plus a flag
+    for a star (which leaves the output universe ambiguous over a join). Computed
+    projections carry no source column through and contribute nothing."""
+    out: dict[_QCol, list[str]] = {}
+    star = False
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Star):
+            star = True
+            continue
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if isinstance(inner, exp.Column):
+            if isinstance(inner.this, exp.Star):  # ``alias.*``
+                star = True
+                continue
+            qc = _qcol(inner)
+            if qc is not None:
+                out.setdefault(qc, []).append(proj.alias_or_name.lower())
+    return {qc: tuple(names) for qc, names in out.items()}, star
+
+
+def _project_qualified(
+    qfds: set[tuple[frozenset[_QCol], _QCol]], rename: Mapping[_QCol, tuple[str, ...]]
+) -> frozenset[FD]:
+    """Rename each qualified dependency onto the projection's output names, dropping any
+    whose columns do not all survive. One output name per column suffices (copies carry
+    equal values), picked stably."""
+    out: set[FD] = set()
+    for determinant, dependent in qfds:
+        dep_names = rename.get(dependent)
+        if not dep_names:
+            continue
+        det_names = [rename.get(d) for d in determinant]
+        if any(names is None for names in det_names):
+            continue
+        determinant_out = frozenset(min(names) for names in det_names if names is not None)
+        out.add(FD(determinant_out, min(dep_names)))
+    return frozenset(out)
 
 
 # --- the property ------------------------------------------------------------

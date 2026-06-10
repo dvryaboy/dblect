@@ -260,20 +260,6 @@ def test_star_over_a_group_by_keeps_only_within_group_fds() -> None:
 # --- shapes the walk does not model ----------------------------------------------
 
 
-def test_join_proves_nothing() -> None:
-    customers = _source("source.shop.raw.customers")
-    out = _fds(
-        _declared(_fd("currency", "country")),
-        _source(_PAYMENTS.unique_id),
-        customers,
-        _model(
-            "model.shop.joined",
-            "SELECT p.country, p.currency FROM payments p JOIN customers c ON p.customer_id = c.id",
-        ),
-    )
-    assert out["model.shop.joined"] == NO_FDS
-
-
 def test_union_all_proves_nothing() -> None:
     """Two arms can each satisfy a dependency while their union violates it (the same
     determinant value mapping to different dependents per arm)."""
@@ -316,3 +302,122 @@ def test_without_the_uniqueness_edge_no_key_fd_is_minted() -> None:
         _model("model.shop.stg", "SELECT id, customer_id FROM orders"),
     )
     assert out["model.shop.stg"] == NO_FDS
+
+
+# --- dependency through joins (C4) ----------------------------------------------
+
+_CUSTOMERS = SourceRef(SourceKind.SOURCE, "source.shop.raw.customers")
+
+
+def _declared_on(by_scope: Mapping[SourceRef, tuple[FD, ...]]) -> _FdFacts:
+    """Declared FD facts on several sources at once (a join needs each side grounded)."""
+    return {
+        scope: (
+            Fact(
+                scope=scope,
+                value=FDSet.of(*fds),
+                provenance=Declared(DeclaredSource.USER_ASSERTED),
+            ),
+        )
+        for scope, fds in by_scope.items()
+    }
+
+
+def test_inner_join_carries_a_joined_relations_fd() -> None:
+    """An FD that holds on one joined relation holds on the inner join: two output
+    rows agreeing on the determinant come from that relation's rows agreeing on it,
+    and a join only filters or duplicates rows. So ``country -> currency`` declared on
+    ``customers`` survives the join."""
+    out = _fds(
+        _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT p.amount, c.country, c.currency FROM payments p "
+            "JOIN customers c ON p.customer_id = c.id",
+        ),
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+
+
+def test_inner_join_carries_both_sides_fds() -> None:
+    out = _fds(
+        _declared_on(
+            {
+                _PAYMENTS: (_fd("amount", "ref"),),
+                _CUSTOMERS: (_fd("currency", "country"),),
+            }
+        ),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT p.ref, p.amount, c.country, c.currency FROM payments p "
+            "JOIN customers c ON p.customer_id = c.id",
+        ),
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("amount", "ref"), _fd("currency", "country"))
+
+
+def test_inner_join_qualifies_under_a_name_collision() -> None:
+    """Both sides expose a ``country`` column, but the dependency is the joined
+    relation's. The walk must track which side each column came from (qualified by
+    alias) rather than blurring the two ``country`` columns, or it would mint a
+    dependency off the wrong column."""
+    out = _fds(
+        _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT c.country AS country, c.currency AS currency, p.country AS p_country "
+            "FROM payments p JOIN customers c ON p.customer_id = c.id",
+        ),
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+
+
+def test_left_join_proves_nothing() -> None:
+    """An outer join pads the optional side with NULL on unmatched rows, so a
+    dependency on that side need not survive; the conservative posture proves
+    nothing until the NULL semantics are worked through."""
+    out = _fds(
+        _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT p.amount, c.country, c.currency FROM payments p "
+            "LEFT JOIN customers c ON p.customer_id = c.id",
+        ),
+    )
+    assert out["model.shop.m"] == NO_FDS
+
+
+def test_cross_join_proves_nothing() -> None:
+    out = _fds(
+        _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT p.amount, c.country, c.currency FROM payments p CROSS JOIN customers c",
+        ),
+    )
+    assert out["model.shop.m"] == NO_FDS
+
+
+def test_inner_join_carries_a_where_pin_on_either_side() -> None:
+    """An equality filter pins its column constant whichever side it sits on."""
+    out = _fds(
+        _declared_on({}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _model(
+            "model.shop.m",
+            "SELECT p.amount, c.currency FROM payments p "
+            "JOIN customers c ON p.customer_id = c.id WHERE c.currency = 'usd'",
+        ),
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("currency"))

@@ -181,3 +181,131 @@ def test_every_claimed_fd_holds_on_the_data(s: Scenario) -> None:
             f"claimed FD {sorted(fd.determinant)} -> {fd.dependent} violated at "
             f"determinant value {witness} for sql={_model_sql(s)!r} rows={rows}"
         )
+
+
+# --- dependency through an inner join (C4) --------------------------------------
+#
+# A second base table is joined in. An FD declared on the joined-in relation (its data
+# honouring it) must still hold on the inner join, whatever the join's fan-out does:
+# duplicated rows still agree on the dependent. The data is again the judge, so a
+# qualified-projection bug that minted the dependency off the wrong same-named column
+# would surface as a two-row counterexample.
+
+_PAY = SourceRef(SourceKind.SOURCE, "source.test.raw.pay")
+_DIM = SourceRef(SourceKind.SOURCE, "source.test.raw.dim")
+_JOIN_MODEL = SourceRef(SourceKind.MODEL, "model.test.j")
+_QCOLS: tuple[tuple[str, str], ...] = (("p", "k"), ("p", "a"), ("d", "k"), ("d", "g"), ("d", "v"))
+
+
+@dataclass(frozen=True)
+class JoinScenario:
+    rows_pay: tuple[tuple[int, int], ...]  # (k, a)
+    rows_dim: tuple[tuple[int, int, int], ...]  # (k, g, v), with v a function of g (g -> v holds)
+    projection: tuple[tuple[tuple[str, str], str], ...]  # ((alias, column), output name)
+
+
+@st.composite
+def _join_scenario(draw: st.DrawFn) -> JoinScenario:
+    vmap = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
+    rows_pay = tuple(
+        (draw(st.integers(min_value=0, max_value=2)), draw(st.integers(min_value=0, max_value=9)))
+        for _ in range(draw(st.integers(min_value=0, max_value=6)))
+    )
+    rows_dim: list[tuple[int, int, int]] = []
+    for _ in range(draw(st.integers(min_value=0, max_value=6))):
+        k = draw(st.integers(min_value=0, max_value=2))
+        g = draw(st.integers(min_value=0, max_value=2))
+        rows_dim.append((k, g, vmap[g]))  # v determined by g, so g -> v holds in the data
+    chosen = draw(st.lists(st.sampled_from(_QCOLS), min_size=1, max_size=5, unique=True))
+    projection = tuple((qc, f"o{i}") for i, qc in enumerate(chosen))
+    return JoinScenario(rows_pay=rows_pay, rows_dim=tuple(rows_dim), projection=projection)
+
+
+def _join_sql(s: JoinScenario) -> str:
+    cols = ", ".join(f"{alias}.{col} AS {name}" for (alias, col), name in s.projection)
+    return f"SELECT {cols} FROM pay p JOIN dim d ON p.k = d.k"
+
+
+def _source_node(ref: SourceRef, name: str) -> Node:
+    return Node(
+        unique_id=ref.unique_id,
+        name=name,
+        resource_type=ResourceType.SOURCE,
+        fqn=(ref.unique_id,),
+        package_name="test",
+        schema="raw",
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+    )
+
+
+def _join_claimed(s: JoinScenario) -> FDSet:
+    """The join model's FD set, exactly as the relation property derives it, with
+    ``g -> v`` declared on the joined-in ``dim``."""
+    nodes = {
+        _PAY.unique_id: _source_node(_PAY, "pay"),
+        _DIM.unique_id: _source_node(_DIM, "dim"),
+        _JOIN_MODEL.unique_id: Node(
+            unique_id=_JOIN_MODEL.unique_id,
+            name="j",
+            resource_type=ResourceType.MODEL,
+            fqn=(_JOIN_MODEL.unique_id,),
+            package_name="test",
+            schema="analytics",
+            raw_code=None,
+            compiled_code=_join_sql(s),
+            original_file_path=None,
+            columns={},
+        ),
+    }
+    manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes=nodes)
+    fact = Fact(
+        scope=_DIM,
+        value=FDSet.of(FD(frozenset({"g"}), "v")),
+        provenance=Declared(DeclaredSource.USER_ASSERTED),
+    )
+    prop = functional_dependency_property(functional_dependency_grounding({_DIM: (fact,)}))
+    anns = propagate(build_relation_graph(manifest).graph, prop)
+    return anns[_JOIN_MODEL].value
+
+
+def _join_materialize(s: JoinScenario) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE pay (k INTEGER, a INTEGER)")
+        con.execute("CREATE TABLE dim (k INTEGER, g INTEGER, v INTEGER)")
+        if s.rows_pay:
+            con.executemany("INSERT INTO pay VALUES (?, ?)", [list(r) for r in s.rows_pay])
+        if s.rows_dim:
+            con.executemany("INSERT INTO dim VALUES (?, ?, ?)", [list(r) for r in s.rows_dim])
+        cursor = con.execute(_join_sql(s))
+        description = cursor.description
+        assert description is not None
+        names = tuple(str(d[0]).lower() for d in description)
+        return names, [tuple(r) for r in cursor.fetchall()]
+    finally:
+        con.close()
+
+
+@given(_join_scenario())
+@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_every_claimed_join_fd_holds_on_the_data(s: JoinScenario) -> None:
+    claimed = _join_claimed(s)
+    assert not claimed.is_bottom
+    selected = dict(s.projection)
+    # Anti-vacuity: when both columns of the joined-in dependency are projected, the
+    # walk must carry it through the join (a silent walk cannot pass on silence alone).
+    if ("d", "g") in selected and ("d", "v") in selected:
+        assert FD(frozenset({selected[("d", "g")]}), selected[("d", "v")]) in claimed.fds
+    names, rows = _join_materialize(s)
+    for fd in claimed.fds:
+        assert {fd.dependent, *fd.determinant} <= set(names), (
+            f"claimed FD names a column the result lacks: {fd} vs {names} for sql={_join_sql(s)!r}"
+        )
+        witness = _fd_holds(fd, names, rows)
+        assert witness is None, (
+            f"claimed FD {sorted(fd.determinant)} -> {fd.dependent} violated at "
+            f"determinant value {witness} for sql={_join_sql(s)!r} rows={rows}"
+        )
