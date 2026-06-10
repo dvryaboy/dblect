@@ -161,9 +161,9 @@ def _null_literal_rule(
     return Annotation(Nullability.NULLABLE)
 
 
-class _OuterJoinNull(exp.Expression):  # pyright: ignore[reportPrivateImportUsage]
+class OuterJoinNull(exp.Expression):  # pyright: ignore[reportPrivateImportUsage]
     """A synthetic marker wrapping a column reference drawn from an outer join's optional
-    side. The taint rewrite (:func:`_taint_outer_joins`) inserts it into the nullability
+    side. The taint rewrite (:func:`taint_outer_joins`) inserts it into the nullability
     graph only; the rule below reads it to taint the value NULLABLE. Other properties
     never see it, since they run over the untainted graph. It subclasses ``Expression``
     (the concrete base) rather than ``Func`` so the standard node constructor works."""
@@ -195,7 +195,7 @@ NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Is: _is_not_null_rule,
     exp.Nullif: _nullif_rule,
     exp.Null: _null_literal_rule,
-    _OuterJoinNull: _outer_join_null_rule,
+    OuterJoinNull: _outer_join_null_rule,
 }
 NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
     exp.Count: AggregateRule(core=_count_core),
@@ -421,7 +421,7 @@ def _conditional_columns_by_relation(
 # taint is a fact about the join, not the column expression, so it cannot be grounded
 # (a more precise NON_NULL inference would win the reconcile) and has to enter
 # inference. We do that by rewriting the nullability graph: each optional-side column
-# reference is wrapped in an :class:`_OuterJoinNull` marker whose rule taints NULLABLE.
+# reference is wrapped in an :class:`OuterJoinNull` marker whose rule taints NULLABLE.
 # Because the marker sits in the expression the propagator walks, the taint rides
 # downstream through every consumer and a guard (COALESCE, IS NOT NULL) still clears it.
 
@@ -468,16 +468,16 @@ def _optional_join_aliases(select: exp.Select) -> set[str]:
 
 def _wrap_optional_columns(expr: Expr, optional: set[str]) -> Expr:
     """A copy of ``expr`` with every column qualified by an optional-side alias wrapped in
-    :class:`_OuterJoinNull`. Unqualified columns are left alone (the side is unknown), the
+    :class:`OuterJoinNull`. Unqualified columns are left alone (the side is unknown), the
     silent-when-unsure posture that keeps the taint from over-firing."""
     rewritten = expr.copy()
     targets = [c for c in rewritten.find_all(exp.Column) if c.table and c.table.lower() in optional]
     for col in targets:
-        col.replace(_OuterJoinNull(this=col.copy()))
+        col.replace(OuterJoinNull(this=col.copy()))
     return rewritten
 
 
-def _taint_outer_joins(
+def taint_outer_joins(
     graph: ColumnLineageGraph,
     manifest: Manifest,
     *,
@@ -529,7 +529,7 @@ def activated_nullability(
     column folds NON_NULL into its annotation. ``parsed`` shares the audit's already-parsed
     trees so the whole pass re-parses nothing; the nullability detectors are its consumer.
     """
-    tainted = _taint_outer_joins(
+    tainted = taint_outer_joins(
         build_manifest_graph(manifest, parsed=parsed).graph, manifest, parsed=parsed
     )
     base = dict(propagate(tainted, nullability_property(manifest, name_to_source={})))

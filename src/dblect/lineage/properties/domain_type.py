@@ -55,6 +55,7 @@ from dblect.lineage.facts.property import (
 )
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
+from dblect.lineage.properties.nullability import OuterJoinNull
 
 # --- unit and tag identities -------------------------------------------------
 
@@ -420,8 +421,26 @@ def _literal_rule(
     return Annotation(NAKED, Opacity.IMPLICIT)
 
 
+def _outer_join_null_rule(
+    _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
+) -> Annotation[DomainTag]:
+    """A column drawn from an outer join's optional side is NULL on unmatched rows, and a
+    NULL pads the whole row: a per-row companion travelling with the magnitude (its unit)
+    is NULL too, so the unit is unknown there and the tag widens to ``NAKED``. A tag with
+    no per-row companion (a pinned currency, or none) is unaffected: a NULL amount is still
+    of its declared unit. Reads the same ``OuterJoinNull`` taint nullability inserts, so it
+    fires only when the domain-type property runs over the outer-join-tainted graph."""
+    if not kids:
+        return Annotation(NAKED, Opacity.IMPLICIT)
+    (child,) = kids
+    if companion_columns(child.value):
+        return Annotation(NAKED, Opacity.IMPLICIT, provisional=child.provisional)
+    return child
+
+
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
+    OuterJoinNull: _outer_join_null_rule,
     exp.Add: _additive_rule,
     exp.Sub: _additive_rule,
     exp.Mul: _multiplicative_rule(_multiply_tags),
