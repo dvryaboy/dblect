@@ -22,8 +22,9 @@ summarizability story (Lenz & Shoshani, SSDBM 1997); see
 Naked-amount taint falls out of lineage: when ``amount`` flows to a model where
 its companion ``currency`` column was projected away, the binding rides as a
 reference that no longer agrees at a confluence and widens to ``NAKED``; the
-coherence guard (a separate build) then blocks a downstream sum until a
-dependency discharges it.
+coherence guard then blocks a downstream sum until a dependency discharges it.
+The guard is armed by :func:`domain_type_property` when the caller passes the
+functional-dependency property's ref.
 
 Grounding for the first version comes from synthetic facts supplied by a caller
 (the same way the uniqueness and nullability tests ground their properties); the
@@ -45,12 +46,15 @@ from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
+    CoherenceGuard,
     DepContext,
     OperatorTransfer,
     Property,
+    PropertyRef,
     column_property,
 )
-from dblect.lineage.graph import ColumnRef
+from dblect.lineage.graph import ColumnRef, SourceRef
+from dblect.lineage.properties.functional_dependency import FDSet, determines
 
 # --- unit and tag identities -------------------------------------------------
 
@@ -365,6 +369,36 @@ DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = {
 }
 
 
+def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
+    """The per-row companion columns a tag's meaning rests on: every ``PerRow``
+    unit in the dimension and every ``PerRow`` nominal binding. These are what an
+    aggregate's coherence guard must prove constant per group; a ``Concrete``
+    identity is constant everywhere, so it asks for nothing."""
+    if isinstance(tag, _Conflict):
+        return frozenset()
+    out: set[ColumnRef] = set()
+    if tag.dimension is not None:
+        out.update(unit.column for unit, _ in tag.dimension.exponents if isinstance(unit, PerRow))
+    out.update(binding.column for _, binding in tag.nominal if isinstance(binding, PerRow))
+    return frozenset(out)
+
+
+def _guarded_aggregates(
+    fd: PropertyRef[FDSet, SourceRef],
+) -> Mapping[type[exp.AggFunc], AggregateRule[DomainTag]]:
+    """The aggregate catalog with the coherence obligation armed on the combining
+    aggregates. ``sum`` and ``avg`` synthesize a new value out of many, so a
+    varying tag corrupts the result and the guard clears it unless discharged.
+    ``min``/``max`` select an existing value and ``count`` ignores values, so
+    they keep their unguarded rules."""
+    guard = CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
+    return {
+        **DOMAIN_TYPE_AGGREGATES,
+        exp.Sum: AggregateRule(core=_passthrough_core, coherence=guard),
+        exp.Avg: AggregateRule(core=_passthrough_core, coherence=guard),
+    }
+
+
 # --- the property ------------------------------------------------------------
 
 
@@ -381,6 +415,8 @@ def domain_type_grounding(
 
 def domain_type_property(
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    *,
+    fd: PropertyRef[FDSet, SourceRef] | None = None,
 ) -> Property[DomainTag, ColumnRef]:
     """The column-scoped domain-type property over a caller-supplied grounding.
 
@@ -389,11 +425,19 @@ def domain_type_property(
     the only part that varies between a synthetic-fact test and the eventual contract
     bridge. No semiring: a confluence widens by the lattice ``join``, which is the
     correct "keep only what both arms agree on" for tags.
+
+    Passing the functional-dependency property's ref arms the coherence guard on
+    ``sum`` and ``avg``: an aggregate over a per-row companion tag keeps its tag
+    only where the group key holds the companion constant (membership, a pin, or
+    an FD entailment at the aggregation input) and clears to top otherwise. The
+    edge is declared in ``depends_on``, so the registry evaluates dependencies
+    first and the guard's read is always answered.
     """
     return column_property(
         name="domain_type",
         lattice=DOMAIN_TYPE_LATTICE,
         operators=DOMAIN_TYPE_OPERATORS,
-        aggregates=DOMAIN_TYPE_AGGREGATES,
+        aggregates=DOMAIN_TYPE_AGGREGATES if fd is None else _guarded_aggregates(fd),
         ground=ground,
+        depends_on=() if fd is None else (fd,),
     )

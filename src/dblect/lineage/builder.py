@@ -37,17 +37,20 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
 
 from dblect.lineage.graph import (
+    AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
     RelationLineageGraph,
     SourceKind,
     SourceRef,
+    attach_aggregation_site,
     attach_source_ref,
 )
 from dblect.lineage.property import UnionConfluence, attach_column_ref
 from dblect.manifest import Manifest, ResourceType
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
+from dblect.sql import _sqlglot as sg
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +242,9 @@ class _Walker:
         # the scope's inner expression (``exp.Subquery.this``) so the stamper can
         # find the scope for a subquery it meets inside a projection.
         self._subquery_scope_by_expr: dict[int, Scope] = {}
+        # One AggregationSite per SELECT scope, resolved lazily and shared by every
+        # aggregate stamped in that scope.
+        self._site_by_scope: dict[int, AggregationSite | None] = {}
 
     def walk(
         self,
@@ -322,6 +328,7 @@ class _Walker:
             return
         col_ref = ColumnRef(source=scope_source, column=out_name.lower())
         immediate = self._stamp_columns(select, scope=scope)
+        self._stamp_aggregates(select, scope=scope)
         self.expressions[col_ref] = select
         self.edges[col_ref] = immediate
 
@@ -380,6 +387,86 @@ class _Walker:
         if scope_ref is None:
             return None
         return ColumnRef(source=scope_ref, column=col_name.lower())
+
+    def _stamp_aggregates(self, projection: Expr, *, scope: Scope) -> None:
+        """Stamp each aggregate call in ``projection`` with its scope's
+        :class:`AggregationSite`, the context the coherence guard judges it in:
+        the projection expression alone carries neither the GROUP BY, nor the
+        relation being aggregated over, nor the scope's literal pins. An aggregate
+        inside a window reduces per partition rather than per group, so it is left
+        unstamped (the guard then stays silent-when-unproven) until window
+        structure is read.
+        """
+        aggs = [a for a in projection.find_all(exp.AggFunc) if a.find_ancestor(exp.Window) is None]
+        if not aggs:
+            return
+        site = self._aggregation_site(scope)
+        if site is None:
+            return
+        for agg in aggs:
+            attach_aggregation_site(agg, site)
+
+    def _aggregation_site(self, scope: Scope) -> AggregationSite | None:
+        key = id(scope)
+        if key not in self._site_by_scope:
+            sel = scope.expression
+            self._site_by_scope[key] = (
+                AggregationSite(
+                    input_source=self._aggregation_input(sel, scope),
+                    group_refs=self._group_refs(sel, scope),
+                    pinned=self._pinned_refs(sel, scope),
+                )
+                if isinstance(sel, exp.Select)
+                else None
+            )
+        return self._site_by_scope[key]
+
+    def _aggregation_input(self, sel: exp.Select, scope: Scope) -> SourceRef | None:
+        """The one relation the scope aggregates over: a join-free FROM of a single
+        resolvable table (a manifest relation, or a CTE/derived table's synthetic
+        ref). ``None`` closes the guard's dependency read, since the FD property
+        has no scope to answer for."""
+        if sg.joins_of(sel):
+            return None
+        from_ = sg.from_of(sel)
+        if from_ is None or not isinstance(from_.this, exp.Table):
+            return None
+        src = scope.sources.get(from_.this.alias_or_name)
+        if isinstance(src, exp.Table):
+            return self._name_to_source.get(src.name)
+        if src is not None:
+            return self._scope_source_ref.get(id(src))
+        return None
+
+    def _group_refs(self, sel: exp.Select, scope: Scope) -> frozenset[ColumnRef] | None:
+        """The GROUP BY columns resolved to their upstream refs; ``None`` for a
+        group shape that is not all plain resolvable columns (positional or
+        computed keys), which a guard must treat as unprovable."""
+        group = sel.args.get("group")
+        if not isinstance(group, exp.Group) or not group.expressions:
+            return frozenset()
+        out: set[ColumnRef] = set()
+        for g in group.expressions:
+            if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
+                return None
+            ref = self._resolve_column(g, scope=scope)
+            if ref is None:
+                return None
+            out.add(ref)
+        return frozenset(out)
+
+    def _pinned_refs(self, sel: exp.Select, scope: Scope) -> frozenset[ColumnRef]:
+        """Columns the scope's own WHERE equates to a literal, constant across
+        every group by construction. An unresolvable pin is dropped, never guessed."""
+        where = sg.where_of(sel)
+        if where is None or not isinstance(where.this, Expr):
+            return frozenset()
+        out: set[ColumnRef] = set()
+        for col in sg.equality_literal_columns(where.this):
+            ref = self._resolve_column(col, scope=scope)
+            if ref is not None:
+                out.add(ref)
+        return frozenset(out)
 
     def _register_derived_table_union(
         self,
@@ -464,6 +551,7 @@ class _Walker:
                 arm_col_ref = ColumnRef(source=arm_ref, column=out_name.lower())
                 arm_refs_per_col[col_idx].append(arm_col_ref)
                 immediate = self._stamp_columns(arm_select, scope=arm_scope)
+                self._stamp_aggregates(arm_select, scope=arm_scope)
                 self.expressions[arm_col_ref] = arm_select
                 self.edges[arm_col_ref] = immediate
 

@@ -155,6 +155,30 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
     return frozenset(cols)
 
 
+def equality_literal_columns(predicate: Expr) -> tuple[exp.Column, ...]:
+    """Columns a conjunct of `predicate` pins to a literal (``col = 'usd'``).
+
+    Walks the AND-conjunction; a leaf contributes its column only when it is an
+    ``exp.EQ`` between a bare column and a literal, in either order. Other leaves
+    are simply skipped (unlike :func:`equality_cols_on_alias`, a non-equality
+    conjunct does not poison the rest: each pin stands on its own conjunct).
+    """
+    out: list[exp.Column] = []
+    for leaf in _conjunctive_leaves(predicate):
+        if not isinstance(leaf, exp.EQ):
+            continue
+        sides = (leaf.this, leaf.expression)
+        for col, lit in (sides, sides[::-1]):
+            if (
+                isinstance(col, exp.Column)
+                and not isinstance(col.this, exp.Star)
+                and isinstance(lit, exp.Literal)
+            ):
+                out.append(col)
+                break
+    return tuple(out)
+
+
 def _conjunctive_leaves(predicate: Expr) -> list[Expr]:
     """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
     if isinstance(predicate, exp.And):

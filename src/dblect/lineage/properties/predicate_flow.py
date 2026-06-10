@@ -211,9 +211,9 @@ def _project_filter(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon
     drops if its column has no image; an opaque atom drops, since its column is
     unknown and cannot be tracked through the rename.
     """
-    if _has_star(sel):
+    if has_star(sel):
         return atoms
-    rename = _explicit_rename(sel)
+    rename = explicit_rename(sel)
     out: set[Canon] = set()
     for atom in atoms:
         if not isinstance(atom, CmpAtom | InAtom):
@@ -226,7 +226,7 @@ def _project_filter(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon
     return frozenset(out)
 
 
-def _has_star(sel: exp.Select) -> bool:
+def has_star(sel: exp.Select) -> bool:
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
             return True
@@ -235,7 +235,7 @@ def _has_star(sel: exp.Select) -> bool:
     return False
 
 
-def _explicit_rename(sel: exp.Select) -> Mapping[str, tuple[str, ...]]:
+def explicit_rename(sel: exp.Select) -> Mapping[str, tuple[str, ...]]:
     """Each input column's output name(s) under an explicit (star-free) projection.
 
     An output name that more than one input column resolves to is ambiguous and is

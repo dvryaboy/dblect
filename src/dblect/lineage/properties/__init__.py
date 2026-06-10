@@ -26,6 +26,13 @@ from dblect.lineage.properties.domain_type import (
     domain_type_property,
     tagged,
 )
+from dblect.lineage.properties.functional_dependency import (
+    FD,
+    FDSet,
+    determines,
+    functional_dependency_grounding,
+    functional_dependency_property,
+)
 from dblect.lineage.properties.nullability import (
     Nullability,
     native_not_null_discoverer,
@@ -43,17 +50,22 @@ from dblect.lineage.properties.where_provenance import where_provenance
 
 __all__ = [
     "CONFLICT",
+    "FD",
     "NAKED",
     "CandidateKeySet",
     "Concrete",
     "Dimension",
     "DomainTag",
+    "FDSet",
     "Nullability",
     "PerRow",
     "Tagged",
     "aggregation_depth",
+    "determines",
     "domain_type_grounding",
     "domain_type_property",
+    "functional_dependency_grounding",
+    "functional_dependency_property",
     "native_key_discoverer",
     "native_not_null_discoverer",
     "not_null_test_discoverer",

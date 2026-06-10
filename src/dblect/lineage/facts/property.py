@@ -77,15 +77,29 @@ class DepContext(Protocol):
 OperatorTransfer = Callable[[Expr, tuple[Annotation[K], ...], DepContext], Annotation[K]]
 
 
-@dataclass(frozen=True, slots=True)
-class CoherenceGuard:
-    """A precondition an aggregate's meaning rests on: the ``within`` columns must
-    be constant across each aggregated group. The guard reads that dependency from
-    ``fd``; where it does not hold, the aggregate clears to top and the seam rule
-    reports it. See ``propagation-soundness.md``."""
+F = TypeVar("F")
 
-    fd: PropertyRef[Any, SourceRef]
-    within: tuple[str, ...]
+
+@dataclass(frozen=True, slots=True)
+class CoherenceGuard(Generic[K, F]):
+    """A precondition an aggregate's meaning rests on: every per-row companion
+    column the aggregated value references must be constant within each group.
+
+    ``companions`` reads those columns off the value being aggregated (a per-row
+    currency binding on a money amount). The propagator discharges each one
+    against the :class:`~dblect.lineage.graph.AggregationSite` the builder stamped
+    on the aggregate call: membership in the group key, a literal pin in the
+    aggregating scope's own WHERE, or an ``entails`` read of the ``fd`` dependency
+    at the aggregation input (antecedent: the group columns, in the input
+    relation's names). Where no path discharges a companion, the aggregate clears
+    to top and the seam rule reports it. See ``propagation-soundness.md``.
+
+    ``fd`` must appear in the carrying property's ``depends_on``, so the registry
+    orders the dependency first and the read is never silently unevaluated."""
+
+    fd: PropertyRef[F, SourceRef]
+    companions: Callable[[K], Collection[ColumnRef]]
+    entails: Callable[[F, frozenset[str], str], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +109,7 @@ class AggregateRule(Generic[K]):
     optional clear-on-failure guard through which any dependency enters."""
 
     core: Callable[[exp.AggFunc, Annotation[K]], Annotation[K]]
-    coherence: CoherenceGuard | None = None
+    coherence: CoherenceGuard[K, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +185,20 @@ class Property(Generic[K, S]):
                     f"property {self.ref.name!r} carries a semiring, so {names} must not "
                     "be redefined in operators; the relational combine derives from the semiring"
                 )
+        # A coherence guard reads its fd through the DepContext; that read is only
+        # ordered (and the handle only verified against a registered property) when
+        # the edge is declared, so an undeclared guard dependency is a construction
+        # error here rather than a silently-unevaluated read at propagation time.
+        undeclared = sorted(
+            rule.coherence.fd.name
+            for rule in self.aggregates.values()
+            if rule.coherence is not None and rule.coherence.fd not in self.depends_on
+        )
+        if undeclared:
+            raise ValueError(
+                f"property {self.ref.name!r} carries a coherence guard reading "
+                f"{', '.join(undeclared)}, which is not declared in depends_on"
+            )
 
     @property
     def name(self) -> str:
