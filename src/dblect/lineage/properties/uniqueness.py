@@ -154,6 +154,21 @@ UNIQUENESS_LATTICE: Lattice[CandidateKeySet] = Lattice(
 )
 
 
+def grain_preserved(keys: CandidateKeySet, origin_key: Key) -> bool:
+    """Whether a relation is still keyed finely enough that each ``origin_key`` row appears
+    once, so a magnitude produced at that grain is summed without double counting.
+
+    True when some surviving candidate key refines ``origin_key`` (is a subset of it): a
+    relation unique on ``K <= origin_key`` is unique on ``origin_key`` too. A relation left
+    keyed only on a different key (the fan trap, where a join to a many-side replicates the
+    magnitude), or with no key known, is not provably single-counted: the fan-out signal a
+    downstream ``sum`` rests on. The user-facing finding is the finding pipeline's job; this
+    is the substrate predicate."""
+    if keys.is_bottom:
+        return True
+    return any(key <= origin_key for key in keys.keys)
+
+
 # --- discoverers -------------------------------------------------------------
 
 # Uniqueness grounds on relations a downstream model can ref by name: models and

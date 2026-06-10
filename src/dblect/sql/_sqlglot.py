@@ -179,6 +179,29 @@ def equality_literal_columns(predicate: Expr) -> tuple[exp.Column, ...]:
     return tuple(out)
 
 
+def equality_column_pairs(predicate: Expr) -> tuple[tuple[exp.Column, exp.Column], ...]:
+    """Column-to-column equalities in `predicate` (``a.x = b.y``), as ordered pairs.
+
+    Walks the AND-conjunction; a leaf contributes a pair only when it is an ``exp.EQ``
+    between two bare columns. This is the join-key extraction a join ON predicate needs
+    (each equated pair, both sides resolved), companion to :func:`equality_literal_columns`
+    for the literal-pin case. Non-equality and non-column leaves are skipped, each pair
+    standing on its own conjunct."""
+    out: list[tuple[exp.Column, exp.Column]] = []
+    for leaf in _conjunctive_leaves(predicate):
+        if not isinstance(leaf, exp.EQ):
+            continue
+        left, right = leaf.this, leaf.expression
+        if (
+            isinstance(left, exp.Column)
+            and isinstance(right, exp.Column)
+            and not isinstance(left.this, exp.Star)
+            and not isinstance(right.this, exp.Star)
+        ):
+            out.append((left, right))
+    return tuple(out)
+
+
 def _conjunctive_leaves(predicate: Expr) -> list[Expr]:
     """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
     if isinstance(predicate, exp.And):

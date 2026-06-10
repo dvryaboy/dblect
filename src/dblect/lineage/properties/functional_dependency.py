@@ -14,16 +14,17 @@ dependencies is more precise, so ``meet`` (resolution of declarations) unions th
 sets, ``join`` (confluence) intersects them, ``top`` is the empty set, and
 ``bottom`` is a formal universal element no real resolution reaches.
 
-Dependencies come from four places. A declaration grounds one directly (synthetic
+Dependencies come from five places. A declaration grounds one directly (synthetic
 facts until the authoring bridge lands; the ``determines(...)`` contract is its
 eventual source). An equality filter pins a column constant, the empty-determinant
 dependency. A GROUP BY makes its group key determine every output (the key of the
-grouped result). And a candidate key read from the uniqueness property determines
+grouped result). A candidate key read from the uniqueness property determines
 every column selected alongside it, since a relation unique on ``K`` admits one
-row per ``K`` value. Posture elsewhere is silent-when-unproven: a join can pair
-determinant values across sources and two UNION arms can each satisfy a dependency
-their union violates, so both prove nothing (the join transfer is a later build,
-alongside the rest of the join concerns).
+row per ``K`` value. And a join carries each kept side's dependencies (qualified
+by source alias) plus an inner join's ``ON`` equalities as mutual determinations.
+Posture elsewhere is silent-when-unproven: an outer join's NULL-padded side and
+two UNION arms that can each satisfy a dependency their union violates both prove
+nothing.
 """
 
 from __future__ import annotations
@@ -172,9 +173,10 @@ class _FdWalk:
     """Bottom-up dependency inference over one relational tree.
 
     ``base_resolve`` resolves a base table; CTEs and inline subqueries are
-    resolved structurally within the walk. Only single-source scopes carry:
-    a join or a UNION proves nothing, and an unmodellable group shape (positional
-    or computed group keys) drops the scope's dependencies entirely.
+    resolved structurally within the walk. Single-source scopes carry fully; a
+    join carries its kept sides (see :meth:`_join_select`); a UNION proves
+    nothing, and an unmodellable group shape (positional or computed group keys)
+    drops the scope's dependencies entirely.
     """
 
     def __init__(self, base_resolve: _BaseResolve) -> None:
@@ -196,8 +198,9 @@ class _FdWalk:
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):
             return frozenset()
-        if sg.joins_of(sel):
-            return frozenset()  # a join can pair determinant values across sources
+        joins = sg.joins_of(sel)
+        if joins:
+            return self._join_select(sel, from_.this, joins, cte_scope=local)
         base = self._resolve_source(from_.this, cte_scope=local)
         if base is None:
             return frozenset()
@@ -259,6 +262,89 @@ class _FdWalk:
             return _Base(self.scope_fds(inner, cte_scope=cte_scope))
         return None
 
+    def _join_select(
+        self,
+        sel: exp.Select,
+        from_node: Expr,
+        joins: list[exp.Join],
+        *,
+        cte_scope: Mapping[str, frozenset[FD]],
+    ) -> frozenset[FD]:
+        """Dependencies a join carries to the projection.
+
+        An FD that holds on a joined relation holds on the join wherever that side's
+        rows come through un-padded: two output rows agreeing on its determinant come
+        from that relation's rows agreeing on it, and a join only filters or duplicates
+        such rows (a duplicate still agrees on the dependent). So each kept side's
+        dependencies carry, an inner join's ``ON`` equalities add a mutual determination
+        between the joined columns, and an equality filter pins its column. Everything
+        is tracked qualified by source alias (a join can expose two ``country``
+        columns), then projected onto the output names.
+
+        Padding is what breaks an FD: an outer join fills its optional side with NULL
+        on unmatched rows, so a padded side's dependencies are dropped (until the NULL
+        semantics are worked through) and an ``ON`` equality is minted only while both
+        its columns stay on kept sides. The padded sides mirror nullability's taint:
+        LEFT pads the joined-in side, RIGHT pads the accumulated left, FULL pads both,
+        INNER and CROSS pad nothing (a cross join only duplicates rows). Aggregation
+        over a join is deferred (the FD scope a downstream guard would read is not a
+        single source), and a candidate-key-derived dependency is not minted across a
+        join (sound to omit; the key path stays single-source for now)."""
+        group = sg.group_of(sel)
+        if group is not None and group.expressions:
+            return frozenset()
+
+        sources: list[tuple[str, _Base]] = []
+        for node in (from_node, *(j.this for j in joins)):
+            if not isinstance(node, Expr):
+                return frozenset()
+            base = self._resolve_source(node, cte_scope=cte_scope)
+            if base is None:
+                return frozenset()
+            sources.append((node.alias_or_name.lower(), base))
+
+        aliases = [alias for alias, _ in sources]
+        padded: set[str] = set()
+        for i, j in enumerate(joins, start=1):
+            side = sg.join_side_of(j)
+            if side is sg.JoinSide.LEFT:
+                padded.add(aliases[i])
+            elif side is sg.JoinSide.RIGHT:
+                padded.update(aliases[:i])
+            elif side is sg.JoinSide.FULL:
+                padded.add(aliases[i])
+                padded.update(aliases[:i])
+
+        qfds: set[tuple[frozenset[_QCol], _QCol]] = set()
+        for alias, base in sources:
+            if alias in padded:
+                continue
+            for fd in base.fds:
+                qfds.add((frozenset((alias, d) for d in fd.determinant), (alias, fd.dependent)))
+        for j in joins:
+            if sg.join_side_of(j) is not sg.JoinSide.INNER:
+                continue
+            on = sg.on_of(j)
+            if on is None:
+                continue
+            for left, right in sg.equality_column_pairs(on):
+                ql, qr = _qcol(left), _qcol(right)
+                if ql is None or qr is None or ql[0] in padded or qr[0] in padded:
+                    continue
+                qfds.add((frozenset({ql}), qr))
+                qfds.add((frozenset({qr}), ql))
+        where = sg.where_of(sel)
+        if where is not None and isinstance(where.this, Expr):
+            for col in sg.equality_literal_columns(where.this):
+                qc = _qcol(col)
+                if qc is not None:
+                    qfds.add((frozenset(), qc))
+
+        qrename, star = _qualified_rename(sel)
+        if star:
+            return frozenset()  # a star over a join leaves the output universe ambiguous
+        return _project_qualified(qfds, qrename)
+
 
 def _group_columns(group: exp.Group) -> frozenset[str] | None:
     """The group key as case-folded input column names, or ``None`` for a shape we
@@ -308,6 +394,64 @@ def _named_outputs(sel: exp.Select) -> frozenset[str]:
         elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
             names.add(sg.column_name(proj).lower())
     return frozenset(names)
+
+
+# --- qualified projection (the join case) ----------------------------------------
+#
+# A join can expose two columns of the same name (``payments.country`` and
+# ``customers.country``), so dependencies under a join are tracked qualified by source
+# alias, ``(alias, column)``, and projected onto bare output names only at the end.
+
+_QCol = tuple[str, str]
+
+
+def _qcol(col: exp.Column) -> _QCol | None:
+    """A column as ``(alias, name)``, or ``None`` when it carries no table qualifier
+    (ambiguous under a join, so not attributable to a side)."""
+    table = sg.column_table(col)
+    if not table:
+        return None
+    return (table.lower(), sg.column_name(col).lower())
+
+
+def _qualified_rename(sel: exp.Select) -> tuple[dict[_QCol, tuple[str, ...]], bool]:
+    """Map each qualified input column to the output names it appears under, plus a flag
+    for a star (which leaves the output universe ambiguous over a join). Computed
+    projections carry no source column through and contribute nothing."""
+    out: dict[_QCol, list[str]] = {}
+    star = False
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Star):
+            star = True
+            continue
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if isinstance(inner, exp.Column):
+            if isinstance(inner.this, exp.Star):  # ``alias.*``
+                star = True
+                continue
+            qc = _qcol(inner)
+            if qc is not None:
+                out.setdefault(qc, []).append(proj.alias_or_name.lower())
+    return {qc: tuple(names) for qc, names in out.items()}, star
+
+
+def _project_qualified(
+    qfds: set[tuple[frozenset[_QCol], _QCol]], rename: Mapping[_QCol, tuple[str, ...]]
+) -> frozenset[FD]:
+    """Rename each qualified dependency onto the projection's output names, dropping any
+    whose columns do not all survive. One output name per column suffices (copies carry
+    equal values), picked stably."""
+    out: set[FD] = set()
+    for determinant, dependent in qfds:
+        dep_names = rename.get(dependent)
+        if not dep_names:
+            continue
+        det_names = [rename.get(d) for d in determinant]
+        if any(names is None for names in det_names):
+            continue
+        determinant_out = frozenset(min(names) for names in det_names if names is not None)
+        out.add(FD(determinant_out, min(dep_names)))
+    return frozenset(out)
 
 
 # --- the property ------------------------------------------------------------
