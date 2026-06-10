@@ -56,6 +56,7 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OuterJoinNull
+from dblect.sql import _sqlglot as sg
 
 # --- unit and tag identities -------------------------------------------------
 
@@ -492,6 +493,34 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
         out.update(unit.column for unit, _ in tag.dimension.exponents if isinstance(unit, PerRow))
     out.update(binding.column for _, binding in tag.nominal if isinstance(binding, PerRow))
     return frozenset(out)
+
+
+# --- join-key type compatibility (substrate signal) -----------------------------
+
+
+def join_key_conflicts(
+    on: Expr, tag_of: Callable[[exp.Column], DomainTag | None]
+) -> tuple[tuple[exp.Column, exp.Column], ...]:
+    """The join-key equalities in ``on`` whose two sides carry conflicting domain tags.
+
+    Joining a ``MoneyUSD`` column against a ``MoneyEUR`` one, or two incompatible nominal
+    tags (an ISO-2 ``Country`` against an ISO-3), equates values that cannot mean the same
+    thing. For each ``a.x = b.y`` the two tags are met; a ``CONFLICT`` meet is the signal.
+    A no-claim side (``tag_of`` returns ``None`` or ``NAKED``) never conflicts, the lenient
+    posture.
+
+    This is the substrate signal only: it returns the offending column pairs rather than
+    raising or producing a finding, because the user-facing finding surface (the seam
+    diagnostic) is a later build. ``tag_of`` resolves a column to its tag, since the
+    builder stamps projection columns but not ON-clause columns."""
+    out: list[tuple[exp.Column, exp.Column]] = []
+    for left, right in sg.equality_column_pairs(on):
+        tag_left, tag_right = tag_of(left), tag_of(right)
+        if tag_left is None or tag_right is None:
+            continue
+        if DOMAIN_TYPE_LATTICE.meet(tag_left, tag_right) is CONFLICT:
+            out.append((left, right))
+    return tuple(out)
 
 
 def _guarded_aggregates(
