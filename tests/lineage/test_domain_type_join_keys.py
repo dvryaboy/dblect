@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import sqlglot
+from sqlglot import expressions as exp
 
 from dblect.lineage.properties.domain_type import (
     Concrete,
@@ -31,14 +32,14 @@ _ISO3 = tagged(nominal={"country": Concrete("iso3")})
 
 def _on(sql: str) -> sqlglot.Expr:
     sel = sqlglot.parse_one(sql, dialect="duckdb")
-    assert isinstance(sel, sqlglot.exp.Select)
+    assert isinstance(sel, exp.Select)
     on = sg.on_of(sg.joins_of(sel)[0])
     assert on is not None
     return on
 
 
 def _resolver(by_qcol: Mapping[tuple[str, str], DomainTag]):
-    def tag_of(col: sqlglot.exp.Column) -> DomainTag | None:
+    def tag_of(col: exp.Column) -> DomainTag | None:
         return by_qcol.get((col.table.lower(), col.name.lower()))
 
     return tag_of
