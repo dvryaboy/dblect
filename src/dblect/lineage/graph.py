@@ -181,6 +181,48 @@ def source_ref_meta(table: exp.Table) -> SourceRef | None:
 
 
 @dataclass(frozen=True, slots=True)
+class AggregationSite:
+    """The scope context an aggregate's coherence obligation is judged in.
+
+    The column builder resolves it once per SELECT scope and stamps it onto each
+    aggregate call in that scope's projections, because the projection expression
+    alone (``Alias(Sum(Column))``) carries neither the GROUP BY nor the relation
+    being aggregated over. The guard then has the three things a discharge can
+    rest on, all resolved to graph identities rather than names:
+
+    * ``input_source``: the single FROM relation the scope aggregates over, when
+      it is one resolvable relation with no joins; ``None`` closes the dependency
+      read (the FD property has no scope to answer for).
+    * ``group_refs``: the GROUP BY columns; ``None`` marks a group shape the
+      builder cannot resolve to plain columns (positional or computed group keys),
+      which a guard must treat as unprovable rather than as an empty group key.
+    * ``pinned``: columns the scope's own WHERE equates to a literal, constant
+      across every group by construction.
+    """
+
+    input_source: SourceRef | None
+    group_refs: frozenset[ColumnRef] | None
+    pinned: frozenset[ColumnRef]
+
+
+# Key on ``exp.AggFunc.meta`` where the column builder records the aggregate's
+# ``AggregationSite``. Centralised so builder and propagator stay in sync.
+AGGREGATION_SITE_META_KEY = "dblect_aggregation_site"
+
+
+def attach_aggregation_site(agg: exp.AggFunc, site: AggregationSite) -> None:
+    """Stamp ``agg`` with the scope context its coherence guard is judged in."""
+    agg.meta[AGGREGATION_SITE_META_KEY] = site
+
+
+def aggregation_site_meta(agg: exp.AggFunc) -> AggregationSite | None:
+    """Read the ``AggregationSite`` the builder stamped on ``agg``; ``None`` if
+    unstamped (a windowed aggregate, or a scope the builder did not model)."""
+    meta = agg.meta.get(AGGREGATION_SITE_META_KEY)
+    return meta if isinstance(meta, AggregationSite) else None
+
+
+@dataclass(frozen=True, slots=True)
 class RelationLineageGraph:
     """Per-audit relation lineage: each model relation paired with the SQL tree
     that derives it.

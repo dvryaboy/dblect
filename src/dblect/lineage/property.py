@@ -40,13 +40,21 @@ from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     AggregateRule,
+    CoherenceGuard,
     DepContext,
     OperatorTransfer,
     Property,
     Reducer,
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, LineageView, SourceRef
+from dblect.lineage.graph import (
+    AggregationSite,
+    ColumnLineageGraph,
+    ColumnRef,
+    LineageView,
+    SourceRef,
+    aggregation_site_meta,
+)
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
@@ -257,7 +265,7 @@ def _column_reduce(
             if child is None:
                 return default_ann
             child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann)
-            return _apply_aggregate(rule, expr, child_ann)
+            return _apply_aggregate(rule, expr, child_ann, dep_context, lat)
         # An aggregate with no registered rule falls through to operator dispatch.
 
     op = _lookup_subclass(prop.operators, type(expr))
@@ -274,15 +282,62 @@ def _column_reduce(
 
 
 def _apply_aggregate(
-    rule: AggregateRule[K], expr: exp.AggFunc, child: Annotation[K]
+    rule: AggregateRule[K],
+    expr: exp.AggFunc,
+    child: Annotation[K],
+    dep_context: DepContext,
+    lat: Lattice[K],
 ) -> Annotation[K]:
-    """Apply an aggregate rule's pure ``core``.
+    """Apply an aggregate rule's pure ``core``, then its coherence guard.
 
-    The optional coherence guard (an FD read that clears to top on failure) reads a
-    dependency property and lands with the first aggregate that needs it; the
-    shipping properties carry no guard, so the core is the whole rule here.
+    The guard is the one channel a dependency enters an aggregate through: where a
+    per-row companion of the aggregated value is not provably constant per group,
+    the result clears to the lattice top. The cleared top is IMPLICIT, so a
+    downstream seam warns on it rather than reading it as a declared opt-out.
     """
-    return rule.core(expr, child)
+    result = rule.core(expr, child)
+    guard = rule.coherence
+    if guard is None or _coherent(guard, child.value, aggregation_site_meta(expr), dep_context):
+        return result
+    return Annotation(lat.top, Opacity.IMPLICIT, provisional=child.provisional)
+
+
+def _coherent(
+    guard: CoherenceGuard[K, Any],
+    value: K,
+    site: AggregationSite | None,
+    dep_context: DepContext,
+) -> bool:
+    """Whether every companion column the aggregated value references is constant
+    within each group: in the group key, pinned by the scope's own filter, or
+    functionally determined by the group columns at the aggregation input.
+
+    Posture is silent-when-unproven. No stamped site (a windowed aggregate, an
+    unmodelled scope) or an unresolvable group shape fails the guard rather than
+    guessing. The dependency path applies only to a companion bound to a column of
+    the aggregation input itself: a binding that survived from a relation further
+    upstream is not chased (rebinding companions through projections is a later
+    build), so it discharges only through group membership or a pin.
+    """
+    companions = guard.companions(value)
+    if not companions:
+        return True
+    if site is None or site.group_refs is None:
+        return False
+    fd_ann = (
+        dep_context.annotation(guard.fd, site.input_source)
+        if site.input_source is not None
+        else None
+    )
+    antecedent = frozenset(g.column for g in site.group_refs if g.source == site.input_source)
+    for companion in companions:
+        if companion in site.group_refs or companion in site.pinned:
+            continue
+        if fd_ann is None or companion.source != site.input_source:
+            return False
+        if not guard.entails(fd_ann.value, antecedent, companion.column):
+            return False
+    return True
 
 
 def _fold(

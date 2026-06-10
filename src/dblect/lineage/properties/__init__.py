@@ -14,6 +14,25 @@ dispatches it with no global registration step.
 """
 
 from dblect.lineage.properties.aggregation_depth import aggregation_depth
+from dblect.lineage.properties.domain_type import (
+    CONFLICT,
+    NAKED,
+    Concrete,
+    Dimension,
+    DomainTag,
+    PerRow,
+    Tagged,
+    domain_type_grounding,
+    domain_type_property,
+    tagged,
+)
+from dblect.lineage.properties.functional_dependency import (
+    FD,
+    FDSet,
+    determines,
+    functional_dependency_grounding,
+    functional_dependency_property,
+)
 from dblect.lineage.properties.nullability import (
     Nullability,
     native_not_null_discoverer,
@@ -30,13 +49,28 @@ from dblect.lineage.properties.uniqueness import (
 from dblect.lineage.properties.where_provenance import where_provenance
 
 __all__ = [
+    "CONFLICT",
+    "FD",
+    "NAKED",
     "CandidateKeySet",
+    "Concrete",
+    "Dimension",
+    "DomainTag",
+    "FDSet",
     "Nullability",
+    "PerRow",
+    "Tagged",
     "aggregation_depth",
+    "determines",
+    "domain_type_grounding",
+    "domain_type_property",
+    "functional_dependency_grounding",
+    "functional_dependency_property",
     "native_key_discoverer",
     "native_not_null_discoverer",
     "not_null_test_discoverer",
     "nullability_property",
+    "tagged",
     "unique_combination_discoverer",
     "unique_test_discoverer",
     "uniqueness_property",

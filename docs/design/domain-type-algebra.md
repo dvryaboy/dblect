@@ -192,6 +192,53 @@ That picture is the single-unit slice. The general structure is the flat lattice
 - **Multi-grain stacking.** `ROLLUP`, `CUBE`, and `GROUPING SETS` raise the obligation at several group keys at once, with `NULL`-padded subtotal rows that overlap the nullability property. The conservative reading (require the obligation at the coarsest set) is stated above; the precise per-set treatment and its reconciliation with nullability want a real cube-shaped mart to settle.
 - **Function signatures.** The catalog of built-in signatures, the extension surface for custom functions, call-site resolution, and the open spellings around them are specified in [domain-type-functions.md](domain-type-functions.md).
 
+## Lenient and strict modes
+
+The produce rules above resolve a no-claim (`Top`) operand by widening rather than
+flagging: where the analyzer cannot discharge an operator's agreement requirement
+because one side carries no tag, it makes no claim about the result instead of calling
+the expression an error. This is the lenient default, and it is the right one for a
+codebase being onboarded, where most columns are still untagged and an eager finding on
+every contact with an untyped magnitude would bury the real ones.
+
+A future strict mode would keep the same lattice and the same produce rules everywhere
+the operands carry claims, and differ only in how it treats a `Top` operand under an
+operator that requires agreement: where lenient widens, strict raises a finding, on the
+reading that the author was obliged to tag every magnitude that reaches such an operator.
+The divergence points, recorded as they are found so the mode is a coherent switch rather
+than a scatter of flags:
+
+- **Additive `Top` operand.** `money + untagged` (and `-`). Lenient produces `Top` (the
+  sum carries no dimensional claim, no finding). Strict treats adding an un-dimensioned
+  magnitude to a dimensioned one as the finding, since the addend's unit was required and
+  absent. This is the one the rescaling PBT exercises: holding the untagged column fixed
+  under the group action witnesses that the lenient `Top` is the only sound claim, and a
+  rule that instead inherited the dimensioned side's unit is unsound.
+- **Comparison against a `Top` operand.** `money = untagged`, ordering, join-key equality.
+  Lenient produces a tag-free boolean and asks nothing of an untagged side. Strict flags
+  comparing a dimensioned value against an un-dimensioned one, the same obligation the
+  join-key-types row raises for two *disagreeing* known tags, extended to the no-claim
+  side.
+
+Multiplication and division are deliberately absent from this list, but for a different
+reason than addition. `*` and `/` carry no agreement requirement at all (any two units
+compose), so a `Top` operand is never a requirement violation, in either mode. It is
+still absorbing: a no-claim factor may carry hidden units (a widened sum such as
+`c0 + c1` is exactly such a value), so the product's dimension is unknown rather than the
+other operand's unit. The rescaling PBT surfaced this: claiming `(c0 + c1) * c1` is clean
+`usd` breaks the law, because the naked factor is not a rescaling-invariant scalar.
+
+The ordinary scalar case (`amount * 0.9`) is kept typed by a separate distinction rather
+than by waving `Top` through: a bare numeric literal is *polymorphic*, not no-claim. A
+polymorphic literal takes its unit from context, acting as the identity under `+`/`-` (so
+`amount + 5` stays the amount's currency) and as a dimensionless factor under `*`/`/` (so
+`amount * 0.9` keeps it). This is the algebra's "a literal sits at bottom, polymorphic,
+until context fixes it", and it is what separates a known scalar from an untagged
+magnitude, the two having been conflated as `Top` before. A further may/must refinement
+that would let a widened sum still carry a *provisional* unit (so `(usd + naked) + eur`
+could be recovered as a conflict, a completeness gain rather than a soundness fix) is left
+as a follow-up.
+
 ## References
 
 - Albano, A., Cardelli, L., & Orsini, R. (1985). Galileo: A Strongly-Typed, Interactive Conceptual Language. *ACM Transactions on Database Systems*, 10(2), 230-260.
