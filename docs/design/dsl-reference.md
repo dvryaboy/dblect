@@ -185,8 +185,8 @@ enumerate the worlds it induces and check each. See
   (or `env_var`), `type` (`bool`, `int`, `str`, or an enum), `domain` (the values to
   explore), `default`, and `affects`.
 - `affects = RefinementEffect(target=..., value_when_true=..., value_when_false=...)`, or
-  `RefinementEffect(target=..., value_map={...})` for an enum flag. Maps each flag value to
-  a field fix on a type.
+  `RefinementEffect(target=..., value_map={...})` for an enum flag. Names the facet a
+  var-gated branch selects per world, applied to the gated model column. Provisional.
 - `CompositeEffect(...)`, `ConditionalEffect(...)`, `OpaqueEffect()`. Combine several
   effects, condition an effect, or declare the flag affects meaning in a way dblect does
   not model (columns lose their refinement under it).

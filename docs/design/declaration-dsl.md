@@ -464,7 +464,7 @@ A natural extension of this surface is a contract over aggregates: that the reve
 
 ## Flags: a logical column whose value a dbt var selects
 
-A dbt `var()` changes what your models produce, and when it gates a branch that changes a column's meaning, it fixes a field to one value in one configuration world and another in the next. This is the logical column at its most dynamic: the value still comes from your declarations rather than the data, but which value depends on the build. Flags are declarations too, and they look like every other class here. The full surface, discovery, and world enumeration live in [flags_and_configs_as_types.md](flags_and_configs_as_types.md); this is just enough to place them in the authoring story.
+A dbt `var()` changes what your models produce, and when it gates a branch that changes a column's meaning, the column carries one refinement in one configuration world and another in the next. This is the logical column at its most dynamic: the value still comes from your declarations rather than the data, but which value depends on the build. This is also one of the least settled corners of the design, and the intent is to lift as much as the framework can from the dbt model rather than have you restate it by hand. Flags are declarations too, and they look like every other class here. The full surface, discovery, and world enumeration live in [flags_and_configs_as_types.md](flags_and_configs_as_types.md); this is just enough to place them in the authoring story.
 
 ```python
 # dblect/flags.py
@@ -484,7 +484,7 @@ class IncludeTaxInRevenue(DomainFlag):
     )
 ```
 
-A flag carries its link to the dbt var, its type and domain, its default, and an `affects` clause naming which field on which type it fixes. The flag knowing the type is what lets one flag target several fields or several types and keeps all flag effects in one registry. `dblect init` scaffolds draft flag classes from the vars it finds in your SQL, pre-filling everything it can infer and leaving the `affects` clause for you, since the meaning of the flag is the one thing the framework cannot read off the Jinja.
+A flag affects models: the var gates a branch in their SQL, and the framework reads from the Jinja which columns branch on it. What it cannot read is what the branch *means*, so the declaration supplies only that. Here `affects` names the facet the branch selects and its value per world, and the framework applies it to the gated column; one registry of effects is what lets a single flag drive several facets. `dblect init` scaffolds draft flag classes from the vars it finds, pre-filling what it can infer and leaving the meaning for you. The `affects` spelling is provisional: it reads as editing a type, where the effect is really on the gated model column, and is likely to change.
 
 With that declaration, a column whose SQL branches on the var has a type per flag world, and the framework checks every world:
 
