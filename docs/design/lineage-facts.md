@@ -11,7 +11,7 @@ The capability this unlocks: a developer declares a refinement (say `RevenueNet`
 
 A `lineage.facts` module makes this a substrate concern. A fact can be about one column or a whole relation, and the substrate treats both uniformly. The uniqueness layer migrates onto it as one property, and the same module is the bridge to the flag system when a config or var carries a refinement.
 
-It is also the convergence point for the three authoring channels the rest of the design relies on: dbt tests and constraints, `meta.dblect.*` blocks in `schema.yml`, and the Python `SemanticType` / `ModelContract` declarations from [`dblect_technical_intro.md`](./dblect_technical_intro.md). The substrate carries all three without exposing any of its machinery to the people writing the declarations.
+It is also the convergence point for the three authoring channels the rest of the design relies on: dbt tests and constraints, `meta.dblect.*` blocks in `schema.yml`, and the Python `DomainType` / `ModelContract` declarations from [`dblect_technical_intro.md`](./dblect_technical_intro.md). The substrate carries all three without exposing any of its machinery to the people writing the declarations.
 
 ## How grounding fits the walk
 
@@ -156,10 +156,10 @@ All three authoring channels reduce to a `Fact`, and a developer writing a decla
 |---|---|---|
 | `not_null` / `unique` test, native constraint, column `data_type` | dbt manifest | structural grounding fact (`Declared(DBT_GENERIC_TEST)`, `NativeConstraint`, `Declared(COLUMN_METADATA)`) |
 | `meta.dblect.*` in `schema.yml` | manifest meta (read-only in v1) | bridge fact (`Declared(DBT_META)`) |
-| `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract` | Python declaration registry | user-domain fact (`Declared(USER_ASSERTED)`) |
-| `SemanticFlag.affects` resolved under a world | flag world enumerator | `CompileValue` fact scoped to that world |
+| `order_total: RevenueNet = Field(ge=0)` on a `ModelContract` | Python declaration registry | user-domain fact (`Declared(USER_ASSERTED)`) |
+| `DomainFlag.affects` resolved under a world | flag world enumerator | `CompileValue` fact scoped to that world |
 
-A worked example, the user-domain channel. A developer writes a Pandera-shaped declaration `order_total: RevenueNet = Field(non_negative=True)` on a `ModelContract`, and a discoverer reading the declaration registry returns one fact:
+A worked example, the user-domain channel. A developer writes a Pandera-shaped declaration `order_total: RevenueNet = Field(ge=0)` on a `ModelContract`, and a discoverer reading the declaration registry returns one fact:
 
 ```python
 Fact(
@@ -208,9 +208,9 @@ The two rows that carry the design:
 
 A refined value meeting an unrefined one is where the highest-value bugs hide and where a partial adopter most wants a nudge. dblect follows the gradual-typing tradition here (see references): separate an explicit opt-out from an absent annotation, and treat them oppositely. The `Opacity` tag carries exactly this distinction through transfers, so the binary `combine` (in the types reference) can decide whether to speak. Its rule: meet the two values; raise `SeamContradictionError` if they meet to `bottom` (two committed, incompatible operands); preserve if they agree; otherwise one operand is top and clears the result to top, inheriting *that operand's* opacity.
 
-So a top the modeler *declared* (`EXPLICIT`) flows silently, because the modeler took responsibility, while a top that is merely *un-annotated* (`IMPLICIT`), where it clears a declared refinement, makes the audit speak up. The diagnostic is on once a project has declared semantic types and off at the zero-declaration layer, so the signal lands where the investment already is. The same rule covers any clearing of a declared refinement, including an aggregate whose coherence precondition is not met (the mixed-currency `SUM`).
+So a top the modeler *declared* (`EXPLICIT`) flows silently, because the modeler took responsibility, while a top that is merely *un-annotated* (`IMPLICIT`), where it clears a declared refinement, makes the audit speak up. The diagnostic is on once a project has declared domain types and off at the zero-declaration layer, so the signal lands where the investment already is. The same rule covers any clearing of a declared refinement, including an aggregate whose coherence precondition is not met (the mixed-currency `SUM`).
 
-The diagnostic is a fixed template, not synthesized prose: the substrate does not know what a user-domain axis means, so it fills slots from the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, drawn from the property's `display` slot, with fallback to the bare type and axis names. The types layer fills that slot (see [`semantic-types-layer.md`](./semantic-types-layer.md)); the substrate plumbs it and never authors the text. A realistic rendering:
+The diagnostic is a fixed template, not synthesized prose: the substrate does not know what a user-domain axis means, so it fills slots from the site, the operator, the two operand columns and their types, the axis that cleared, and the suppression path. The only domain-flavored text is a name the modeler chose, drawn from the property's `display` slot, with fallback to the bare type and axis names. The types layer fills that slot (see [`declaration-dsl.md`](./declaration-dsl.md)); the substrate plumbs it and never authors the text. A realistic rendering:
 
 > `orders.sql:12`: `total` combines `revenue` and `net_revenue` with `+`. `net_revenue` is `RevenueWithTax` but `revenue` carries no refinement on `contains_tax`, so the result drops it. Annotate `revenue` as `RevenueWithTax` if it qualifies, or treat this as a possible mismatch. To silence: mark `revenue` opaque, or disable `refinement-erased-at-seam` for this model.
 
@@ -273,6 +273,6 @@ The transfer, aggregate-commutation, semiring-law, and walk-determinism obligati
 - The complete type surface: [`lineage-facts-types.md`](./lineage-facts-types.md).
 - The propagation calculus and its soundness obligations: [`propagation-soundness.md`](./propagation-soundness.md).
 - The engine this layers on: [`column-level-lineage.md`](./column-level-lineage.md), including the K-relations encoding for uniqueness.
-- The end-user declaration surface the facts layer carries: [`dblect_technical_intro.md`](./dblect_technical_intro.md), [`semantic-types-layer.md`](./semantic-types-layer.md), and [`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md).
+- The end-user declaration surface the facts layer carries: [`dblect_technical_intro.md`](./dblect_technical_intro.md), [`declaration-dsl.md`](./declaration-dsl.md), and [`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md).
 - The current uniqueness facts module this migration evolves: [`../../src/dblect/uniqueness/facts.py`](../../src/dblect/uniqueness/facts.py).
 - Issue [`#26`](https://github.com/dvryaboy/dblect/issues/26): promotes the demo nullability and aggregation-depth properties. Issue [`#16`](https://github.com/dvryaboy/dblect/issues/16): multi-source uniqueness detectors consume the substrate.

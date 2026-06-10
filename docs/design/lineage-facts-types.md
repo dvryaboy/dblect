@@ -41,7 +41,7 @@ class DeclaredSource(StrEnum):
     COLUMN_METADATA  = "column_metadata"   # data_type, nullable in schema.yml
     DBT_META         = "dbt_meta"          # meta.dblect.* blocks in schema.yml
     MODEL_CONTRACT   = "model_contract"    # dbt model-contract declaration
-    USER_ASSERTED    = "user_asserted"     # Python SemanticType / Field / ModelContract
+    USER_ASSERTED    = "user_asserted"     # Python DomainType / Field / ModelContract
 
 
 class CompileOrigin(StrEnum):

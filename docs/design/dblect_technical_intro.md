@@ -1,10 +1,10 @@
-# dblect: contracts and semantic types in Python
+# dblect: contracts and domain types in Python
 
 *Status: working design notes. Captures current direction. Internal AST shape and some API details remain unsettled; overall shape is settled. The Python approach below evolved out of an earlier exploration that placed expressions inside YAML strings. Filename kept for continuity.*
 
 ## What this is
 
-dblect's contracts and semantic types are written in Python. Declarations live in plain Python files that look and feel like Pydantic models and Hypothesis strategies, because that's what they fundamentally are: a typed schema layer over the dbt DAG that doubles as a generator specification for property-based testing.
+dblect's contracts and domain types are written in Python. Declarations live in plain Python files that look and feel like Pydantic models and Hypothesis strategies, because that's what they fundamentally are: a typed schema layer over the dbt DAG that doubles as a generator specification for property-based testing.
 
 This builds on a Python idiom that's well-developed in adjacent territory. SQLAlchemy, Pandera, Polars, Ibis, dlt, and dbt-Pydantic-contracts all use host-language type annotations with operator-overloaded column proxies. Each has worked through the ergonomic tradeoffs over years of production use, and the pattern has earned its popularity by giving users autocomplete, type-checking, refactor-rename, and jump-to-definition for free.
 
@@ -22,15 +22,15 @@ A longer accounting of influences, including Pandera, Ibis, Polars, mypy, Metric
 
 Four kinds of declarations, each a Python class or decorated function. The running examples are jaffle-shop-shaped: orders, customers, products, line items, returns.
 
-### Semantic types
+### Domain types
 
-A semantic type is a class derived from `dblect.SemanticType` declaring its base SQL type and its refinement axes. SemanticTypes are scalar: each type wraps one SQL column. The base type is declared as a Pydantic-style annotated field; refinement axes are annotated fields whose values are Python primitives or enums.
+A domain type is a class derived from `dblect.DomainType` declaring its base SQL type and its refinement axes. DomainTypes are scalar: each type wraps one SQL column. The base type is declared as a Pydantic-style annotated field; refinement axes are annotated fields whose values are Python primitives or enums.
 
 ```python
 import dblect
 from dblect.types import Decimal
 
-class Revenue(dblect.SemanticType):
+class Revenue(dblect.DomainType):
     amount: Decimal(18, 2)      # base SQL type
     contains_tax: bool          # is sales tax included?
     contains_discount: bool     # is this post-discount or pre-discount?
@@ -54,11 +54,11 @@ These three are different numbers measuring related but distinct things. The bug
 
 Multi-column concepts (money with an explicit per-row currency column, address-with-parts, range-with-start-end) are modeled as separate columns linked by contracts rather than as record-shaped types. The rule of thumb: per-row varying values stay as their own columns and get cross-column contracts; values globally fixed for a model (or pinned by a flag) become refinement axes so the static type layer catches mismatches at PR time.
 
-Flag-conditional refinement is declared via the `SemanticFlag` system rather than on the type itself. A separate `SemanticFlag` class names the dbt var, declares its type and domain, and binds via an `affects = RefinementEffect(...)` clause that names which refinement axis on which type the flag controls. See [Flags and configuration in dblect](flags_and_configs_as_types.md) for the full pattern.
+Flag-conditional refinement is declared via the `DomainFlag` system rather than on the type itself. A separate `DomainFlag` class names the dbt var, declares its type and domain, and binds via an `affects = RefinementEffect(...)` clause that names which refinement axis on which type the flag controls. See [Flags and configuration in dblect](flags_and_configs_as_types.md) for the full pattern.
 
 ### Model contracts
 
-A `ModelContract` class binds semantic types to columns of a specific dbt model and attaches the contracts the model must satisfy.
+A `ModelContract` class binds domain types to columns of a specific dbt model and attaches the contracts the model must satisfy.
 
 ```python
 from dblect import models, ModelContract, Field, contract
@@ -73,22 +73,22 @@ class FctOrders(ModelContract):
     order_id: OrderId
     customer_id: dblect.ForeignKey("dim_customers.customer_id")
     order_date: OrderDate
-    order_total: RevenueNet = Field(non_negative=True)
-    tax_paid: TaxAmount = Field(non_negative=True)
+    order_total: RevenueNet = Field(ge=0)
+    tax_paid: TaxAmount = Field(ge=0)
     
     # contract methods
-    @contract.conservation(tolerance=0.01)
+    @contract
     def order_total_matches_line_items(self):
         """Order header total reconciles to sum of line item subtotals."""
         return (
             self.order_total.sum().group_by(self.order_id)
             == models.stg_order_items.subtotal.sum()
                 .group_by(models.stg_order_items.order_id)
-        )
+        ).within(0.01)
     
-    @contract.cardinality(relation="1:1", on="order_id")
+    @contract
     def one_row_per_order(self):
-        return self
+        return self.grain(per=self.order_id)
     
     @contract.replay_class("deterministic")
     def deterministic_under_inputs(self): ...
@@ -97,10 +97,12 @@ class FctOrders(ModelContract):
 A few features earning their place:
 
 - `dbt_model = "marts.fct_orders"` binds the class to a specific dbt manifest entity. Resolution happens at framework-load time rather than at class-definition time, so circular references and missing models surface as findings rather than import errors.
-- Column annotations are semantic types from your project's type registry. `Field(...)` adds refinements and column-level constraints.
+- Column annotations are domain types from your project's type registry. `Field(...)` adds refinements and column-level constraints.
 - `dblect.ForeignKey("dim_customers.customer_id")` is a parameterized type referencing another model's column. The FK-aware fixture builder uses this to construct coordinated multi-table inputs.
-- Contract decorators wrap methods. The method body builds an AST via operator-overloaded column proxies, with column references like `self.order_total` and `models.stg_order_items.subtotal` returning symbolic placeholders rather than actual values. The framework introspects the AST to do static analysis, change-impact, and Hegel compilation.
-- `self.where(...)` scopes a contract to rows matching a predicate. Composes with any contract decorator.
+- The `@contract` marker wraps a method. The method body builds an AST via operator-overloaded column proxies, with column references like `self.order_total` and `models.stg_order_items.subtotal` returning symbolic placeholders rather than actual values. The framework introspects the AST to do static analysis, change-impact, and Hegel compilation.
+- `self.where(...)` scopes a contract to rows matching a predicate. Composes with any contract.
+
+> Note: `replay_class` above, and the late-arrival contracts in the same family, are the least developed part of the contract surface. They reach into replay determinism and temporal consistency, work that is not underway yet, so their spelling is provisional and will be reworked once that work begins rather than treated as settled.
 
 ### Standalone contracts
 
@@ -109,8 +111,7 @@ Some contracts don't belong on a single model. Cross-model contracts without a c
 ```python
 from dblect import contract, models
 
-@contract.when(models.fct_revenue_by_store.exists())
-@contract.numerical
+@contract(when=models.fct_revenue_by_store.exists())
 def store_breakdown_reconciles_to_total():
     """If we have a per-store revenue breakdown, its total matches the company-wide total."""
     return (
@@ -121,7 +122,7 @@ def store_breakdown_reconciles_to_total():
 
 This is the reconciliation pattern: a breakdown table whose total should match a non-broken-down version of the same underlying fact. Universal across analytics shops. Sources of bugs include filter drift (the breakdown table filters out something the total doesn't), double counting (a join in the breakdown fanout-multiplies rows), and stale incremental refresh (one table updates, the other doesn't).
 
-- `@contract.when(...)` is a precondition. Here it's a structural predicate (does the model exist in the manifest?), and it can also be a runtime predicate over generated data.
+- `@contract(when=...)` is a precondition. Here it's a structural predicate (does the model exist in the manifest?), and it can also be a runtime predicate over generated data.
 - The contract is a function rather than a method, because it isn't naturally attached to any one model.
 - `.within(0.001).relative_to(...)` is the relative-tolerance idiom, expressed as method chaining on the column proxy.
 
@@ -135,7 +136,7 @@ class ReturnReconciliation(dblect.ContractGroup):
     
     when = models.fct_returns.row_count() > 0
     
-    @contract.numerical
+    @contract
     def refunds_never_exceed_originals(self):
         """You can't refund more than was originally charged."""
         return (
@@ -143,7 +144,7 @@ class ReturnReconciliation(dblect.ContractGroup):
             <= models.fct_orders.order_total.sum()
         )
     
-    @contract.numerical
+    @contract
     def returned_quantity_at_most_sold(self):
         """For any product, returns can't exceed sales (per all-time)."""
         return (
@@ -182,7 +183,7 @@ SQLAlchemy has the most comprehensive Python SQL type system, and it would work 
 
 ### Connecting to the dbt manifest
 
-dbt's manifest carries column `data_type` strings like `"DECIMAL(10,2)"` and `"VARCHAR(255)"`. sqlglot parses these into typed objects via `sqlglot.parse_one(data_type_string, into=DataType)`. No wrapping or remapping needed; dblect works with the parsed sqlglot types directly. The framework cross-checks user-declared semantic types against the actual SQL types in the warehouse via the coercion dispatch: a column declared as `RevenueNet` (whose base annotation is `Decimal(18, 2)`) should be backed by a `DECIMAL` or `NUMERIC` column in the database, and a mismatch surfaces as a finding.
+dbt's manifest carries column `data_type` strings like `"DECIMAL(10,2)"` and `"VARCHAR(255)"`. sqlglot parses these into typed objects via `sqlglot.parse_one(data_type_string, into=DataType)`. No wrapping or remapping needed; dblect works with the parsed sqlglot types directly. The framework cross-checks user-declared domain types against the actual SQL types in the warehouse via the coercion dispatch: a column declared as `RevenueNet` (whose base annotation is `Decimal(18, 2)`) should be backed by a `DECIMAL` or `NUMERIC` column in the database, and a mismatch surfaces as a finding.
 
 ### Decimal is the tricky case
 
@@ -196,7 +197,7 @@ The v1 stdlib layers, from lowest to highest:
 - **Constraint primitives** (`PositiveInt`, `NonNegativeDecimal`, `BoundedFloat`): borrowed from `annotated-types` + Pydantic naming. Used via `Annotated[T, M]`, not class inheritance.
 - **String formats** (`Email`, `Url`, `UUID`, `Hostname`, `IpAddress`): JSON Schema standard format names.
 - **Refinement-axis enumerations** (`Currency`, `Country`, `LanguageTag`): ISO 4217 / 3166 / BCP 47 value sets, shipped as enums.
-- **Analytics primitives** (`Money`, `Identifier`, `PrimaryKey`, `ForeignKey[target]`, `Count`, `Probability`, `Percentage`, `EventTime`, `LoadedAt`, audit columns): hand-written `SemanticType` subclasses. Names and structure follow MetricFlow / DDD / dbt-utils precedent. This is where the real engineering goes.
+- **Analytics primitives** (`Money`, `Identifier`, `PrimaryKey`, `ForeignKey[target]`, `Count`, `Probability`, `Percentage`, `EventTime`, `LoadedAt`, audit columns): hand-written `DomainType` subclasses. Names and structure follow MetricFlow / DDD / dbt-utils precedent. This is where the real engineering goes.
 
 Deferred to later: addresses, geo, quantities-with-units, phone numbers, domain-specific tax/jurisdiction types. Users declare those in their own project until a clear stdlib case emerges.
 
@@ -234,15 +235,15 @@ This list is *finite by design*. The set grows only when a real contract can't b
 When the proxy API genuinely can't express a contract, typically because the predicate needs custom logic over the materialized data, a contract can drop into a runtime function:
 
 ```python
-@contract.check
+@contract
 def stock_levels_consistent(df_orders, df_inventory, df_returns):
     """
     Per product, expected on-hand stock = initial - sold + returned.
 
-    Uses @contract.check rather than a specific verb because the relation
-    spans three models with multi-step arithmetic the declarative verbs
-    don't express. Receives materialized DataFrames from Hegel-generated
-    inputs and returns a boolean.
+    Takes materialized DataFrames rather than column proxies, because the
+    relation spans three models with multi-step arithmetic the symbolic form
+    doesn't express. The analyzer cannot read it, so it is verify-only: it
+    receives Hegel-generated inputs and returns a boolean.
     """
     sold = df_orders.groupby('product_id')['quantity'].sum()
     returned = df_returns.groupby('product_id')['quantity'].sum()
@@ -255,7 +256,7 @@ def stock_levels_consistent(df_orders, df_inventory, df_returns):
     return (actual == expected).all()
 ```
 
-The framework loses static analysis on these (it can't propagate types through arbitrary Python), and it can still run them inside the PBT loop and report failures with shrunk counterexamples. The escape hatch is meant to be rare and visible; a project with many `@contract.check` declarations is signaling that the proxy API is missing a useful primitive that should be added. Prefer the specific verbs (`@contract.conservation`, `@contract.cardinality`, and so on) when they fit; reach for `@contract.check` when the declarative shape doesn't capture the relation.
+The framework loses static analysis on these (it can't propagate types through arbitrary Python), and it can still run them inside the PBT loop and report failures with shrunk counterexamples. The escape hatch is meant to be rare and visible; a project with many materialized `@contract` declarations is signaling that the proxy API is missing a useful primitive that should be added. Prefer the symbolic form, a `@contract` returning a fact or a proxy predicate, when it fits; reach for the materialized form over DataFrames when the declarative shape doesn't capture the relation.
 
 This is the same `@check` decorator pattern Pandera uses, applied at the contract layer.
 
@@ -280,8 +281,8 @@ my_jaffle_project/
 │   └── ... (existing dbt models, unchanged)
 ├── dblect/
 │   ├── __init__.py           # empty; makes the directory importable
-│   ├── types.py              # SemanticType definitions
-│   ├── flags.py              # SemanticFlag declarations
+│   ├── types.py              # DomainType definitions
+│   ├── flags.py              # DomainFlag declarations
 │   ├── contracts/
 │   │   ├── __init__.py
 │   │   ├── staging.py        # ModelContract for staging models
@@ -379,7 +380,7 @@ dbt's existing `schema.yml` already carries information dblect should consume di
 - **`tests: [unique, not_null, relationships]`** are primary keys and foreign keys in everything but name. The fixture builder honors them automatically. A `relationships` test pointing at another model's column *is* a foreign key declaration; users who've written one shouldn't have to also write `dblect.ForeignKey(...)` in Python.
 - **`description` fields** are useful for documentation surface and for the LLM-assisted auto-suggestion path.
 - **`meta` fields**, which dbt accepts under any node for downstream tooling, are the natural place to land the eventual YAML ergonomics extension. For v1 we can already read `meta.dblect.*` entries as a complementary declaration source.
-- **Column `data_type`** is the base SQL type, used as a sanity check on semantic-type declarations.
+- **Column `data_type`** is the base SQL type, used as a sanity check on domain-type declarations.
 - **dbt model contracts** (the dbt feature, distinct from ours) provide structural type constraints. The two compose well: users who've used dbt's contracts get structural guarantees from dbt, and dblect adds the semantic layer on top.
 
 The schema.yml read is one-directional in v1: dblect consumes and never writes back. The eventual YAML ergonomics extension would change that, and it's deferred.
@@ -396,8 +397,8 @@ Model: marts.fct_orders
     order_id: OrderId
     customer_id: ForeignKey(dim_customers.customer_id)
     order_date: OrderDate
-    order_total: RevenueNet [non_negative=True]
-    tax_paid: TaxAmount [non_negative=True]
+    order_total: RevenueNet [ge=0]
+    tax_paid: TaxAmount [ge=0]
   Contracts:
     order_total_matches_line_items [conservation, tolerance=0.01]
     one_row_per_order [cardinality, 1:1 on order_id]
@@ -435,7 +436,7 @@ The user makes this call per flag because the type system would explode if every
 
 ### Scaffolding: the discovery-to-declaration handoff
 
-dblect can't infer domains soundly, because dbt vars are intentionally flexible by design and there's no project-level type system for them. The framework can do most of the work and hand the rest to the user. The discovery pass produces draft `SemanticFlag` classes (one per var) with type, domain, and default pre-filled where they could be inferred, and the `affects` clause left for the user to write. See [Flags and configuration in dblect](flags_and_configs_as_types.md) for the full scaffolding behavior, the inference heuristics, and the `SemanticFlag` declaration shape that's canonical going forward.
+dblect can't infer domains soundly, because dbt vars are intentionally flexible by design and there's no project-level type system for them. The framework can do most of the work and hand the rest to the user. The discovery pass produces draft `DomainFlag` classes (one per var) with type, domain, and default pre-filled where they could be inferred, and the `affects` clause left for the user to write. See [Flags and configuration in dblect](flags_and_configs_as_types.md) for the full scaffolding behavior, the inference heuristics, and the `DomainFlag` declaration shape that's canonical going forward.
 
 The heuristics (briefly): used only inside `{% if var(...) %}` → boolean candidate; comparison against string literals → enum candidate with observed literals; date or time arithmetic context → date or interval parameter; listed in `dbt_project.yml`'s `vars:` block with a default → type inferred from the default; no detectable context → user must classify. This is the "scaffold and refine" pattern Pandera uses for schema inference, applied here to a domain it wasn't originally designed for. Anything left unclassified surfaces as a soft finding rather than blocking analysis.
 
@@ -470,7 +471,7 @@ FROM {{ ref('stg_orders') }}
 WHERE ordered_at >= '{{ var("start_date") }}'
 ```
 
-After the discovery pass and user refinement, a `SemanticFlag` class for `include_tax_in_revenue` declares its `affects` clause as `RefinementEffect(target=Revenue.contains_tax, value_when_true=True, value_when_false=False)`. The framework enumerates flag worlds and propagates:
+After the discovery pass and user refinement, a `DomainFlag` class for `include_tax_in_revenue` declares its `affects` clause as `RefinementEffect(target=Revenue.contains_tax, value_when_true=True, value_when_false=False)`. The framework enumerates flag worlds and propagates:
 
 - World `{include_tax_in_revenue: True}`: `fct_orders.revenue` has type `Revenue(contains_tax=True, contains_discount=True)`, assuming `subtotal` is post-discount.
 - World `{include_tax_in_revenue: False}`: `fct_orders.revenue` has type `Revenue(contains_tax=False, contains_discount=True)`, which is `RevenueNet`.
@@ -500,7 +501,7 @@ Runtime PBT covers the orthogonal case where types align and values don't. Hegel
 
 ### CLI surface
 
-Flag discovery and the initial draft `SemanticFlag` classes are produced by `dblect init` as part of its end-to-end first-run flow. Dedicated flag subcommands (re-scaffold on demand, list, world enumeration, impact analysis) are not in the v1 surface. `dblect init`'s idempotent re-run covers the re-scaffold case, and per-world selection is a CLI flag on `dblect check`:
+Flag discovery and the initial draft `DomainFlag` classes are produced by `dblect init` as part of its end-to-end first-run flow. Dedicated flag subcommands (re-scaffold on demand, list, world enumeration, impact analysis) are not in the v1 surface. `dblect init`'s idempotent re-run covers the re-scaffold case, and per-world selection is a CLI flag on `dblect check`:
 
 ```
 dblect check --flag-world include_tax_in_revenue=true,revenue_basis=cash
@@ -512,7 +513,7 @@ A dedicated `dblect impact --flag X` command ("if I flip this flag, what could b
 
 The translation from declaration to verification is mechanical, in the same way Pandera's `schema.strategy()` is mechanical.
 
-- A semantic type → a generator. `RevenueNet` becomes a generator over positive decimals in the relevant currency context.
+- A domain type → a generator. `RevenueNet` becomes a generator over positive decimals in the relevant currency context.
 - A `ModelContract` → a stateful fixture rule that produces rows for that model, respecting declared foreign keys to other models' rules.
 - A contract method → a property over the fixture state.
 - Custom runtime contracts → Python predicate functions called inside the framework's invariant-checking loop.
@@ -556,7 +557,7 @@ This section accounts for the prior art dblect draws on. It isn't exhaustive; it
 
 Pydantic established the modern Python pattern of declarations as classes with type-annotated fields and `Field(...)` metadata, where the class serves as both Python code (for IDE tooling, autocomplete, refactoring) and structured data (for JSON schema export, validation, serialization). The pattern is now so widely adopted that an entire ecosystem of libraries assumes it.
 
-dblect adopts the Pydantic class-and-field pattern directly. `SemanticType`, `ModelContract`, `ContractGroup`, and the flag declarations are all Pydantic-shaped classes whose fields carry type annotations and `Field(...)` metadata. The class is both the authoring surface for users and the data structure the framework introspects, with no separate config file or schema document required.
+dblect adopts the Pydantic class-and-field pattern directly. `DomainType`, `ModelContract`, `ContractGroup`, and the flag declarations are all Pydantic-shaped classes whose fields carry type annotations and `Field(...)` metadata. The class is both the authoring surface for users and the data structure the framework introspects, with no separate config file or schema document required.
 
 What dblect takes specifically: the class-as-declaration pattern, `Field(...)` metadata for per-field constraints, methods on declaration classes for derived computation, the JSON-schema export idea (we want similar for the MCP surface so Claude can inspect contracts as JSON), and the broader convention that declaration objects are the primary interface rather than configuration files.
 
@@ -566,7 +567,7 @@ Hypothesis is the canonical Python property-based testing library, with a years-
 
 Hegel descends from Hypothesis (same authors, same core engine, same shrinking philosophy) with extensions for the stateful and multi-table scenarios PBT against data pipelines particularly wants. dblect treats Hegel as the longer-term target: if and when it's available as a callable Python dependency, the swap from Hypothesis to Hegel is mechanical because the conceptual vocabulary is the same. Until then, the v1 build uses Hypothesis with dblect-side machinery filling in the FK-aware fixture and multi-table shrinking pieces.
 
-What dblect takes specifically: the entire mental model of generators-as-types, the shrinking-to-minimal-counterexample workflow (made FK-aware for multi-table fixtures), the idea that the framework picks generators automatically from type information, and the `@given` pattern itself, even though dblect hides it from users behind the contract decorators. The dblect user never types `@given`; the framework supplies it.
+What dblect takes specifically: the entire mental model of generators-as-types, the shrinking-to-minimal-counterexample workflow (made FK-aware for multi-table fixtures), the idea that the framework picks generators automatically from type information, and the `@given` pattern itself, even though dblect hides it from users behind the `@contract` marker. The dblect user never types `@given`; the framework supplies it.
 
 ### SQLAlchemy
 
@@ -588,7 +589,7 @@ What dblect takes specifically: the contemporary method-chain idiom for expressi
 
 Pandera applies the Pydantic class-based pattern to DataFrame schemas. The result is the closest precedent for the schema-is-generator architectural move dblect needs. The crucial feature is `schema.strategy()`, which returns a Hypothesis strategy from a schema declaration, unifying the declaration and the generator into a single object. Pandera also pioneered the `@check` decorator pattern for custom predicates the declarative system can't express, lazy validation as a first-class mode (collecting all errors rather than failing on the first), and an `example()` method for materializing schema instances.
 
-dblect's `MyContract.fixture()` is the direct descendant of Pandera's `MySchema.strategy()`, scaled up for FK-respecting multi-table generation. The `@contract.check` escape hatch follows Pandera's `@check` pattern directly, including the name. Lazy validation is the default mode in dblect, just as it is in Pandera. The "scaffold and refine" workflow for flag discovery is modeled on Pandera's schema inference workflow.
+dblect's `MyContract.fixture()` is the direct descendant of Pandera's `MySchema.strategy()`, scaled up for FK-respecting multi-table generation. The materialized-frame escape hatch follows Pandera's `@check` pattern directly. Lazy validation is the default mode in dblect, just as it is in Pandera. The "scaffold and refine" workflow for flag discovery is modeled on Pandera's schema inference workflow.
 
 What dblect takes specifically: the schema-yields-a-generator unification (this is the single most important pattern we take from Pandera), lazy validation as the default mode, the `@check` escape hatch for predicates the declarative system can't express, the `example()` method for materialization, and the scaffold-and-refine workflow for inferring declarations from existing artifacts.
 
@@ -598,7 +599,7 @@ dblect borrows patterns from Pandera gratefully, without depending on it as a li
 
 mypy and pyright are the canonical Python static type checkers, and they established the user-experience pattern dblect's static analyzer follows. Users declare types in source code; a separate analyzer walks the AST at check time; findings emit as structured diagnostics rather than runtime crashes; PR-time checks run on changed files and propagate impact to affected dependents; type propagation follows data-flow edges; findings have a standardized output format that downstream tools (CI runners, editor diagnostics, code-review bots) can consume.
 
-dblect's analyzer is, structurally, a type checker for SQL data. The dbt DAG is the data-flow graph; semantic types are the types; the analyzer walks contract ASTs and column-lineage edges; findings emit in a format CI tools and the MCP surface can consume. The architectural inheritance from mypy and pyright is direct, even though the type system itself is quite different (semantic refinements on SQL columns rather than Python types).
+dblect's analyzer is, structurally, a type checker for SQL data. The dbt DAG is the data-flow graph; domain types are the types; the analyzer walks contract ASTs and column-lineage edges; findings emit in a format CI tools and the MCP surface can consume. The architectural inheritance from mypy and pyright is direct, even though the type system itself is quite different (semantic refinements on SQL columns rather than Python types).
 
 What dblect takes specifically: the user-declares-types pattern, the separate-analyzer model, structured findings rather than crashes, PR-time impact propagation, the type-error-finding output format, and the general design principle that static checking is a separate phase that complements rather than replaces runtime verification.
 
@@ -638,13 +639,13 @@ The relationship is closer to the relationship between mypy and Python's `ast` m
 
 ## Open questions
 
-A number of earlier open questions are resolved in [questions_and_decisions.md](questions_and_decisions.md): the DSL shape (Style A, decorated methods on Pydantic-shaped classes), SemanticType structure (scalar, B1 syntax), flag/type composition direction (flags know the type), the namespace (`dblect.Field`, `dblect.ForeignKey`, `dblect.flag`), the v1 generator scope (intents + synthesis, no mutation), audit scope (includes execution), the `dblect init` end-to-end flow, the ignore syntax (`# noqa-fixture`), and the v1 intent catalog. What remains genuinely unsettled:
+A number of earlier open questions are resolved in [questions_and_decisions.md](questions_and_decisions.md): the DSL shape (Style A, decorated methods on Pydantic-shaped classes), DomainType structure (scalar, B1 syntax), flag/type composition direction (flags know the type), the namespace (`dblect.Field`, `dblect.ForeignKey`, `dblect.flag`), the v1 generator scope (intents + synthesis, no mutation), audit scope (includes execution), the `dblect init` end-to-end flow, the ignore syntax (`# noqa-fixture`), and the v1 intent catalog. What remains genuinely unsettled:
 
 - **AST shape.** The internal expression AST needs to be expressive enough to handle every operation the proxy API exposes, and restricted enough to be statically analyzable. The right starting point is probably "sqlglot AST with our extensions," and the proxy API doesn't have to produce sqlglot directly. It could produce its own AST that converts to sqlglot for the SQL-compilation path. Unsettled which is cleaner.
 - **Sync vs async contract registration.** Pydantic and Pandera classes register on definition. For projects with hundreds of model contracts, eager import-time registration may be slow. Lazy registration via `dblect.scan(path)` is the alternative.
 - **Macro expansion fidelity for flag discovery.** Recursive expansion is what dbt does internally. For our purposes we want reference tracking without full expansion, so that we don't diverge from dbt's compiled output. The right abstraction is probably a "macro shape" representation that records what vars each macro touches without materializing every expansion.
 - **Vars-that-set-vars.** Real projects have `{% set x = var('y') if var('z') else var('w') %}`. Discovery handles this syntactically; domain inference for derived values requires user declaration. Workflow for getting users to declare these cleanly is unsettled.
-- **Switch-type convenience vs SemanticFlag canonical surface.** The canonical flag composition is the `SemanticFlag` class with `affects = RefinementEffect(...)`. A `Revenue.switch(on=flag, cases={...})` shorthand may ship as a thin convenience over the same registry if the engineering cost is small; whether to bother is unsettled.
-- **Direct Pandera compatibility (defer).** Could a dblect semantic type be consumed as a Pandera column type and vice versa? Possibly useful for teams already on Pandera; possibly a tar pit.
+- **Switch-type convenience vs DomainFlag canonical surface.** The canonical flag composition is the `DomainFlag` class with `affects = RefinementEffect(...)`. A `Revenue.switch(on=flag, cases={...})` shorthand may ship as a thin convenience over the same registry if the engineering cost is small; whether to bother is unsettled.
+- **Direct Pandera compatibility (defer).** Could a dblect domain type be consumed as a Pandera column type and vice versa? Possibly useful for teams already on Pandera; possibly a tar pit.
 
 None of these block a working v1. The right time to settle each is when a real contract or real user request forces the question.

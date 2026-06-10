@@ -30,17 +30,17 @@ Practical implication: extending the framework with a new operator or a new refi
 
 The framework gives useful output at every level of declaration investment. Three layers ship in v1:
 
-- *Zero-declaration audit:* Static analyzer catches ordering hazards, unsafe `ROW_NUMBER() = 1` patterns, ambiguous tiebreakers in window functions; runtime executes models in dbt-duckdb to check replay-determinism and heuristic invariants. No semantic types involved. `dblect init` produces first findings end-to-end in under a minute on typical projects.
-- *Typed critical chain:* Declare semantic types on the critical chain (revenue, customer_id, order_date). Run propagation. Most projects find at least one real bug within the first hour.
+- *Zero-declaration audit:* Static analyzer catches ordering hazards, unsafe `ROW_NUMBER() = 1` patterns, ambiguous tiebreakers in window functions; runtime executes models in dbt-duckdb to check replay-determinism and heuristic invariants. No domain types involved. `dblect init` produces first findings end-to-end in under a minute on typical projects.
+- *Typed critical chain:* Declare domain types on the critical chain (revenue, customer_id, order_date). Run propagation. Most projects find at least one real bug within the first hour.
 - *Focused contracts:* Add conservation and cardinality contracts on the few joins where fanout matters. The PBT runtime half engages with the intent catalog. Hours-to-days commitment.
 
-A future layer (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is the `@contract.check` decorator plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
+A future layer (custom operator semantics for project-specific UDFs, for the small fraction of users with unusual domain operators that the framework's defaults can't capture) is deferred until v1 ships and demand surfaces. The v1 escape hatch for these cases is a materialized `@contract` (a predicate over DataFrames) plus `# noqa-fixture` annotations on regions the framework should treat as opaque.
 
-No layer requires the next. A team that stops at the typed-critical-chain layer has a working semantic typecheck and never sees the words "lattice" or "operator signature." This gradient is the answer to the recurring tension between formal rigor underneath and practical adoption on top.
+No layer requires the next. A team that stops at the typed-critical-chain layer has a working domain typecheck and never sees the words "lattice" or "operator signature." This gradient is the answer to the recurring tension between formal rigor underneath and practical adoption on top.
 
 ### Surface stays Pandera-shaped
 
-Users declare semantic types, model contracts, and flags as Python classes that look like Pandera schemas. They don't write propagation rules, operator signatures, or refinement axioms by hand. The lattice and propagation machinery is internal to the framework.
+Users declare domain types, model contracts, and flags as Python classes that look like Pandera schemas. They don't write propagation rules, operator signatures, or refinement axioms by hand. The lattice and propagation machinery is internal to the framework.
 
 This is a hard design constraint. Anywhere a future feature would require users to write something that looks like a type rule or a propagation signature in regular use, the design should be revisited. The escape hatch is the `@dblect.function` decorator for project-specific UDFs, which is the only place users encounter anything resembling a signature in v1.
 
@@ -101,7 +101,7 @@ dblect uniquely covers cases data-diff structurally can't:
 
 - *Bugs that don't manifest in current data.* Join fanout on input shapes production hasn't seen yet. New models with no baseline. Rare-customer behaviors that production data doesn't exercise.
 - *Flag changes that don't trip current data.* When a flag's True branch isn't exercised by current customers, the value diff is empty until the configuration changes.
-- *Values that coincide but meanings drift.* When pre-tax and post-tax happen to produce the same numeric values in your current data, diff sees nothing; semantic types catch the meaning shift.
+- *Values that coincide but meanings drift.* When pre-tax and post-tax happen to produce the same numeric values in your current data, diff sees nothing; domain types catch the meaning shift.
 - *Temporal and replay properties.* Idempotence, late-data tolerance, replay-class behaviors. These don't show up in two-snapshot comparison.
 - *Cross-table semantic correlation.* "Contains_tax must hold consistently across these three related models." Diff tools treat tables independently.
 
@@ -149,7 +149,7 @@ The rationale: dbt vars are universal in dbt projects, the manifest gives comple
 
 *Application-side flags.* Flags evaluated in producer code that change the shape of data written to the warehouse but never appear as columns there. dblect can't auto-discover these. Users can declare them manually if they want, with hints about which source columns are flag-dependent.
 
-In every deferred case, the underlying flag machinery is identical. Adding integrations in later versions is shallow work because the abstraction (`SemanticFlag` with type, domain, and effect) is stable.
+In every deferred case, the underlying flag machinery is identical. Adding integrations in later versions is shallow work because the abstraction (`DomainFlag` with type, domain, and effect) is stable.
 
 ## Prior art map
 
