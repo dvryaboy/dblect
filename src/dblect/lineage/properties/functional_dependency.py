@@ -14,16 +14,17 @@ dependencies is more precise, so ``meet`` (resolution of declarations) unions th
 sets, ``join`` (confluence) intersects them, ``top`` is the empty set, and
 ``bottom`` is a formal universal element no real resolution reaches.
 
-Dependencies come from four places. A declaration grounds one directly (synthetic
+Dependencies come from five places. A declaration grounds one directly (synthetic
 facts until the authoring bridge lands; the ``determines(...)`` contract is its
 eventual source). An equality filter pins a column constant, the empty-determinant
 dependency. A GROUP BY makes its group key determine every output (the key of the
-grouped result). And a candidate key read from the uniqueness property determines
+grouped result). A candidate key read from the uniqueness property determines
 every column selected alongside it, since a relation unique on ``K`` admits one
-row per ``K`` value. Posture elsewhere is silent-when-unproven: a join can pair
-determinant values across sources and two UNION arms can each satisfy a dependency
-their union violates, so both prove nothing (the join transfer is a later build,
-alongside the rest of the join concerns).
+row per ``K`` value. And a join carries each kept side's dependencies (qualified
+by source alias) plus an inner join's ``ON`` equalities as mutual determinations.
+Posture elsewhere is silent-when-unproven: an outer join's NULL-padded side and
+two UNION arms that can each satisfy a dependency their union violates both prove
+nothing.
 """
 
 from __future__ import annotations
@@ -172,9 +173,10 @@ class _FdWalk:
     """Bottom-up dependency inference over one relational tree.
 
     ``base_resolve`` resolves a base table; CTEs and inline subqueries are
-    resolved structurally within the walk. Only single-source scopes carry:
-    a join or a UNION proves nothing, and an unmodellable group shape (positional
-    or computed group keys) drops the scope's dependencies entirely.
+    resolved structurally within the walk. Single-source scopes carry fully; a
+    join carries its kept sides (see :meth:`_join_select`); a UNION proves
+    nothing, and an unmodellable group shape (positional or computed group keys)
+    drops the scope's dependencies entirely.
     """
 
     def __init__(self, base_resolve: _BaseResolve) -> None:
@@ -268,23 +270,26 @@ class _FdWalk:
         *,
         cte_scope: Mapping[str, frozenset[FD]],
     ) -> frozenset[FD]:
-        """Dependencies an inner join carries to the projection.
+        """Dependencies a join carries to the projection.
 
-        An FD that holds on one joined relation holds on the inner join: two output
-        rows agreeing on its determinant come from that relation's rows agreeing on it,
-        and a join only filters or duplicates rows (a duplicate still agrees on the
-        dependent). So each source's dependencies carry, the ``ON`` equalities add a
-        mutual determination between the joined columns, and an equality filter pins its
-        column. Everything is tracked qualified by source alias (a join can expose two
-        ``country`` columns), then projected onto the output names.
+        An FD that holds on a joined relation holds on the join wherever that side's
+        rows come through un-padded: two output rows agreeing on its determinant come
+        from that relation's rows agreeing on it, and a join only filters or duplicates
+        such rows (a duplicate still agrees on the dependent). So each kept side's
+        dependencies carry, an inner join's ``ON`` equalities add a mutual determination
+        between the joined columns, and an equality filter pins its column. Everything
+        is tracked qualified by source alias (a join can expose two ``country``
+        columns), then projected onto the output names.
 
-        Only inner joins carry: an outer join pads its optional side with NULL and a
-        cross join multiplies rows, so both prove nothing here. Aggregation over a join
-        is deferred (the FD scope a downstream guard would read is not a single source),
-        and a candidate-key-derived dependency is not minted across a join (sound to omit;
-        the key path stays single-source for now)."""
-        if any(sg.join_side_of(j) is not sg.JoinSide.INNER for j in joins):
-            return frozenset()
+        Padding is what breaks an FD: an outer join fills its optional side with NULL
+        on unmatched rows, so a padded side's dependencies are dropped (until the NULL
+        semantics are worked through) and an ``ON`` equality is minted only while both
+        its columns stay on kept sides. The padded sides mirror nullability's taint:
+        LEFT pads the joined-in side, RIGHT pads the accumulated left, FULL pads both,
+        INNER and CROSS pad nothing (a cross join only duplicates rows). Aggregation
+        over a join is deferred (the FD scope a downstream guard would read is not a
+        single source), and a candidate-key-derived dependency is not minted across a
+        join (sound to omit; the key path stays single-source for now)."""
         group = sg.group_of(sel)
         if group is not None and group.expressions:
             return frozenset()
@@ -298,19 +303,36 @@ class _FdWalk:
                 return frozenset()
             sources.append((node.alias_or_name.lower(), base))
 
+        aliases = [alias for alias, _ in sources]
+        padded: set[str] = set()
+        for i, j in enumerate(joins, start=1):
+            side = sg.join_side_of(j)
+            if side is sg.JoinSide.LEFT:
+                padded.add(aliases[i])
+            elif side is sg.JoinSide.RIGHT:
+                padded.update(aliases[:i])
+            elif side is sg.JoinSide.FULL:
+                padded.add(aliases[i])
+                padded.update(aliases[:i])
+
         qfds: set[tuple[frozenset[_QCol], _QCol]] = set()
         for alias, base in sources:
+            if alias in padded:
+                continue
             for fd in base.fds:
                 qfds.add((frozenset((alias, d) for d in fd.determinant), (alias, fd.dependent)))
         for j in joins:
+            if sg.join_side_of(j) is not sg.JoinSide.INNER:
+                continue
             on = sg.on_of(j)
             if on is None:
                 continue
             for left, right in sg.equality_column_pairs(on):
                 ql, qr = _qcol(left), _qcol(right)
-                if ql is not None and qr is not None:
-                    qfds.add((frozenset({ql}), qr))
-                    qfds.add((frozenset({qr}), ql))
+                if ql is None or qr is None or ql[0] in padded or qr[0] in padded:
+                    continue
+                qfds.add((frozenset({ql}), qr))
+                qfds.add((frozenset({qr}), ql))
         where = sg.where_of(sel)
         if where is not None and isinstance(where.this, Expr):
             for col in sg.equality_literal_columns(where.this):
