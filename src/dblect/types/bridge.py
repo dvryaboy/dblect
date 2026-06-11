@@ -351,15 +351,22 @@ def _resolve_one(
                         detail=f"{cspec.name}.{fname}",
                     )
                 )
+                # A constraint can only attach where we have a resolved column to
+                # anchor it, and the bound magnitude column is the only ColumnRef
+                # this bridge derives. Constraints on every other declaration form
+                # below (scalar, key) and on a domain type that produced no tag
+                # (the bound-is-None skip above) are dropped here: the
+                # constraint-checking work that consumes ColumnConstraint will
+                # resolve a column for those forms and carry their constraints.
                 if decl.constraints is not None:
                     constraints.append(ColumnConstraint(bound.column, decl.constraints))
         elif isinstance(form, PrimaryKeyDecl):
-            key_columns.append(fname)
+            key_columns.append(fname)  # decl.constraints dropped (no anchor column yet)
         elif isinstance(form, ForeignKeyDecl):
             edge = _resolve_foreign_key(manifest, src, fname, form.target, cspec.name, issues)
             if edge is not None:
-                foreign_keys.append(edge)
-        # ScalarDecl carries no fact in this build.
+                foreign_keys.append(edge)  # decl.constraints dropped (no anchor column yet)
+        # ScalarDecl carries no fact, and no ColumnConstraint, in this build.
 
     if key_columns:
         key_facts.append(
