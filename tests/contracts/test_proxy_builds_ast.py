@@ -29,6 +29,16 @@ def test_models_column_names_its_model() -> None:
     assert models.stg_orders.subtotal.col == ast.Col("stg_orders", "subtotal")
 
 
+def test_indexing_reaches_columns_that_collide_with_proxy_names() -> None:
+    """A column whose name shadows a proxy method or slot (``key``/``grain`` on
+    self, ``model`` on a model reference) is reachable through indexing, which
+    never resolves to the shadowing member."""
+    s = _self()
+    assert s["key"].col == ast.Col(None, "key")
+    assert s["grain"].col == ast.Col(None, "grain")
+    assert models.dim_customers["model"].col == ast.Col("dim_customers", "model")
+
+
 def test_sum_group_by_builds_grouped_aggregate() -> None:
     s = _self()
     agg = s.order_total.sum().group_by(s.order_id)

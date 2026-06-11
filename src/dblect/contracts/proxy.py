@@ -286,6 +286,12 @@ class ContractSelf:
             raise AttributeError(name)
         return ColumnProxy(Col(None, name))
 
+    def __getitem__(self, name: str) -> ColumnProxy:
+        """A column by name, the escape hatch for one that collides with a method
+        here (``self["key"]``, ``self["grain"]``). Indexing never resolves to a
+        method, so it reaches any column attribute access would shadow."""
+        return ColumnProxy(Col(None, name))
+
     def key(self, *columns: ColumnProxy) -> FactProxy:
         """The columns are unique together."""
         cols = tuple(_col_of(c, "a key column") for c in columns)
@@ -313,6 +319,11 @@ class ModelProxy:
     def __getattr__(self, name: str) -> ColumnProxy:
         if name.startswith("__"):
             raise AttributeError(name)
+        return ColumnProxy(Col(self.model, name))
+
+    def __getitem__(self, name: str) -> ColumnProxy:
+        """A column by name, the escape hatch for one that collides with the
+        ``model`` slot (``models.other["model"]``). Indexing always names a column."""
         return ColumnProxy(Col(self.model, name))
 
 
