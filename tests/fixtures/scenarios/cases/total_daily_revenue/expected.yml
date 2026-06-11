@@ -1,0 +1,6 @@
+# Summing every payment in a day mixes currencies; nothing holds the currency
+# constant per group.
+findings:
+  - kind: aggregation_not_well_typed
+    model: model.jaffle_shop.total_daily_revenue
+    column: revenue

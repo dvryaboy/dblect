@@ -63,6 +63,23 @@ def test_unresolved_contract_is_a_finding() -> None:
     assert _kinds(report) == [CheckFindingKind.CONTRACT_ISSUE]
 
 
+def test_a_model_that_cannot_be_analyzed_is_surfaced() -> None:
+    # A model whose SQL does not parse must not vanish into a clean report: it is
+    # reported as unbuilt so the absence of findings on it is never read as "clean".
+    broken = _node(
+        "model.shop.broken",
+        kind=ResourceType.MODEL,
+        sql="select from where group",  # not valid SQL
+        columns=_cols(x="INT"),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={broken.unique_id: broken}
+    )
+    report = run_check(manifest)
+    assert [m.unique_id for m in report.unbuilt] == ["model.shop.broken"]
+    assert report.models_analyzed == 0
+
+
 # --- currency creep (a declared type contradicted downstream) --------------------
 
 _CREEP_NODES = (
@@ -160,6 +177,42 @@ def test_mixed_currency_sum_is_flagged() -> None:
     assert len(agg) == 1
     assert agg[0].model_unique_id == "model.shop.revenue_by_country"
     assert agg[0].column == "total"
+
+
+def test_sum_over_a_case_expression_is_not_flagged() -> None:
+    # `sum(CASE WHEN ... THEN amount ELSE 0 END)` clears to naked at the CASE (it
+    # mixes money with a dimensionless 0), which is a different concern than a
+    # companion that is not constant per group. The aggregation finding is reserved
+    # for a reduction directly over a tagged column, so this stays quiet.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", method="VARCHAR", k="VARCHAR"),
+        ),
+        _node(
+            "model.shop.by_method",
+            kind=ResourceType.MODEL,
+            sql=(
+                "SELECT k, SUM(CASE WHEN method = 'card' THEN amount ELSE 0 END) AS card "
+                "FROM payments GROUP BY k"
+            ),
+            columns=_cols(k="VARCHAR", card="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest)
+    assert not [
+        f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ]
 
 
 def test_declared_dependency_discharges_the_sum() -> None:

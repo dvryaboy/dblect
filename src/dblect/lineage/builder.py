@@ -146,7 +146,12 @@ def build_manifest_graph(
     share already-parsed trees so the SQL is parsed once (the audit walker does).
     """
     name_to_source = _build_name_to_source(manifest)
-    schema = _build_schema(manifest)
+    # The schema starts from documented columns (the only source for DAG leaves,
+    # which have no SQL of their own) and grows as the walk proceeds: a model's
+    # resolved output columns are folded in before its dependents are qualified.
+    # Topological order is what makes that sound, so a `select *` or a qualified
+    # reference resolves against an upstream model the project never documented.
+    schema: dict[str, dict[str, str]] = {k: dict(v) for k, v in _build_schema(manifest).items()}
     issues: list[BuildIssue] = []
     graph = ColumnLineageGraph.empty()
     for uid in manifest.dag.topological_order():
@@ -179,7 +184,23 @@ def build_manifest_graph(
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
         graph = graph.merge(per_model)
+        _record_output_columns(schema, model.name, uid, per_model)
     return BuildResult(graph=graph, issues=tuple(issues))
+
+
+def _record_output_columns(
+    schema: dict[str, dict[str, str]], name: str, uid: str, per_model: ColumnLineageGraph
+) -> None:
+    """Fold a model's resolved output columns into the running schema so its
+    dependents can qualify against them. The output columns are exactly the graph
+    subjects keyed by the model's own ``SourceRef`` (its top-level projection; CTE
+    and upstream subjects carry other refs). Types are irrelevant to column
+    resolution, so they enter as ``UNKNOWN`` and never clobber a documented type."""
+    self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=uid)
+    columns = schema.setdefault(name, {})
+    for ref in per_model.subjects():
+        if ref.source == self_ref:
+            columns.setdefault(ref.column, "UNKNOWN")
 
 
 def build_model_graph(

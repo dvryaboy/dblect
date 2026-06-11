@@ -1,0 +1,50 @@
+version: 2
+
+# The seeds are documented so dblect (and any reader) knows their columns: the
+# staging models `select *` from them, and column lineage needs the column list
+# to expand the star.
+seeds:
+  - name: raw_payments
+    columns:
+      - name: id
+      - name: order_id
+      - name: payment_method
+      - name: amount
+      - name: currency
+  - name: raw_orders
+    columns:
+      - name: id
+      - name: user_id
+      - name: order_date
+      - name: status
+  - name: raw_customers
+    columns:
+      - name: id
+      - name: first_name
+      - name: last_name
+
+# Only the seeds (the DAG leaves) are documented. The staging models below carry
+# just the columns they happen to test, exactly as stock jaffle does: dblect
+# derives each model's remaining output columns from its own SQL as it walks the
+# DAG, so the marts downstream still resolve `select *` and qualified references.
+models:
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_orders
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_payments
+    columns:
+      - name: payment_id
+        tests:
+          - unique
+          - not_null

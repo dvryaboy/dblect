@@ -1,0 +1,3 @@
+# The per-order rollup is sound: an order is paid in one currency, declared as
+# order_id -> currency, so the sum is discharged and dblect stays quiet.
+findings: []

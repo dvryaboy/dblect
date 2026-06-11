@@ -9,14 +9,26 @@ from __future__ import annotations
 
 import json
 
-from dblect.check import CheckFinding, CheckFindingKind, CheckReport, render_json, render_text
+from dblect.check import (
+    CheckFinding,
+    CheckFindingKind,
+    CheckReport,
+    UnbuiltModel,
+    render_json,
+    render_text,
+)
 from dblect.loader import LoadIssue
 
 
-def _report(*findings: CheckFinding, load_issues: tuple[LoadIssue, ...] = ()) -> CheckReport:
+def _report(
+    *findings: CheckFinding,
+    load_issues: tuple[LoadIssue, ...] = (),
+    unbuilt: tuple[UnbuiltModel, ...] = (),
+) -> CheckReport:
     return CheckReport(
         findings=findings,
         load_issues=load_issues,
+        unbuilt=unbuilt,
         contracts_resolved=2,
         models_propagated=3,
         predicates_collected=1,
@@ -53,10 +65,26 @@ def test_json_is_a_stable_versioned_schema() -> None:
     assert payload["summary"] == {
         "contracts_resolved": 2,
         "models_propagated": 3,
+        "models_analyzed": 3,
         "predicates_collected": 1,
         "findings": 1,
         "load_issues": 1,
+        "unbuilt": 0,
     }
     assert payload["findings"][0]["kind"] == "domain_type_contradiction"
     assert payload["findings"][0]["column"] == "amount"
     assert payload["load_issues"][0]["module"] == "m"
+
+
+def test_unbuilt_models_are_surfaced_not_silent() -> None:
+    report = _report(unbuilt=(UnbuiltModel("model.shop.weird", "sqlglot: Unknown column: x"),))
+    text = render_text(report)
+    assert "could not analyze" in text
+    assert "model.shop.weird" in text
+    assert "1 model(s) could not be analyzed" in text
+    # models_analyzed discounts the unbuilt one, so the count never overstates coverage.
+    assert "over 2 models" in text
+    payload = json.loads(render_json(report))
+    assert payload["summary"]["unbuilt"] == 1
+    assert payload["summary"]["models_analyzed"] == 2
+    assert payload["unbuilt"][0]["unique_id"] == "model.shop.weird"
