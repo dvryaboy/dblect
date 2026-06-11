@@ -49,7 +49,8 @@ This lets one type describe different shapes in different projects or even diffe
 
 ```python
 import dblect
-from dblect.types import Decimal, Currency   # Currency is the ISO 4217 enum
+from dblect.types import Decimal
+from dblect.demo import Currency   # ISO 4217 enum from the starter vocabulary
 
 class Money(dblect.DomainType):
     """An amount of money in some currency."""
@@ -123,7 +124,7 @@ If you have used `typing.Literal` to narrow a type, this is the same move: `Reve
 `Money` refines the same way:
 
 ```python
-from dblect.types import Money, Currency
+from dblect.demo import Money, Currency
 
 MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
@@ -506,7 +507,8 @@ The authored surface assembled, the parts this document covered shown together:
 ```python
 # dblect/types.py
 import dblect
-from dblect.types import Decimal, Currency
+from dblect.types import Decimal
+from dblect.demo import Currency
 
 class Revenue(dblect.DomainType):
     """Revenue, with what it includes and its currency recorded as fields."""

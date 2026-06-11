@@ -77,8 +77,8 @@ Used directly as a column's type.
   spelling of a `foreign_key` fact, also read from a dbt `relationships` test, and used as
   an edge for fixture generation.
 - `Count`. A count magnitude, always safe to sum.
-- `Money`. `amount: Decimal` together with `currency: Currency`.
-- `Currency`, `Country`. Enum tags (ISO 4217, ISO 3166).
+- `Money`. `amount: Decimal` together with `currency: Currency`. Starter vocabulary in `dblect.demo`.
+- `Currency`, `Country`. Enum tags (ISO 4217, ISO 3166), shipped in `dblect.demo` as illustrative slices. A project declares its own by subclassing the `UnitEnum` / `NominalEnum` markers in `dblect.types`.
 - `Decimal(precision, scale)`, `Date`, `Timestamp`, `Varchar`, `Integer`, `BigInt`,
   `Boolean`, `Uuid`, `Json`. Base SQL types with convenience constructors.
 
