@@ -214,9 +214,7 @@ def evaluate_predicate(
         left_rows = _run_side(con, left, tables, alias="l")
         right_rows = _run_side(con, right, tables, alias="r")
         ref_rows = (
-            _run_reference(con, reference, left.group_by, tables)
-            if reference is not None
-            else None
+            _run_reference(con, reference, left.group_by, tables) if reference is not None else None
         )
 
     mismatches = _align(left_rows, right_rows, pred.op, eps, ref_rows)
