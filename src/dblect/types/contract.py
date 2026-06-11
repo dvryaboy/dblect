@@ -22,7 +22,13 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from dblect.contracts import CapturedContract, ContractMethod, capture, is_contract
+from dblect.contracts import (
+    CapturedContract,
+    ContractError,
+    ContractMethod,
+    capture,
+    is_contract,
+)
 from dblect.types.domain import DomainSpec, DomainType, DomainTypeMeta
 from dblect.types.errors import DomainTypeError
 from dblect.types.scalars import FieldDef, classify
@@ -283,7 +289,17 @@ def _collect_methods(cls: type) -> tuple[CapturedContract, ...]:
         for name, attr in vars(klass).items()
         if is_contract(attr)
     }
-    return tuple(capture(name, method) for name, method in marked.items())
+    return tuple(_capture_or_defer(name, method) for name, method in marked.items())
+
+
+def _capture_or_defer(name: str, method: ContractMethod) -> CapturedContract:
+    """Capture a body, recording a capture-time ``ContractError`` instead of letting
+    it abort class creation. The bridge surfaces the recorded failure as a finding,
+    so one malformed contract never sinks the scan."""
+    try:
+        return capture(name, method)
+    except ContractError as exc:
+        return CapturedContract(name, result=None, error=str(exc))
 
 
 class ModelContract:

@@ -139,6 +139,35 @@ def test_cross_relation_determines_is_a_finding() -> None:
     assert [i.code for i in resolved.issues] == [IssueCode.MALFORMED_DECLARATION]
 
 
+def test_method_columns_are_validated_against_known_columns() -> None:
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+
+        @contract
+        def country_sets_currency(self: ContractSelf) -> object:
+            return self.country.determines(self.currency)
+
+    known = {_CHARGES: frozenset({"country"})}  # 'currency' is absent from the relation
+    resolved = resolve_contracts(_manifest(), known_columns=known)
+    assert resolved.fd_facts == ()
+    assert [i.code for i in resolved.issues] == [IssueCode.UNKNOWN_COLUMN]
+
+
+def test_malformed_contract_is_a_finding_not_a_crash() -> None:
+    # A body that trips a ContractError at capture (a non-equality cannot carry a
+    # tolerance) surfaces as a finding; defining the class must not raise.
+    class FctOrders(ModelContract):
+        dbt_model = "fct_orders"
+
+        @contract
+        def bad(self: ContractSelf) -> object:
+            return (self.a.sum() < self.b.sum()).within(0.01)
+
+    resolved = resolve_contracts(_manifest())
+    assert resolved.fd_facts == ()
+    assert [i.code for i in resolved.issues] == [IssueCode.MALFORMED_DECLARATION]
+
+
 def test_predicate_is_collected_not_grounded() -> None:
     class FctOrders(ModelContract):
         dbt_model = "fct_orders"

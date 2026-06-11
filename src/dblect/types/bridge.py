@@ -408,33 +408,51 @@ def _resolve_one(
             )
         )
 
-    _resolve_methods(cspec, src, manifest, out)
+    _resolve_methods(cspec, src, known, manifest, out)
 
 
 def _resolve_methods(
-    cspec: ContractSpec, src: SourceRef, manifest: Manifest, out: _Accumulator
+    cspec: ContractSpec,
+    src: SourceRef,
+    known: frozenset[str] | None,
+    manifest: Manifest,
+    out: _Accumulator,
 ) -> None:
     """Lower each captured ``@contract`` method onto the substrate. A fact becomes
     its matching ground fact (a dependency, a key, an edge); a predicate is set
-    aside for the execution loop."""
+    aside for the execution loop. A body that failed at capture is a finding."""
     for method in cspec.methods:
+        if method.error is not None:
+            out.issues.append(
+                ContractIssue(
+                    IssueCode.MALFORMED_DECLARATION,
+                    contract=cspec.name,
+                    field=method.name,
+                    message=method.error,
+                )
+            )
+            continue
         result = method.result
+        assert result is not None  # a capture carries a result xor an error
         if isinstance(result, ast.Pred):
             out.predicates.append(ResolvedPredicate(cspec.name, src, result))
         else:
-            _lower_fact(result, src, manifest, cspec.name, method, out)
+            _lower_fact(result, src, known, manifest, cspec.name, method, out)
 
 
 def _lower_fact(
     fact: ast.FactNode,
     src: SourceRef,
+    known: frozenset[str] | None,
     manifest: Manifest,
     contract: str,
     method: CapturedContract,
     out: _Accumulator,
 ) -> None:
     if isinstance(fact, ast.DeterminesFact):
-        names = _own_columns((*fact.determinant, fact.dependent), contract, method, out.issues)
+        names = _own_columns(
+            (*fact.determinant, fact.dependent), contract, method, out.issues, known
+        )
         if names is None:
             return
         *determinant, dependent = names
@@ -448,7 +466,7 @@ def _lower_fact(
         )
     elif isinstance(fact, (ast.KeyFact, ast.GrainFact)):
         columns = fact.columns if isinstance(fact, ast.KeyFact) else fact.per
-        names = _own_columns(columns, contract, method, out.issues, fold=False)
+        names = _own_columns(columns, contract, method, out.issues, known, fold=False)
         if names is None:
             return
         out.key_facts.append(
@@ -460,12 +478,13 @@ def _lower_fact(
             )
         )
     else:
-        _lower_references(fact, src, manifest, contract, method, out)
+        _lower_references(fact, src, known, manifest, contract, method, out)
 
 
 def _lower_references(
     fact: ast.ReferencesFact,
     src: SourceRef,
+    known: frozenset[str] | None,
     manifest: Manifest,
     contract: str,
     method: CapturedContract,
@@ -478,6 +497,16 @@ def _lower_references(
                 contract=contract,
                 field=method.name,
                 message="a references edge starts on the contract's own column (self), not models.*",
+            )
+        )
+        return
+    if known is not None and fact.child.name not in known:
+        out.issues.append(
+            ContractIssue(
+                IssueCode.UNKNOWN_COLUMN,
+                contract=contract,
+                field=method.name,
+                message=f"column {fact.child.name!r} is absent from the model",
             )
         )
         return
@@ -515,13 +544,17 @@ def _own_columns(
     contract: str,
     method: CapturedContract,
     issues: list[ContractIssue],
+    known: frozenset[str] | None,
     *,
     fold: bool = True,
 ) -> list[str] | None:
     """The column names of ``columns``, all of which must live on the contract's
-    own model. A reference into another model is a finding, since the dependency
-    and key facts the substrate carries are single-relation. ``fold`` case-folds
-    the names to match the dependency property's column universe."""
+    own model and (when ``known`` is supplied) name a real column. A reference into
+    another model is a finding, since the dependency and key facts the substrate
+    carries are single-relation; a column absent from ``known`` is an unknown-column
+    finding, matching the declaration path. ``fold`` case-folds the returned names
+    to the dependency property's lowercased column universe; key and grain facts
+    keep the authored case, which is why they pass ``fold=False``."""
     names: list[str] = []
     for col in columns:
         if col.model is not None:
@@ -534,6 +567,16 @@ def _own_columns(
                         f"column {col.model}.{col.name} is on another model; this fact "
                         "ranges over the contract's own relation"
                     ),
+                )
+            )
+            return None
+        if known is not None and col.name not in known:
+            issues.append(
+                ContractIssue(
+                    IssueCode.UNKNOWN_COLUMN,
+                    contract=contract,
+                    field=method.name,
+                    message=f"column {col.name!r} is absent from the model",
                 )
             )
             return None

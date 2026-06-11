@@ -208,21 +208,41 @@ def evaluate_predicate(
     if not isinstance(left, Agg) or not isinstance(right, Agg):
         raise ContractError("a conservation check compares two aggregates")
     eps = pred.tolerance.eps if pred.tolerance is not None else tolerance
+    reference = pred.tolerance.relative_to if pred.tolerance is not None else None
 
     with duckdb.connect(":memory:") as con:
-        loaded: set[str | None] = set()
-        left_rows = _run_side(con, left, tables, loaded, alias="l")
-        right_rows = _run_side(con, right, tables, loaded, alias="r")
+        left_rows = _run_side(con, left, tables, alias="l")
+        right_rows = _run_side(con, right, tables, alias="r")
+        ref_rows = (
+            _run_reference(con, reference, left.group_by, tables)
+            if reference is not None
+            else None
+        )
 
-    mismatches = _align(left_rows, right_rows, pred.op, eps)
+    mismatches = _align(left_rows, right_rows, pred.op, eps, ref_rows)
     return GroupedResult(ok=not mismatches, mismatches=tuple(mismatches))
+
+
+def _run_reference(
+    con: duckdb.DuckDBPyConnection,
+    reference: ValueExpr,
+    group_by: tuple[Col, ...],
+    tables: Mapping[str | None, Sequence[Mapping[str, Any]]],
+) -> dict[tuple[Any, ...], float]:
+    """The per-group reference total a relative tolerance scales by, run under the
+    conservation's own grouping. Only an aggregate reduces to one value per group,
+    so a non-aggregate reference is a contract error rather than a silently dropped
+    scale. The proxy already requires a ``within(...)`` to precede ``relative_to``."""
+    if not isinstance(reference, Agg):
+        raise ContractError("relative_to(...) scales by an aggregate, one value per group")
+    grouped = Agg(reference.func, reference.operand, group_by, reference.joined_on)
+    return _run_side(con, grouped, tables, alias="ref")
 
 
 def _run_side(
     con: duckdb.DuckDBPyConnection,
     agg: Agg,
     tables: Mapping[str | None, Sequence[Mapping[str, Any]]],
-    loaded: set[str | None],
     *,
     alias: str,
 ) -> dict[tuple[Any, ...], float]:
@@ -269,12 +289,18 @@ def _align(
     right: Mapping[tuple[Any, ...], float],
     op: CmpOp,
     eps: float,
+    ref: Mapping[tuple[Any, ...], float] | None = None,
 ) -> list[GroupMismatch]:
+    # A relative tolerance reinterprets ``eps`` as a fraction of each group's
+    # reference total, so the slack scales with the group rather than being one
+    # flat absolute amount. A group absent from ``ref`` scales to zero (an exact
+    # check), which is the conservative reading.
     mismatches: list[GroupMismatch] = []
     for key in sorted(set(left) | set(right), key=repr):
         lv = left.get(key)
         rv = right.get(key)
-        if lv is None or rv is None or not _holds(op, lv, rv, eps):
+        group_eps = eps * abs(ref.get(key, 0.0)) if ref is not None else eps
+        if lv is None or rv is None or not _holds(op, lv, rv, group_eps):
             mismatches.append(GroupMismatch(key, lv, rv))
     return mismatches
 
@@ -302,13 +328,21 @@ def _load_table(
     if not rows:
         raise ContractError(f"table {name!r} has no rows to infer a schema from")
     columns = list(rows[0].keys())
-    decls = ", ".join(f"{c} {_column_type(rows, c)}" for c in columns)
-    con.execute(f"CREATE TABLE {name} ({decls})")
+    # Quote every identifier through sqlglot: the column names come from the
+    # supplied row dicts, so interpolating them raw would let an odd name reshape
+    # the DDL. The table name is ours, but quoting it too keeps one rule.
+    table = _quote(name)
+    decls = ", ".join(f"{_quote(c)} {_column_type(rows, c)}" for c in columns)
+    con.execute(f"CREATE TABLE {table} ({decls})")
     placeholders = ", ".join("?" for _ in columns)
     con.executemany(
-        f"INSERT INTO {name} VALUES ({placeholders})",
+        f"INSERT INTO {table} VALUES ({placeholders})",
         [[row.get(c) for c in columns] for row in rows],
     )
+
+
+def _quote(identifier: str) -> str:
+    return exp.to_identifier(identifier, quoted=True).sql(dialect="duckdb")
 
 
 def _column_type(rows: Sequence[Mapping[str, Any]], column: str) -> str:

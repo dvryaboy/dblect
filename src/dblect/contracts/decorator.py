@@ -46,10 +46,13 @@ def is_contract(obj: object) -> bool:
 @dataclass(frozen=True, slots=True)
 class CapturedContract:
     """One contract method evaluated to its AST. ``result`` is a fact the analyzer
-    reads or a predicate it checks; the kind is read off the node's type."""
+    reads or a predicate it checks; the kind is read off the node's type. A capture
+    that tripped a :class:`ContractError` carries ``error`` instead of a ``result``,
+    so a malformed body becomes a finding rather than aborting class creation."""
 
     name: str
-    result: ContractResult
+    result: ContractResult | None
+    error: str | None = None
 
     @property
     def is_fact(self) -> bool:

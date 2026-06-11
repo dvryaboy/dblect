@@ -138,6 +138,38 @@ def test_tolerance_absorbs_small_drift() -> None:
     assert evaluate_predicate(pred, {None: left, "other": right}).ok
 
 
+def test_relative_tolerance_scales_each_group_by_a_reference() -> None:
+    """``within(0.05).relative_to(own.sum())`` checks 5% of each group's reference
+    total, not one flat absolute slack: the small group is held to a proportionally
+    tighter bound than the large one. An absolute 0.05 would flag both groups."""
+    own = [{"k": "a", "amount": 1000.0}, {"k": "b", "amount": 10.0}]
+    other = [{"k": "a", "amount": 1020.0}, {"k": "b", "amount": 12.0}]
+    reference = ast.Agg(ast.AggFunc.SUM, ast.Col(None, "amount"))
+    pred = ast.Compare(
+        ast.CmpOp.EQ,
+        ast.Agg(ast.AggFunc.SUM, ast.Col(None, "amount"), (ast.Col(None, "k"),)),
+        ast.Agg(ast.AggFunc.SUM, ast.Col("other", "amount"), (ast.Col("other", "k"),)),
+        ast.Tolerance(0.05, reference),
+    )
+    result = evaluate_predicate(pred, {None: own, "other": other})
+    # group a: |1000 - 1020| = 20 <= 5% of 1000 (= 50), holds.
+    # group b: |10 - 12|     =  2  > 5% of 10   (= 0.5), off.
+    assert [m.key for m in result.mismatches] == [("b",)]
+
+
+def test_relative_tolerance_reference_must_reduce_to_one_value_per_group() -> None:
+    """A bare column cannot scale a grouped check; only an aggregate reference can."""
+    rows = [{"k": "a", "amount": 1.0}]
+    pred = ast.Compare(
+        ast.CmpOp.EQ,
+        ast.Agg(ast.AggFunc.SUM, ast.Col(None, "amount"), (ast.Col(None, "k"),)),
+        ast.Agg(ast.AggFunc.SUM, ast.Col("other", "amount"), (ast.Col("other", "k"),)),
+        ast.Tolerance(0.05, ast.Col(None, "amount")),
+    )
+    with pytest.raises(ContractError):
+        evaluate_predicate(pred, {None: rows, "other": list(rows)})
+
+
 def test_inequality_conservation() -> None:
     """``returns <= orders`` per group: a refund never exceeds the order."""
     orders = [{"k": "a", "amount": 100}, {"k": "b", "amount": 50}]
