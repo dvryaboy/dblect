@@ -25,6 +25,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 
+from dblect.contracts import CapturedContract, ast
 from dblect.lineage.facts.model import Declared, DeclaredSource, Fact
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.domain_type import (
@@ -37,6 +38,7 @@ from dblect.lineage.properties.domain_type import (
     Unit,
     tagged,
 )
+from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import generic_test_target_uid
@@ -106,13 +108,26 @@ class ColumnConstraint:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedPredicate:
+    """A ``@contract`` predicate collected for running. The analyzer never reasons
+    over it; the execution loop compiles ``predicate`` to SQL and checks it against
+    generated data for ``owner`` and any models the expression references."""
+
+    contract: str
+    owner: SourceRef
+    predicate: ast.Pred
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedContracts:
     """Everything the bridge derived from the registry against one manifest."""
 
     tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
     key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...]
+    fd_facts: tuple[Fact[FDSet, SourceRef], ...]
     foreign_keys: tuple[ForeignKeyEdge, ...]
     constraints: tuple[ColumnConstraint, ...]
+    predicates: tuple[ResolvedPredicate, ...]
     issues: tuple[ContractIssue, ...]
 
 
@@ -292,17 +307,13 @@ def resolve_contracts(
     findings. ``known_columns`` enables column validation per relation; without
     it, column references are trusted (the manifest may not document columns)."""
     reg = registry if registry is not None else active_registry()
-    tag_facts: list[Fact[DomainTag, ColumnRef]] = []
-    key_facts: list[Fact[CandidateKeySet, SourceRef]] = []
-    foreign_keys: list[ForeignKeyEdge] = []
-    constraints: list[ColumnConstraint] = []
-    issues: list[ContractIssue] = []
+    out = _Accumulator()
 
     for cspec in reg.contracts:
         src, code = _resolve_model(manifest, cspec.dbt_model)
         if src is None:
             assert code is not None
-            issues.append(
+            out.issues.append(
                 ContractIssue(
                     code,
                     contract=cspec.name,
@@ -312,17 +323,40 @@ def resolve_contracts(
             )
             continue
         known = known_columns.get(src) if known_columns is not None else None
-        _resolve_one(
-            cspec, src, known, manifest, tag_facts, key_facts, foreign_keys, constraints, issues
-        )
+        _resolve_one(cspec, src, known, manifest, out)
 
     return ResolvedContracts(
-        tag_facts=tuple(tag_facts),
-        key_facts=tuple(key_facts),
-        foreign_keys=tuple(foreign_keys),
-        constraints=tuple(constraints),
-        issues=tuple(issues),
+        tag_facts=tuple(out.tag_facts),
+        key_facts=tuple(out.key_facts),
+        fd_facts=tuple(out.fd_facts),
+        foreign_keys=tuple(out.foreign_keys),
+        constraints=tuple(out.constraints),
+        predicates=tuple(out.predicates),
+        issues=tuple(out.issues),
     )
+
+
+class _Accumulator:
+    """The growing outputs of a resolution pass, one bucket per derived kind."""
+
+    __slots__ = (
+        "constraints",
+        "fd_facts",
+        "foreign_keys",
+        "issues",
+        "key_facts",
+        "predicates",
+        "tag_facts",
+    )
+
+    def __init__(self) -> None:
+        self.tag_facts: list[Fact[DomainTag, ColumnRef]] = []
+        self.key_facts: list[Fact[CandidateKeySet, SourceRef]] = []
+        self.fd_facts: list[Fact[FDSet, SourceRef]] = []
+        self.foreign_keys: list[ForeignKeyEdge] = []
+        self.constraints: list[ColumnConstraint] = []
+        self.predicates: list[ResolvedPredicate] = []
+        self.issues: list[ContractIssue] = []
 
 
 def _resolve_one(
@@ -330,20 +364,16 @@ def _resolve_one(
     src: SourceRef,
     known: frozenset[str] | None,
     manifest: Manifest,
-    tag_facts: list[Fact[DomainTag, ColumnRef]],
-    key_facts: list[Fact[CandidateKeySet, SourceRef]],
-    foreign_keys: list[ForeignKeyEdge],
-    constraints: list[ColumnConstraint],
-    issues: list[ContractIssue],
+    out: _Accumulator,
 ) -> None:
     key_columns: list[str] = []
     for fname, decl in cspec.declarations.items():
         form = decl.form
         if isinstance(form, DomainDecl):
             bound, found = _build_tag(fname, form.spec, src, known)
-            issues.extend(replace(issue, contract=cspec.name) for issue in found)
+            out.issues.extend(replace(issue, contract=cspec.name) for issue in found)
             if bound is not None:
-                tag_facts.append(
+                out.tag_facts.append(
                     Fact(
                         scope=bound.column,
                         value=bound.tag,
@@ -359,17 +389,17 @@ def _resolve_one(
                 # constraint-checking work that consumes ColumnConstraint will
                 # resolve a column for those forms and carry their constraints.
                 if decl.constraints is not None:
-                    constraints.append(ColumnConstraint(bound.column, decl.constraints))
+                    out.constraints.append(ColumnConstraint(bound.column, decl.constraints))
         elif isinstance(form, PrimaryKeyDecl):
             key_columns.append(fname)  # decl.constraints dropped (no anchor column yet)
         elif isinstance(form, ForeignKeyDecl):
-            edge = _resolve_foreign_key(manifest, src, fname, form.target, cspec.name, issues)
+            edge = _resolve_foreign_key(manifest, src, fname, form.target, cspec.name, out.issues)
             if edge is not None:
-                foreign_keys.append(edge)  # decl.constraints dropped (no anchor column yet)
+                out.foreign_keys.append(edge)  # decl.constraints dropped (no anchor column yet)
         # ScalarDecl carries no fact, and no ColumnConstraint, in this build.
 
     if key_columns:
-        key_facts.append(
+        out.key_facts.append(
             Fact(
                 scope=src,
                 value=CandidateKeySet.of(frozenset(key_columns)),
@@ -377,6 +407,138 @@ def _resolve_one(
                 detail=cspec.name,
             )
         )
+
+    _resolve_methods(cspec, src, manifest, out)
+
+
+def _resolve_methods(
+    cspec: ContractSpec, src: SourceRef, manifest: Manifest, out: _Accumulator
+) -> None:
+    """Lower each captured ``@contract`` method onto the substrate. A fact becomes
+    its matching ground fact (a dependency, a key, an edge); a predicate is set
+    aside for the execution loop."""
+    for method in cspec.methods:
+        result = method.result
+        if isinstance(result, ast.Pred):
+            out.predicates.append(ResolvedPredicate(cspec.name, src, result))
+        else:
+            _lower_fact(result, src, manifest, cspec.name, method, out)
+
+
+def _lower_fact(
+    fact: ast.FactNode,
+    src: SourceRef,
+    manifest: Manifest,
+    contract: str,
+    method: CapturedContract,
+    out: _Accumulator,
+) -> None:
+    if isinstance(fact, ast.DeterminesFact):
+        names = _own_columns((*fact.determinant, fact.dependent), contract, method, out.issues)
+        if names is None:
+            return
+        *determinant, dependent = names
+        out.fd_facts.append(
+            Fact(
+                scope=src,
+                value=FDSet.of(FD(frozenset(determinant), dependent)),
+                provenance=Declared(DeclaredSource.USER_ASSERTED),
+                detail=f"{contract}.{method.name}",
+            )
+        )
+    elif isinstance(fact, (ast.KeyFact, ast.GrainFact)):
+        columns = fact.columns if isinstance(fact, ast.KeyFact) else fact.per
+        names = _own_columns(columns, contract, method, out.issues, fold=False)
+        if names is None:
+            return
+        out.key_facts.append(
+            Fact(
+                scope=src,
+                value=CandidateKeySet.of(frozenset(names)),
+                provenance=Declared(DeclaredSource.USER_ASSERTED),
+                detail=f"{contract}.{method.name}",
+            )
+        )
+    else:
+        _lower_references(fact, src, manifest, contract, method, out)
+
+
+def _lower_references(
+    fact: ast.ReferencesFact,
+    src: SourceRef,
+    manifest: Manifest,
+    contract: str,
+    method: CapturedContract,
+    out: _Accumulator,
+) -> None:
+    if fact.child.model is not None:
+        out.issues.append(
+            ContractIssue(
+                IssueCode.MALFORMED_DECLARATION,
+                contract=contract,
+                field=method.name,
+                message="a references edge starts on the contract's own column (self), not models.*",
+            )
+        )
+        return
+    if fact.parent.model is None:
+        out.issues.append(
+            ContractIssue(
+                IssueCode.UNRESOLVED_FOREIGN_KEY,
+                contract=contract,
+                field=method.name,
+                message="references(...) needs a target on another model (models.parent.column)",
+            )
+        )
+        return
+    parent_src = _resolve_model(manifest, fact.parent.model)[0]
+    if parent_src is None:
+        out.issues.append(
+            ContractIssue(
+                IssueCode.UNRESOLVED_FOREIGN_KEY,
+                contract=contract,
+                field=method.name,
+                message=f"references target model {fact.parent.model!r} did not resolve",
+            )
+        )
+        return
+    out.foreign_keys.append(
+        ForeignKeyEdge(
+            child=ColumnRef(src, fact.child.name),
+            parent=ColumnRef(parent_src, fact.parent.name),
+        )
+    )
+
+
+def _own_columns(
+    columns: tuple[ast.Col, ...],
+    contract: str,
+    method: CapturedContract,
+    issues: list[ContractIssue],
+    *,
+    fold: bool = True,
+) -> list[str] | None:
+    """The column names of ``columns``, all of which must live on the contract's
+    own model. A reference into another model is a finding, since the dependency
+    and key facts the substrate carries are single-relation. ``fold`` case-folds
+    the names to match the dependency property's column universe."""
+    names: list[str] = []
+    for col in columns:
+        if col.model is not None:
+            issues.append(
+                ContractIssue(
+                    IssueCode.MALFORMED_DECLARATION,
+                    contract=contract,
+                    field=method.name,
+                    message=(
+                        f"column {col.model}.{col.name} is on another model; this fact "
+                        "ranges over the contract's own relation"
+                    ),
+                )
+            )
+            return None
+        names.append(col.name.lower() if fold else col.name)
+    return names
 
 
 def _resolve_foreign_key(
@@ -496,12 +658,23 @@ class _TagDiscoverer:
 
 class _KeyDiscoverer:
     """Yields the contract-sourced candidate-key facts (from ``PrimaryKey``
-    markers), to be merged with the dbt-test-sourced keys in ``collect``."""
+    markers and ``self.key`` / ``self.grain`` methods), to be merged with the
+    dbt-test-sourced keys in ``collect``."""
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
     ) -> Collection[Fact[CandidateKeySet, SourceRef]]:
         return resolve_contracts(manifest).key_facts
+
+
+class _FdDiscoverer:
+    """Yields the contract-sourced functional-dependency facts (from
+    ``self.a.determines(self.b)`` methods) that ground the FD property."""
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[FDSet, SourceRef]]:
+        return resolve_contracts(manifest).fd_facts
 
 
 def contract_tag_discoverer() -> _TagDiscoverer:
@@ -510,3 +683,7 @@ def contract_tag_discoverer() -> _TagDiscoverer:
 
 def contract_key_discoverer() -> _KeyDiscoverer:
     return _KeyDiscoverer()
+
+
+def contract_fd_discoverer() -> _FdDiscoverer:
+    return _FdDiscoverer()
