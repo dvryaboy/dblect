@@ -14,15 +14,14 @@ propagation here to assert against.
 
 from pathlib import Path
 
+from dblect.demo import Currency, Money
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata
 from dblect.types import (
-    Currency,
     ForeignKey,
     ForeignKeyEdge,
     ModelContract,
-    Money,
     PrimaryKey,
     dbt_relationship_edges,
     foreign_key_edges,

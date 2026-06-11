@@ -82,7 +82,8 @@ Create `dblect/types.py`:
 ```python
 # dblect/types.py
 from dblect import DomainType
-from dblect.types import Decimal, Currency
+from dblect.types import Decimal
+from dblect.demo import Currency
 
 class Money(DomainType):
     """A monetary amount in a specified currency."""

@@ -11,6 +11,7 @@ facts that merge with dbt-test-sourced ones in ``collect``.
 
 from collections.abc import Mapping
 
+from dblect.demo import Currency, Money
 from dblect.lineage.facts.grounding import collect
 from dblect.lineage.facts.model import Declared, DeclaredSource
 from dblect.lineage.facts.property import FactDiscoverer
@@ -25,14 +26,12 @@ from dblect.lineage.properties.uniqueness import CandidateKeySet, unique_test_di
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata
 from dblect.types import (
-    Currency,
     Decimal,
     Field,
     ForeignKey,
     ForeignKeyEdge,
     IssueCode,
     ModelContract,
-    Money,
     PrimaryKey,
     contract_key_discoverer,
     contract_tag_discoverer,
@@ -155,7 +154,8 @@ def test_nominal_facets_ride_as_concrete_or_per_row_bindings() -> None:
 
 
 def test_a_type_with_no_magnitude_grounds_nothing() -> None:
-    from dblect.types import Country, DomainType
+    from dblect.demo import Country
+    from dblect.types import DomainType
 
     class Locale(DomainType):
         country: Country

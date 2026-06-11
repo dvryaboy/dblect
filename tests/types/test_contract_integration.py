@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
+from dblect.demo import Currency, Money
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.facts.grounding import collect
 from dblect.lineage.facts.model import Annotation
@@ -34,7 +35,7 @@ from dblect.lineage.properties.domain_type import (
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
 from dblect.manifest.parse import Column
-from dblect.types import Currency, ModelContract, Money, contract_tag_discoverer, resolve_contracts
+from dblect.types import ModelContract, contract_tag_discoverer, resolve_contracts
 
 MoneyUSD = Money.refine(currency=Currency.USD)
 

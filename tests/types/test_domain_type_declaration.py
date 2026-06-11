@@ -11,15 +11,13 @@ required where two bases fix the same field.
 
 import pytest
 
+from dblect.demo import Country, Currency, Money
 from dblect.types import (
-    Country,
-    Currency,
     Date,
     Decimal,
     DomainType,
     DomainTypeError,
     FieldKind,
-    Money,
 )
 
 

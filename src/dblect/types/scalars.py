@@ -105,5 +105,5 @@ def classify(name: str, annotation: object) -> FieldDef:
         return FieldDef(name, FieldKind.INERT)
     raise DomainTypeError(
         f"field {name!r}: {annotation!r} is not a domain field type "
-        "(use Decimal/Count, a Currency/Country enum, bool, str, or Date)"
+        "(use Decimal/Count, a UnitEnum or NominalEnum subclass, bool, str, or Date)"
     )

@@ -13,9 +13,10 @@ column.
 from hypothesis import given
 from hypothesis import strategies as st
 
+from dblect.demo import Currency, Money
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.domain_type import Concrete, Dimension, PerRow, Tagged, tagged
-from dblect.types import Currency, Money, domain_tag
+from dblect.types import domain_tag
 
 _SRC = SourceRef(SourceKind.MODEL, "model.shop.stg_charges")
 

@@ -9,10 +9,9 @@ constraint vocabulary and inline fixings at one binding site.
 
 import pytest
 
+from dblect.demo import Country, Currency, Money
 from dblect.types import (
     ContractRegistry,
-    Country,
-    Currency,
     Date,
     DomainDecl,
     DomainTypeError,
@@ -21,7 +20,6 @@ from dblect.types import (
     ForeignKey,
     ForeignKeyDecl,
     ModelContract,
-    Money,
     PrimaryKey,
     PrimaryKeyDecl,
     ScalarDecl,
