@@ -22,6 +22,13 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from dblect.contracts import (
+    CapturedContract,
+    ContractError,
+    ContractMethod,
+    capture,
+    is_contract,
+)
 from dblect.types.domain import DomainSpec, DomainType, DomainTypeMeta
 from dblect.types.errors import DomainTypeError
 from dblect.types.scalars import FieldDef, classify
@@ -169,11 +176,14 @@ class ContractField:
 
 @dataclass(frozen=True, slots=True)
 class ContractSpec:
-    """A model contract read into data: which model, and what each column means."""
+    """A model contract read into data: which model, what each column means, and
+    the captured ``@contract`` methods (each a fact the analyzer reads or a
+    predicate it runs)."""
 
     name: str
     dbt_model: str
     declarations: Mapping[str, ContractField]
+    methods: tuple[CapturedContract, ...] = ()
 
 
 # --- the registry ---------------------------------------------------------------
@@ -268,6 +278,30 @@ def _collect_declarations(cls: type) -> dict[str, ContractField]:
 _MISSING = object()
 
 
+def _collect_methods(cls: type) -> tuple[CapturedContract, ...]:
+    """Capture every ``@contract`` method, merged across the MRO so a base's
+    contracts flow to subclasses and a subclass's override wins. Each is run once
+    over a self-proxy and recorded as its AST."""
+    marked: dict[str, ContractMethod] = {
+        name: attr
+        for klass in reversed(cls.__mro__)
+        if klass is not object and klass is not ModelContract
+        for name, attr in vars(klass).items()
+        if is_contract(attr)
+    }
+    return tuple(_capture_or_defer(name, method) for name, method in marked.items())
+
+
+def _capture_or_defer(name: str, method: ContractMethod) -> CapturedContract:
+    """Capture a body, recording a capture-time ``ContractError`` instead of letting
+    it abort class creation. The bridge surfaces the recorded failure as a finding,
+    so one malformed contract never sinks the scan."""
+    try:
+        return capture(name, method)
+    except ContractError as exc:
+        return CapturedContract(name, result=None, error=str(exc))
+
+
 class ModelContract:
     """Base class for model contracts. Subclass it, set ``dbt_model``, and declare
     one column per field. A subclass without its own ``dbt_model`` is an abstract
@@ -279,11 +313,13 @@ class ModelContract:
         super().__init_subclass__(**kwargs)
         own_model = cls.__dict__.get("dbt_model")
         declarations = _collect_declarations(cls)
+        methods = _collect_methods(cls)
         if not isinstance(own_model, str):
             return  # abstract base: declarations flow down, nothing registered
         spec = ContractSpec(
             name=cls.__qualname__,
             dbt_model=own_model,
             declarations=declarations,
+            methods=methods,
         )
         active_registry().register(spec)

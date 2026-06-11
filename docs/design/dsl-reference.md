@@ -147,6 +147,11 @@ another model. Proxies are symbolic: they build an expression and fetch no data.
 are overloaded, so the result of a comparison is a predicate, not a Python bool.
 See [dblect_technical_intro.md](dblect_technical_intro.md) and [domain-type-algebra.md](domain-type-algebra.md).
 
+A few attribute names are taken by the proxy surface itself: `key` and `grain` are the
+fact constructors on `self`, and `model` names a model reference. A column that collides
+with one of these is still reachable by indexing, which always names a column:
+`self["key"]`, `self["grain"]`, `models.dim_customers["model"]`.
+
 - Aggregations: `col.sum()`, `col.avg()`, `col.min()`, `col.max()`, `col.count()`,
   `col.count_distinct()`. Reduce a column to one value. A reduction over one field of a
   multi-field type is well-typed only when the type's other fields are constant across the
