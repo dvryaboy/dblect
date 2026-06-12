@@ -31,6 +31,7 @@ from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     AggregationSite,
+    ColumnLineageGraph,
     ColumnRef,
     SourceRef,
     aggregation_site_meta,
@@ -61,12 +62,13 @@ def run_check(
     loader populates a fresh registry the CLI passes in)."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
-    annotations = _propagate(manifest, resolved, dialect=dialect)
+    column_graph = build_manifest_graph(manifest, dialect=dialect).graph
+    annotations = _propagate(manifest, resolved, column_graph, dialect=dialect)
 
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(resolved))
     findings.extend(_contradiction_findings(manifest, annotations))
-    findings.extend(_aggregation_findings(manifest, annotations, dialect=dialect))
+    findings.extend(_aggregation_findings(manifest, column_graph, annotations))
 
     return CheckReport(
         findings=tuple(findings),
@@ -81,7 +83,11 @@ def run_check(
 
 
 def _propagate(
-    manifest: Manifest, resolved: ResolvedContracts, *, dialect: str | None
+    manifest: Manifest,
+    resolved: ResolvedContracts,
+    column_graph: ColumnLineageGraph,
+    *,
+    dialect: str | None,
 ) -> Mapping[ColumnRef, Annotation[DomainTag]]:
     """Propagate the FD property over the relation graph, then domain type over the
     column graph reading it, exactly as the substrate end-to-end test wires them."""
@@ -97,7 +103,6 @@ def _propagate(
         domain_type_grounding(_by_scope(resolved.tag_facts)), fd=fd_prop.ref
     )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
-    column_graph = build_manifest_graph(manifest, dialect=dialect).graph
     return propagate(column_graph, dt_prop, dep_context=ctx)
 
 
@@ -154,13 +159,11 @@ def _contradiction_findings(
 
 def _aggregation_findings(
     manifest: Manifest,
+    column_graph: ColumnLineageGraph,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
-    *,
-    dialect: str | None,
 ) -> list[CheckFinding]:
     """One finding per aggregate output whose tag cleared to naked while an operand
     it summed still carried one: a reduction the algebra cannot call well typed."""
-    column_graph = build_manifest_graph(manifest, dialect=dialect).graph
     out: list[CheckFinding] = []
     for ref, ann in _sorted(annotations):
         if ann.value != NAKED:

@@ -10,6 +10,7 @@ load issue on the report, not an exception that aborts the scan.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from dblect.loader import load_declarations
@@ -76,6 +77,25 @@ def test_a_broken_module_becomes_an_issue_not_a_crash(tmp_path: Path) -> None:
     assert [c.dbt_model for c in result.registry.contracts] == ["good"]
     assert len(result.issues) == 1
     assert "broken" in result.issues[0].module
+
+
+def test_a_broken_package_init_becomes_an_issue_not_a_crash(tmp_path: Path) -> None:
+    project = tmp_path
+    _write(project, "dblect/__init__.py", "import nonexistent_module_xyz\n")
+    _write(
+        project,
+        "dblect/contracts.py",
+        "from dblect import ModelContract\nclass C(ModelContract):\n    dbt_model = 'c'\n",
+    )
+    synthetic_before = {n for n in sys.modules if n.startswith("_dblect_declarations_")}
+    result = load_declarations(project)
+    # The package root could not be built, so nothing under it loaded, but the
+    # failure is a load issue rather than an exception that escapes the loader.
+    assert result.registry.contracts == ()
+    assert len(result.issues) == 1
+    # A failed root import must not wedge the synthetic package in sys.modules,
+    # or the next load would resolve against a half-initialized ghost.
+    assert {n for n in sys.modules if n.startswith("_dblect_declarations_")} == synthetic_before
 
 
 def test_stubs_directory_is_skipped(tmp_path: Path) -> None:

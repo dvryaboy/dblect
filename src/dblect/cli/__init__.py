@@ -101,6 +101,7 @@ def audit(
         project_dir=project_dir,
         explicit=manifest,
         dbt_executable=dbt_executable,
+        command="audit",
     )
     typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
@@ -170,7 +171,7 @@ def check(
     from dblect.manifest import Manifest
 
     manifest_path = _resolve_manifest_path(
-        project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable
+        project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
     )
     typer.echo(f"check: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
@@ -212,7 +213,7 @@ def init(
     from dblect.manifest import Manifest
 
     manifest_path = _resolve_manifest_path(
-        project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable
+        project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="init"
     )
     loaded = Manifest.from_file(manifest_path)
 
@@ -278,6 +279,7 @@ def _resolve_manifest_path(
     project_dir: Path,
     explicit: Path | None,
     dbt_executable: str,
+    command: str,
 ) -> Path:
     if explicit is not None:
         if not explicit.exists():
@@ -295,7 +297,7 @@ def _resolve_manifest_path(
             f"`{dbt_executable}` not on PATH and no manifest at {default}; "
             "install dbt (e.g. `uv add 'dblect[dbt-core]'`) or pass --manifest"
         )
-    typer.echo(f"audit: running `{dbt_executable} compile` in {project_dir}", err=True)
+    typer.echo(f"{command}: running `{dbt_executable} compile` in {project_dir}", err=True)
     completed = subprocess.run(
         [dbt_executable, "compile", "--project-dir", str(project_dir)],
         capture_output=True,

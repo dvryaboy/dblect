@@ -57,13 +57,19 @@ def load_declarations(project_dir: Path, *, decl_dir_name: str = "dblect") -> Lo
 
     pkg_name = f"_dblect_declarations_{uuid.uuid4().hex}"
     issues: list[LoadIssue] = []
-    with isolated_registry() as reg, _synthetic_package(pkg_name, decl_root):
-        for dotted in _module_names(decl_root):
-            full = f"{pkg_name}.{dotted}" if dotted else pkg_name
-            try:
-                importlib.import_module(full)
-            except Exception as exc:
-                issues.append(LoadIssue(module=dotted or decl_dir_name, message=str(exc)))
+    with isolated_registry() as reg:
+        try:
+            # A broken root __init__ aborts this load (nothing under it could resolve
+            # its relative imports anyway), but as an issue, not an escaping exception.
+            with _synthetic_package(pkg_name, decl_root):
+                for dotted in _module_names(decl_root):
+                    full = f"{pkg_name}.{dotted}" if dotted else pkg_name
+                    try:
+                        importlib.import_module(full)
+                    except Exception as exc:
+                        issues.append(LoadIssue(module=dotted or decl_dir_name, message=str(exc)))
+        except Exception as exc:
+            issues.append(LoadIssue(module=decl_dir_name, message=str(exc)))
     return LoadResult(reg, tuple(issues))
 
 
@@ -105,7 +111,13 @@ class _synthetic_package:  # noqa: N801 (used as a context manager)
             assert spec.loader is not None
             module = importlib.util.module_from_spec(spec)
             sys.modules[self.pkg_name] = module
-            spec.loader.exec_module(module)
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                # __exit__ does not run when __enter__ raises, so a failed root
+                # import would otherwise leave the package wedged in sys.modules.
+                del sys.modules[self.pkg_name]
+                raise
         else:
             module = ModuleType(self.pkg_name)
             module.__path__ = locations
