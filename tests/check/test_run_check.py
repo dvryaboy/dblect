@@ -210,9 +210,7 @@ def test_sum_over_a_case_expression_is_not_flagged() -> None:
         amount: Money.columns(amount="amount", currency="currency")
 
     report = run_check(manifest)
-    assert not [
-        f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
-    ]
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 
 def test_declared_dependency_discharges_the_sum() -> None:
