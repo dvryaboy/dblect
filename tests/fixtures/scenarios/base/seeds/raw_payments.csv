@@ -112,3 +112,6 @@ id,order_id,payment_method,amount,currency
 111,97,bank_transfer,1400,EUR
 112,98,bank_transfer,1000,GBP
 113,99,credit_card,2400,USD
+114,1,bank_transfer,500,EUR
+115,6,credit_card,400,USD
+116,2,bank_transfer,750,GBP

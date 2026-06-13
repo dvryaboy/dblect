@@ -5,7 +5,7 @@ from dblect.demo import Currency, Money
 class RawPayments(ModelContract):
     # Payments now arrive in several currencies; the source records which.
     dbt_model = "raw_payments"
-    amount: Money.columns(amount="amount", currency="currency")
+    value: Money.columns(amount="amount", currency="currency")
 
 
 class StgPayments(ModelContract):

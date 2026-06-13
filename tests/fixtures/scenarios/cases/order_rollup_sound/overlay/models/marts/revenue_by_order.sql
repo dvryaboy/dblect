@@ -1,6 +1,7 @@
--- Revenue per order. An order is paid in a single currency, so summing its
--- payments is well defined. We tell dblect that fact with a functional
--- dependency, and the audit stays quiet.
+-- Revenue per order. An order can be settled across several payments (split
+-- across two cards, say), so this rolls those rows into one total. They are all
+-- in the order's single currency, so summing them is well defined. We tell dblect
+-- that fact with a functional dependency, and the audit stays quiet.
 select
     order_id,
     sum(amount) as revenue

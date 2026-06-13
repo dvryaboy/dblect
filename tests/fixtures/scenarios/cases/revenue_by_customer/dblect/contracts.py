@@ -1,9 +1,15 @@
-from dblect import ModelContract
+from dblect import ModelContract, contract
 from dblect.demo import Money
 
 
 class StgPayments(ModelContract):
-    # The staging layer is typed as multi-currency money; nobody added a contract
-    # to the customer rollup downstream.
     dbt_model = "stg_payments"
-    amount: Money.columns(amount="amount", currency="currency")
+    value: Money.columns(amount="amount", currency="currency")
+
+    @contract
+    def one_currency_per_order(self):
+        # The same per-order fix that discharges the order rollup. It holds the
+        # currency constant within an order, not within a customer: a customer
+        # spans many orders that can be in different currencies, so it does not
+        # discharge this wider sum.
+        return self.order_id.determines(self.currency)

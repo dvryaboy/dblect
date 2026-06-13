@@ -4,7 +4,7 @@ from dblect.demo import Money
 
 class StgPayments(ModelContract):
     dbt_model = "stg_payments"
-    amount: Money.columns(amount="amount", currency="currency")
+    value: Money.columns(amount="amount", currency="currency")
 
     @contract
     def one_currency_per_order(self):

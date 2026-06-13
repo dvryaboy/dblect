@@ -31,8 +31,15 @@ declarations, so adding a case does not touch the base or any other case.
 |---|---|---|
 | `currency_creep` | source goes multi-currency; a stale `stg_payments` contract still says USD | flags the contradiction and its blast radius onto an undeclared rollup |
 | `total_daily_revenue` | a new "revenue per day" report sums across currencies | flags the sum as not well typed |
-| `revenue_by_customer` | a lifetime-revenue rollup sums a customer's multi-currency payments | flags the sum as not well typed |
 | `order_rollup_sound` | revenue per order, with `order_id -> currency` declared | stays quiet (the dependency discharges the sum) |
+| `revenue_by_customer` | a lifetime-revenue rollup, with the same `order_id -> currency` declared | still flags: a customer spans orders in different currencies, so the per-order dependency does not reach the wider grain |
+
+`order_rollup_sound` and `revenue_by_customer` are a matched pair: both declare the
+same `order_id -> currency` dependency, and it discharges the per-order sum while
+leaving the per-customer sum flagged. The discharge is grain-precise, not a blanket
+silence. `order_rollup_sound`'s mart is deliberately the same `sum(amount)` by
+`order_id` as `currency_creep`'s `order_revenue`; the verdict differs only because
+of what each case declares.
 
 ## Running
 
@@ -70,3 +77,10 @@ does not discharge yet, because companion bindings are not rebound through
 projections (tracked in issue #76). Declaring the type at the layer that is
 aggregated is a realistic pattern and exercises the discharge paths today; the
 scenarios will move to the more natural seed-origin shape once that gap closes.
+
+The open multi-currency declaration is named `value`, not `amount`: with the
+currency carried in its own column, `Money` is a two-column tuple, and `value`
+names the tuple while `amount` and `currency` stay the columns it binds to. The
+pinned single-currency form keeps the column's own name (`amount:
+Money.refine(currency=Currency.USD)`), where the currency is a constant rather than
+a second column and the declaration types the one `amount` column in place.

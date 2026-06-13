@@ -16,7 +16,7 @@ declared:
 ```python
 class StgPayments(ModelContract):
     dbt_model = "stg_payments"
-    amount: Money.columns(amount="amount", currency="currency")
+    value: Money.columns(amount="amount", currency="currency")
 ```
 
 **Why it is a bug.** A day contains payments in several currencies, so

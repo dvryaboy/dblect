@@ -7,7 +7,7 @@ added a `currency` column to the `raw_payments` source and carried it through
 ```python
 class RawPayments(ModelContract):
     dbt_model = "raw_payments"
-    amount: Money.columns(amount="amount", currency="currency")
+    value: Money.columns(amount="amount", currency="currency")
 ```
 
 What they did not touch is the year-old contract on `stg_payments`, which still
