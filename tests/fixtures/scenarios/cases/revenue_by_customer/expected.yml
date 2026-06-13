@@ -1,0 +1,6 @@
+# A customer can transact in several currencies, so the lifetime-revenue sum is
+# not well typed.
+findings:
+  - kind: aggregation_not_well_typed
+    model: model.jaffle_shop.revenue_by_customer
+    column: lifetime_revenue

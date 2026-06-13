@@ -94,6 +94,12 @@ indent-style = "space"
 
 [tool.pyright]
 include = ["src", "tests"]
+# The scenario fixtures' dblect/ packages are user-style declaration files (typed
+# `amount: Money.columns(...)`, contract methods over a `self` proxy). They are
+# illustrative inputs, not library code, and exercising them is the scenario test's
+# job; static-checking them as library code is not meaningful. (Typed authoring of
+# contract bodies is the generated-stubs concern; see issue #76 for the related gap.)
+exclude = ["**/node_modules", "**/__pycache__", "tests/fixtures/scenarios"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 reportMissingImports = "error"

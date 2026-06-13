@@ -25,14 +25,15 @@ from typing import TypeVar
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
-from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
-from dblect.lineage.builder import build_manifest_graph, build_relation_graph
+from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
+from dblect.lineage.builder import BuildIssue, build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
+    RelationLineageGraph,
     SourceRef,
     aggregation_site_meta,
 )
@@ -62,32 +63,44 @@ def run_check(
     loader populates a fresh registry the CLI passes in)."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
-    column_graph = build_manifest_graph(manifest, dialect=dialect).graph
-    annotations = _propagate(manifest, resolved, column_graph, dialect=dialect)
+
+    relation_build = build_relation_graph(manifest, dialect=dialect)
+    column_build = build_manifest_graph(manifest, dialect=dialect)
+    annotations = _propagate(resolved, relation_build.graph, column_build.graph)
 
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(resolved))
     findings.extend(_contradiction_findings(manifest, annotations))
-    findings.extend(_aggregation_findings(manifest, column_graph, annotations))
+    findings.extend(_aggregation_findings(manifest, annotations, column_build.graph))
 
     return CheckReport(
         findings=tuple(findings),
         load_issues=(),
+        unbuilt=_unbuilt(relation_build.issues, column_build.issues),
         contracts_resolved=len(reg.contracts),
         models_propagated=len(manifest.models),
         predicates_collected=len(resolved.predicates),
     )
 
 
+def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:
+    """The models no graph could analyze, one entry per model. A model can fail in
+    both the relation and column builds; the first reason seen wins, and the column
+    build (the domain-type path) is passed first so its reason is preferred."""
+    reasons: dict[str, str] = {}
+    for group in issue_groups:
+        for issue in group:
+            reasons.setdefault(issue.model_unique_id, issue.message)
+    return tuple(UnbuiltModel(uid, reason) for uid, reason in sorted(reasons.items()))
+
+
 # --- propagation ----------------------------------------------------------------
 
 
 def _propagate(
-    manifest: Manifest,
     resolved: ResolvedContracts,
+    relation_graph: RelationLineageGraph,
     column_graph: ColumnLineageGraph,
-    *,
-    dialect: str | None,
 ) -> Mapping[ColumnRef, Annotation[DomainTag]]:
     """Propagate the FD property over the relation graph, then domain type over the
     column graph reading it, exactly as the substrate end-to-end test wires them."""
@@ -95,7 +108,6 @@ def _propagate(
         functional_dependency_grounding(_by_scope(resolved.fd_facts))
     )
     store = AnnotationStore()
-    relation_graph = build_relation_graph(manifest, dialect=dialect).graph
     for scope, ann in propagate(relation_graph, fd_prop).items():
         store.record(fd_prop.name, scope, ann)
 
@@ -159,8 +171,8 @@ def _contradiction_findings(
 
 def _aggregation_findings(
     manifest: Manifest,
-    column_graph: ColumnLineageGraph,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    column_graph: ColumnLineageGraph,
 ) -> list[CheckFinding]:
     """One finding per aggregate output whose tag cleared to naked while an operand
     it summed still carried one: a reduction the algebra cannot call well typed."""
@@ -169,7 +181,7 @@ def _aggregation_findings(
         if ann.value != NAKED:
             continue
         derivation = column_graph.derivation(ref)
-        if derivation is None or not _is_guarded_aggregate(derivation):
+        if derivation is None or not _reduces_a_bare_column(derivation):
             continue
         operands = column_graph.edges.get(ref, frozenset())
         if any(annotations.get(up, _NO_ANN).value != NAKED for up in operands):
@@ -188,11 +200,19 @@ def _aggregation_findings(
     return out
 
 
-def _is_guarded_aggregate(derivation: Expr) -> bool:
-    """Whether a projection is a non-windowed aggregate the coherence guard judged
-    (the builder stamps an :class:`AggregationSite` on exactly those)."""
+def _reduces_a_bare_column(derivation: Expr) -> bool:
+    """Whether a projection is a non-windowed aggregate (one the coherence guard
+    judged) directly over a bare column.
+
+    Restricting to a bare-column operand keeps the finding precise. An aggregate
+    over an expression, ``sum(CASE WHEN ... THEN amount ELSE 0 END)`` being the
+    common one, already clears to naked at the expression because it mixes a
+    magnitude with a dimensionless literal, which is a different concern than a
+    companion that is not constant per group. The operand column carrying a tag
+    that the reduction cleared is the signal that names a mixed-currency sum.
+    """
     return any(
-        isinstance(aggregation_site_meta(agg), AggregationSite)
+        isinstance(aggregation_site_meta(agg), AggregationSite) and isinstance(agg.this, exp.Column)
         for agg in derivation.find_all(exp.AggFunc)
     )
 

@@ -7,7 +7,7 @@ and ``docs/design/declaration-dsl.md`` for the findings it surfaces.
 
 from __future__ import annotations
 
-from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
+from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
 from dblect.check.report import JSON_SCHEMA_VERSION, render_json, render_text
 from dblect.check.run import run_check
 
@@ -16,6 +16,7 @@ __all__ = [
     "CheckFinding",
     "CheckFindingKind",
     "CheckReport",
+    "UnbuiltModel",
     "render_json",
     "render_text",
     "run_check",

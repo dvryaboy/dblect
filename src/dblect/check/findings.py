@@ -46,12 +46,23 @@ class CheckFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class UnbuiltModel:
+    """A model dblect could not analyze (no compiled SQL, or a parse/qualify
+    failure), with the reason. Surfaced so a model the analysis could not read is
+    never mistaken for one it read and found clean."""
+
+    unique_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class CheckReport:
     """The output of one ``run_check``: findings, the modules that failed to load,
-    and a few counts for the summary line."""
+    the models that could not be analyzed, and a few counts for the summary line."""
 
     findings: tuple[CheckFinding, ...]
     load_issues: tuple[LoadIssue, ...]
+    unbuilt: tuple[UnbuiltModel, ...]
     contracts_resolved: int
     models_propagated: int
     predicates_collected: int
@@ -59,3 +70,7 @@ class CheckReport:
     @property
     def has_findings(self) -> bool:
         return bool(self.findings) or bool(self.load_issues)
+
+    @property
+    def models_analyzed(self) -> int:
+        return self.models_propagated - len(self.unbuilt)

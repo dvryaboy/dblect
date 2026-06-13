@@ -1,0 +1,9 @@
+# The stale USD type is contradicted by the multi-currency source, and the
+# contradiction rides the DAG onto order_revenue, a model with no contract.
+findings:
+  - kind: domain_type_contradiction
+    model: model.jaffle_shop.stg_payments
+    column: amount
+  - kind: domain_type_contradiction
+    model: model.jaffle_shop.order_revenue
+    column: revenue
