@@ -36,7 +36,10 @@ from sqlglot import Expr
 from dblect.lineage.facts.grounding import collect, grounding
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
+    BASE_WORLD,
     Annotation,
+    CompileOrigin,
+    CompileValue,
     Declared,
     DeclaredSource,
     Fact,
@@ -352,6 +355,81 @@ def unique_combination_discoverer() -> FactDiscoverer[CandidateKeySet, SourceRef
 
 def native_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, SourceRef]:
     return _NativeKeyDiscoverer(adapter_type)
+
+
+# --- config-derived keys -----------------------------------------------------
+#
+# An incremental model's write can enforce uniqueness on its `unique_key`, but
+# only under a strategy that deduplicates: `merge` updates the matching row and
+# `delete+insert` removes then reinserts, so each key value lands once. `append`
+# inserts unconditionally and `insert_overwrite` replaces whole partitions, so
+# neither enforces the key (a `unique_key` under `append` is silently ignored at
+# write time). The guarantee is therefore a property of the (strategy, key) pair,
+# not of `unique_key` alone, and the default strategy is adapter-dependent. We
+# claim a key only when we are sure the write dedups; everywhere else we stay
+# silent, because a wrong key would suppress the very duplicates the audit exists
+# to catch.
+
+# Strategies whose write deduplicates on `unique_key`.
+_DEDUP_STRATEGIES: frozenset[str] = frozenset({"merge", "delete+insert"})
+
+# Adapters whose default `incremental_strategy` (when unset) is `merge`, the only
+# default that dedups. Sourced from dbt's adapter docs. An adapter absent here has
+# an unknown-or-non-dedup default, so an unset strategy claims no key: append (the
+# other common default) does not dedup either way, so the conservative choice
+# costs nothing on those and stays sound on the rest.
+_MERGE_DEFAULT_ADAPTERS: frozenset[str] = frozenset(
+    {"snowflake", "bigquery", "redshift", "postgres"}
+)
+
+
+def _effective_strategy(strategy: str | None, adapter_type: str) -> str | None:
+    """The incremental strategy in force: the declared one, else the adapter
+    default where we know it to dedup, else ``None`` (unknown, claim nothing)."""
+    if strategy is not None:
+        return strategy.lower()
+    if adapter_type.lower() in _MERGE_DEFAULT_ADAPTERS:
+        return "merge"
+    return None
+
+
+class _ConfigKeyDiscoverer:
+    """Grounds a candidate key from the ``unique_key`` / ``incremental_strategy``
+    config pair, but only when the materialization actually deduplicates on write.
+
+    The fact is a compile-time value fixed in the manifest's world
+    (``CompileValue(origin=DBT_CONFIG)``), with the same standing as any other
+    grounding fact: resolution unions it with declared and native keys."""
+
+    def __init__(self, adapter_type: str) -> None:
+        self._adapter_type = adapter_type
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[CandidateKeySet, SourceRef]]:
+        out: list[Fact[CandidateKeySet, SourceRef]] = []
+        for node in manifest.nodes.values():
+            if node.resource_type is not ResourceType.MODEL:
+                continue
+            config = node.config
+            if config is None or config.materialized != "incremental" or not config.unique_key:
+                continue
+            strategy = _effective_strategy(config.incremental_strategy, self._adapter_type)
+            if strategy not in _DEDUP_STRATEGIES:
+                continue
+            out.append(
+                Fact(
+                    scope=SourceRef(SourceKind.MODEL, node.unique_id),
+                    value=_single_key(*config.unique_key),
+                    provenance=CompileValue(origin=CompileOrigin.DBT_CONFIG, world=BASE_WORLD),
+                    detail=f"{strategy} on unique_key",
+                )
+            )
+        return out
+
+
+def config_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, SourceRef]:
+    return _ConfigKeyDiscoverer(adapter_type)
 
 
 # --- the relation reducer ----------------------------------------------------
@@ -817,7 +895,8 @@ def uniqueness_property(
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
 ) -> Property[CandidateKeySet, SourceRef]:
     """The manifest-backed uniqueness property: declared keys (unique tests,
-    ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, plus any
+    ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, the
+    config ``unique_key`` of a deduplicating incremental model, plus any
     ``extra``) ground each relation, and the relation reducer infers more from the
     SQL. Declared and inferred keys both hold, so they compose by meet
     (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
@@ -827,6 +906,7 @@ def uniqueness_property(
         unique_test_discoverer(),
         unique_combination_discoverer(),
         native_key_discoverer(manifest.adapter_type),
+        config_key_discoverer(manifest.adapter_type),
         *extra,
     )
     # The uniqueness discoverers ground against the manifest directly, so they

@@ -36,6 +36,15 @@ class WorldRef:
     assignments: frozenset[tuple[str, Hashable]]
 
 
+# The world a single manifest represents when no flag enumeration is active: the
+# one configuration dbt compiled under, with no flag assignments fixed. Compile
+# values discovered from that manifest (a config key, a var resolved in it) carry
+# this world. When the flag-world enumerator lands it fixes a non-empty world per
+# run; until then every CompileValue fact shares this base world, so resolution is
+# the ordinary single-world fold.
+BASE_WORLD: WorldRef = WorldRef(frozenset())
+
+
 class ScopeKind(StrEnum):
     COLUMN = "column"  # propagator walks per-column projections
     RELATION = "relation"  # propagator walks relation-algebra structure

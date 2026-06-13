@@ -10,7 +10,7 @@ import from here and don't touch the parser's types directly.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -115,6 +115,22 @@ class DbtTestMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelConfig:
+    """The slice of a node's resolved ``config`` block dblect reasons about.
+
+    Carries only the keys a property currently consumes, not the whole config.
+    ``unique_key`` is normalized to a tuple of column names: dbt accepts it as a
+    single string or a list, and both reduce to the same candidate-key shape.
+    More keys (``on_schema_change``, ``cluster_by`` ...) land here as the
+    properties that read them are added.
+    """
+
+    materialized: str | None = None
+    incremental_strategy: str | None = None
+    unique_key: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class Column:
     """A column on a dbt model/source as declared in schema.yml."""
 
@@ -147,6 +163,12 @@ class Node:
     constraints: tuple[ConstraintSpec, ...] = ()
     test_metadata: DbtTestMetadata | None = None
     attached_node: str | None = None
+    config: ModelConfig | None = None
+    """The dblect-relevant slice of the node's resolved ``config`` block.
+
+    Present for data-flow nodes whose config dblect reads (models carry the
+    incremental keys); ``None`` for sources and for nodes with no config block.
+    """
     identifier: str | None = None
     """The relation name as it appears in compiled SQL.
 
@@ -303,6 +325,7 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         constraints=_constraints_from_parsed(getattr(n, "constraints", None) or ()),
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
+        config=_model_config_from_parsed(n),
     )
 
 
@@ -352,6 +375,40 @@ def _constraints_from_parsed(raw: Any) -> tuple[ConstraintSpec, ...]:
         )
         for c in raw
     )
+
+
+def _model_config_from_parsed(node: Any) -> ModelConfig | None:
+    """Build :class:`ModelConfig` from a parsed node's ``config`` block, or ``None``.
+
+    Returns ``None`` when the node has no config block (sources, and any node the
+    parser leaves config-less). ``unique_key`` is normalized from dbt's string or
+    list shape to a tuple of the string column names, dropping any non-string
+    entry rather than failing on a malformed list.
+    """
+    config = getattr(node, "config", None)
+    if config is None:
+        return None
+    materialized = _opt_str(getattr(config, "materialized", None))
+    strategy = _opt_str(getattr(config, "incremental_strategy", None))
+    unique_key = _normalize_unique_key(getattr(config, "unique_key", None))
+    return ModelConfig(
+        materialized=materialized,
+        incremental_strategy=strategy,
+        unique_key=unique_key,
+    )
+
+
+def _opt_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _normalize_unique_key(raw: Any) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        return (raw,) if raw else ()
+    if isinstance(raw, (list, tuple)):
+        seq = tuple(cast("Iterable[object]", raw))
+        return tuple(c for c in seq if isinstance(c, str) and c)
+    return ()
 
 
 def _test_metadata_from_parsed(node: Any) -> DbtTestMetadata | None:
