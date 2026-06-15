@@ -1,6 +1,3 @@
-"""Snowflake: PRIMARY KEY / UNIQUE advisory, NOT NULL enforced; incremental default
-``merge``, which deduplicates on a ``unique_key``."""
-
 from __future__ import annotations
 
 from dblect.adapters import AdapterProfile, IncrementalStrategy, register

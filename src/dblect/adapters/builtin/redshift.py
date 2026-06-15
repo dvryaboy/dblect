@@ -1,6 +1,3 @@
-"""Redshift: PRIMARY KEY / UNIQUE advisory, NOT NULL enforced. Like Postgres,
-dbt-redshift defaults to ``delete+insert`` once a ``unique_key`` is set."""
-
 from __future__ import annotations
 
 from dblect.adapters import AdapterProfile, IncrementalStrategy, register
@@ -12,6 +9,7 @@ register(
         validated=False,
         not_null_enforced=True,
         key_enforced=False,
+        # dbt-redshift, like Postgres, defaults to delete+insert (not merge) with a unique_key
         default_incremental_strategy=IncrementalStrategy.DELETE_INSERT,
     )
 )
