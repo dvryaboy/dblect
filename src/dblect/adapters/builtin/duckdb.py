@@ -1,9 +1,5 @@
-"""duckdb: the one adapter dblect has validated end-to-end.
-
-duckdb enforces PRIMARY KEY / UNIQUE and NOT NULL on write. Its incremental dedup
-default is left unset pending validation, so an unset strategy claims no key, the
-conservative reading.
-"""
+"""duckdb: the validated adapter; enforces PRIMARY KEY / UNIQUE and NOT NULL. Its
+dedup default is left unset pending validation, so an unset strategy claims no key."""
 
 from __future__ import annotations
 

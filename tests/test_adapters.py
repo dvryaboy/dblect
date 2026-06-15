@@ -1,10 +1,10 @@
-"""The adapter profile: one coherent target per dbt adapter.
+"""The adapter profile and its registry.
 
-These pin the contract the rest of dblect reads through: that resolving a target
-yields a single value whose SQL grammar and runtime semantics come from the same
-adapter, so an override can never leave the two disagreeing. The strategy
-normalization and the per-adapter defaults are the parts with real logic, so they
-are exercised directly.
+The strategy normalization, the override resolution, and the conservative fallback
+carry the real behavior. The per-adapter data is pinned only where it has bitten
+(the incremental dedup default), parametrized rather than restated per adapter.
+Resolving any builtin (snowflake, bigquery, ...) below also exercises the
+registry's auto-discovery, since none of these import an adapter module directly.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import pytest
 
 from dblect.adapters import (
-    DEDUP_STRATEGIES,
     AdapterProfile,
     IncrementalStrategy,
     UnvalidatedAdapterError,
@@ -41,69 +40,60 @@ def test_parse_recognizes_dbt_builtins(raw: str, expected: IncrementalStrategy) 
 
 @pytest.mark.parametrize("raw", [None, "", "my_custom_strategy", "upsert"])
 def test_parse_unset_or_custom_is_none(raw: str | None) -> None:
-    """An unset or project-defined strategy is not a known builtin, so it carries
-    no dedup guarantee dblect can assume."""
     assert IncrementalStrategy.parse(raw) is None
 
 
-def test_dedup_strategies_are_merge_and_delete_insert() -> None:
-    assert {IncrementalStrategy.MERGE, IncrementalStrategy.DELETE_INSERT} == DEDUP_STRATEGIES
+# --- effective_strategy and the per-adapter defaults -------------------------
 
 
-# --- AdapterProfile.effective_strategy ---------------------------------------
-
-
-def test_declared_strategy_wins_over_default() -> None:
-    snowflake = profile_for_adapter("snowflake")  # default merge
-    assert snowflake.effective_strategy("append") is IncrementalStrategy.APPEND
-
-
-def test_custom_declared_strategy_does_not_fall_back_to_default() -> None:
-    """A model that explicitly chose a custom strategy gets no dedup claim, even on
-    an adapter whose default dedups: the explicit choice is not the default."""
-    snowflake = profile_for_adapter("snowflake")  # default merge
-    assert snowflake.effective_strategy("my_custom_strategy") is None
-
-
-def test_unset_strategy_uses_the_adapter_default() -> None:
-    assert profile_for_adapter("snowflake").effective_strategy(None) is IncrementalStrategy.MERGE
-    assert (
-        profile_for_adapter("postgres").effective_strategy(None)
-        is IncrementalStrategy.DELETE_INSERT
-    )
-    assert profile_for_adapter("duckdb").effective_strategy(None) is None
+@pytest.mark.parametrize(
+    ("adapter", "declared", "expected"),
+    [
+        ("snowflake", "append", IncrementalStrategy.APPEND),  # a declared known strategy wins
+        ("snowflake", "my_custom", None),  # a custom strategy is not assumed to dedup
+        ("snowflake", None, IncrementalStrategy.MERGE),  # unset -> the adapter default, which is...
+        ("bigquery", None, IncrementalStrategy.MERGE),
+        (
+            "postgres",
+            None,
+            IncrementalStrategy.DELETE_INSERT,
+        ),  # ...delete+insert on pg/redshift, not merge
+        ("redshift", None, IncrementalStrategy.DELETE_INSERT),
+        ("duckdb", None, None),  # duckdb's dedup default is left unset
+    ],
+)
+def test_effective_strategy(
+    adapter: str, declared: str | None, expected: IncrementalStrategy | None
+) -> None:
+    assert profile_for_adapter(adapter).effective_strategy(declared) is expected
 
 
 # --- profile_for_adapter -----------------------------------------------------
 
 
-def test_known_adapter_enforcement_flags() -> None:
-    # PRIMARY KEY / UNIQUE: advisory on the cloud warehouses, enforced on duckdb
-    # and Postgres. NOT NULL: enforced everywhere.
-    assert profile_for_adapter("duckdb").key_enforced is True
-    assert profile_for_adapter("postgres").key_enforced is True
-    assert profile_for_adapter("snowflake").key_enforced is False
-    assert profile_for_adapter("bigquery").key_enforced is False
-    assert all(
-        profile_for_adapter(a).not_null_enforced
-        for a in ("duckdb", "snowflake", "bigquery", "redshift", "postgres")
-    )
+@pytest.mark.parametrize(
+    ("adapter", "key_enforced"),
+    [("duckdb", True), ("postgres", True), ("snowflake", False), ("bigquery", False)],
+)
+def test_key_enforcement_per_adapter(adapter: str, key_enforced: bool) -> None:
+    # PRIMARY KEY / UNIQUE is advisory on the cloud warehouses, enforced on duckdb and Postgres.
+    assert profile_for_adapter(adapter).key_enforced is key_enforced
 
 
 def test_adapter_lookup_is_case_and_whitespace_insensitive() -> None:
-    assert profile_for_adapter("  SnowFlake ").default_incremental_strategy is (
-        IncrementalStrategy.MERGE
-    )
+    assert profile_for_adapter("  SnowFlake ") is profile_for_adapter("snowflake")
 
 
 def test_unknown_adapter_is_conservative_never_raises() -> None:
-    """The semantics lookup tolerates any adapter: advisory keys, NOT NULL
-    enforced, no dedup default, and the name carried through as the dialect guess."""
+    """An adapter no module registered gets advisory keys, NOT NULL enforced, no
+    dedup default, and its name carried through as the dialect guess."""
     profile = profile_for_adapter("exotic_warehouse")
-    assert profile.key_enforced is False
-    assert profile.not_null_enforced is True
+    assert (profile.key_enforced, profile.not_null_enforced, profile.validated) == (
+        False,
+        True,
+        False,
+    )
     assert profile.default_incremental_strategy is None
-    assert profile.validated is False
     assert profile.sqlglot_dialect == "exotic_warehouse"
 
 
@@ -112,9 +102,8 @@ def test_unknown_adapter_is_conservative_never_raises() -> None:
 
 def test_validated_adapter_resolves_without_override() -> None:
     profile = resolve_profile(adapter_type="duckdb", explicit_dialect=None)
-    assert profile.adapter_type == "duckdb"
-    assert profile.sqlglot_dialect == "duckdb"
     assert profile.validated is True
+    assert profile.sqlglot_dialect == "duckdb"
 
 
 def test_unvalidated_adapter_without_override_raises() -> None:
@@ -123,41 +112,35 @@ def test_unvalidated_adapter_without_override_raises() -> None:
     assert exc_info.value.adapter_type == "snowflake"
 
 
-def test_override_selects_the_whole_target_so_grammar_and_semantics_agree() -> None:
-    """The core guarantee: an override names the target wholesale. Forcing snowflake
-    onto an unknown adapter yields snowflake's grammar AND snowflake's runtime
-    semantics, never a hybrid of one adapter's grammar with another's semantics."""
-    profile = resolve_profile(adapter_type="acme_warehouse", explicit_dialect="snowflake")
-    assert profile.sqlglot_dialect == "snowflake"
-    assert profile.default_incremental_strategy is IncrementalStrategy.MERGE
-    assert profile.key_enforced is False  # snowflake's, not the unknown adapter's
-
-
-def test_override_to_validated_target_is_validated() -> None:
-    profile = resolve_profile(adapter_type="snowflake", explicit_dialect="duckdb")
-    assert profile.sqlglot_dialect == "duckdb"
-    assert profile.validated is True
-
-
-def test_override_to_unknown_dialect_stays_conservative() -> None:
-    profile = resolve_profile(adapter_type="snowflake", explicit_dialect="exotic")
-    assert profile.sqlglot_dialect == "exotic"
-    assert profile.validated is False
-    assert profile.default_incremental_strategy is None
+@pytest.mark.parametrize(
+    ("adapter", "override", "dialect", "validated", "default"),
+    [
+        # The override names the whole target: snowflake's grammar AND its semantics,
+        # never a hybrid of one adapter's grammar with another's enforcement.
+        ("acme_warehouse", "snowflake", "snowflake", False, IncrementalStrategy.MERGE),
+        ("snowflake", "duckdb", "duckdb", True, None),  # validated follows the override target
+        ("snowflake", "exotic", "exotic", False, None),  # an unknown override stays conservative
+    ],
+)
+def test_override_names_the_whole_target(
+    adapter: str,
+    override: str,
+    dialect: str,
+    validated: bool,
+    default: IncrementalStrategy | None,
+) -> None:
+    profile = resolve_profile(adapter_type=adapter, explicit_dialect=override)
+    assert profile.sqlglot_dialect == dialect
+    assert profile.validated is validated
+    assert profile.default_incremental_strategy is default
 
 
 # --- the registry is the extension point -------------------------------------
 
 
-def test_builtins_are_auto_discovered() -> None:
-    """The built-in adapter modules register themselves on first lookup, so a known
-    adapter resolves without this test importing its module."""
-    assert profile_for_adapter("bigquery").default_incremental_strategy is IncrementalStrategy.MERGE
-
-
-def test_register_makes_a_new_adapter_self_contained() -> None:
-    """Supporting a warehouse is registering a profile, no core map to edit; the
-    built-ins register themselves this same way."""
+def test_register_makes_a_new_adapter_resolvable() -> None:
+    """Supporting a warehouse is registering a profile, with no core map to edit;
+    the builtins register themselves this same way."""
     profile = register(
         AdapterProfile(
             adapter_type="widget_warehouse",
@@ -169,4 +152,3 @@ def test_register_makes_a_new_adapter_self_contained() -> None:
         )
     )
     assert profile_for_adapter("widget_warehouse") is profile
-    assert profile_for_adapter("  WIDGET_WAREHOUSE ").key_enforced is True

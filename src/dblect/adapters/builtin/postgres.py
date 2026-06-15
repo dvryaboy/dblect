@@ -1,9 +1,5 @@
-"""Postgres: enforces PRIMARY KEY / UNIQUE and NOT NULL on write.
-
-Its incremental default deduplicates once a ``unique_key`` is set: dbt-postgres
-defaults to ``delete+insert`` with a key (and ``append`` without one, but the
-config discoverer only consults the default when a key is present).
-"""
+"""Postgres: enforces PRIMARY KEY / UNIQUE and NOT NULL. dbt-postgres defaults to
+``delete+insert`` once a ``unique_key`` is set (the only default the discoverer reads)."""
 
 from __future__ import annotations
 

@@ -1,9 +1,5 @@
-"""Redshift: PRIMARY KEY / UNIQUE are advisory (declared but unenforced); NOT NULL
-is enforced on write.
-
-Like Postgres, its incremental default deduplicates with a ``unique_key``:
-dbt-redshift defaults to ``delete+insert`` once a key is set.
-"""
+"""Redshift: PRIMARY KEY / UNIQUE advisory, NOT NULL enforced. Like Postgres,
+dbt-redshift defaults to ``delete+insert`` once a ``unique_key`` is set."""
 
 from __future__ import annotations
 

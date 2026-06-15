@@ -1,16 +1,8 @@
-"""The adapter registry: where target profiles are registered and looked up.
+"""The adapter registry: registration, auto-discovery, and resolution.
 
-Supporting a new warehouse is self-contained. Drop a module under
-:mod:`dblect.adapters.builtin` (or, out of tree, any module a host imports) that
-builds an :class:`AdapterProfile` and calls :func:`register`. The built-in
-modules are auto-discovered on first lookup, so nothing here enumerates them and
-adding one edits no shared file.
-
-A dbt adapter name and a sqlglot dialect name are two namespaces that overlap by
-name without being the same thing (a custom adapter may share Snowflake's SQL
-grammar, for instance). The profile carries both, and :func:`resolve_profile` is
-the one place a run commits to a target: an explicit override names that target
-wholesale, so its grammar and its runtime semantics always agree.
+Built-in profiles live one per module under :mod:`dblect.adapters.builtin` and are
+auto-discovered on first lookup, so nothing here enumerates them. See the package
+docstring for how the pieces fit together.
 """
 
 from __future__ import annotations

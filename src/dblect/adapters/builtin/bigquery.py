@@ -1,7 +1,5 @@
-"""BigQuery: PRIMARY KEY / UNIQUE are advisory (declared but unenforced); NOT NULL
-is enforced on write. Its incremental default is ``merge``, which deduplicates on
-a ``unique_key``.
-"""
+"""BigQuery: PRIMARY KEY / UNIQUE advisory, NOT NULL enforced; incremental default
+``merge``, which deduplicates on a ``unique_key``."""
 
 from __future__ import annotations
 
