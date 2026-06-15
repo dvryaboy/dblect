@@ -225,6 +225,8 @@ Whichever granularity grounds the producing scopes, the check the flag-world ana
 
 The bridge for value-substitution and control-flow vars depends on var-inference for the var's domain (to enumerate worlds), its type, and its usage locations (to establish responsiveness). The config discoverer does not, which is why config ships first. This dependency is the concrete form of the two-front-end architecture: the bridge is where the Jinja-source view (var identity, domain, usage) meets the compiled-SQL view (scopes, lineage, contracts).
 
+One boundary worth naming, since it shapes the domain the bridge enumerates over: var-inference sources a variable's default from `dbt_project.yml` (and target values from `profiles.yml`), not from an inline `var(name, default)` call site. A variable whose only default is inline is still discovered and typed by name, so it appears in the scaffold, yet it carries no recorded default value. dbt has already folded that inline default into the compiled SQL, so the base world's facts are correct as they stand; what the bridge lacks is a base-world assignment to attach to the flag and a domain member to enumerate from, so such a variable degrades to its single compiled value as one world, the same degrade-not-lie posture the `COMPUTED` case takes. Capturing the inline default, which is present in the parsed AST at the call site, is a natural extension once the enumerator consumes it.
+
 ## Soundness contract
 
 The general transfer obligations live in [`propagation-soundness.md`](./propagation-soundness.md) and the facts-specific ones in [`lineage-facts.md`](./lineage-facts.md). The world-specific layer on top:
