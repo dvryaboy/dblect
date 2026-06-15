@@ -90,3 +90,43 @@ The config discoverer already ships. The world-plumbing stream can start immedia
 - The internals of the world enumerator's diffing and reporting beyond the interface D1 fixes.
 - The variability-aware Jinja front end's construction, which is specified when it is scheduled.
 - The discovery adapters deferred in [`flags_and_configs_as_types.md`](./flags_and_configs_as_types.md) (per-entity flags, external flag platforms, cross-package inference).
+
+## File-level breakdown: world plumbing and the fact-level enumerator
+
+This is the first stream specified to the file. It is a working scratch for the implementer and will be removed before merge; the durable record is the streams and decisions above.
+
+### Staging `run_check` (in [`check/run.py`](../../src/dblect/check/run.py))
+
+Today `run_check` resolves contracts, builds the relation and column graphs, propagates FD then domain type in `_propagate`, and derives findings, in one pass. Split the world-invariant build from the per-world propagation:
+
+- `CheckGraphs` (frozen): the world-invariant build, holding `manifest`, `resolved` contracts, and both graph builds. The graph builds stamp `SourceRef`/`ColumnRef` onto the parsed trees in place; those stamps are world-invariant and `propagate` never mutates the trees, so one build is safe to reuse across worlds. State this as an invariant in the docstring so a later control-flow author does not mutate the shared trees.
+- `build_check_graphs(manifest, *, registry=None, dialect="duckdb") -> CheckGraphs`. `resolve_contracts` reads only manifest and registry, so it belongs here.
+- `WorldFacts` (frozen): `world: WorldRef`, plus the world-invariant declared facts and this world's `CompileValue` leaves, kept in separate tuples so the enumerator only appends compile facts and never recomputes declared ones.
+- `base_world_facts(resolved) -> WorldFacts`: wraps `resolved.fd_facts`/`tag_facts` under `BASE_WORLD`, reproducing today's facts exactly.
+- `propagate_world(graphs, facts) -> WorldAnnotations`: the verbatim body of `_propagate`, grounded from `facts` rather than `resolved`, with a fresh `AnnotationStore` per call. `WorldAnnotations` is a frozen bundle (`world`, `domain_type` map) so a later property can be added without changing the signature.
+- `run_check` becomes the thin orchestrator: build graphs, `base_world_facts`, `propagate_world`, derive findings (`_issue_findings` once, `_contradiction_findings`/`_aggregation_findings` over the one world). Signature and behavior unchanged; the CLI call site in [`cli/__init__.py`](../../src/dblect/cli/__init__.py) does not change.
+
+The single-world path stays identical because `base_world_facts` hands `propagate_world` exactly today's fact tuples and `propagate_world` is today's `_propagate`. Pin it with a staging-equivalence boundary test and the unchanged `tests/check/test_run_check.py`.
+
+### The enumerator (new [`check/worlds.py`](../../src/dblect/check/worlds.py))
+
+- `enumerate_worlds(graphs, world_facts: Mapping[WorldRef, tuple[CompileFact, ...]]) -> EnumeratedFindings`: holds one `CheckGraphs`; for each world, builds `WorldFacts` (shared declared facts + this world's routed compile facts), calls `propagate_world`, derives findings, collects a `WorldResult` keyed by `WorldRef`. `BASE_WORLD` with an empty compile-fact tuple reproduces `run_check`.
+- `CompileFact` is a tagged container (property tag + the typed `Fact`) so one map carries both `DomainTag` and `FDSet` facts without stringy typing.
+- Cross-world disagreement is data: a finding present in some worlds and absent in others becomes distinct `WorldResult`s, grouped by finding identity in `EnumeratedFindings`. No exception on disagreement.
+- For this stream the worlds and their facts are supplied directly (a hand-declared `DomainFlag` lowered by hand, or a fixture). The enumerator does not cache annotations across worlds; the lifted/shared-representation optimization is the deferred factoring stream, and the docstring says so to prevent premature coupling.
+
+Re-running propagation per world is clean: `AnnotationStore` and the `propagate` memo are per-call, grounding folds by lattice meet and ignores provenance, and the graphs are immutable. So bucketing by world is filtering which facts reach grounding, never touching `resolve`.
+
+### Coverage (in [`check/findings.py`](../../src/dblect/check/findings.py) and [`check/report.py`](../../src/dblect/check/report.py))
+
+- `ContractCoverage` (`contract`, `worlds_checked`, `axes_at_base_world`) and `WorldCoverage` (`worlds_enumerated`, `per_contract`), added to `CheckReport`. The single-world `run_check` produces the trivial value (one base world, every axis at base).
+- This stream reports enumerated worlds, not influence-scoped worlds; precise per-contract flag-influence attribution waits for the multiplicity cone. The docstring says so, so the number is honest about what it measures.
+- `render_text` gains an additive coverage line (one honest line for the single-world case, so the existing summary-line assertions hold). `render_json` gains a `coverage` block and bumps `JSON_SCHEMA_VERSION` to `"2"`; the schema-version test updates for the new shape.
+
+### Commit sequencing
+
+1. **Stage `run_check`, behavior-preserving.** Add the staging types and functions, rewrite `run_check` to orchestrate them, export from `check/__init__.py`. Staging-equivalence test lands; `test_run_check.py` and the propagation suite stay green unchanged.
+2. **Add the enumerator.** New `check/worlds.py`; base-world-identity, determinism, and cross-world-disagreement tests. Additive, behind a new entry point.
+3. **Land coverage.** Coverage types on `CheckReport`, both renderers, the single JSON schema-version bump and its test update.
+
+`BASE_WORLD`, the config discoverer, and `CompileValue` construction already exist on `main`, so no substrate commit precedes these.
