@@ -393,26 +393,27 @@ class _Walker:
         src = scope.sources.get(table)
         if src is None:
             return None
-        # A struct field access (``t.payload.id``) qualifies to this ``Column``
-        # (``t.payload``) wrapped in a ``Dot`` chain; fold the field path into the
-        # column so lineage addresses the leaf field rather than the struct root,
-        # keeping sibling fields distinct.
-        column = _nested_path(col)
         if isinstance(src, exp.Table):
             source_ref = self._name_to_source.get(src.name)
             if source_ref is None:
                 return None
-            return ColumnRef(source=source_ref, column=column)
-        # ``scope.sources`` values are ``Table | Scope``, so by elimination
-        # ``src`` is a Scope here. Union derived tables: the source is the
-        # union's combined output, not the derived-table scope itself.
-        union_ref = self._union_output_ref.get((id(src), col_name.lower()))
+            # A source relation is a terminal leaf, so a struct field access
+            # (``t.payload.id``) can address the nested leaf directly, keeping it
+            # distinct from a sibling ``t.payload.amt``.
+            return ColumnRef(source=source_ref, column=_nested_path(col))
+        # ``scope.sources`` values are ``Table | Scope``, so by elimination ``src``
+        # is a Scope here (CTE, derived table, or union output). Its columns are
+        # registered intermediate outputs keyed by output name, and a struct passes
+        # through under its root; the field path would dangle on an unregistered
+        # node, so address the root and let the outer query own the ``.id`` access.
+        root = col_name.lower()
+        union_ref = self._union_output_ref.get((id(src), root))
         if union_ref is not None:
-            return ColumnRef(source=union_ref, column=column)
+            return ColumnRef(source=union_ref, column=root)
         scope_ref = self._scope_source_ref.get(id(src))
         if scope_ref is None:
             return None
-        return ColumnRef(source=scope_ref, column=column)
+        return ColumnRef(source=scope_ref, column=root)
 
     def _stamp_aggregates(self, projection: Expr, *, scope: Scope) -> None:
         """Stamp each aggregate call in ``projection`` with its scope's

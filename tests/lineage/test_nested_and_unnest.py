@@ -18,7 +18,7 @@ from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_model_graph, build_relation_graph
-from dblect.lineage.graph import SourceKind, SourceRef
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
@@ -72,6 +72,24 @@ def test_struct_root_projection_still_resolves_to_the_struct_column() -> None:
     # struct column itself.
     edges = _edges("SELECT t.payload AS p FROM t", _STRUCT_SCHEMA)
     assert edges["p"] == {("source.s.t", "payload")}
+
+
+def test_struct_field_access_through_a_cte_connects_to_the_registered_output() -> None:
+    # A struct passes through a CTE under its root, so the outer ``.id`` access must
+    # land on that registered output rather than a ``payload.id`` node the CTE never
+    # registered (which would dangle and cut lineage at the boundary).
+    graph = build_model_graph(
+        model_uid="model.m",
+        sql="WITH c AS (SELECT t.payload FROM t) SELECT c.payload.id AS a FROM c",
+        name_to_source={"t": _T},
+        schema=_STRUCT_SCHEMA,
+        dialect="bigquery",
+    )
+    subjects = set(graph.subjects())
+    upstream = graph.edges.get(ColumnRef(SourceRef(SourceKind.MODEL, "model.m"), "a"), frozenset())
+    assert upstream  # connected, not blind
+    assert upstream <= subjects  # every upstream ref is a registered node, none dangling
+    assert {(u.source.unique_id, u.column) for u in upstream} == {("cte.model.m.c", "payload")}
 
 
 # --- UNNEST grain (uniqueness propagation) --------------------------------------
