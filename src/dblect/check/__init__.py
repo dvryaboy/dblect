@@ -8,6 +8,7 @@ and ``docs/design/declaration-dsl.md`` for the findings it surfaces.
 from __future__ import annotations
 
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
+from dblect.check.flags import DomainFlag, check_worlds, flag_worlds, lower_flag
 from dblect.check.report import JSON_SCHEMA_VERSION, render_json, render_text
 from dblect.check.run import (
     CheckGraphs,
@@ -35,6 +36,7 @@ __all__ = [
     "CheckGraphs",
     "CheckReport",
     "CompileFact",
+    "DomainFlag",
     "EnumeratedFindings",
     "FdCompileFact",
     "TagCompileFact",
@@ -44,7 +46,10 @@ __all__ = [
     "WorldResult",
     "base_world_facts",
     "build_check_graphs",
+    "check_worlds",
     "enumerate_worlds",
+    "flag_worlds",
+    "lower_flag",
     "propagate_world",
     "render_json",
     "render_text",
