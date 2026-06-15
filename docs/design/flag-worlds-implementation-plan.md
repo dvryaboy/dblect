@@ -31,7 +31,7 @@ The start-now stream. It stages the analysis for many worlds and ships the world
 
 ### Var-inference
 
-The long pole, and the critical-path dependency for everything flag-driven. It is specified in [`var-inference-spec.md`](./var-inference-spec.md) and has no code yet, so it is its own milestone.
+The long pole, and the critical-path dependency for everything flag-driven. It is specified in [`var-inference-spec.md`](./var-inference-spec.md), tracked in [#98](https://github.com/dvryaboy/dblect/issues/98), and has no code yet, so it is its own milestone.
 
 - Discover `var()` and `env_var()` usage from Jinja source, infer type, domain, and default, and detect numeric branch points (the spec's `UsageContext` variants).
 - Produce the scaffold (`dblect/flags/discovered.py`) and the discovery report.
