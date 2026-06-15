@@ -26,6 +26,7 @@ This document specifies the algorithm, the output format, and the implementation
 2. Handling external feature flag platforms (LaunchDarkly, Statsig, OpenFeature) or per-entity configuration tables. Deferred to later versions.
 3. Runtime evaluation of macros that depend on warehouse state.
 4. Cross-project inference (a flag declared in one dbt package and referenced in another that doesn't import it).
+5. Reading a variable's default from an inline `var(name, default)` or `env_var(name, default)` call. The default value is sourced only from `dbt_project.yml` (and target-specific values from `profiles.yml`). A variable referenced solely with an inline default is still discovered by name through the usage walk, so it appears in the scaffold; what is not captured is the default *value*. The practical consequence for the world layer: dbt has already resolved that inline default into the compiled SQL, so its effect is fully reflected in the single world the manifest represents (the base world), and a fact derived from compiled SQL is correct for that world. What the enumerator cannot do is recognize the inline default as the base-world assignment for the flag or fold it into the inferred domain, so a variable whose only default is inline is pinned to its compiled value rather than enumerated across worlds. Capturing the inline default (it is present in the parsed AST at the call site) is a natural extension once the enumerator consumes it.
 
 ## Inputs
 
