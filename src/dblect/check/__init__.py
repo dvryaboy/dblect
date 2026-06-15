@@ -9,14 +9,28 @@ from __future__ import annotations
 
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
 from dblect.check.report import JSON_SCHEMA_VERSION, render_json, render_text
-from dblect.check.run import run_check
+from dblect.check.run import (
+    CheckGraphs,
+    WorldAnnotations,
+    WorldFacts,
+    base_world_facts,
+    build_check_graphs,
+    propagate_world,
+    run_check,
+)
 
 __all__ = [
     "JSON_SCHEMA_VERSION",
     "CheckFinding",
     "CheckFindingKind",
+    "CheckGraphs",
     "CheckReport",
     "UnbuiltModel",
+    "WorldAnnotations",
+    "WorldFacts",
+    "base_world_facts",
+    "build_check_graphs",
+    "propagate_world",
     "render_json",
     "render_text",
     "run_check",
