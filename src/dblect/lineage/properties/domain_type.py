@@ -405,9 +405,10 @@ def _multiplicative_rule(
 # Namespaced sketch functions whose result is an opaque sketch (or a count read
 # off one), carrying no value-domain identity. BigQuery spells these as a
 # namespace call, ``HLL_COUNT.INIT(x)``, which parses as ``Dot(Identifier,
-# Anonymous)``. A sketch is dialect-specific, so the set is keyed by namespace and
-# grows as other warehouses' equivalents are added (compare #2's dialect-keyed
-# non-deterministic names).
+# Anonymous)``. The set is keyed by namespace name and grows as other warehouses'
+# sketch families are added; the namespaces seen so far are distinct enough not to
+# need per-dialect disambiguation, so that keying is deferred until one does
+# (compare #2's dialect-keyed non-deterministic names).
 _SKETCH_NAMESPACES: frozenset[str] = frozenset({"HLL_COUNT"})
 
 

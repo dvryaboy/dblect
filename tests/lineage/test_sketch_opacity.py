@@ -68,8 +68,12 @@ def test_hll_init_does_not_carry_the_input_tag() -> None:
     assert ann.value == NAKED
 
 
-def test_hll_extract_yields_no_tag() -> None:
-    ann = _run("SELECT HLL_COUNT.EXTRACT(e.sketch) AS n FROM events e", _facts(), out="n")
+def test_hll_extract_does_not_carry_the_input_tag() -> None:
+    # Tag the sketch column so this pins that EXTRACT drops a tag on its input,
+    # not merely that an untagged input stays untagged.
+    ann = _run(
+        "SELECT HLL_COUNT.EXTRACT(e.sketch) AS n FROM events e", _facts(sketch=_USD), out="n"
+    )
     assert ann.value == NAKED
 
 
