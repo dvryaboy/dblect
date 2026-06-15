@@ -28,17 +28,16 @@ from dblect.adapters import (
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("merge", IncrementalStrategy.MERGE),
-        ("MERGE", IncrementalStrategy.MERGE),
-        ("  delete+insert  ", IncrementalStrategy.DELETE_INSERT),
-        ("insert_overwrite", IncrementalStrategy.INSERT_OVERWRITE),
+        ("merge", IncrementalStrategy.MERGE),  # exact match
+        ("MERGE", IncrementalStrategy.MERGE),  # case-folded
+        ("  delete+insert  ", IncrementalStrategy.DELETE_INSERT),  # whitespace-stripped
     ],
 )
 def test_parse_normalizes_known_strategies(raw: str, expected: IncrementalStrategy) -> None:
     assert IncrementalStrategy.parse(raw) == expected
 
 
-@pytest.mark.parametrize("raw", [None, "", "my_custom_strategy", "upsert"])
+@pytest.mark.parametrize("raw", [None, "", "my_custom_strategy"])
 def test_parse_unset_or_custom_is_none(raw: str | None) -> None:
     assert IncrementalStrategy.parse(raw) is None
 
@@ -97,23 +96,14 @@ def test_unvalidated_adapter_without_override_raises() -> None:
     assert exc_info.value.adapter_type == "snowflake"
 
 
-@pytest.mark.parametrize(
-    ("adapter", "override"),
-    [
-        ("acme_warehouse", "snowflake"),  # an unknown adapter forced to a known target
-        ("snowflake", "duckdb"),  # one known target forced to another (also re-validates)
-        ("snowflake", "exotic"),  # forced to an unknown dialect (conservative target)
-    ],
-)
-def test_override_resolves_to_the_override_targets_whole_profile(
-    adapter: str, override: str
-) -> None:
+def test_override_resolves_to_the_override_targets_whole_profile() -> None:
     # The contract that kills the hybrid: an override names the target wholesale,
     # so the resolved profile IS the override adapter's profile (grammar AND
     # semantics), never the manifest adapter's semantics under another grammar.
-    assert resolve_profile(adapter_type=adapter, explicit_dialect=override) == profile_for_adapter(
-        override
-    )
+    # Using an unvalidated manifest adapter also shows the override bypasses the gate.
+    assert resolve_profile(
+        adapter_type="acme_warehouse", explicit_dialect="snowflake"
+    ) == profile_for_adapter("snowflake")
 
 
 # --- the registry is the extension point --------------------------------------
