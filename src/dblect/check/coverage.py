@@ -21,9 +21,11 @@ See ``docs/design/lineage-facts.md`` ("Coverage and degradation").
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from dblect.lineage.builder import ModelResolution
+from dblect.lineage.facts.model import WorldRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,3 +102,31 @@ class GroundingCoverage:
     by_property: tuple[PropertyGrounding, ...]
     contract_columns: int
     contract_columns_checkable: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorldCoverage:
+    """How many configuration worlds the analysis checked, and which flag axes it
+    varied across them. The single-world run reports one base world and no axes, so
+    today's one-world analysis becomes a stated number rather than a silent
+    assumption that a clean report covers every configuration.
+
+    Per-contract attribution (which worlds each contract was actually checked under)
+    awaits the flag-influence cone. Until it exists every enumerated contract is
+    checked under every enumerated world, so the honest report is the global count
+    and the axes swept, not a per-contract claim the analysis cannot yet back."""
+
+    worlds_enumerated: int
+    axes_enumerated: tuple[str, ...]
+
+    @staticmethod
+    def over(worlds: Iterable[WorldRef]) -> WorldCoverage:
+        """World coverage for an enumeration: the world count and the sorted union of
+        the flag axes the worlds assign."""
+        materialized = tuple(worlds)
+        axes = sorted({axis for world in materialized for axis, _ in world.assignments})
+        return WorldCoverage(worlds_enumerated=len(materialized), axes_enumerated=tuple(axes))
+
+
+# The world coverage of a single-manifest run: one base world, no flag axes swept.
+SINGLE_WORLD: WorldCoverage = WorldCoverage(worlds_enumerated=1, axes_enumerated=())

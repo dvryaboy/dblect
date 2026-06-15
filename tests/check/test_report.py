@@ -17,7 +17,12 @@ from dblect.check import (
     render_json,
     render_text,
 )
-from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
+from dblect.check.coverage import (
+    GroundingCoverage,
+    PropertyGrounding,
+    ResolutionCoverage,
+    WorldCoverage,
+)
 from dblect.loader import LoadIssue
 
 
@@ -27,6 +32,7 @@ def _report(
     unbuilt: tuple[UnbuiltModel, ...] = (),
     resolution: ResolutionCoverage | None = None,
     grounding: GroundingCoverage | None = None,
+    worlds: WorldCoverage | None = None,
 ) -> CheckReport:
     return CheckReport(
         findings=findings,
@@ -37,6 +43,7 @@ def _report(
         predicates_collected=1,
         resolution=resolution or ResolutionCoverage(0, 0, 0, ()),
         grounding=grounding or GroundingCoverage((), 0, 0),
+        worlds=worlds or WorldCoverage(worlds_enumerated=1, axes_enumerated=()),
     )
 
 
@@ -66,7 +73,7 @@ def test_json_is_a_stable_versioned_schema() -> None:
         column="amount",
     )
     payload = json.loads(render_json(_report(finding, load_issues=(LoadIssue("m", "boom"),))))
-    assert payload["schema_version"] == "2"
+    assert payload["schema_version"] == "3"
     assert payload["summary"] == {
         "contracts_resolved": 2,
         "models_propagated": 3,
@@ -113,6 +120,22 @@ def test_coverage_is_rendered_in_both_formats() -> None:
         "resolved": 10,
     }
     assert cov["grounding"]["contract_columns_checkable"] == 3
+
+
+def test_world_coverage_reads_as_one_base_world_by_default() -> None:
+    # The single-world run states its one-world scope plainly, so a clean report is
+    # not mistaken for one that covered every configuration.
+    text = render_text(_report())
+    assert "worlds: 1 (base); no flag axes enumerated" in text
+    worlds = json.loads(render_json(_report()))["coverage"]["worlds"]
+    assert worlds == {"worlds_enumerated": 1, "axes_enumerated": []}
+
+
+def test_world_coverage_reports_the_enumerated_worlds_and_axes() -> None:
+    report = _report(worlds=WorldCoverage(worlds_enumerated=4, axes_enumerated=("currency", "env")))
+    assert "worlds: 4 enumerated over axes: currency, env" in render_text(report)
+    worlds = json.loads(render_json(report))["coverage"]["worlds"]
+    assert worlds == {"worlds_enumerated": 4, "axes_enumerated": ["currency", "env"]}
 
 
 def test_resolution_with_nothing_to_resolve_reads_as_not_applicable() -> None:

@@ -20,6 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import TypeVar
 
 import sqlglot.expressions as exp
@@ -30,17 +31,17 @@ from dblect.check.coverage import GroundingCoverage, PropertyGrounding, Resoluti
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
 from dblect.lineage.builder import (
     BuildIssue,
+    BuildResult,
     RelationBuildResult,
     build_manifest_graph,
     build_relation_graph,
 )
-from dblect.lineage.facts.model import Annotation, Fact
+from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, WorldRef
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
-    RelationLineageGraph,
     SourceKind,
     SourceRef,
     aggregation_site_meta,
@@ -53,6 +54,7 @@ from dblect.lineage.properties.domain_type import (
     domain_type_property,
 )
 from dblect.lineage.properties.functional_dependency import (
+    FDSet,
     functional_dependency_grounded_scopes,
     functional_dependency_grounding,
     functional_dependency_property,
@@ -60,6 +62,93 @@ from dblect.lineage.properties.functional_dependency import (
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
+
+
+@dataclass(frozen=True, slots=True)
+class CheckGraphs:
+    """The world-invariant build: resolved contracts and the two stamped graphs,
+    built once and reused across worlds.
+
+    The builds stamp ``SourceRef``/``ColumnRef`` onto the parsed trees in place;
+    those stamps encode graph identity, not flag values, and ``propagate`` never
+    mutates the trees, so one build is safe to share across every world a run
+    enumerates. Do not mutate the graphs or their trees per world."""
+
+    manifest: Manifest
+    resolved: ResolvedContracts
+    relation_build: RelationBuildResult
+    column_build: BuildResult
+    contracts_resolved: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorldFacts:
+    """The facts that ground one world's propagation. The declared facts are
+    world-invariant (shared across worlds); a world's ``CompileValue`` leaves are
+    appended by the enumerator. Keeping the two apart means the enumerator only
+    adds, never recomputes, the declared facts."""
+
+    world: WorldRef
+    fd_facts: tuple[Fact[FDSet, SourceRef], ...]
+    tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorldAnnotations:
+    """One world's propagation result, keyed by the world it holds under. A bundle
+    rather than a bare mapping so a later property can ride alongside the domain-type
+    annotations without changing ``propagate_world``'s signature."""
+
+    world: WorldRef
+    domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
+
+
+def build_check_graphs(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    registry: ContractRegistry | None = None,
+) -> CheckGraphs:
+    """Resolve contracts and build both lineage graphs once. ``profile`` supplies the
+    dialect every model parses under; the result is world-invariant and reusable
+    across an enumeration."""
+    reg = registry if registry is not None else active_registry()
+    resolved = resolve_contracts(manifest, registry=reg)
+    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect)
+    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
+    return CheckGraphs(
+        manifest=manifest,
+        resolved=resolved,
+        relation_build=relation_build,
+        column_build=column_build,
+        contracts_resolved=len(reg.contracts),
+    )
+
+
+def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
+    """The single manifest's declared facts under ``BASE_WORLD``: the facts the
+    one-world analysis grounds from, with no flag enumeration active."""
+    return WorldFacts(world=BASE_WORLD, fd_facts=resolved.fd_facts, tag_facts=resolved.tag_facts)
+
+
+def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
+    """Propagate the FD property over the relation graph, then domain type over the
+    column graph reading it, grounding from one world's ``facts``. Pure in
+    ``graphs``: a fresh ``AnnotationStore`` per call and no mutation of the shared
+    build, so worlds re-run independently."""
+    fd_prop = functional_dependency_property(
+        functional_dependency_grounding(_by_scope(facts.fd_facts))
+    )
+    store = AnnotationStore()
+    for scope, ann in propagate(graphs.relation_build.graph, fd_prop).items():
+        store.record(fd_prop.name, scope, ann)
+
+    dt_prop = domain_type_property(
+        domain_type_grounding(_by_scope(facts.tag_facts)), fd=fd_prop.ref
+    )
+    ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
+    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx)
+    return WorldAnnotations(world=facts.world, domain_type=domain_type)
 
 
 def run_check(
@@ -77,33 +166,44 @@ def run_check(
     ``resolution_floor`` is the minimum share of column references the propagator
     must resolve before a clean report is trustworthy; when set and the project
     falls under it, a ``RESOLUTION_BELOW_FLOOR`` finding fires. It keys on
-    resolution only, never on grounding."""
-    reg = registry if registry is not None else active_registry()
-    resolved = resolve_contracts(manifest, registry=reg)
+    resolution only, never on grounding.
 
-    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect)
-    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
-    annotations = _propagate(resolved, relation_build.graph, column_build.graph)
+    The single-world entry: it builds the graphs once and propagates the base world,
+    the same sequence the enumerator runs per world."""
+    graphs = build_check_graphs(manifest, profile, registry=registry)
+    world = propagate_world(graphs, base_world_facts(graphs.resolved))
 
-    resolution = ResolutionCoverage.from_models(column_build.resolution)
-    grounding = _grounding_coverage(resolved, relation_build, annotations)
+    resolution = ResolutionCoverage.from_models(graphs.column_build.resolution)
+    grounding = _grounding_coverage(graphs.resolved, graphs.relation_build, world.domain_type)
 
     findings: list[CheckFinding] = []
-    findings.extend(_issue_findings(resolved))
-    findings.extend(_contradiction_findings(manifest, annotations))
-    findings.extend(_aggregation_findings(manifest, annotations, column_build.graph))
+    findings.extend(_issue_findings(graphs.resolved))
+    findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
     return CheckReport(
         findings=tuple(findings),
         load_issues=(),
-        unbuilt=_unbuilt(relation_build.issues, column_build.issues),
-        contracts_resolved=len(reg.contracts),
+        unbuilt=_unbuilt(graphs.relation_build.issues, graphs.column_build.issues),
+        contracts_resolved=graphs.contracts_resolved,
         models_propagated=len(manifest.models),
-        predicates_collected=len(resolved.predicates),
+        predicates_collected=len(graphs.resolved.predicates),
         resolution=resolution,
         grounding=grounding,
     )
+
+
+def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
+    """The findings that vary by world: the domain-type contradictions and the
+    not-well-typed aggregations, read off one world's annotations. The
+    contract-resolution and resolution-floor findings are world-invariant and stay
+    ``run_check``'s to report once."""
+    findings: list[CheckFinding] = []
+    findings.extend(_contradiction_findings(graphs.manifest, world.domain_type))
+    findings.extend(
+        _aggregation_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+    )
+    return findings
 
 
 def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:
@@ -118,27 +218,6 @@ def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:
 
 
 # --- propagation ----------------------------------------------------------------
-
-
-def _propagate(
-    resolved: ResolvedContracts,
-    relation_graph: RelationLineageGraph,
-    column_graph: ColumnLineageGraph,
-) -> Mapping[ColumnRef, Annotation[DomainTag]]:
-    """Propagate the FD property over the relation graph, then domain type over the
-    column graph reading it, exactly as the substrate end-to-end test wires them."""
-    fd_prop = functional_dependency_property(
-        functional_dependency_grounding(_by_scope(resolved.fd_facts))
-    )
-    store = AnnotationStore()
-    for scope, ann in propagate(relation_graph, fd_prop).items():
-        store.record(fd_prop.name, scope, ann)
-
-    dt_prop = domain_type_property(
-        domain_type_grounding(_by_scope(resolved.tag_facts)), fd=fd_prop.ref
-    )
-    ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
-    return propagate(column_graph, dt_prop, dep_context=ctx)
 
 
 _V = TypeVar("_V")
