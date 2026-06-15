@@ -175,11 +175,11 @@ def grain_preserved(keys: CandidateKeySet, origin_key: Key) -> bool:
 
 # --- discoverers -------------------------------------------------------------
 
-# Uniqueness grounds on relations a downstream model can ref by name: models and
-# sources. Seeds and snapshots are eligible in the shared default but kept out
-# until their downstream consumers are tested against them; see issue #52.
-_TARGET_PREFIXES: tuple[str, ...] = ("model.", "source.")
-
+# Uniqueness grounds on any relation a downstream model can ref by name: models,
+# sources, seeds, and snapshots alike (a seed or snapshot feeds downstream SQL the
+# same way a source does, and the relation graph's name map registers all four).
+# The test-target resolution uses the shared default prefix set, which spans the
+# data-flow kinds, so the discoverers stay in step with the nullability siblings.
 _SOURCE_KIND: Mapping[ResourceType, SourceKind] = {
     ResourceType.MODEL: SourceKind.MODEL,
     ResourceType.SOURCE: SourceKind.SOURCE,
@@ -225,7 +225,7 @@ class _UniqueTestDiscoverer:
             col = tm.kwargs.get("column_name")
             if not isinstance(col, str) or not col:
                 continue
-            target = generic_test_target_uid(node, eligible_prefixes=_TARGET_PREFIXES)
+            target = generic_test_target_uid(node)
             scope = _source_ref(manifest, target) if target is not None else None
             if scope is None:
                 continue
@@ -267,7 +267,7 @@ class _UniqueCombinationDiscoverer:
             # rather than ground a partial key.
             if not cols or len(cols) != len(raw_list):
                 continue
-            target = generic_test_target_uid(node, eligible_prefixes=_TARGET_PREFIXES)
+            target = generic_test_target_uid(node)
             scope = _source_ref(manifest, target) if target is not None else None
             if scope is None:
                 continue
