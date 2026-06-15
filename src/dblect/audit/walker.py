@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from sqlglot import Expr
 
+from dblect.adapters import AdapterProfile
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node
 from dblect.nullability.detector import make_nullability_detectors
@@ -99,11 +100,15 @@ class AuditReport:
 
 def run_audit(
     manifest: Manifest,
+    profile: AdapterProfile,
     *,
     detectors: Sequence[Detector] = DEFAULT_DETECTORS,
-    dialect: str | None = "duckdb",
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
+
+    ``profile`` is the run's resolved target: its dialect parses every model and
+    its semantics ground the fact-based detectors, so parsing and enforcement read
+    the same adapter.
 
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
     Models whose ``compiled_code`` is missing or unparseable are listed in
@@ -117,10 +122,10 @@ def run_audit(
     nothing, so they need no opt-in flag. They share the audit's pre-parsed trees,
     so the SQL is parsed once.
     """
-    parsed = _parse_models_for_audit(manifest, dialect=dialect)
+    parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
-    fact_grounded = make_fact_grounded_detectors(manifest, dialect=dialect, parsed=trees)
-    nullability = make_nullability_detectors(manifest, dialect=dialect, parsed=trees)
+    fact_grounded = make_fact_grounded_detectors(manifest, profile, parsed=trees)
+    nullability = make_nullability_detectors(manifest, profile, parsed=trees)
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded, *nullability)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []

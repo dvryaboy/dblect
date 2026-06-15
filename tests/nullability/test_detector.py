@@ -21,9 +21,12 @@ from __future__ import annotations
 import duckdb
 import pytest
 
+from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.sql import FindingKind, parse_sql
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _source(name: str) -> Node:
@@ -106,7 +109,7 @@ def _manifest(mart_sql: str) -> Manifest:
 
 def _kinds(mart_sql: str) -> list[FindingKind]:
     """Every nullability finding the detectors raise on ``mart``."""
-    detectors = make_nullability_detectors(_manifest(mart_sql))
+    detectors = make_nullability_detectors(_manifest(mart_sql), _DUCKDB)
     tree = parse_sql(mart_sql, dialect="duckdb")
     return [f.kind for detector in detectors for f in detector(tree)]
 

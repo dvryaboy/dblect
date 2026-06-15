@@ -185,4 +185,7 @@ def test_audit_warns_when_using_unvalidated_dialect(
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "unvalidated dialect" in result.output
+    # The override names a target dblect has not validated end-to-end, so the run
+    # warns it is best-effort and names the target it fell back to.
+    assert "unvalidated target" in result.output
+    assert "snowflake" in result.output

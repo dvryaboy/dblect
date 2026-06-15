@@ -27,11 +27,14 @@ from dataclasses import dataclass
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import Nullability
 from dblect.lineage.properties.nullability import activated_nullability
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 _MODEL_UID = "model.test.m"
 _OUTPUT_COLS = ("bk", "bv", "jk", "jv")
@@ -139,7 +142,7 @@ def test_non_null_columns_are_never_null_over_materialized_rows(s: NullScenario)
     """Every output column the analyzer calls NON_NULL has no nulls in the duckdb
     materialization. The check never recomputes which columns should be nullable; the
     data is the judge."""
-    anns = activated_nullability(_manifest(s))
+    anns = activated_nullability(_manifest(s), _DUCKDB)
     model = SourceRef(SourceKind.MODEL, _MODEL_UID)
     non_null_cols = [
         c for c in _OUTPUT_COLS if anns[ColumnRef(model, c)].value is Nullability.NON_NULL

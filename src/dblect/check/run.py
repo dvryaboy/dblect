@@ -25,6 +25,7 @@ from typing import TypeVar
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.adapters import AdapterProfile
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
 from dblect.lineage.builder import BuildIssue, build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.model import Annotation, Fact
@@ -54,18 +55,19 @@ from dblect.types import ContractRegistry, ResolvedContracts, active_registry, r
 
 def run_check(
     manifest: Manifest,
+    profile: AdapterProfile,
     *,
     registry: ContractRegistry | None = None,
-    dialect: str | None = "duckdb",
 ) -> CheckReport:
     """Resolve the registered contracts against ``manifest``, propagate, and return
-    the declaration-level findings. ``registry`` defaults to the active one (the
-    loader populates a fresh registry the CLI passes in)."""
+    the declaration-level findings. ``profile`` is the run's resolved target, whose
+    dialect parses every model. ``registry`` defaults to the active one (the loader
+    populates a fresh registry the CLI passes in)."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
 
-    relation_build = build_relation_graph(manifest, dialect=dialect)
-    column_build = build_manifest_graph(manifest, dialect=dialect)
+    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect)
+    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
     annotations = _propagate(resolved, relation_build.graph, column_build.graph)
 
     findings: list[CheckFinding] = []

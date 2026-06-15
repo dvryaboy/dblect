@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from hypothesis import given
 from hypothesis import strategies as st
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint, Predicate
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import (
@@ -223,7 +224,11 @@ def test_model_level_primary_key_grounds_a_composite_key() -> None:
             ConstraintSpec(type=ConstraintType.PRIMARY_KEY, columns=("order_id", "line_id")),
         ),
     )
-    facts = list(native_key_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_key_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert len(facts) == 1
     assert facts[0].value == CandidateKeySet.of(_key("order_id", "line_id"))
     assert isinstance(facts[0].provenance, NativeConstraint)
@@ -241,7 +246,11 @@ def test_column_level_unique_constraint_grounds_a_single_column_key() -> None:
             )
         },
     )
-    facts = list(native_key_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_key_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert facts[0].value == CandidateKeySet.of(_key("email"))
 
 
@@ -250,7 +259,11 @@ def test_native_non_key_constraint_is_ignored() -> None:
         "model.shop.dim_customer",
         constraints=(ConstraintSpec(type=ConstraintType.NOT_NULL, columns=("email",)),),
     )
-    facts = list(native_key_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_key_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert facts == []
 
 
@@ -261,10 +274,18 @@ def test_native_key_enforcement_is_adapter_aware() -> None:
     duck = _model("model.shop.m", constraints=spec)
     snow = _model("model.shop.m", constraints=spec)
     duck_fact = next(
-        iter(native_key_discoverer("duckdb").discover(_manifest(duck), name_to_source={}))
+        iter(
+            native_key_discoverer(profile_for_adapter("duckdb")).discover(
+                _manifest(duck), name_to_source={}
+            )
+        )
     )
     snow_fact = next(
-        iter(native_key_discoverer("snowflake").discover(_manifest(snow), name_to_source={}))
+        iter(
+            native_key_discoverer(profile_for_adapter("snowflake")).discover(
+                _manifest(snow), name_to_source={}
+            )
+        )
     )
     assert isinstance(duck_fact.provenance, NativeConstraint)
     assert isinstance(snow_fact.provenance, NativeConstraint)

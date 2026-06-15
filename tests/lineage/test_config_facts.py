@@ -18,6 +18,7 @@ from __future__ import annotations
 from hypothesis import given
 from hypothesis import strategies as st
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.facts.model import CompileOrigin, CompileValue
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import (
@@ -68,7 +69,9 @@ def _incremental(uid: str, *, strategy: str | None, unique_key: tuple[str, ...])
 
 
 def _keys(manifest: Manifest, *, adapter: str = "duckdb") -> list[CandidateKeySet]:
-    facts = config_key_discoverer(adapter).discover(manifest, name_to_source={})
+    facts = config_key_discoverer(profile_for_adapter(adapter)).discover(
+        manifest, name_to_source={}
+    )
     return [f.value for f in facts]
 
 
@@ -81,7 +84,11 @@ def _key(*cols: str) -> frozenset[str]:
 
 def test_merge_with_unique_key_grounds_the_key() -> None:
     model = _incremental("model.shop.events", strategy="merge", unique_key=("event_id",))
-    facts = list(config_key_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        config_key_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert len(facts) == 1
     fact = facts[0]
     assert fact.scope == SourceRef(SourceKind.MODEL, model.unique_id)

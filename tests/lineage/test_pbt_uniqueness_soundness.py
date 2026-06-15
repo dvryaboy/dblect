@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.predicate_flow import predicate_flow_property
@@ -54,6 +55,8 @@ from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
 
+_DUCKDB = profile_for_adapter("duckdb")
+
 _MODEL_UID = "model.test.m"
 
 # --- shared analyzer + duckdb oracle ----------------------------------------------
@@ -63,7 +66,7 @@ def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
     """The model's promoted candidate keys, exactly as the audit path derives them:
     propagate uniqueness and predicate-flow, then activate conditional keys."""
     graph = build_relation_graph(manifest).graph
-    keys = propagate(graph, uniqueness_property(manifest))
+    keys = propagate(graph, uniqueness_property(manifest, _DUCKDB))
     flow = propagate(graph, predicate_flow_property())
     activated = activate_conditional(keys, flow)
     return activated[SourceRef(SourceKind.MODEL, _MODEL_UID)].keys

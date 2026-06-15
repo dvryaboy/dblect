@@ -24,6 +24,7 @@ from typing import TypeVar
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.predicate_flow import (
@@ -167,8 +168,8 @@ def detect_join_fanout(
 
 def make_fact_grounded_detectors(
     manifest: Manifest,
+    profile: AdapterProfile,
     *,
-    dialect: str | None = "duckdb",
     parsed: Mapping[str, Expr] | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against substrate-derived keys.
@@ -178,9 +179,12 @@ def make_fact_grounded_detectors(
     already-parsed trees so the graph build does not re-parse. Each curried
     detector consults a per-tree scope index, cached so the relation walk runs at
     most once per tree no matter how many detectors consume it.
+
+    ``profile`` is the run's resolved target: its dialect parses the graph and its
+    semantics ground the uniqueness keys, so parsing and enforcement agree.
     """
-    graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
-    keys = propagate(graph, uniqueness_property(manifest))
+    graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    keys = propagate(graph, uniqueness_property(manifest, profile))
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every

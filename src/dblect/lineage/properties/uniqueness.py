@@ -33,6 +33,7 @@ from typing import cast
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.adapters import DEDUP_STRATEGIES, AdapterProfile
 from dblect.lineage.facts.grounding import collect, grounding
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
@@ -190,17 +191,6 @@ _KEY_CONSTRAINT_TYPES: frozenset[ConstraintType] = frozenset(
     {ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE}
 )
 
-# Whether the active adapter enforces PRIMARY KEY / UNIQUE on write. Most cloud
-# warehouses treat them as advisory (Snowflake, BigQuery, Redshift enforce
-# neither), so the default is unenforced; the set names adapters that do enforce.
-# The flag is descriptive provenance, read only by the unenforced-constraint
-# finding, never by fact resolution.
-_KEY_ENFORCING_ADAPTERS: frozenset[str] = frozenset({"duckdb", "postgres"})
-
-
-def _key_enforced(adapter_type: str) -> bool:
-    return adapter_type.lower() in _KEY_ENFORCING_ADAPTERS
-
 
 def _source_ref(manifest: Manifest, target_uid: str) -> SourceRef | None:
     """The graph-keyed ``SourceRef`` for a target node, or ``None`` if the node is
@@ -300,8 +290,8 @@ class _NativeKeyDiscoverer:
     constraint is the implicit single-column key on the column it attaches to.
     """
 
-    def __init__(self, adapter_type: str) -> None:
-        self._enforced = _key_enforced(adapter_type)
+    def __init__(self, profile: AdapterProfile) -> None:
+        self._enforced = profile.key_enforced
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
@@ -353,8 +343,8 @@ def unique_combination_discoverer() -> FactDiscoverer[CandidateKeySet, SourceRef
     return _UniqueCombinationDiscoverer()
 
 
-def native_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, SourceRef]:
-    return _NativeKeyDiscoverer(adapter_type)
+def native_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKeySet, SourceRef]:
+    return _NativeKeyDiscoverer(profile)
 
 
 # --- config-derived keys -----------------------------------------------------
@@ -365,38 +355,11 @@ def native_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, 
 # inserts unconditionally and `insert_overwrite` replaces whole partitions, so
 # neither enforces the key (a `unique_key` under `append` is silently ignored at
 # write time). The guarantee is therefore a property of the (strategy, key) pair,
-# not of `unique_key` alone, and the default strategy is adapter-dependent. We
+# not of `unique_key` alone, and the default strategy is adapter-dependent. The
+# adapter profile owns both the dedup-strategy set and the per-adapter default. We
 # claim a key only when we are sure the write dedups; everywhere else we stay
 # silent, because a wrong key would suppress the very duplicates the audit exists
 # to catch.
-
-# Strategies whose write deduplicates on `unique_key`.
-_DEDUP_STRATEGIES: frozenset[str] = frozenset({"merge", "delete+insert"})
-
-# The adapter's default `incremental_strategy` when one is left unset, for the
-# adapters whose default deduplicates once a `unique_key` is present. Sourced from
-# dbt's adapter docs: Snowflake and BigQuery default to `merge`; Postgres and
-# Redshift default to `delete+insert` when a `unique_key` is set (without one they
-# default to `append`, but the discoverer only consults this map after it has seen
-# a key). An adapter absent here has an unknown-or-non-dedup default (Spark's
-# `append`, for one), so an unset strategy claims no key. The conservative choice
-# costs nothing where the real default is `append` and stays sound elsewhere.
-_KEYED_DEDUP_DEFAULT: Mapping[str, str] = {
-    "snowflake": "merge",
-    "bigquery": "merge",
-    "redshift": "delete+insert",
-    "postgres": "delete+insert",
-}
-
-
-def _effective_strategy(strategy: str | None, adapter_type: str) -> str | None:
-    """The incremental strategy in force: the declared one, else the adapter's
-    default where we know it to dedup on a ``unique_key``, else ``None`` (unknown,
-    claim nothing). The default branch is meaningful only when a key is set, which
-    the discoverer guarantees before consulting it."""
-    if strategy is not None:
-        return strategy.lower()
-    return _KEYED_DEDUP_DEFAULT.get(adapter_type.lower())
 
 
 class _ConfigKeyDiscoverer:
@@ -407,8 +370,8 @@ class _ConfigKeyDiscoverer:
     (``CompileValue(origin=DBT_CONFIG)``), with the same standing as any other
     grounding fact: resolution unions it with declared and native keys."""
 
-    def __init__(self, adapter_type: str) -> None:
-        self._adapter_type = adapter_type
+    def __init__(self, profile: AdapterProfile) -> None:
+        self._profile = profile
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
@@ -420,8 +383,8 @@ class _ConfigKeyDiscoverer:
             config = node.config
             if config is None or config.materialized != "incremental" or not config.unique_key:
                 continue
-            strategy = _effective_strategy(config.incremental_strategy, self._adapter_type)
-            if strategy not in _DEDUP_STRATEGIES:
+            strategy = self._profile.effective_strategy(config.incremental_strategy)
+            if strategy not in DEDUP_STRATEGIES:
                 continue
             out.append(
                 Fact(
@@ -434,8 +397,8 @@ class _ConfigKeyDiscoverer:
         return out
 
 
-def config_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, SourceRef]:
-    return _ConfigKeyDiscoverer(adapter_type)
+def config_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKeySet, SourceRef]:
+    return _ConfigKeyDiscoverer(profile)
 
 
 # --- the relation reducer ----------------------------------------------------
@@ -897,6 +860,7 @@ class _Projection:
 
 def uniqueness_property(
     manifest: Manifest,
+    profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
 ) -> Property[CandidateKeySet, SourceRef]:
@@ -907,12 +871,16 @@ def uniqueness_property(
     SQL. Declared and inferred keys both hold, so they compose by meet
     (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
     set is empty. The property carries its relation-algebra walk as ``reducer`` so
-    the propagator dispatches it without a global registry."""
+    the propagator dispatches it without a global registry.
+
+    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
+    and dedup semantics, and carries any ``--dialect`` override so grammar and
+    semantics stay coherent."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
-        native_key_discoverer(manifest.adapter_type),
-        config_key_discoverer(manifest.adapter_type),
+        native_key_discoverer(profile),
+        config_key_discoverer(profile),
         *extra,
     )
     # The uniqueness discoverers ground against the manifest directly, so they

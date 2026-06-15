@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage import propagate
 from dblect.lineage.builder import build_model_graph
 from dblect.lineage.facts.model import Declared, DeclaredSource, NativeConstraint, Predicate
@@ -30,6 +31,8 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _manifest(*nodes: Node, adapter_type: str = "duckdb") -> Manifest:
@@ -183,7 +186,11 @@ def test_column_level_not_null_constraint_grounds_non_null() -> None:
             )
         },
     )
-    facts = list(native_not_null_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_not_null_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert len(facts) == 1
     fact = facts[0]
     assert fact.scope == ColumnRef(SourceRef(SourceKind.MODEL, model.unique_id), "order_id")
@@ -198,7 +205,11 @@ def test_model_level_not_null_constraint_grounds_each_named_column() -> None:
             ConstraintSpec(type=ConstraintType.NOT_NULL, columns=("order_id", "customer_id")),
         ),
     )
-    facts = list(native_not_null_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_not_null_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     cols = {f.scope.column for f in facts}
     assert cols == {"order_id", "customer_id"}
 
@@ -215,7 +226,11 @@ def test_native_constraint_other_than_not_null_is_ignored() -> None:
             )
         },
     )
-    facts = list(native_not_null_discoverer("duckdb").discover(_manifest(model), name_to_source={}))
+    facts = list(
+        native_not_null_discoverer(profile_for_adapter("duckdb")).discover(
+            _manifest(model), name_to_source={}
+        )
+    )
     assert facts == []
 
 
@@ -233,7 +248,7 @@ def test_nullability_property_flows_discovered_non_null_through_a_model() -> Non
         name_to_source={"orders": src_ref},
         schema={"orders": {"id": "INT"}},
     )
-    prop = nullability_property(manifest, name_to_source={"orders": src_ref})
+    prop = nullability_property(manifest, _DUCKDB, name_to_source={"orders": src_ref})
     anns = propagate(graph, prop)
     leaf = ColumnRef(src_ref, "id")
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.fct"), "id")
@@ -251,7 +266,7 @@ def test_nullability_property_leaves_undeclared_columns_unknown() -> None:
         name_to_source={"orders": src_ref},
         schema={"orders": {"id": "INT"}},
     )
-    prop = nullability_property(manifest, name_to_source={"orders": src_ref})
+    prop = nullability_property(manifest, _DUCKDB, name_to_source={"orders": src_ref})
     anns = propagate(graph, prop)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.fct"), "id")
     assert anns[out].value is Nullability.UNKNOWN
@@ -282,7 +297,7 @@ def test_nullability_property_accepts_extra_discoverers() -> None:
         schema={"orders": {"id": "INT"}},
     )
     prop = nullability_property(
-        _manifest(src), name_to_source={"orders": src_ref}, extra=(_AlwaysNonNull(),)
+        _manifest(src), _DUCKDB, name_to_source={"orders": src_ref}, extra=(_AlwaysNonNull(),)
     )
     anns = propagate(graph, prop)
     assert anns[ColumnRef(src_ref, "id")].value is Nullability.NON_NULL
