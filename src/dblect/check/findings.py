@@ -11,9 +11,10 @@ one statement). See ``docs/design/declaration-dsl.md`` and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
+from dblect.check.coverage import GroundingCoverage, ResolutionCoverage
 from dblect.loader import LoadIssue
 
 
@@ -31,6 +32,11 @@ class CheckFindingKind(StrEnum):
     AGGREGATION_NOT_WELL_TYPED = auto()
     """A reduction over one field of a multi-field type whose other fields are not
     provably constant across the group (the mixed-currency sum)."""
+
+    RESOLUTION_BELOW_FLOOR = auto()
+    """Lineage resolution across the project sits below the configured floor, so
+    the analysis covers only a fraction of columns and a clean report would
+    overstate what was checked. A capability gap, not a project defect."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +72,8 @@ class CheckReport:
     contracts_resolved: int
     models_propagated: int
     predicates_collected: int
+    resolution: ResolutionCoverage = field(default_factory=lambda: ResolutionCoverage(0, 0, 0, ()))
+    grounding: GroundingCoverage = field(default_factory=lambda: GroundingCoverage((), 0, 0))
 
     @property
     def has_findings(self) -> bool:

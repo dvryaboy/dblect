@@ -13,7 +13,8 @@ from typing import TypedDict
 
 from dblect.check.findings import CheckFinding, CheckReport
 
-JSON_SCHEMA_VERSION = "1"
+# Bumped to 2 with the coverage block (resolution + grounding) added to the JSON.
+JSON_SCHEMA_VERSION = "2"
 
 
 class JsonSummary(TypedDict):
@@ -24,6 +25,31 @@ class JsonSummary(TypedDict):
     findings: int
     load_issues: int
     unbuilt: int
+
+
+class JsonPropertyGrounding(TypedDict):
+    property: str
+    grounded: int
+    resolved: int
+
+
+class JsonResolutionCoverage(TypedDict):
+    resolved_columns: int
+    blind_columns: int
+    sites: int
+    unexpanded_stars: int
+    fraction: float | None
+
+
+class JsonGroundingCoverage(TypedDict):
+    by_property: list[JsonPropertyGrounding]
+    contract_columns: int
+    contract_columns_checkable: int
+
+
+class JsonCoverage(TypedDict):
+    resolution: JsonResolutionCoverage
+    grounding: JsonGroundingCoverage
 
 
 class JsonFinding(TypedDict):
@@ -48,13 +74,14 @@ class JsonUnbuilt(TypedDict):
 class JsonReport(TypedDict):
     schema_version: str
     summary: JsonSummary
+    coverage: JsonCoverage
     findings: list[JsonFinding]
     load_issues: list[JsonLoadIssue]
     unbuilt: list[JsonUnbuilt]
 
 
 def render_text(report: CheckReport) -> str:
-    sections: list[str] = [_summary_line(report)]
+    sections: list[str] = [_summary_line(report), _coverage_block(report)]
     if report.load_issues:
         lines = [
             f"  could not load {issue.module}: {issue.message}" for issue in report.load_issues
@@ -69,6 +96,28 @@ def render_text(report: CheckReport) -> str:
         lines = [f"  {m.unique_id}: {m.reason}" for m in report.unbuilt]
         sections.append("could not analyze (no findings reported for these):\n" + "\n".join(lines))
     return "\n\n".join(sections) + "\n"
+
+
+def _coverage_block(report: CheckReport) -> str:
+    """The two coverage metrics, rendered so thin coverage cannot hide behind a
+    short finding list. Resolution is the lineage the propagator could follow;
+    grounding is, among that, how many columns a fact actually checks."""
+    res = report.resolution
+    frac = res.fraction
+    res_pct = "n/a" if frac is None else f"{frac:.1%}"
+    star = f"; {res.unexpanded_stars} unexpanded SELECT *" if res.unexpanded_stars else ""
+    lines = [
+        "coverage:",
+        f"  resolution: {res_pct} of columns ({res.resolved_columns}/{res.sites}){star}",
+    ]
+    g = report.grounding
+    per_prop = "; ".join(f"{p.property_name} {p.grounded}/{p.resolved}" for p in g.by_property)
+    if per_prop:
+        lines.append(f"  grounding: {per_prop}")
+    lines.append(
+        f"  contract columns checkable: {g.contract_columns_checkable}/{g.contract_columns}"
+    )
+    return "\n".join(lines)
 
 
 def _summary_line(report: CheckReport) -> str:
@@ -105,6 +154,23 @@ def render_json(report: CheckReport) -> str:
             "findings": len(report.findings),
             "load_issues": len(report.load_issues),
             "unbuilt": len(report.unbuilt),
+        },
+        "coverage": {
+            "resolution": {
+                "resolved_columns": report.resolution.resolved_columns,
+                "blind_columns": report.resolution.blind_columns,
+                "sites": report.resolution.sites,
+                "unexpanded_stars": report.resolution.unexpanded_stars,
+                "fraction": report.resolution.fraction,
+            },
+            "grounding": {
+                "by_property": [
+                    {"property": p.property_name, "grounded": p.grounded, "resolved": p.resolved}
+                    for p in report.grounding.by_property
+                ],
+                "contract_columns": report.grounding.contract_columns,
+                "contract_columns_checkable": report.grounding.contract_columns_checkable,
+            },
         },
         "findings": [
             {

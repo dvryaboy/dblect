@@ -17,6 +17,7 @@ from dblect.check import (
     render_json,
     render_text,
 )
+from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.loader import LoadIssue
 
 
@@ -24,6 +25,8 @@ def _report(
     *findings: CheckFinding,
     load_issues: tuple[LoadIssue, ...] = (),
     unbuilt: tuple[UnbuiltModel, ...] = (),
+    resolution: ResolutionCoverage | None = None,
+    grounding: GroundingCoverage | None = None,
 ) -> CheckReport:
     return CheckReport(
         findings=findings,
@@ -32,6 +35,8 @@ def _report(
         contracts_resolved=2,
         models_propagated=3,
         predicates_collected=1,
+        resolution=resolution or ResolutionCoverage(0, 0, 0, ()),
+        grounding=grounding or GroundingCoverage((), 0, 0),
     )
 
 
@@ -61,7 +66,7 @@ def test_json_is_a_stable_versioned_schema() -> None:
         column="amount",
     )
     payload = json.loads(render_json(_report(finding, load_issues=(LoadIssue("m", "boom"),))))
-    assert payload["schema_version"] == "1"
+    assert payload["schema_version"] == "2"
     assert payload["summary"] == {
         "contracts_resolved": 2,
         "models_propagated": 3,
@@ -74,6 +79,46 @@ def test_json_is_a_stable_versioned_schema() -> None:
     assert payload["findings"][0]["kind"] == "domain_type_contradiction"
     assert payload["findings"][0]["column"] == "amount"
     assert payload["load_issues"][0]["module"] == "m"
+
+
+def test_coverage_is_rendered_in_both_formats() -> None:
+    resolution = ResolutionCoverage(
+        resolved_columns=8, blind_columns=2, unexpanded_stars=1, worst_models=()
+    )
+    grounding = GroundingCoverage(
+        by_property=(PropertyGrounding("domain_type", grounded=3, resolved=10),),
+        contract_columns=4,
+        contract_columns_checkable=3,
+    )
+    report = _report(resolution=resolution, grounding=grounding)
+
+    # 8 resolved of 11 sites (8 resolved columns + 2 blind columns + 1 unexpanded star).
+    text = render_text(report)
+    assert "resolution: 72.7% of columns (8/11)" in text
+    assert "unexpanded SELECT *" in text
+    assert "domain_type 3/10" in text
+    assert "contract columns checkable: 3/4" in text
+
+    cov = json.loads(render_json(report))["coverage"]
+    assert cov["resolution"] == {
+        "resolved_columns": 8,
+        "blind_columns": 2,
+        "sites": 11,
+        "unexpanded_stars": 1,
+        "fraction": 8 / 11,
+    }
+    assert cov["grounding"]["by_property"][0] == {
+        "property": "domain_type",
+        "grounded": 3,
+        "resolved": 10,
+    }
+    assert cov["grounding"]["contract_columns_checkable"] == 3
+
+
+def test_resolution_with_nothing_to_resolve_reads_as_not_applicable() -> None:
+    text = render_text(_report())
+    assert "resolution: n/a" in text
+    assert json.loads(render_json(_report()))["coverage"]["resolution"]["fraction"] is None
 
 
 def test_unbuilt_models_are_surfaced_not_silent() -> None:
