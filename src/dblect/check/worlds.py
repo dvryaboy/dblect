@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from dblect.check.coverage import WorldCoverage
 from dblect.check.findings import CheckFinding
 from dblect.check.run import CheckGraphs, WorldFacts, propagate_world, world_findings
 from dblect.lineage.facts.model import Fact, WorldRef
@@ -66,6 +67,11 @@ class EnumeratedFindings:
     """Findings aggregated across the enumerated worlds."""
 
     per_world: tuple[WorldResult, ...]
+
+    def coverage(self) -> WorldCoverage:
+        """The world coverage this enumeration achieved: the world count and the flag
+        axes swept."""
+        return WorldCoverage.over(result.world for result in self.per_world)
 
     def by_finding(self) -> Mapping[CheckFinding, frozenset[WorldRef]]:
         """Each finding mapped to the worlds it holds under. A finding whose world

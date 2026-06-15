@@ -169,6 +169,10 @@ def test_identical_compile_facts_yield_identical_findings() -> None:
     # Same facts (USD agreeing with the declared USD downstream): same findings.
     assert by_world[world_a] == by_world[world_b]
 
+    coverage = result.coverage()
+    assert coverage.worlds_enumerated == 2
+    assert coverage.axes_enumerated == ("currency",)
+
 
 def test_cross_world_disagreement_is_data_not_error() -> None:
     manifest = _passthrough_manifest()

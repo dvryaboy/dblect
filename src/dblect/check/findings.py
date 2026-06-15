@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
-from dblect.check.coverage import GroundingCoverage, ResolutionCoverage
+from dblect.check.coverage import SINGLE_WORLD, GroundingCoverage, ResolutionCoverage, WorldCoverage
 from dblect.loader import LoadIssue
 
 
@@ -74,6 +74,7 @@ class CheckReport:
     predicates_collected: int
     resolution: ResolutionCoverage = field(default_factory=lambda: ResolutionCoverage(0, 0, 0, ()))
     grounding: GroundingCoverage = field(default_factory=lambda: GroundingCoverage((), 0, 0))
+    worlds: WorldCoverage = SINGLE_WORLD
 
     @property
     def has_findings(self) -> bool:

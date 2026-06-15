@@ -13,8 +13,8 @@ from typing import TypedDict
 
 from dblect.check.findings import CheckFinding, CheckReport
 
-# Bumped to 2 with the coverage block (resolution + grounding) added to the JSON.
-JSON_SCHEMA_VERSION = "2"
+# Bumped to 3 with world coverage added to the JSON coverage block.
+JSON_SCHEMA_VERSION = "3"
 
 
 class JsonSummary(TypedDict):
@@ -47,9 +47,15 @@ class JsonGroundingCoverage(TypedDict):
     contract_columns_checkable: int
 
 
+class JsonWorldCoverage(TypedDict):
+    worlds_enumerated: int
+    axes_enumerated: list[str]
+
+
 class JsonCoverage(TypedDict):
     resolution: JsonResolutionCoverage
     grounding: JsonGroundingCoverage
+    worlds: JsonWorldCoverage
 
 
 class JsonFinding(TypedDict):
@@ -117,7 +123,19 @@ def _coverage_block(report: CheckReport) -> str:
     lines.append(
         f"  contract columns checkable: {g.contract_columns_checkable}/{g.contract_columns}"
     )
+    lines.append(_worlds_line(report))
     return "\n".join(lines)
+
+
+def _worlds_line(report: CheckReport) -> str:
+    """How many worlds the analysis checked. The single-world case says so plainly so
+    a clean report is not read as covering every configuration."""
+    w = report.worlds
+    axes = ", ".join(w.axes_enumerated)
+    if w.worlds_enumerated <= 1 and not axes:
+        return "  worlds: 1 (base); no flag axes enumerated"
+    over = f" over axes: {axes}" if axes else ""
+    return f"  worlds: {w.worlds_enumerated} enumerated{over}"
 
 
 def _summary_line(report: CheckReport) -> str:
@@ -170,6 +188,10 @@ def render_json(report: CheckReport) -> str:
                 ],
                 "contract_columns": report.grounding.contract_columns,
                 "contract_columns_checkable": report.grounding.contract_columns_checkable,
+            },
+            "worlds": {
+                "worlds_enumerated": report.worlds.worlds_enumerated,
+                "axes_enumerated": list(report.worlds.axes_enumerated),
             },
         },
         "findings": [

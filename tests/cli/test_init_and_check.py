@@ -128,11 +128,12 @@ def test_check_json_format(jaffle_manifest_path: Path, runner: CliRunner, tmp_pa
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "2"
+    assert payload["schema_version"] == "3"
     assert payload["summary"]["contracts_resolved"] == 1
     # The coverage block rides alongside the summary in the schema.
     assert "resolution" in payload["coverage"]
     assert "grounding" in payload["coverage"]
+    assert payload["coverage"]["worlds"] == {"worlds_enumerated": 1, "axes_enumerated": []}
 
 
 # --- catalog wiring -------------------------------------------------------------
