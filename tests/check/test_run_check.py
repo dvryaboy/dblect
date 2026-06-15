@@ -246,8 +246,8 @@ def test_resolution_and_grounding_coverage_are_reported() -> None:
     report = run_check(_creep_manifest(), _DUCKDB)
 
     res = report.resolution
-    assert res.resolved_refs > 0
-    assert res.fraction == 1.0  # every column reference resolves against an upstream
+    assert res.resolved_columns > 0
+    assert res.fraction == 1.0  # every output column's lineage resolves against an upstream
     assert res.unexpanded_stars == 0
 
     # Both contracts name a column whose lineage resolves, so every contract

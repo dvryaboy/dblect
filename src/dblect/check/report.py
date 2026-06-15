@@ -34,8 +34,8 @@ class JsonPropertyGrounding(TypedDict):
 
 
 class JsonResolutionCoverage(TypedDict):
-    resolved_refs: int
-    blind_refs: int
+    resolved_columns: int
+    blind_columns: int
     sites: int
     unexpanded_stars: int
     fraction: float | None
@@ -104,11 +104,11 @@ def _coverage_block(report: CheckReport) -> str:
     grounding is, among that, how many columns a fact actually checks."""
     res = report.resolution
     frac = res.fraction
-    res_pct = "n/a" if frac is None else f"{frac:.0%}"
+    res_pct = "n/a" if frac is None else f"{frac:.1%}"
     star = f"; {res.unexpanded_stars} unexpanded SELECT *" if res.unexpanded_stars else ""
     lines = [
         "coverage:",
-        f"  resolution: {res_pct} of lineage sites ({res.resolved_refs}/{res.sites}){star}",
+        f"  resolution: {res_pct} of columns ({res.resolved_columns}/{res.sites}){star}",
     ]
     g = report.grounding
     per_prop = "; ".join(f"{p.property_name} {p.grounded}/{p.resolved}" for p in g.by_property)
@@ -157,8 +157,8 @@ def render_json(report: CheckReport) -> str:
         },
         "coverage": {
             "resolution": {
-                "resolved_refs": report.resolution.resolved_refs,
-                "blind_refs": report.resolution.blind_refs,
+                "resolved_columns": report.resolution.resolved_columns,
+                "blind_columns": report.resolution.blind_columns,
                 "sites": report.resolution.sites,
                 "unexpanded_stars": report.resolution.unexpanded_stars,
                 "fraction": report.resolution.fraction,

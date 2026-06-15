@@ -35,7 +35,7 @@ from dataclasses import dataclass
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
-from dblect.lineage.facts.grounding import grounding
+from dblect.lineage.facts.grounding import grounded_scopes, grounding
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
 from dblect.lineage.facts.property import DepContext, Property, PropertyRef, relation_property
@@ -142,6 +142,16 @@ def functional_dependency_grounding(
     fold every property uses: an opt-out grounds EXPLICIT top, a resolved bucket
     grounds its value CONCRETE, everything else the IMPLICIT-top default."""
     return grounding(facts, opaque, FUNCTIONAL_DEPENDENCY_LATTICE)
+
+
+def functional_dependency_grounded_scopes(
+    facts: Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]],
+    *,
+    opaque: Collection[SourceRef] = (),
+) -> set[SourceRef]:
+    """The relations a dependency fact grounded, for coverage. Reads the same fold
+    ``functional_dependency_grounding`` does."""
+    return grounded_scopes(facts, opaque, FUNCTIONAL_DEPENDENCY_LATTICE)
 
 
 # --- the relation reducer --------------------------------------------------------

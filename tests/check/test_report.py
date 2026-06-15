@@ -83,7 +83,7 @@ def test_json_is_a_stable_versioned_schema() -> None:
 
 def test_coverage_is_rendered_in_both_formats() -> None:
     resolution = ResolutionCoverage(
-        resolved_refs=8, blind_refs=2, unexpanded_stars=1, worst_models=()
+        resolved_columns=8, blind_columns=2, unexpanded_stars=1, worst_models=()
     )
     grounding = GroundingCoverage(
         by_property=(PropertyGrounding("domain_type", grounded=3, resolved=10),),
@@ -92,17 +92,17 @@ def test_coverage_is_rendered_in_both_formats() -> None:
     )
     report = _report(resolution=resolution, grounding=grounding)
 
-    # 8 resolved of 11 sites (8 resolved refs + 2 blind refs + 1 unexpanded star).
+    # 8 resolved of 11 sites (8 resolved columns + 2 blind columns + 1 unexpanded star).
     text = render_text(report)
-    assert "resolution: 73% of lineage sites (8/11)" in text
+    assert "resolution: 72.7% of columns (8/11)" in text
     assert "unexpanded SELECT *" in text
     assert "domain_type 3/10" in text
     assert "contract columns checkable: 3/4" in text
 
     cov = json.loads(render_json(report))["coverage"]
     assert cov["resolution"] == {
-        "resolved_refs": 8,
-        "blind_refs": 2,
+        "resolved_columns": 8,
+        "blind_columns": 2,
         "sites": 11,
         "unexpanded_stars": 1,
         "fraction": 8 / 11,

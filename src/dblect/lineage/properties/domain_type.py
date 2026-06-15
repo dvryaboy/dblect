@@ -41,7 +41,7 @@ from typing import Final, final
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
-from dblect.lineage.facts.grounding import grounding
+from dblect.lineage.facts.grounding import grounded_scopes, grounding
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
 from dblect.lineage.facts.property import (
@@ -567,6 +567,16 @@ def domain_type_grounding(
     every property uses: an opt-out grounds EXPLICIT top, a resolved bucket grounds its
     value CONCRETE, everything else the IMPLICIT-top default."""
     return grounding(facts, opaque, DOMAIN_TYPE_LATTICE)
+
+
+def domain_type_grounded_scopes(
+    facts: Mapping[ColumnRef, tuple[Fact[DomainTag, ColumnRef], ...]],
+    *,
+    opaque: Collection[ColumnRef] = (),
+) -> set[ColumnRef]:
+    """The columns a domain-type fact grounded, for coverage. Reads the same fold
+    ``domain_type_grounding`` does."""
+    return grounded_scopes(facts, opaque, DOMAIN_TYPE_LATTICE)
 
 
 def domain_type_property(

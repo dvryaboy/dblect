@@ -67,22 +67,22 @@ class BuildIssue:
 
 @dataclass(frozen=True, slots=True)
 class ModelResolution:
-    """Per-model resolution coverage: how many projection column references the
-    builder could follow against how many it fell blind on, plus the count of
-    ``SELECT *`` it could not expand. A model that failed to build at all carries
-    no entry here; it is reported in ``issues`` instead."""
+    """Per-model resolution coverage: how many of the model's output columns the
+    builder could follow the lineage of against how many it fell blind on, plus the
+    count of ``SELECT *`` it could not expand. A model that failed to build at all
+    carries no entry here; it is reported in ``issues`` instead."""
 
     unique_id: str
-    resolved_refs: int
-    blind_refs: int
+    resolved_columns: int
+    blind_columns: int
     unexpanded_stars: int
 
     @property
     def sites(self) -> int:
-        """Resolution sites the builder met: every column reference it tried to
-        resolve, plus every ``SELECT *`` it could not expand. The denominator the
-        resolved share is taken over."""
-        return self.resolved_refs + self.blind_refs + self.unexpanded_stars
+        """Resolution sites the builder met: every output column whose lineage it
+        tried to follow, plus every ``SELECT *`` it could not expand. The
+        denominator the resolved share is taken over."""
+        return self.resolved_columns + self.blind_columns + self.unexpanded_stars
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,8 +209,8 @@ def build_manifest_graph(
         resolution.append(
             ModelResolution(
                 unique_id=uid,
-                resolved_refs=walker.resolved_refs,
-                blind_refs=walker.blind_refs,
+                resolved_columns=walker.resolved_columns,
+                blind_columns=walker.blind_columns,
                 unexpanded_stars=walker.unexpanded_stars,
             )
         )
@@ -294,6 +294,18 @@ def _walk_model(
     return walker
 
 
+@dataclass(frozen=True, slots=True)
+class _Stamped:
+    """A projection's resolved upstream refs (its ``edges`` entry) alongside the
+    leaf tally coverage reads: how many column references attached upstream and how
+    many fell blind. ``refs`` deduplicates; the counts do not, so a column reading
+    one upstream twice still reports two resolved leaves."""
+
+    refs: frozenset[ColumnRef]
+    resolved: int
+    blind: int
+
+
 class _Walker:
     """Per-model scope walker that builds graph entries as it descends."""
 
@@ -323,13 +335,17 @@ class _Walker:
         # One AggregationSite per SELECT scope, resolved lazily and shared by every
         # aggregate stamped in that scope.
         self._site_by_scope: dict[int, AggregationSite | None] = {}
-        # Resolution coverage: every projection column reference the walker meets
-        # is either resolved to an upstream ColumnRef (lineage the propagator can
-        # follow) or fell blind (qualify could not attach a source: a macro that
-        # escaped rendering, an unqualifiable reference, a misparse). An
-        # unexpanded ``SELECT *`` is a blind site of unknown width, counted apart.
-        self.resolved_refs = 0
-        self.blind_refs = 0
+        # Resolution coverage, counted over the model's own output columns (the
+        # top-level projection, the columns the model exposes) rather than every
+        # reference in every nested scope, so a deep CTE chain does not inflate the
+        # denominator. An output column is resolved when every column it reads
+        # attached to an upstream ColumnRef (lineage the propagator can follow) and
+        # blind when any reference fell blind (qualify could not attach a source: a
+        # macro that escaped rendering, an unqualifiable reference, a misparse). A
+        # pure-literal column reads nothing, so it is no resolution site at all. An
+        # unexpanded ``SELECT *`` is one blind column of unknown width, counted apart.
+        self.resolved_columns = 0
+        self.blind_columns = 0
         self.unexpanded_stars = 0
 
     def walk(
@@ -406,21 +422,34 @@ class _Walker:
     ) -> None:
         # A surviving ``Star`` means qualify couldn't expand ``SELECT *`` (no
         # schema for the source). Registering it would surface a phantom
-        # ``"*"`` column on the scope's source. It is a blind site of unknown
-        # width: the propagator follows none of the columns it stands for.
+        # ``"*"`` column on the scope's source. Only the model's own unexpanded
+        # star is an output blind site of unknown width; a star deeper in the tree
+        # surfaces as blind leaves wherever an output column reads through it.
         if isinstance(select, exp.Star):
-            self.unexpanded_stars += 1
+            if scope_source == self._self_ref:
+                self.unexpanded_stars += 1
             return
         out_name = self._alias_or_name(select)
         if not out_name:
             return
         col_ref = ColumnRef(source=scope_source, column=out_name.lower())
-        immediate = self._stamp_columns(select, scope=scope)
+        stamped = self._stamp_columns(select, scope=scope)
         self._stamp_aggregates(select, scope=scope)
         self.expressions[col_ref] = select
-        self.edges[col_ref] = immediate
+        self.edges[col_ref] = stamped.refs
+        if scope_source == self._self_ref:
+            self._count_output_column(stamped)
 
-    def _stamp_columns(self, expr: Expr, *, scope: Scope) -> frozenset[ColumnRef]:
+    def _count_output_column(self, stamped: _Stamped) -> None:
+        """Tally one model output column: blind if any reference fell blind,
+        resolved if it read at least one reference and none fell blind. A column
+        that reads nothing (a pure literal) is no resolution site."""
+        if stamped.blind:
+            self.blind_columns += 1
+        elif stamped.resolved:
+            self.resolved_columns += 1
+
+    def _stamp_columns(self, expr: Expr, *, scope: Scope) -> _Stamped:
         """Stamp the columns that supply ``expr``'s value with their upstream ``ColumnRef``.
 
         Columns lying directly in ``expr`` resolve against ``scope``. A scalar
@@ -428,19 +457,22 @@ class _Walker:
         recurse into its projection against the subquery's own scope and never
         touch its WHERE/FROM, so a correlated predicate column (which filters rows
         rather than supplying the value) does not leak in even though it may
-        resolve against the outer scope. Returns the deduped set of refs as this
-        projection's ``edges`` entry. An unresolved Column is silently skipped:
-        the propagator reads an unstamped Column as "unknown" via the property
-        default.
+        resolve against the outer scope. Returns the deduped set of refs (this
+        projection's ``edges`` entry) with the resolved/blind leaf tally coverage
+        reads. An unresolved Column is silently skipped from ``edges`` (the
+        propagator reads an unstamped Column as "unknown" via the property default)
+        and counted blind.
         """
         direct, subqueries = _projection_leaves(expr)
         immediate: set[ColumnRef] = set()
+        resolved = 0
+        blind = 0
         for col in direct:
             ref = self._resolve_column(col, scope=scope)
             if ref is None:
-                self.blind_refs += 1
+                blind += 1
                 continue
-            self.resolved_refs += 1
+            resolved += 1
             attach_column_ref(col, ref)
             immediate.add(ref)
         for subq in subqueries:
@@ -451,8 +483,11 @@ class _Walker:
             for sel in inner.selects:
                 if isinstance(sel, exp.Star):
                     continue
-                immediate |= self._stamp_columns(sel, scope=sub_scope)
-        return frozenset(immediate)
+                sub = self._stamp_columns(sel, scope=sub_scope)
+                immediate |= sub.refs
+                resolved += sub.resolved
+                blind += sub.blind
+        return _Stamped(refs=frozenset(immediate), resolved=resolved, blind=blind)
 
     def _resolve_column(self, col: exp.Column, *, scope: Scope) -> ColumnRef | None:
         table = col.table
@@ -625,6 +660,9 @@ class _Walker:
             )
 
         arm_refs_per_col: list[list[ColumnRef]] = [[] for _ in output_names]
+        # Leaf tally per output column, summed across arms, so a top-level union
+        # output column counts once with the resolution of everything its arms read.
+        leaves_per_col: list[list[int]] = [[0, 0] for _ in output_names]
         for arm_idx, arm_scope in enumerate(arm_scopes):
             arm_path = (*scope_path, f"arm{arm_idx}")
             arm_ref = SourceRef(
@@ -640,10 +678,12 @@ class _Walker:
                 arm_select = arm_selects[col_idx]
                 arm_col_ref = ColumnRef(source=arm_ref, column=out_name.lower())
                 arm_refs_per_col[col_idx].append(arm_col_ref)
-                immediate = self._stamp_columns(arm_select, scope=arm_scope)
+                stamped = self._stamp_columns(arm_select, scope=arm_scope)
+                leaves_per_col[col_idx][0] += stamped.resolved
+                leaves_per_col[col_idx][1] += stamped.blind
                 self._stamp_aggregates(arm_select, scope=arm_scope)
                 self.expressions[arm_col_ref] = arm_select
-                self.edges[arm_col_ref] = immediate
+                self.edges[arm_col_ref] = stamped.refs
 
         for col_idx, out_name in enumerate(output_names):
             if not out_name or not arm_refs_per_col[col_idx]:
@@ -655,6 +695,10 @@ class _Walker:
             arm_refs = tuple(arm_refs_per_col[col_idx])
             self.expressions[output_col_ref] = UnionConfluence(arm_refs)
             self.edges[output_col_ref] = frozenset(arm_refs)
+            # A top-level union output column is a model output column; count it.
+            if output_src == self._self_ref:
+                resolved, blind = leaves_per_col[col_idx]
+                self._count_output_column(_Stamped(frozenset(arm_refs), resolved, blind))
 
     def _source_ref_for_scope(self, scope: Scope) -> SourceRef:
         ref = self._scope_source_ref.get(id(scope))

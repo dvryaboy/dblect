@@ -1,12 +1,13 @@
 """Coverage as a first-class output of a check, kept as two metrics that mean
 opposite things.
 
-**Resolution coverage** is the fraction of projection column references whose
-lineage the propagator could follow against the fraction it fell blind on (a
+**Resolution coverage** is the fraction of model output columns whose lineage the
+propagator could follow against the fraction it fell blind on (a column reading a
 reference qualify could not attach a source to, an unexpanded ``SELECT *``, a
-macro that escaped rendering). Blindness is a capability gap, so a configurable
-floor turns sustained blindness into a finding, and the floor keys on resolution
-only.
+macro that escaped rendering). Counting model output columns rather than every
+reference in every nested scope keeps a deep CTE chain from inflating the
+denominator. Blindness is a capability gap, so a configurable floor turns
+sustained blindness into a finding, and the floor keys on resolution only.
 
 **Grounding coverage** is, among resolved columns, how many a fact grounded,
 reported per property. An ungrounded column is the expected case under "absence
@@ -30,16 +31,17 @@ class ResolutionCoverage:
     """Aggregate resolution coverage across every model that built, plus the
     lowest-covered models for a message that can name where the blindness is."""
 
-    resolved_refs: int
-    blind_refs: int
+    resolved_columns: int
+    blind_columns: int
     unexpanded_stars: int
     worst_models: tuple[ModelResolution, ...]
 
     @property
     def sites(self) -> int:
-        """Every resolution site across the project: column references attempted
-        plus unexpanded ``SELECT *``. The denominator of the resolved share."""
-        return self.resolved_refs + self.blind_refs + self.unexpanded_stars
+        """Every resolution site across the project: model output columns whose
+        lineage was attempted plus unexpanded ``SELECT *``. The denominator of the
+        resolved share."""
+        return self.resolved_columns + self.blind_columns + self.unexpanded_stars
 
     @property
     def fraction(self) -> float | None:
@@ -48,7 +50,7 @@ class ResolutionCoverage:
         rather than blindness, so the floor skips it). An unexpanded ``SELECT *``
         is one blind site of unknown width: it lowers the share rather than being
         ignored, so a fully ``SELECT *`` model reads as fully blind."""
-        return self.resolved_refs / self.sites if self.sites else None
+        return self.resolved_columns / self.sites if self.sites else None
 
     def below(self, floor: float) -> bool:
         """Whether resolution sits under ``floor``. A project with nothing to
@@ -59,8 +61,8 @@ class ResolutionCoverage:
 
     @staticmethod
     def from_models(models: tuple[ModelResolution, ...], *, worst_n: int = 5) -> ResolutionCoverage:
-        resolved = sum(m.resolved_refs for m in models)
-        blind = sum(m.blind_refs for m in models)
+        resolved = sum(m.resolved_columns for m in models)
+        blind = sum(m.blind_columns for m in models)
         stars = sum(m.unexpanded_stars for m in models)
         # Worst-first by resolved share, then by absolute blindness, so the
         # message names the models a reader should look at. Models with no sites
@@ -68,13 +70,13 @@ class ResolutionCoverage:
         ranked = sorted(
             (m for m in models if m.sites),
             key=lambda m: (
-                m.resolved_refs / m.sites,
-                -(m.blind_refs + m.unexpanded_stars),
+                m.resolved_columns / m.sites,
+                -(m.blind_columns + m.unexpanded_stars),
             ),
         )
         return ResolutionCoverage(
-            resolved_refs=resolved,
-            blind_refs=blind,
+            resolved_columns=resolved,
+            blind_columns=blind,
             unexpanded_stars=stars,
             worst_models=tuple(ranked[:worst_n]),
         )

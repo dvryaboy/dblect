@@ -48,10 +48,12 @@ from dblect.lineage.graph import (
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
+    domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
 )
 from dblect.lineage.properties.functional_dependency import (
+    functional_dependency_grounded_scopes,
     functional_dependency_grounding,
     functional_dependency_property,
 )
@@ -164,17 +166,17 @@ def _grounding_coverage(
     "Resolved" is the set of columns the propagator actually reached: the keys of
     the domain-type annotation map, which includes source leaves the lineage flows
     from (these are absent from ``graph.subjects()``, yet a contract on a source
-    column is genuinely checkable). A scope counts as grounded only when an
-    unconditional fact lands on it (a purely conditional fact grounds nothing
-    unconditionally, matching ``grounding``). The per-property denominator keeps
-    only model-kind columns, since the synthetic CTE and UNION scaffolding is
-    internal, not a column a fact would ever ground."""
+    column is genuinely checkable). "Grounded" reads the property's own grounding
+    fold (``*_grounded_scopes``), the very fold ``_propagate`` grounds from, so the
+    coverage number cannot drift from what was actually grounded. The per-property
+    denominator keeps only model-kind columns, since the synthetic CTE and UNION
+    scaffolding is internal, not a column a fact would ever ground."""
     resolved_columns = set(annotations)
     model_columns = _model_scopes(resolved_columns)
     relation_subjects = _model_scopes(relation_build.graph.subjects())
 
-    tag_scopes = _grounded_scopes(resolved.tag_facts)
-    fd_scopes = _grounded_scopes(resolved.fd_facts)
+    tag_scopes = domain_type_grounded_scopes(_by_scope(resolved.tag_facts))
+    fd_scopes = functional_dependency_grounded_scopes(_by_scope(resolved.fd_facts))
 
     by_property = (
         PropertyGrounding(
@@ -208,11 +210,6 @@ def _model_scopes(subjects: Iterable[ColumnRef | SourceRef]) -> set[ColumnRef | 
     return out
 
 
-def _grounded_scopes(facts: tuple[Fact[_V, _S], ...]) -> set[_S]:
-    """Scopes carrying at least one unconditional fact, the ones that ground."""
-    return {f.scope for f in facts if f.condition is None}
-
-
 def _resolution_floor_findings(
     resolution: ResolutionCoverage, floor: float | None
 ) -> list[CheckFinding]:
@@ -222,18 +219,18 @@ def _resolution_floor_findings(
     # Only models that actually fell blind are worth naming; a fully-resolved
     # model is not "lowest" however the ranking sorted it.
     worst = ", ".join(
-        f"{m.unique_id} ({m.resolved_refs}/{m.sites})"
+        f"{m.unique_id} ({m.resolved_columns}/{m.sites})"
         for m in resolution.worst_models
-        if m.resolved_refs < m.sites
+        if m.resolved_columns < m.sites
     )
     tail = f"; lowest: {worst}" if worst else ""
     return [
         CheckFinding(
             kind=CheckFindingKind.RESOLUTION_BELOW_FLOOR,
             message=(
-                f"resolved {frac:.0%} of lineage sites "
-                f"({resolution.resolved_refs}/{resolution.sites}), below the "
-                f"{floor:.0%} floor; analysis covers only what was resolved{tail}"
+                f"resolved {resolution.resolved_columns}/{resolution.sites} columns "
+                f"({frac:.1%}), below the {floor:.1%} floor; "
+                f"analysis covers only what was resolved{tail}"
             ),
             model_unique_id=None,
         )

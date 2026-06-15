@@ -90,23 +90,25 @@ def collect(
     return {scope: tuple(facts) for scope, facts in buckets.items()}
 
 
-def grounding(
+def _ground(
     facts: Mapping[S, tuple[Fact[K, S], ...]],
     opaque: Collection[S],
     lat: Lattice[K],
-) -> Callable[[S], Annotation[K]]:
-    """Fold each scope's bucket into its grounded annotation and return the lookup.
+) -> dict[S, Annotation[K]]:
+    """The fold itself: the explicit map from scope to grounded annotation, with
+    no IMPLICIT-top default applied. The single home for "what grounds", shared by
+    ``grounding`` (which wraps it in the default-filling lookup) and
+    ``grounded_scopes`` (which reads back which scopes a fact actually grounded).
 
     An opaque scope grounds ``Annotation(top, EXPLICIT)`` regardless of any facts
     present (an opt-out is consulted before facts). A scope whose bucket resolves
-    grounds ``Annotation(value, CONCRETE)``. Every other scope grounds
-    ``Annotation(top, IMPLICIT)``, the "nothing declared" default.
+    grounds ``Annotation(value, CONCRETE)``.
 
     Conditional facts (those carrying a ``condition``) are excluded from the fold:
     they hold only over a row filter, so grounding them unconditionally would
-    over-claim. A scope whose only facts are conditional grounds the IMPLICIT-top
-    default, exactly as if nothing were declared; the facts stay captured in the
-    bucket for an activation step to consume.
+    over-claim. A scope whose only facts are conditional is absent from the map,
+    so it falls to the IMPLICIT-top default exactly as if nothing were declared;
+    the facts stay captured in the bucket for an activation step to consume.
 
     A bucket that resolves to ``bottom`` is a contradiction and raises
     ``FactConflictError`` here, at build time, rather than swallowing it; recovery
@@ -126,13 +128,42 @@ def grounding(
         if is_contradiction:
             raise FactConflictError(scope, unconditional)
         grounded[scope] = Annotation(value, Opacity.CONCRETE)
+    return grounded
 
+
+def grounding(
+    facts: Mapping[S, tuple[Fact[K, S], ...]],
+    opaque: Collection[S],
+    lat: Lattice[K],
+) -> Callable[[S], Annotation[K]]:
+    """Fold each scope's bucket into its grounded annotation and return the lookup.
+
+    A scope absent from the fold grounds ``Annotation(top, IMPLICIT)``, the
+    "nothing declared" default. See ``_ground`` for the grounding rule itself.
+    """
+    grounded = _ground(facts, opaque, lat)
     implicit_top: Annotation[K] = Annotation(lat.top, Opacity.IMPLICIT)
 
     def ground(scope: S) -> Annotation[K]:
         return grounded.get(scope, implicit_top)
 
     return ground
+
+
+def grounded_scopes(
+    facts: Mapping[S, tuple[Fact[K, S], ...]],
+    opaque: Collection[S],
+    lat: Lattice[K],
+) -> set[S]:
+    """The scopes a fact actually grounded (``CONCRETE``), which coverage reports
+    as the grounded share. Reads the same fold ``grounding`` does, so the two can
+    never disagree on what grounds. An opaque opt-out grounds ``EXPLICIT`` top
+    rather than a value, so it is not a fact grounding and is excluded here."""
+    return {
+        scope
+        for scope, ann in _ground(facts, opaque, lat).items()
+        if ann.opacity is Opacity.CONCRETE
+    }
 
 
 def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:
