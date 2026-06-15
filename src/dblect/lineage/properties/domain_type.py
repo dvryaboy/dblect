@@ -402,6 +402,40 @@ def _multiplicative_rule(
     return rule
 
 
+# Namespaced sketch functions whose result is an opaque sketch (or a count read
+# off one), carrying no value-domain identity. BigQuery spells these as a
+# namespace call, ``HLL_COUNT.INIT(x)``, which parses as ``Dot(Identifier,
+# Anonymous)``. A sketch is dialect-specific, so the set is keyed by namespace and
+# grows as other warehouses' equivalents are added (compare #2's dialect-keyed
+# non-deterministic names).
+_SKETCH_NAMESPACES: frozenset[str] = frozenset({"HLL_COUNT"})
+
+
+def _is_sketch_dot(expr: Expr) -> bool:
+    return (
+        isinstance(expr, exp.Dot)
+        and isinstance(expr.this, exp.Identifier)
+        and expr.this.name.upper() in _SKETCH_NAMESPACES
+        and isinstance(expr.expression, exp.Anonymous)
+    )
+
+
+def _dot_rule(
+    expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
+) -> Annotation[DomainTag]:
+    """A ``Dot`` is either a namespaced sketch call or ordinary field access.
+
+    A sketch (``HLL_COUNT.*``) is opaque: its result carries no tag, so it degrades
+    to the no-claim top explicitly rather than relying on the fold happening to
+    absorb at top. Any other ``Dot`` (struct or JSON field access) keeps the
+    default scalar fold, so this rule changes nothing for non-sketch dots."""
+    if _is_sketch_dot(expr):
+        return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
+    if not kids:
+        return Annotation(NAKED, Opacity.IMPLICIT)
+    return _annotate(reduce(_join, (k.value for k in kids)), kids)
+
+
 def _comparison_rule(
     _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
@@ -457,6 +491,7 @@ def _outer_join_null_rule(
 
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
+    exp.Dot: _dot_rule,
     OuterJoinNull: _outer_join_null_rule,
     exp.Add: _additive_rule,
     exp.Sub: _additive_rule,
@@ -494,6 +529,10 @@ DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = {
     exp.Min: AggregateRule(core=_passthrough_core),
     exp.Max: AggregateRule(core=_passthrough_core),
     exp.Count: AggregateRule(core=_count_core),
+    # An approximate distinct count is a cardinality like COUNT: a tag-free number,
+    # not a value in the input's domain. Without this rule the single-operand fold
+    # would carry the input's tag straight through the sketch (#90).
+    exp.ApproxDistinct: AggregateRule(core=_count_core),
 }
 
 
