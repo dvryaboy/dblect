@@ -19,6 +19,7 @@ from dblect.lineage.facts.grounding import (
 )
 from dblect.lineage.facts.lattice import Lattice, consistent, resolve
 from dblect.lineage.facts.model import (
+    BASE_WORLD,
     Annotation,
     CompileOrigin,
     CompileValue,
@@ -46,6 +47,7 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 
 __all__ = [
+    "BASE_WORLD",
     "AggregateRule",
     "Annotation",
     "AnnotationStore",
