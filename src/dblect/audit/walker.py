@@ -39,6 +39,11 @@ from dblect.sql import (
     detect_where_on_outer_joined_nullable,
     parse_sql,
 )
+
+# Manifest-driven, so it is not a public no-arg ``detect_*`` in DEFAULT_DETECTORS;
+# the walker currs it against the manifest's snapshot names (see
+# ``_make_snapshot_detectors``), the same shape as the fact-grounded detectors.
+from dblect.sql.patterns import detect_snapshot_temporal_filter
 from dblect.uniqueness.detector import make_fact_grounded_detectors
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
@@ -126,7 +131,13 @@ def run_audit(
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
     fact_grounded = make_fact_grounded_detectors(manifest, profile, parsed=trees)
     nullability = make_nullability_detectors(manifest, profile, parsed=trees)
-    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded, *nullability)
+    snapshot = _make_snapshot_detectors(manifest)
+    effective_detectors: tuple[Detector, ...] = (
+        *tuple(detectors),
+        *fact_grounded,
+        *nullability,
+        *snapshot,
+    )
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []
@@ -167,6 +178,21 @@ def _parse_models_for_audit(
         except SQLParseError as e:
             out[uid] = e
     return out
+
+
+def _make_snapshot_detectors(manifest: Manifest) -> tuple[Detector, ...]:
+    """The snapshot temporal-filter detector, curried against the manifest's
+    snapshot relation names (by ``name``, matching the relation-graph builder).
+    Returns nothing when the project has no snapshots, so the detector never fires
+    without manifest knowledge that a referenced relation is a snapshot."""
+    names = frozenset(node.name.lower() for node in manifest.snapshots.values())
+    if not names:
+        return ()
+
+    def snapshot_temporal(tree: Expr) -> tuple[Finding, ...]:
+        return detect_snapshot_temporal_filter(tree, snapshot_names=names)
+
+    return (snapshot_temporal,)
 
 
 @dataclass(frozen=True, slots=True)
