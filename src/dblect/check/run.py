@@ -171,15 +171,14 @@ def run_check(
     The single-world entry: it builds the graphs once and propagates the base world,
     the same sequence the enumerator runs per world."""
     graphs = build_check_graphs(manifest, profile, registry=registry)
-    annotations = propagate_world(graphs, base_world_facts(graphs.resolved)).domain_type
+    world = propagate_world(graphs, base_world_facts(graphs.resolved))
 
     resolution = ResolutionCoverage.from_models(graphs.column_build.resolution)
-    grounding = _grounding_coverage(graphs.resolved, graphs.relation_build, annotations)
+    grounding = _grounding_coverage(graphs.resolved, graphs.relation_build, world.domain_type)
 
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(graphs.resolved))
-    findings.extend(_contradiction_findings(manifest, annotations))
-    findings.extend(_aggregation_findings(manifest, annotations, graphs.column_build.graph))
+    findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
     return CheckReport(
@@ -192,6 +191,19 @@ def run_check(
         resolution=resolution,
         grounding=grounding,
     )
+
+
+def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
+    """The findings that vary by world: the domain-type contradictions and the
+    not-well-typed aggregations, read off one world's annotations. The
+    contract-resolution and resolution-floor findings are world-invariant and stay
+    ``run_check``'s to report once."""
+    findings: list[CheckFinding] = []
+    findings.extend(_contradiction_findings(graphs.manifest, world.domain_type))
+    findings.extend(
+        _aggregation_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+    )
+    return findings
 
 
 def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:

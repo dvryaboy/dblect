@@ -17,6 +17,15 @@ from dblect.check.run import (
     build_check_graphs,
     propagate_world,
     run_check,
+    world_findings,
+)
+from dblect.check.worlds import (
+    CompileFact,
+    EnumeratedFindings,
+    FdCompileFact,
+    TagCompileFact,
+    WorldResult,
+    enumerate_worlds,
 )
 
 __all__ = [
@@ -25,13 +34,20 @@ __all__ = [
     "CheckFindingKind",
     "CheckGraphs",
     "CheckReport",
+    "CompileFact",
+    "EnumeratedFindings",
+    "FdCompileFact",
+    "TagCompileFact",
     "UnbuiltModel",
     "WorldAnnotations",
     "WorldFacts",
+    "WorldResult",
     "base_world_facts",
     "build_check_graphs",
+    "enumerate_worlds",
     "propagate_world",
     "render_json",
     "render_text",
     "run_check",
+    "world_findings",
 ]
