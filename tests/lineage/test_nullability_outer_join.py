@@ -14,9 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.nullability import Nullability, activated_nullability
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _model(uid: str, sql: str) -> Node:
@@ -74,7 +77,7 @@ def _activated(*nodes: Node) -> Mapping[ColumnRef, Nullability]:
         adapter_type="duckdb",
         nodes={n.unique_id: n for n in nodes},
     )
-    return {ref: ann.value for ref, ann in activated_nullability(manifest).items()}
+    return {ref: ann.value for ref, ann in activated_nullability(manifest, _DUCKDB).items()}
 
 
 def _col(uid: str, col: str) -> ColumnRef:

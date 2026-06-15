@@ -16,6 +16,7 @@ from collections.abc import Mapping
 import sqlglot.expressions as exp
 
 # The relation-graph builder lives next to the column builder.
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.properties.uniqueness import (
@@ -35,6 +36,8 @@ from dblect.manifest import (
     ResourceType,
 )
 from dblect.sql import parse_sql
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _model(
@@ -105,7 +108,7 @@ def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
         nodes={n.unique_id: n for n in nodes},
     )
     result = build_relation_graph(manifest)
-    prop = uniqueness_property(manifest)
+    prop = uniqueness_property(manifest, _DUCKDB)
     anns = propagate(result.graph, prop)
     return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
 

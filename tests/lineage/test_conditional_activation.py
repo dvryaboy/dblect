@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.properties.predicate_flow import predicate_flow_property
@@ -26,6 +27,8 @@ from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness.detector import make_fact_grounded_detectors
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _model(uid: str, sql: str) -> Node:
@@ -90,7 +93,7 @@ def _activated(*nodes: Node) -> Mapping[str, CandidateKeySet]:
         nodes={n.unique_id: n for n in nodes},
     )
     graph = build_relation_graph(manifest).graph
-    keys = propagate(graph, uniqueness_property(manifest))
+    keys = propagate(graph, uniqueness_property(manifest, _DUCKDB))
     flow = propagate(graph, predicate_flow_property())
     activated = activate_conditional(keys, flow)
     return {ref.unique_id: cks for ref, cks in activated.items() if ref.kind is SourceKind.MODEL}
@@ -316,7 +319,7 @@ def _fanout_kinds(*nodes: Node) -> list[FindingKind]:
         adapter_type="duckdb",
         nodes={n.unique_id: n for n in nodes},
     )
-    _window, fanout = make_fact_grounded_detectors(manifest)
+    _window, fanout = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in fanout(parse_sql(_CONSUMER, dialect="duckdb"))]
 
 
@@ -382,7 +385,7 @@ def _window_kinds(model_sql: str, *nodes: Node) -> list[FindingKind]:
         adapter_type="duckdb",
         nodes={n.unique_id: n for n in nodes},
     )
-    window_keys, _fanout = make_fact_grounded_detectors(manifest)
+    window_keys, _fanout = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in window_keys(parse_sql(model_sql, dialect="duckdb"))]
 
 

@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from dblect.adapters import profile_for_adapter
 from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding, run_audit
 from dblect.audit.reporter import JSON_SCHEMA_VERSION, render_json, render_text
 from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 def _finding(
@@ -112,7 +115,7 @@ def test_skipped_block_shows_reasons() -> None:
 
 def test_report_against_real_jaffle_manifest(jaffle_manifest_path: Path) -> None:
     manifest = Manifest.from_file(jaffle_manifest_path)
-    report = run_audit(manifest)
+    report = run_audit(manifest, _DUCKDB)
     text = render_text(report)
     # The customers null-group hit is the one we know jaffle has.
     assert "models/customers.sql" in text
@@ -212,7 +215,7 @@ def test_json_is_stable_under_unsorted_input() -> None:
 
 def test_json_against_real_jaffle(jaffle_manifest_path: Path) -> None:
     manifest = Manifest.from_file(jaffle_manifest_path)
-    report = run_audit(manifest)
+    report = run_audit(manifest, _DUCKDB)
     payload = json.loads(render_json(report))
     assert payload["summary"]["models_scanned"] == len(manifest.models)
     kinds = {f["kind"] for f in payload["findings"]}

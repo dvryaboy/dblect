@@ -21,9 +21,12 @@ from typing import Any, cast
 import pytest
 import yaml
 
+from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFinding, run_check
 from dblect.loader import load_declarations
 from dblect.manifest import Manifest
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 _CASES_DIR = Path(__file__).parent.parent / "fixtures" / "scenarios" / "cases"
 
@@ -55,7 +58,7 @@ def test_scenario_findings_match(case: Path) -> None:
     loaded = load_declarations(case)
     assert loaded.issues == (), f"declarations failed to load: {loaded.issues}"
 
-    report = run_check(manifest, registry=loaded.registry, dialect="duckdb")
+    report = run_check(manifest, _DUCKDB, registry=loaded.registry)
     actual = sorted(_finding_key(f) for f in report.findings)
     assert actual == _expected(case)
 

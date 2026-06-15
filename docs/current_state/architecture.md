@@ -109,20 +109,23 @@ Topological order is deterministic (ties are broken by node-id sort) so the audi
 
 ## The SQL layer (`src/dblect/sql/`)
 
-Four modules:
+Three modules:
 
 - [**`parse.py`**](../../src/dblect/sql/parse.py): a thin wrapper that runs `sqlglot.parse_one` over the model's compiled SQL.
 - [**`patterns.py`**](../../src/dblect/sql/patterns.py): list queries and detectors over the AST.
-- [**`dialects.py`**](../../src/dblect/sql/dialects.py): adapter -> sqlglot dialect mapping and the validated-set gate.
 - [**`_sqlglot.py`**](../../src/dblect/sql/_sqlglot.py): typed accessors over sqlglot's `Any`-heavy attribute surface.
 
-### Dialect resolution
+### The target adapter (`src/dblect/adapters/`)
 
-`ADAPTER_TO_SQLGLOT_DIALECT` in `dialects.py` is the explicit set of dbt adapters whose detector behavior dblect has validated end-to-end. Today that's `{"duckdb": "duckdb"}`. `VALIDATED_DIALECTS` is derived from the mapping's values.
+A dbt project compiles against one adapter (duckdb, snowflake, bigquery, ...), and that single choice fixes everything dblect reasons about the target: which sqlglot dialect parses its compiled SQL, whether the warehouse enforces `PRIMARY KEY` / `UNIQUE` and `NOT NULL` on write, and which incremental strategy runs when a model leaves `incremental_strategy` unset. [`AdapterProfile`](../../src/dblect/adapters/model.py) gathers those facets into one value so a run reads a single coherent target rather than assembling it from independent per-facet lookups. A dbt adapter name and a sqlglot dialect name are two namespaces that overlap by name without being the same thing; the profile carries both.
 
-`resolve_dialect(adapter_type, explicit_dialect)` is what the CLI calls after loading the manifest. An explicit `--dialect` always wins (the flag itself is the operator's acknowledgment that detector behavior is best-effort). Without it, the adapter must be in the validated mapping; otherwise `UnvalidatedAdapterError` fires and the CLI bails with a message that names the adapter, the validated set, and the `--dialect` escape. When the resolved dialect is outside `VALIDATED_DIALECTS`, the CLI prints a one-line stderr warning so the run is never silently best-effort.
+Profiles live behind a [registry](../../src/dblect/adapters/registry.py): each warehouse is a self-contained module under [`adapters/builtin/`](../../src/dblect/adapters/builtin/) that builds an `AdapterProfile` and calls `register(...)`. The registry auto-discovers those modules on first lookup, so **adding a warehouse is a new file and nothing else** (no central map to edit); an out-of-tree package extends support the same way, by calling `register` at import.
 
-Programmatic callers of `run_audit(manifest, dialect=...)` are unaffected: they pass whatever dialect they want and the walker forwards it to `parse_sql`. The gate lives at the CLI boundary, not in the walker.
+`profile_for_adapter(adapter_type)` is the semantics lookup: it returns the registered profile for a known adapter and a conservative profile for any other, never raising. `resolve_profile(adapter_type, explicit_dialect)` is the parsing-validation gate the CLI calls after loading the manifest. An explicit `--dialect` names the target wholesale, so its grammar and its runtime semantics always agree (forcing `snowflake` gives snowflake's dialect *and* snowflake's enforcement, never a hybrid); passing the flag is the operator's acknowledgment of a best-effort interpretation. Without it, the manifest's adapter must be validated, otherwise `UnvalidatedAdapterError` fires and the CLI bails with a message that names the adapter, the validated set, and the `--dialect` escape. When the resolved target is not validated, the CLI prints a one-line stderr warning so the run is never silently best-effort.
+
+An adapter is **validated** when dblect's detectors have been exercised against its SQL end-to-end. Only `duckdb` is validated today (`validated_adapters()`).
+
+The resolved `AdapterProfile` is threaded as the single target through `run_audit`, `run_check`, the detector makers, and the property constructors; the leaf parsing functions take the profile's `sqlglot_dialect`. Programmatic callers pass a profile directly (e.g. `profile_for_adapter("duckdb")`); the validation gate lives at the CLI boundary, not in the analysis pipeline.
 
 ### `parse_sql(sql, dialect)`
 

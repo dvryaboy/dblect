@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.adapters import AdapterProfile
 from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import ColumnRef, SourceKind
 from dblect.lineage.properties import Nullability
@@ -227,18 +228,23 @@ def _nullable_by_name(
 
 
 def make_nullability_detectors(
-    manifest: Manifest, *, dialect: str | None = "duckdb", parsed: Mapping[str, Expr] | None = None
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    parsed: Mapping[str, Expr] | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the nullability-consuming detectors against the propagated annotations.
 
     Runs one cross-model nullability propagation (outer-join taint plus conditional
     activation, via ``activated_nullability``), indexes the proven-NULLABLE columns by
     relation name, and curries the GROUP BY, join-key, and NOT-IN detectors against that
-    index. ``dialect`` and ``parsed`` are accepted for symmetry with
-    ``make_fact_grounded_detectors`` (the walker passes the pre-parsed trees); the
-    detectors read only the per-relation index.
+    index. ``profile`` is the run's resolved target (its dialect parses, its semantics
+    ground); ``parsed`` lets the walker share its pre-parsed trees. The detectors read
+    only the per-relation index.
     """
-    nullable_by_name = _nullable_by_name(manifest, activated_nullability(manifest, parsed=parsed))
+    nullable_by_name = _nullable_by_name(
+        manifest, activated_nullability(manifest, profile, parsed=parsed)
+    )
 
     def group_by_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_null_group_on_nullable_key(tree, nullable_by_name=nullable_by_name)

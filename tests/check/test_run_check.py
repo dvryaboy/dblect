@@ -16,12 +16,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
 from dblect.types import ModelContract
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 MoneyUSD = Money.refine(currency=Currency.USD)
 
@@ -59,7 +62,7 @@ def test_unresolved_contract_is_a_finding() -> None:
         amount: MoneyUSD
 
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={})
-    report = run_check(manifest)
+    report = run_check(manifest, _DUCKDB)
     assert _kinds(report) == [CheckFindingKind.CONTRACT_ISSUE]
 
 
@@ -75,7 +78,7 @@ def test_a_model_that_cannot_be_analyzed_is_surfaced() -> None:
     manifest = Manifest(
         schema_version="v12", adapter_type="duckdb", nodes={broken.unique_id: broken}
     )
-    report = run_check(manifest)
+    report = run_check(manifest, _DUCKDB)
     assert [m.unique_id for m in report.unbuilt] == ["model.shop.broken"]
     assert report.models_analyzed == 0
 
@@ -121,7 +124,7 @@ def test_currency_creep_flags_the_contradiction_and_its_blast_radius() -> None:
         dbt_model = "stg_payments"
         amount: MoneyUSD  # declared single-currency, contradicted by the multi-currency source
 
-    report = run_check(_creep_manifest())
+    report = run_check(_creep_manifest(), _DUCKDB)
     contradictions = [
         f for f in report.findings if f.kind is CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
     ]
@@ -139,7 +142,7 @@ def test_consistent_single_currency_is_quiet() -> None:
         dbt_model = "stg_payments"
         amount: MoneyUSD
 
-    report = run_check(_creep_manifest())
+    report = run_check(_creep_manifest(), _DUCKDB)
     assert report.findings == ()
 
 
@@ -172,7 +175,7 @@ def test_mixed_currency_sum_is_flagged() -> None:
         dbt_model = "payments"
         amount: Money.columns(amount="amount", currency="currency")
 
-    report = run_check(_agg_manifest())
+    report = run_check(_agg_manifest(), _DUCKDB)
     agg = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
     assert len(agg) == 1
     assert agg[0].model_unique_id == "model.shop.revenue_by_country"
@@ -209,7 +212,7 @@ def test_sum_over_a_case_expression_is_not_flagged() -> None:
         dbt_model = "payments"
         amount: Money.columns(amount="amount", currency="currency")
 
-    report = run_check(manifest)
+    report = run_check(manifest, _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 
@@ -222,5 +225,5 @@ def test_declared_dependency_discharges_the_sum() -> None:
         def country_sets_currency(self: ContractSelf) -> object:
             return self.country.determines(self.currency)
 
-    report = run_check(_agg_manifest())
+    report = run_check(_agg_manifest(), _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]

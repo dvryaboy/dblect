@@ -28,6 +28,7 @@ from enum import StrEnum
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
+from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.grounding import collect, grounding
 from dblect.lineage.facts.lattice import Lattice
@@ -261,22 +262,15 @@ class _NotNullTestDiscoverer:
         return out
 
 
-# NOT NULL is enforced on write by essentially every warehouse, unlike the
-# advisory PRIMARY KEY / UNIQUE that several leave unchecked, so the default is
-# enforced. The set names adapters known to treat it otherwise (none yet); the
-# flag is descriptive provenance, read only by the unenforced-constraint finding.
-_NOT_NULL_ADVISORY_ADAPTERS: frozenset[str] = frozenset()
-
-
-def _not_null_enforced(adapter_type: str) -> bool:
-    return adapter_type.lower() not in _NOT_NULL_ADVISORY_ADAPTERS
-
-
 class _NativeNotNullDiscoverer:
-    """Grounds NON_NULL from native ``NOT NULL`` constraints (dbt 1.5+)."""
+    """Grounds NON_NULL from native ``NOT NULL`` constraints (dbt 1.5+).
 
-    def __init__(self, adapter_type: str) -> None:
-        self._enforced = _not_null_enforced(adapter_type)
+    Whether the constraint is enforced on write is the adapter profile's call
+    (NOT NULL is enforced on essentially every warehouse); the flag is descriptive
+    provenance, read only by the unenforced-constraint finding."""
+
+    def __init__(self, profile: AdapterProfile) -> None:
+        self._enforced = profile.not_null_enforced
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
@@ -315,12 +309,13 @@ def not_null_test_discoverer() -> FactDiscoverer[Nullability, ColumnRef]:
     return _NotNullTestDiscoverer()
 
 
-def native_not_null_discoverer(adapter_type: str) -> FactDiscoverer[Nullability, ColumnRef]:
-    return _NativeNotNullDiscoverer(adapter_type)
+def native_not_null_discoverer(profile: AdapterProfile) -> FactDiscoverer[Nullability, ColumnRef]:
+    return _NativeNotNullDiscoverer(profile)
 
 
 def nullability_property(
     manifest: Manifest,
+    profile: AdapterProfile,
     *,
     name_to_source: Mapping[str, SourceRef],
     extra: tuple[FactDiscoverer[Nullability, ColumnRef], ...] = (),
@@ -328,10 +323,11 @@ def nullability_property(
     """The manifest-backed nullability property: grounding folds the discoverers'
     NON_NULL claims (plus any ``extra``) through the lattice, leaving every
     undeclared column UNKNOWN. No opaque opt-out reader is wired yet, so the
-    opaque set is empty."""
+    opaque set is empty. ``profile`` is the run's resolved target, fixing the
+    adapter's enforcement semantics."""
     discoverers = (
         not_null_test_discoverer(),
-        native_not_null_discoverer(manifest.adapter_type),
+        native_not_null_discoverer(profile),
         *extra,
     )
     facts = collect(manifest, discoverers, name_to_source=name_to_source)
@@ -356,7 +352,9 @@ def nullability_property(
 # activated columns then fold NON_NULL into the column annotations.
 
 
-def _conditional_notnull_carrier(manifest: Manifest) -> Property[CandidateKeySet, SourceRef]:
+def _conditional_notnull_carrier(
+    manifest: Manifest, profile: AdapterProfile
+) -> Property[CandidateKeySet, SourceRef]:
     """A relation-scoped carrier for conditional NON_NULL columns, grounded from the
     ``where``-filtered ``not_null`` tests and flowed across model boundaries.
 
@@ -371,7 +369,7 @@ def _conditional_notnull_carrier(manifest: Manifest) -> Property[CandidateKeySet
     """
     facts = collect(
         manifest,
-        (not_null_test_discoverer(), native_not_null_discoverer(manifest.adapter_type)),
+        (not_null_test_discoverer(), native_not_null_discoverer(profile)),
         name_to_source={},
     )
     conditional = _conditional_columns_by_relation(facts)
@@ -517,7 +515,7 @@ def taint_outer_joins(
 
 
 def activated_nullability(
-    manifest: Manifest, *, parsed: Mapping[str, Expr] | None = None
+    manifest: Manifest, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
 ) -> Mapping[ColumnRef, Annotation[Nullability]]:
     """Per-column nullability with outer-join optional sides tainted NULLABLE and
     conditional NON_NULL facts activated against the predicate flow.
@@ -528,13 +526,18 @@ def activated_nullability(
     relations, the flow says which scopes satisfy the predicate, and every activated
     column folds NON_NULL into its annotation. ``parsed`` shares the audit's already-parsed
     trees so the whole pass re-parses nothing; the nullability detectors are its consumer.
+    ``profile`` is the run's resolved target, fixing both the parse dialect and the
+    enforcement semantics so they agree.
     """
+    dialect = profile.sqlglot_dialect
     tainted = taint_outer_joins(
-        build_manifest_graph(manifest, parsed=parsed).graph, manifest, parsed=parsed
+        build_manifest_graph(manifest, dialect=dialect, parsed=parsed).graph,
+        manifest,
+        parsed=parsed,
     )
-    base = dict(propagate(tainted, nullability_property(manifest, name_to_source={})))
-    relation_graph = build_relation_graph(manifest, parsed=parsed).graph
-    carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest))
+    base = dict(propagate(tainted, nullability_property(manifest, profile, name_to_source={})))
+    relation_graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
+    carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest, profile))
     # Flow is consulted only where a conditional claim waits to activate, so seed the
     # flow pass with those scopes and let it pull in their upstreams rather than walking
     # every relation. ``activate_conditional`` reads flow only at carrier scopes whose

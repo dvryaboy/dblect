@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from sqlglot import Expr
 
+from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness.detector import (
@@ -16,6 +17,8 @@ from dblect.uniqueness.detector import (
     detect_non_unique_window_order_keys,
     make_fact_grounded_detectors,
 )
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 _Keys = dict[str, frozenset[frozenset[str]]]
 
@@ -354,7 +357,9 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
         nodes={n.unique_id: n for n in (src, test, model)},
     )
     tree = _parse(sql)
-    window_keys, _fanout = make_fact_grounded_detectors(manifest, parsed={model.unique_id: tree})
+    window_keys, _fanout = make_fact_grounded_detectors(
+        manifest, _DUCKDB, parsed={model.unique_id: tree}
+    )
     findings = window_keys(tree)
     # `orders_v2` is unique on (id); the window's (customer_id, ts) key is not
     # covered, so the non-deterministic ranking is flagged.

@@ -6,9 +6,12 @@ import shutil
 import subprocess
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
+
+if TYPE_CHECKING:
+    from dblect.adapters import AdapterProfile
 
 app = typer.Typer(
     name="dblect",
@@ -91,11 +94,6 @@ def audit(
     from dblect.audit import run_audit
     from dblect.audit.reporter import render_json, render_text
     from dblect.manifest import Manifest
-    from dblect.sql.dialects import (
-        VALIDATED_DIALECTS,
-        UnvalidatedAdapterError,
-        resolve_dialect,
-    )
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir,
@@ -105,26 +103,8 @@ def audit(
     )
     typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
-    try:
-        dialect = resolve_dialect(
-            adapter_type=loaded.adapter_type,
-            explicit_dialect=dialect_override,
-        )
-    except UnvalidatedAdapterError as e:
-        raise typer.BadParameter(
-            f"manifest adapter is `{e.adapter_type}`, which is not in "
-            f"dblect's validated set ({sorted(VALIDATED_DIALECTS)}). "
-            f"Pass --dialect <name> to force a sqlglot dialect "
-            f"(interpretation will be best-effort)."
-        ) from e
-    if dialect not in VALIDATED_DIALECTS:
-        typer.echo(
-            f"audit: using unvalidated dialect `{dialect}` "
-            f"(validated: {sorted(VALIDATED_DIALECTS)}); "
-            f"detector behavior is best-effort.",
-            err=True,
-        )
-    report = run_audit(loaded, dialect=dialect)
+    profile = _resolve_profile(loaded.adapter_type, dialect_override, command="audit")
+    report = run_audit(loaded, profile)
     rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
     typer.echo(rendered)
     if report.findings and not no_fail:
@@ -175,11 +155,11 @@ def check(
     )
     typer.echo(f"check: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
-    dialect = _resolve_dialect(loaded.adapter_type, dialect_override)
+    profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check")
 
     load_result = load_declarations(project_dir)
     report = replace(
-        run_check(loaded, registry=load_result.registry, dialect=dialect),
+        run_check(loaded, profile, registry=load_result.registry),
         load_issues=load_result.issues,
     )
     rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
@@ -255,23 +235,33 @@ def _scaffold_declarations(decl: Path) -> list[Path]:
     return created
 
 
-def _resolve_dialect(adapter_type: str, dialect_override: str | None) -> str:
-    from dblect.sql.dialects import (
-        VALIDATED_DIALECTS,
+def _resolve_profile(
+    adapter_type: str, dialect_override: str | None, *, command: str
+) -> AdapterProfile:
+    """Resolve the run's single target profile, turning an unvalidated adapter into
+    an actionable CLI error and warning when the resolved target is best-effort."""
+    from dblect.adapters import (
         UnvalidatedAdapterError,
-        resolve_dialect,
+        resolve_profile,
+        validated_adapters,
     )
 
     try:
-        dialect = resolve_dialect(adapter_type=adapter_type, explicit_dialect=dialect_override)
+        profile = resolve_profile(adapter_type=adapter_type, explicit_dialect=dialect_override)
     except UnvalidatedAdapterError as e:
         raise typer.BadParameter(
             f"manifest adapter is `{e.adapter_type}`, not in dblect's validated set "
-            f"({sorted(VALIDATED_DIALECTS)}); pass --dialect <name> to force one."
+            f"({sorted(validated_adapters())}); pass --dialect <name> to force a target "
+            f"(interpretation will be best-effort)."
         ) from e
-    if dialect not in VALIDATED_DIALECTS:
-        typer.echo(f"using unvalidated dialect `{dialect}`; behavior is best-effort.", err=True)
-    return dialect
+    if not profile.validated:
+        typer.echo(
+            f"{command}: using unvalidated target `{profile.adapter_type}` "
+            f"(dialect `{profile.sqlglot_dialect}`, validated: {sorted(validated_adapters())}); "
+            f"behavior is best-effort.",
+            err=True,
+        )
+    return profile
 
 
 def _resolve_manifest_path(

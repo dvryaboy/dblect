@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
@@ -30,6 +31,8 @@ from dblect.lineage.properties.functional_dependency import (
 from dblect.lineage.properties.uniqueness import uniqueness_property
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 _FdFacts = Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]]
 
@@ -108,7 +111,7 @@ def _fds(facts: _FdFacts, *nodes: Node, read_keys: bool = False) -> dict[str, FD
     graph = build_relation_graph(manifest).graph
     ground = functional_dependency_grounding(facts)
     if read_keys:
-        uniq = uniqueness_property(manifest)
+        uniq = uniqueness_property(manifest, _DUCKDB)
         store = AnnotationStore()
         for scope, ann in propagate(graph, uniq).items():
             store.record(uniq.name, scope, ann)

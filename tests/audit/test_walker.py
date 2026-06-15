@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from dblect.adapters import profile_for_adapter
 from dblect.audit import (
     DEFAULT_DETECTORS,
     AuditReport,
@@ -14,6 +15,8 @@ from dblect.audit import (
 )
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.sql import FindingKind
+
+_DUCKDB = profile_for_adapter("duckdb")
 
 
 @pytest.fixture(scope="module")
@@ -23,7 +26,7 @@ def jaffle(jaffle_manifest_path: Path) -> Manifest:
 
 @pytest.fixture(scope="module")
 def jaffle_report(jaffle: Manifest) -> AuditReport:
-    return run_audit(jaffle)
+    return run_audit(jaffle, _DUCKDB)
 
 
 def test_audit_scans_every_model_with_compiled_code(
@@ -60,7 +63,7 @@ def test_audit_skips_models_without_sql(jaffle: Manifest) -> None:
         adapter_type=jaffle.adapter_type,
         nodes=drained,
     )
-    report = run_audit(altered)
+    report = run_audit(altered, _DUCKDB)
     assert any(
         s.unique_id == a_model_uid and s.reason.startswith("no compiled SQL")
         for s in report.skipped
@@ -78,7 +81,7 @@ def test_audit_records_parse_errors_without_blowing_up(jaffle: Manifest) -> None
         adapter_type=jaffle.adapter_type,
         nodes=drained,
     )
-    report = run_audit(altered)
+    report = run_audit(altered, _DUCKDB)
     assert any(
         s.unique_id == a_model_uid and s.reason.startswith("parse error") for s in report.skipped
     )
@@ -88,7 +91,7 @@ def test_audit_records_parse_errors_without_blowing_up(jaffle: Manifest) -> None
 
 def test_custom_detector_list_only_runs_those(jaffle: Manifest) -> None:
     # Empty detector tuple = nothing fires; still exercises the parse/scan loop.
-    report = run_audit(jaffle, detectors=())
+    report = run_audit(jaffle, _DUCKDB, detectors=())
     assert report.findings == ()
     assert report.models_scanned == len(jaffle.models)
 
@@ -148,7 +151,7 @@ def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> N
             customers.unique_id: replace(customers, raw_code=suppressed_sql),
         },
     )
-    report = run_audit(altered)
+    report = run_audit(altered, _DUCKDB)
     # The customers null-group finding is gone from active findings.
     null_group_hits = [
         lf
@@ -176,7 +179,7 @@ def test_bare_noqa_fixture_surfaces_as_malformed_suppression(jaffle: Manifest) -
             a_model_uid: replace(node, raw_code="-- noqa-fixture\n" + node.raw_code),
         },
     )
-    report = run_audit(altered)
+    report = run_audit(altered, _DUCKDB)
     [bad] = [
         lf
         for lf in report.findings
@@ -198,7 +201,7 @@ def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> N
             customers.unique_id: replace(customers, raw_code=blanket),
         },
     )
-    report = run_audit(altered)
+    report = run_audit(altered, _DUCKDB)
     # The blanket suppression at line 1 only covers line 1-2, not the GROUP BY.
     # So the customers null-group finding still surfaces.
     still_there = [lf for lf in report.findings if lf.model_unique_id == customers.unique_id]
@@ -231,7 +234,7 @@ def test_run_audit_parses_each_model_once(
         return real_parse_one(sql, *args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
 
     monkeypatch.setattr(sqlglot, "parse_one", counting_parse_one)
-    run_audit(jaffle)
+    run_audit(jaffle, _DUCKDB)
     assert set(counts) == model_sqls, "every model's compiled SQL should be parsed"
     repeated = {n for n in counts.values() if n > 1}
     assert not repeated, f"each model's SQL should parse exactly once; counts: {counts.values()}"
@@ -267,7 +270,7 @@ def test_macro_emitted_join_visible_in_compiled_code() -> None:
         columns={},
     )
     manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
-    report = run_audit(manifest)
+    report = run_audit(manifest, _DUCKDB)
     assert any(
         lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
     ), "compiled path should see the macro-emitted LEFT JOIN and flag the GROUP BY"
