@@ -19,15 +19,21 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TypeVar
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
+from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
-from dblect.lineage.builder import BuildIssue, build_manifest_graph, build_relation_graph
+from dblect.lineage.builder import (
+    BuildIssue,
+    RelationBuildResult,
+    build_manifest_graph,
+    build_relation_graph,
+)
 from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
@@ -35,6 +41,7 @@ from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
     RelationLineageGraph,
+    SourceKind,
     SourceRef,
     aggregation_site_meta,
 )
@@ -58,11 +65,17 @@ def run_check(
     profile: AdapterProfile,
     *,
     registry: ContractRegistry | None = None,
+    resolution_floor: float | None = None,
 ) -> CheckReport:
     """Resolve the registered contracts against ``manifest``, propagate, and return
     the declaration-level findings. ``profile`` is the run's resolved target, whose
     dialect parses every model. ``registry`` defaults to the active one (the loader
-    populates a fresh registry the CLI passes in)."""
+    populates a fresh registry the CLI passes in).
+
+    ``resolution_floor`` is the minimum share of column references the propagator
+    must resolve before a clean report is trustworthy; when set and the project
+    falls under it, a ``RESOLUTION_BELOW_FLOOR`` finding fires. It keys on
+    resolution only, never on grounding."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
 
@@ -70,10 +83,14 @@ def run_check(
     column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
     annotations = _propagate(resolved, relation_build.graph, column_build.graph)
 
+    resolution = ResolutionCoverage.from_models(column_build.resolution)
+    grounding = _grounding_coverage(resolved, relation_build, annotations)
+
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(resolved))
     findings.extend(_contradiction_findings(manifest, annotations))
     findings.extend(_aggregation_findings(manifest, annotations, column_build.graph))
+    findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
     return CheckReport(
         findings=tuple(findings),
@@ -82,6 +99,8 @@ def run_check(
         contracts_resolved=len(reg.contracts),
         models_propagated=len(manifest.models),
         predicates_collected=len(resolved.predicates),
+        resolution=resolution,
+        grounding=grounding,
     )
 
 
@@ -129,6 +148,96 @@ def _by_scope(facts: tuple[Fact[_V, _S], ...]) -> dict[_S, tuple[Fact[_V, _S], .
     for fact in facts:
         grouped.setdefault(fact.scope, []).append(fact)
     return {scope: tuple(items) for scope, items in grouped.items()}
+
+
+# --- coverage --------------------------------------------------------------------
+
+
+def _grounding_coverage(
+    resolved: ResolvedContracts,
+    relation_build: RelationBuildResult,
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+) -> GroundingCoverage:
+    """Per-property grounding over the property's resolved subjects, plus the
+    contract-scoped slice.
+
+    "Resolved" is the set of columns the propagator actually reached: the keys of
+    the domain-type annotation map, which includes source leaves the lineage flows
+    from (these are absent from ``graph.subjects()``, yet a contract on a source
+    column is genuinely checkable). A scope counts as grounded only when an
+    unconditional fact lands on it (a purely conditional fact grounds nothing
+    unconditionally, matching ``grounding``). The per-property denominator keeps
+    only model-kind columns, since the synthetic CTE and UNION scaffolding is
+    internal, not a column a fact would ever ground."""
+    resolved_columns = set(annotations)
+    model_columns = _model_scopes(resolved_columns)
+    relation_subjects = _model_scopes(relation_build.graph.subjects())
+
+    tag_scopes = _grounded_scopes(resolved.tag_facts)
+    fd_scopes = _grounded_scopes(resolved.fd_facts)
+
+    by_property = (
+        PropertyGrounding(
+            property_name="domain_type",
+            grounded=len(tag_scopes & model_columns),
+            resolved=len(model_columns),
+        ),
+        PropertyGrounding(
+            property_name="functional_dependency",
+            grounded=len(fd_scopes & relation_subjects),
+            resolved=len(relation_subjects),
+        ),
+    )
+    # The columns contracts name are the column scopes a contract fact lands on;
+    # "checkable" means lineage reached them, so a declared type is actually
+    # propagated rather than silently uncheckable on a model that did not build.
+    return GroundingCoverage(
+        by_property=by_property,
+        contract_columns=len(tag_scopes),
+        contract_columns_checkable=len(tag_scopes & resolved_columns),
+    )
+
+
+def _model_scopes(subjects: Iterable[ColumnRef | SourceRef]) -> set[ColumnRef | SourceRef]:
+    """The model-kind subjects among ``subjects``; synthetic scaffolding dropped."""
+    out: set[ColumnRef | SourceRef] = set()
+    for s in subjects:
+        ref = s.source if isinstance(s, ColumnRef) else s
+        if ref.kind is SourceKind.MODEL:
+            out.add(s)
+    return out
+
+
+def _grounded_scopes(facts: tuple[Fact[_V, _S], ...]) -> set[_S]:
+    """Scopes carrying at least one unconditional fact, the ones that ground."""
+    return {f.scope for f in facts if f.condition is None}
+
+
+def _resolution_floor_findings(
+    resolution: ResolutionCoverage, floor: float | None
+) -> list[CheckFinding]:
+    if floor is None or not resolution.below(floor):
+        return []
+    frac = resolution.fraction or 0.0
+    # Only models that actually fell blind are worth naming; a fully-resolved
+    # model is not "lowest" however the ranking sorted it.
+    worst = ", ".join(
+        f"{m.unique_id} ({m.resolved_refs}/{m.sites})"
+        for m in resolution.worst_models
+        if m.resolved_refs < m.sites
+    )
+    tail = f"; lowest: {worst}" if worst else ""
+    return [
+        CheckFinding(
+            kind=CheckFindingKind.RESOLUTION_BELOW_FLOOR,
+            message=(
+                f"resolved {frac:.0%} of lineage sites "
+                f"({resolution.resolved_refs}/{resolution.sites}), below the "
+                f"{floor:.0%} floor; analysis covers only what was resolved{tail}"
+            ),
+            model_unique_id=None,
+        )
+    ]
 
 
 # --- finding derivation ---------------------------------------------------------

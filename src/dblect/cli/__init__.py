@@ -142,6 +142,19 @@ def check(
         bool,
         typer.Option("--no-fail", help="Always exit 0, even when findings exist."),  # pyright: ignore[reportUnknownMemberType]
     ] = False,
+    resolution_floor: Annotated[
+        float | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--resolution-floor",
+            min=0.0,
+            max=1.0,
+            help=(
+                "Minimum share (0..1) of column references lineage must resolve; "
+                "below it a RESOLUTION_BELOW_FLOOR finding fires so thin coverage "
+                "is not read as a clean bill."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Load a project's contracts, propagate, and report declaration-level findings."""
     from dataclasses import replace
@@ -159,7 +172,9 @@ def check(
 
     load_result = load_declarations(project_dir)
     report = replace(
-        run_check(loaded, profile, registry=load_result.registry),
+        run_check(
+            loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
+        ),
         load_issues=load_result.issues,
     )
     rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)

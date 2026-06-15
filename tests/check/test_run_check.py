@@ -227,3 +227,68 @@ def test_declared_dependency_discharges_the_sum() -> None:
 
     report = run_check(_agg_manifest(), _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+# --- coverage -------------------------------------------------------------------
+
+
+def test_resolution_and_grounding_coverage_are_reported() -> None:
+    # Consistent single-currency contracts keep the report quiet, so the coverage
+    # numbers are what is under test, not a side effect of findings.
+    class RawPayments(ModelContract):
+        dbt_model = "payments"
+        amount: MoneyUSD
+
+    class StgPayments(ModelContract):
+        dbt_model = "stg_payments"
+        amount: MoneyUSD
+
+    report = run_check(_creep_manifest(), _DUCKDB)
+
+    res = report.resolution
+    assert res.resolved_refs > 0
+    assert res.fraction == 1.0  # every column reference resolves against an upstream
+    assert res.unexpanded_stars == 0
+
+    # Both contracts name a column whose lineage resolves, so every contract
+    # column is checkable: a declared type that is actually propagated.
+    grounding = report.grounding
+    assert grounding.contract_columns >= 1
+    assert grounding.contract_columns_checkable == grounding.contract_columns
+    dt = next(p for p in grounding.by_property if p.property_name == "domain_type")
+    assert dt.grounded >= 1
+    assert dt.resolved >= dt.grounded
+
+
+def test_resolution_floor_fires_on_blindness_and_is_silent_when_clean() -> None:
+    # `SELECT *` over a source with no documented columns cannot be expanded, so
+    # the projection is an unexpanded-star blind site and resolution is 0%.
+    opaque = _node("source.shop.raw.opaque", kind=ResourceType.SOURCE, sql=None, columns=_cols())
+    passthru = _node(
+        "model.shop.passthru",
+        kind=ResourceType.MODEL,
+        sql="SELECT * FROM opaque",
+        columns=_cols(x="INT"),
+    )
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={opaque.unique_id: opaque, passthru.unique_id: passthru},
+    )
+
+    assert passthru.unique_id not in {m.unique_id for m in run_check(manifest, _DUCKDB).unbuilt}
+    assert run_check(manifest, _DUCKDB).resolution.unexpanded_stars == 1
+
+    breached = run_check(manifest, _DUCKDB, resolution_floor=0.5)
+    assert CheckFindingKind.RESOLUTION_BELOW_FLOOR in _kinds(breached)
+    # The floor keys on resolution only and never fires without one set.
+    assert CheckFindingKind.RESOLUTION_BELOW_FLOOR not in _kinds(run_check(manifest, _DUCKDB))
+
+
+def test_resolution_floor_is_silent_when_coverage_clears_it() -> None:
+    class RawPayments(ModelContract):
+        dbt_model = "payments"
+        amount: MoneyUSD
+
+    report = run_check(_creep_manifest(), _DUCKDB, resolution_floor=0.99)
+    assert CheckFindingKind.RESOLUTION_BELOW_FLOOR not in _kinds(report)

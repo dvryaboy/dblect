@@ -66,9 +66,30 @@ class BuildIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelResolution:
+    """Per-model resolution coverage: how many projection column references the
+    builder could follow against how many it fell blind on, plus the count of
+    ``SELECT *`` it could not expand. A model that failed to build at all carries
+    no entry here; it is reported in ``issues`` instead."""
+
+    unique_id: str
+    resolved_refs: int
+    blind_refs: int
+    unexpanded_stars: int
+
+    @property
+    def sites(self) -> int:
+        """Resolution sites the builder met: every column reference it tried to
+        resolve, plus every ``SELECT *`` it could not expand. The denominator the
+        resolved share is taken over."""
+        return self.resolved_refs + self.blind_refs + self.unexpanded_stars
+
+
+@dataclass(frozen=True, slots=True)
 class BuildResult:
     graph: ColumnLineageGraph
     issues: tuple[BuildIssue, ...]
+    resolution: tuple[ModelResolution, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +174,7 @@ def build_manifest_graph(
     # reference resolves against an upstream model the project never documented.
     schema: dict[str, dict[str, str]] = {k: dict(v) for k, v in _build_schema(manifest).items()}
     issues: list[BuildIssue] = []
+    resolution: list[ModelResolution] = []
     graph = ColumnLineageGraph.empty()
     for uid in manifest.dag.topological_order():
         if uid not in manifest.models:
@@ -163,7 +185,7 @@ def build_manifest_graph(
             issues.append(BuildIssue(model_unique_id=uid, message="model has no compiled SQL"))
             continue
         try:
-            per_model = build_model_graph(
+            walker = _walk_model(
                 model_uid=uid,
                 sql=sql,
                 name_to_source=name_to_source,
@@ -183,9 +205,18 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
+        per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
+        resolution.append(
+            ModelResolution(
+                unique_id=uid,
+                resolved_refs=walker.resolved_refs,
+                blind_refs=walker.blind_refs,
+                unexpanded_stars=walker.unexpanded_stars,
+            )
+        )
         graph = graph.merge(per_model)
         _record_output_columns(schema, model.name, uid, per_model)
-    return BuildResult(graph=graph, issues=tuple(issues))
+    return BuildResult(graph=graph, issues=tuple(issues), resolution=tuple(resolution))
 
 
 def _record_output_columns(
@@ -219,6 +250,32 @@ def build_model_graph(
     SQL is parsed once. It is copied before qualification, which mutates in place, so
     the caller's tree is left untouched.
     """
+    walker = _walk_model(
+        model_uid=model_uid,
+        sql=sql,
+        name_to_source=name_to_source,
+        schema=schema,
+        dialect=dialect,
+        tree=tree,
+    )
+    return ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
+
+
+def _walk_model(
+    *,
+    model_uid: str,
+    sql: str,
+    name_to_source: Mapping[str, SourceRef],
+    schema: Mapping[str, Mapping[str, str]] | None = None,
+    dialect: str | None = "duckdb",
+    tree: Expr | None = None,
+) -> _Walker:
+    """Parse, qualify, and walk one model, returning the populated walker.
+
+    The walker carries both the graph entries (``edges``, ``expressions``) and the
+    resolution counts. ``build_model_graph`` keeps only the graph; the manifest
+    build also reads the counts. Splitting it here is what lets coverage ride
+    alongside the graph without changing ``build_model_graph``'s return type."""
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
     expression: Expr = tree.copy() if tree is not None else sqlglot.parse_one(sql, dialect=dialect)
     expression = qualify(
@@ -234,7 +291,7 @@ def build_model_graph(
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
     walker.walk(root_scope, scope_path=())
-    return ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
+    return walker
 
 
 class _Walker:
@@ -266,6 +323,14 @@ class _Walker:
         # One AggregationSite per SELECT scope, resolved lazily and shared by every
         # aggregate stamped in that scope.
         self._site_by_scope: dict[int, AggregationSite | None] = {}
+        # Resolution coverage: every projection column reference the walker meets
+        # is either resolved to an upstream ColumnRef (lineage the propagator can
+        # follow) or fell blind (qualify could not attach a source: a macro that
+        # escaped rendering, an unqualifiable reference, a misparse). An
+        # unexpanded ``SELECT *`` is a blind site of unknown width, counted apart.
+        self.resolved_refs = 0
+        self.blind_refs = 0
+        self.unexpanded_stars = 0
 
     def walk(
         self,
@@ -341,8 +406,10 @@ class _Walker:
     ) -> None:
         # A surviving ``Star`` means qualify couldn't expand ``SELECT *`` (no
         # schema for the source). Registering it would surface a phantom
-        # ``"*"`` column on the scope's source.
+        # ``"*"`` column on the scope's source. It is a blind site of unknown
+        # width: the propagator follows none of the columns it stands for.
         if isinstance(select, exp.Star):
+            self.unexpanded_stars += 1
             return
         out_name = self._alias_or_name(select)
         if not out_name:
@@ -371,7 +438,9 @@ class _Walker:
         for col in direct:
             ref = self._resolve_column(col, scope=scope)
             if ref is None:
+                self.blind_refs += 1
                 continue
+            self.resolved_refs += 1
             attach_column_ref(col, ref)
             immediate.add(ref)
         for subq in subqueries:
