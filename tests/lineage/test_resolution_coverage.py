@@ -50,7 +50,7 @@ def _resolution(manifest: Manifest, uid: str) -> tuple[int, int, int]:
     return model.resolved_columns, model.blind_columns, model.unexpanded_stars
 
 
-def test_every_column_reference_resolves_against_a_documented_upstream() -> None:
+def test_each_output_column_resolves_against_a_documented_upstream() -> None:
     src = _node(
         "source.shop.raw.payments",
         kind=ResourceType.SOURCE,
@@ -68,8 +68,6 @@ def test_every_column_reference_resolves_against_a_documented_upstream() -> None
 
 
 def test_unexpanded_select_star_is_a_blind_site() -> None:
-    # A source with no documented columns: qualify cannot expand `*`, so the
-    # projection is one unexpanded-star blind site and no reference resolves.
     src = _node("source.shop.raw.opaque", kind=ResourceType.SOURCE, sql=None, columns=_cols())
     model = _node(
         "model.shop.passthru",
@@ -93,8 +91,6 @@ def test_literal_only_model_has_no_resolution_sites() -> None:
 
 
 def test_a_column_built_from_many_references_counts_once() -> None:
-    # ``amount + tax`` reads two upstream columns but is one output column:
-    # coverage counts the column, not the references that supply it.
     src = _node(
         "source.shop.raw.payments",
         kind=ResourceType.SOURCE,
@@ -111,9 +107,6 @@ def test_a_column_built_from_many_references_counts_once() -> None:
 
 
 def test_cte_depth_does_not_inflate_the_denominator() -> None:
-    # The model exposes one output column however many CTE hops its lineage takes.
-    # Intermediate CTE columns are not output columns, so deepening the chain
-    # leaves coverage at one resolved column rather than one per hop.
     src = _node(
         "source.shop.raw.payments",
         kind=ResourceType.SOURCE,
