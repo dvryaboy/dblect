@@ -501,17 +501,23 @@ class _Walker:
             source_ref = self._name_to_source.get(src.name)
             if source_ref is None:
                 return None
-            return ColumnRef(source=source_ref, column=col_name.lower())
-        # ``scope.sources`` values are ``Table | Scope``, so by elimination
-        # ``src`` is a Scope here. Union derived tables: the source is the
-        # union's combined output, not the derived-table scope itself.
-        union_ref = self._union_output_ref.get((id(src), col_name.lower()))
+            # A source relation is a terminal leaf, so a struct field access
+            # (``t.payload.id``) can address the nested leaf directly, keeping it
+            # distinct from a sibling ``t.payload.amt``.
+            return ColumnRef(source=source_ref, column=_nested_path(col))
+        # ``scope.sources`` values are ``Table | Scope``, so by elimination ``src``
+        # is a Scope here (CTE, derived table, or union output). Its columns are
+        # registered intermediate outputs keyed by output name, and a struct passes
+        # through under its root; the field path would dangle on an unregistered
+        # node, so address the root and let the outer query own the ``.id`` access.
+        root = col_name.lower()
+        union_ref = self._union_output_ref.get((id(src), root))
         if union_ref is not None:
-            return ColumnRef(source=union_ref, column=col_name.lower())
+            return ColumnRef(source=union_ref, column=root)
         scope_ref = self._scope_source_ref.get(id(src))
         if scope_ref is None:
             return None
-        return ColumnRef(source=scope_ref, column=col_name.lower())
+        return ColumnRef(source=scope_ref, column=root)
 
     def _stamp_aggregates(self, projection: Expr, *, scope: Scope) -> None:
         """Stamp each aggregate call in ``projection`` with its scope's
@@ -742,6 +748,30 @@ class _Walker:
             if src is child:
                 return alias
         return None
+
+
+def _nested_path(col: exp.Column) -> str:
+    """The case-folded column path a projection column addresses, including any
+    trailing struct-field access.
+
+    After qualification, ``t.payload.id`` is the ``Column`` ``t.payload`` wrapped
+    in ``Dot(..., id)``, and ``t.payload.inner.id`` nests another ``Dot`` on the
+    left spine. Walking up while the column is that left spine recovers the field
+    path, so the leaf is addressed as ``payload.id`` rather than collapsing every
+    field of ``payload`` to the struct root. A column with no field access is just
+    its own name.
+    """
+    parts = [col.name]
+    node: Expr = col
+    parent = node.parent
+    while isinstance(parent, exp.Dot) and parent.this is node:
+        field = parent.expression
+        if not isinstance(field, exp.Identifier):
+            break  # a computed field access is not a static path; stop here
+        parts.append(field.name)
+        node = parent
+        parent = node.parent
+    return ".".join(p.lower() for p in parts)
 
 
 def _projection_leaves(expr: Expr) -> tuple[list[exp.Column], list[exp.Subquery]]:

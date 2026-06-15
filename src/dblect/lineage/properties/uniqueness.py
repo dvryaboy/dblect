@@ -646,6 +646,12 @@ class _RelationWalk:
             if not isinstance(inner, Expr) or not alias:
                 return None
             return alias, self.scope_keys(inner, cte_scope=cte_scope)
+        # UNNEST explodes one row per array element, so it multiplies the row set
+        # and carries no candidate key of its own. Left unresolved on purpose: a
+        # FROM-position UNNEST then yields no keys, and a joined UNNEST fails
+        # ``_join_preserves`` (its target resolves to nothing), so a parent key
+        # correctly does not survive the explosion. Recovering ``(parent_key,
+        # offset)`` when ``WITH OFFSET`` is present is a later precision refinement.
         return None
 
     def _join_preserves(self, j: exp.Join, *, cte_scope: Mapping[str, _Carried]) -> bool:
