@@ -241,9 +241,9 @@ def _resolve_profile(
     """Resolve the run's single target profile, turning an unvalidated adapter into
     an actionable CLI error and warning when the resolved target is best-effort."""
     from dblect.adapters import (
-        VALIDATED_ADAPTERS,
         UnvalidatedAdapterError,
         resolve_profile,
+        validated_adapters,
     )
 
     try:
@@ -251,13 +251,13 @@ def _resolve_profile(
     except UnvalidatedAdapterError as e:
         raise typer.BadParameter(
             f"manifest adapter is `{e.adapter_type}`, not in dblect's validated set "
-            f"({sorted(VALIDATED_ADAPTERS)}); pass --dialect <name> to force a target "
+            f"({sorted(validated_adapters())}); pass --dialect <name> to force a target "
             f"(interpretation will be best-effort)."
         ) from e
     if not profile.validated:
         typer.echo(
             f"{command}: using unvalidated target `{profile.adapter_type}` "
-            f"(dialect `{profile.sqlglot_dialect}`, validated: {sorted(VALIDATED_ADAPTERS)}); "
+            f"(dialect `{profile.sqlglot_dialect}`, validated: {sorted(validated_adapters())}); "
             f"behavior is best-effort.",
             err=True,
         )

@@ -13,9 +13,11 @@ import pytest
 
 from dblect.adapters import (
     DEDUP_STRATEGIES,
+    AdapterProfile,
     IncrementalStrategy,
     UnvalidatedAdapterError,
     profile_for_adapter,
+    register,
     resolve_profile,
 )
 
@@ -142,3 +144,29 @@ def test_override_to_unknown_dialect_stays_conservative() -> None:
     assert profile.sqlglot_dialect == "exotic"
     assert profile.validated is False
     assert profile.default_incremental_strategy is None
+
+
+# --- the registry is the extension point -------------------------------------
+
+
+def test_builtins_are_auto_discovered() -> None:
+    """The built-in adapter modules register themselves on first lookup, so a known
+    adapter resolves without this test importing its module."""
+    assert profile_for_adapter("bigquery").default_incremental_strategy is IncrementalStrategy.MERGE
+
+
+def test_register_makes_a_new_adapter_self_contained() -> None:
+    """Supporting a warehouse is registering a profile, no core map to edit; the
+    built-ins register themselves this same way."""
+    profile = register(
+        AdapterProfile(
+            adapter_type="widget_warehouse",
+            sqlglot_dialect="duckdb",
+            validated=False,
+            not_null_enforced=True,
+            key_enforced=True,
+            default_incremental_strategy=IncrementalStrategy.MERGE,
+        )
+    )
+    assert profile_for_adapter("widget_warehouse") is profile
+    assert profile_for_adapter("  WIDGET_WAREHOUSE ").key_enforced is True
