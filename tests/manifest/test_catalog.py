@@ -216,3 +216,66 @@ def test_nodes_absent_from_catalog_pass_through_untouched() -> None:
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={model.unique_id: model})
     merged = manifest.merge_catalog(Catalog.from_raw(_raw_catalog(nodes={}, sources={})))
     assert merged.nodes["model.shop.orders"] is manifest.nodes["model.shop.orders"]
+
+
+def test_catalog_internal_case_collision_collapses_to_first() -> None:
+    # A warehouse that reports a column under two cases (`amount` and `AMOUNT`)
+    # for an otherwise-undocumented leaf must not yield two columns: the first
+    # wins and the second case-folds into it.
+    source = _node("source.shop.raw.payments", kind=ResourceType.SOURCE, columns={})
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={source.unique_id: source}
+    )
+    catalog = Catalog.from_raw(
+        _raw_catalog(
+            nodes={},
+            sources={
+                "source.shop.raw.payments": _catalog_entry(
+                    "source.shop.raw.payments", "raw", "payments", amount="DECIMAL", AMOUNT="FLOAT"
+                )
+            },
+        )
+    )
+    cols = manifest.merge_catalog(catalog).nodes["source.shop.raw.payments"].columns
+    assert set(cols) == {"amount"}
+    assert cols["amount"].data_type == "DECIMAL"
+
+
+def test_uppercase_catalog_columns_resolve_against_lowercase_sql() -> None:
+    # The motivating warehouse shape: a Snowflake-style catalog reports columns
+    # uppercased, while the model SQL writes them lowercase. sqlglot's qualifier
+    # normalizes identifier case against the schema, so `SELECT *` over the
+    # undocumented source still expands and the columns flow through.
+    source = _node("source.shop.raw.payments", kind=ResourceType.SOURCE, columns={})
+    model = _sql_node(
+        "model.shop.stg_payments",
+        kind=ResourceType.MODEL,
+        sql="SELECT * FROM payments",
+        columns={},
+    )
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="snowflake",
+        nodes={source.unique_id: source, model.unique_id: model},
+    )
+    catalog = Catalog.from_raw(
+        _raw_catalog(
+            nodes={},
+            sources={
+                "source.shop.raw.payments": _catalog_entry(
+                    "source.shop.raw.payments",
+                    "raw",
+                    "payments",
+                    AMOUNT="DECIMAL",
+                    CURRENCY="VARCHAR",
+                )
+            },
+        )
+    )
+    graph = build_manifest_graph(manifest.merge_catalog(catalog)).graph
+    resolved = {
+        ref.column
+        for ref in graph.subjects()
+        if ref.source.kind is SourceKind.MODEL and ref.source.unique_id == "model.shop.stg_payments"
+    }
+    assert resolved == {"amount", "currency"}

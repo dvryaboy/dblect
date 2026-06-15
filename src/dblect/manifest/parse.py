@@ -285,11 +285,16 @@ class Manifest:
                 merged[uid] = node
                 continue
             columns = dict(node.columns)
-            documented = {name.lower() for name in columns}
+            # Track present names case-insensitively, seeded from the documented
+            # columns and grown as catalog columns land, so two catalog entries
+            # that differ only in case (a warehouse reporting both) collapse to
+            # the first rather than duplicating.
+            present = {name.lower() for name in columns}
             for col_name, data_type in catalog_columns.items():
-                if col_name.lower() in documented:
+                if col_name.lower() in present:
                     continue
                 columns[col_name] = Column(name=col_name, data_type=data_type, description=None)
+                present.add(col_name.lower())
             merged[uid] = replace(node, columns=columns)
         return replace(self, nodes=merged)
 

@@ -48,8 +48,8 @@ class Catalog:
         parsed = parse_catalog(raw)
         by_uid: dict[str, dict[str, str | None]] = {}
         sections: tuple[Mapping[str, Any], ...] = (
-            cast("Mapping[str, Any]", getattr(parsed, "nodes", None) or {}),
-            cast("Mapping[str, Any]", getattr(parsed, "sources", None) or {}),
+            cast("Mapping[str, Any]", parsed.nodes or {}),
+            cast("Mapping[str, Any]", parsed.sources or {}),
         )
         for section in sections:
             for uid, entry in section.items():
