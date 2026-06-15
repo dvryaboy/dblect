@@ -68,6 +68,7 @@ from dblect.manifest import (
     ResourceType,
     generic_test_target_uid,
 )
+from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -399,6 +400,241 @@ class _ConfigKeyDiscoverer:
 
 def config_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKeySet, SourceRef]:
     return _ConfigKeyDiscoverer(profile)
+
+
+# --- surrogate-hash keys -----------------------------------------------------
+#
+# A relation is often keyed by a surrogate hash of a column tuple
+# (`to_hex(md5(concat(a, b)))`, `dbt_utils.generate_surrogate_key([...])`), with a
+# `unique` test declared on the hash column. The hash determines its input tuple
+# (modulo collision), so uniqueness on the hash is uniqueness on the inputs, and a
+# downstream join on `(a, b)` can then use the key. Recognizing the idiom is
+# conservative: only a recognized hash function over a structural combination
+# (concat, cast, coalesce, case-folding, literals) of plain columns grounds the
+# input key, and only when those inputs are themselves output columns of the
+# relation; anything opaque grounds nothing rather than a wrong key.
+
+# Hash functions whose output uniquely determines their input tuple. Resolved by
+# name so the set is stable across sqlglot versions that lack a given node.
+# Both the hex (`exp.MD5`, the `TO_HEX(MD5(...))` form) and raw-digest
+# (`exp.MD5Digest`, the bare `MD5(...)` form) spellings, plus SHA and BigQuery's
+# FARM_FINGERPRINT.
+_HASH_FUNCS: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n)
+    for n in ("MD5", "MD5Digest", "SHA", "SHA2", "FarmFingerprint")
+    if hasattr(exp, n)
+)
+# Single-argument wrappers that do not change which tuple is hashed, looked through
+# to reach the hash (e.g. `TO_HEX(MD5(...))`, `LOWER(...)`).
+_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
+)
+# Structural combinators that assemble columns into the hashed value without making
+# the input anything other than those columns.
+_STRUCTURAL: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n)
+    for n in ("Concat", "DPipe", "Cast", "TryCast", "Coalesce", "Lower", "Upper", "Trim", "Paren")
+    if hasattr(exp, n)
+)
+
+
+def _expr_args(node: Expr) -> list[Expr]:
+    """The ``Expr`` children of ``node``, flattening list-valued args (a CONCAT's
+    expressions) and dropping non-expression args (a string flag, a CAST's
+    ``DataType``)."""
+    out: list[Expr] = []
+    for value in node.args.values():
+        if isinstance(value, exp.DataType):
+            continue
+        if isinstance(value, Expr):
+            out.append(value)
+        elif isinstance(value, list):
+            out.extend(v for v in cast("list[object]", value) if isinstance(v, Expr))
+    return out
+
+
+def _pure_input_columns(node: Expr) -> frozenset[str] | None:
+    """The column names feeding ``node`` when it is built only from columns and
+    literals via structural combinators; ``None`` if any opaque node intervenes (an
+    unknown function, arithmetic, a subquery), since then the hashed value is not a
+    plain tuple of the columns and the key equivalence does not hold."""
+    if isinstance(node, exp.Column):
+        return frozenset({sg.column_name(node).lower()})
+    if isinstance(node, exp.Literal):
+        return frozenset()
+    if isinstance(node, _STRUCTURAL):
+        cols: set[str] = set()
+        for child in _expr_args(node):
+            sub = _pure_input_columns(child)
+            if sub is None:
+                return None
+            cols |= sub
+        return frozenset(cols)
+    return None
+
+
+def _surrogate_hash_inputs(expr: Expr) -> frozenset[str] | None:
+    """The input columns of a recognized surrogate hash, or ``None`` if ``expr`` is
+    not one. At least one column is required, so a hash of only literals is not a
+    key."""
+    node: Expr | None = expr
+    seen = 0
+    while (
+        node is not None
+        and not isinstance(node, _HASH_FUNCS)
+        and isinstance(node, _HASH_PASSTHROUGH)
+    ):
+        inner = node.this
+        node = inner if isinstance(inner, Expr) else None
+        seen += 1
+        if seen > 4:
+            return None
+    if not isinstance(node, _HASH_FUNCS):
+        return None
+    cols: set[str] = set()
+    for child in _expr_args(node):
+        sub = _pure_input_columns(child)
+        if sub is None:
+            return None
+        cols |= sub
+    return frozenset(cols) or None
+
+
+def _output_projections(tree: Expr) -> Mapping[str, Expr] | None:
+    """Map each output column name to the expression that produces it, for the
+    relation's top-level SELECT. ``None`` for a UNION or other shape whose output
+    columns the substitution cannot read off one projection list."""
+    if not isinstance(tree, exp.Select):
+        return None
+    out: dict[str, Expr] = {}
+    for proj in tree.expressions:
+        if isinstance(proj, exp.Alias):
+            name = proj.alias_or_name
+            inner = proj.this
+            if name and isinstance(inner, Expr):
+                out[name.lower()] = inner
+        elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
+            out[sg.column_name(proj).lower()] = proj
+    return out
+
+
+def _declared_key_columns(tm: object) -> list[str] | None:
+    """The key columns a uniqueness test declares, or ``None`` if it is not one.
+    Mirrors the unique / unique_combination discoverers' shape so the surrogate
+    expansion sees the same declared keys they ground."""
+    from dblect.manifest import DbtTestMetadata
+
+    if not isinstance(tm, DbtTestMetadata) or not tm.enabled:
+        return None
+    if tm.name == "unique":
+        col = tm.kwargs.get("column_name")
+        return [col] if isinstance(col, str) and col else None
+    if tm.name.endswith("unique_combination_of_columns"):
+        raw = tm.kwargs.get("combination_of_columns")
+        if not isinstance(raw, list):
+            return None
+        raw_list = cast("list[object]", raw)
+        cols = [c for c in raw_list if isinstance(c, str) and c]
+        return cols if cols and len(cols) == len(raw_list) else None
+    return None
+
+
+class _SurrogateKeyDiscoverer:
+    """Grounds a candidate key on the input columns of a surrogate-hash key.
+
+    Reads the same uniqueness tests as the unique / unique_combination discoverers;
+    for any declared key whose member is a recognized surrogate hash of output
+    columns, emits the key with that member replaced by its inputs. The original
+    discoverers still emit the as-declared key, so both hold (they meet)."""
+
+    def __init__(self, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None) -> None:
+        self._dialect = profile.sqlglot_dialect
+        self._parsed = parsed
+
+    def _tree(self, uid: str, sql: str) -> Expr | None:
+        """The model's parsed tree, reusing a caller-shared parse when available so
+        the audit's parse-once invariant holds, else parsing once here."""
+        if self._parsed is not None:
+            shared = self._parsed.get(uid)
+            return shared if isinstance(shared, Expr) else None
+        try:
+            return parse_sql(sql, dialect=self._dialect)
+        except SQLParseError:
+            return None
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[CandidateKeySet, SourceRef]]:
+        out: list[Fact[CandidateKeySet, SourceRef]] = []
+        for node in manifest.nodes.values():
+            declared = _declared_key_columns(node.test_metadata)
+            if declared is None:
+                continue
+            target = generic_test_target_uid(node)
+            if target is None:
+                continue
+            model = manifest.nodes.get(target)
+            # Only a model carries SQL to recognize a hash in; a source/seed/snapshot
+            # has no projection to read the input tuple from.
+            if model is None or model.resource_type is not ResourceType.MODEL:
+                continue
+            sql = model.analysis_sql
+            if sql is None:
+                continue
+            tree = self._tree(target, sql)
+            if tree is None:
+                continue
+            projections = _output_projections(tree)
+            if projections is None:
+                continue
+            outputs = set(projections)
+            substituted: set[str] = set()
+            changed = False
+            for col in declared:
+                inputs = (
+                    _surrogate_hash_inputs(projections[col.lower()])
+                    if col.lower() in projections
+                    else None
+                )
+                if inputs is not None and inputs <= outputs:
+                    substituted |= inputs
+                    changed = True
+                else:
+                    substituted.add(col.lower())
+            if not changed:
+                continue
+            out.append(
+                Fact(
+                    scope=SourceRef(SourceKind.MODEL, target),
+                    value=_single_key(*substituted),
+                    provenance=Declared(_test_source(node.test_metadata)),
+                    detail=node.name,
+                    condition=_test_condition(node.test_metadata),
+                )
+            )
+        return out
+
+
+def _test_source(tm: object) -> DeclaredSource:
+    from dblect.manifest import DbtTestMetadata
+
+    if isinstance(tm, DbtTestMetadata) and tm.name.endswith("unique_combination_of_columns"):
+        return DeclaredSource.DBT_UTILS_TEST
+    return DeclaredSource.DBT_GENERIC_TEST
+
+
+def _test_condition(tm: object) -> Predicate | None:
+    from dblect.manifest import DbtTestMetadata
+
+    if isinstance(tm, DbtTestMetadata) and tm.where is not None:
+        return Predicate(tm.where)
+    return None
+
+
+def surrogate_key_discoverer(
+    profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
+) -> FactDiscoverer[CandidateKeySet, SourceRef]:
+    return _SurrogateKeyDiscoverer(profile, parsed=parsed)
 
 
 # --- the relation reducer ----------------------------------------------------
@@ -869,6 +1105,7 @@ def uniqueness_property(
     profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    parsed: Mapping[str, Expr] | None = None,
 ) -> Property[CandidateKeySet, SourceRef]:
     """The manifest-backed uniqueness property: declared keys (unique tests,
     ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, the
@@ -887,6 +1124,7 @@ def uniqueness_property(
         unique_combination_discoverer(),
         native_key_discoverer(profile),
         config_key_discoverer(profile),
+        surrogate_key_discoverer(profile, parsed=parsed),
         *extra,
     )
     # The uniqueness discoverers ground against the manifest directly, so they

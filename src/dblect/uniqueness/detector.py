@@ -184,7 +184,7 @@ def make_fact_grounded_detectors(
     semantics ground the uniqueness keys, so parsing and enforcement agree.
     """
     graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    keys = propagate(graph, uniqueness_property(manifest, profile))
+    keys = propagate(graph, uniqueness_property(manifest, profile, parsed=parsed))
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every
