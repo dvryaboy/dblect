@@ -373,24 +373,30 @@ def native_key_discoverer(adapter_type: str) -> FactDiscoverer[CandidateKeySet, 
 # Strategies whose write deduplicates on `unique_key`.
 _DEDUP_STRATEGIES: frozenset[str] = frozenset({"merge", "delete+insert"})
 
-# Adapters whose default `incremental_strategy` (when unset) is `merge`, the only
-# default that dedups. Sourced from dbt's adapter docs. An adapter absent here has
-# an unknown-or-non-dedup default, so an unset strategy claims no key: append (the
-# other common default) does not dedup either way, so the conservative choice
-# costs nothing on those and stays sound on the rest.
-_MERGE_DEFAULT_ADAPTERS: frozenset[str] = frozenset(
-    {"snowflake", "bigquery", "redshift", "postgres"}
-)
+# The adapter's default `incremental_strategy` when one is left unset, for the
+# adapters whose default deduplicates once a `unique_key` is present. Sourced from
+# dbt's adapter docs: Snowflake and BigQuery default to `merge`; Postgres and
+# Redshift default to `delete+insert` when a `unique_key` is set (without one they
+# default to `append`, but the discoverer only consults this map after it has seen
+# a key). An adapter absent here has an unknown-or-non-dedup default (Spark's
+# `append`, for one), so an unset strategy claims no key. The conservative choice
+# costs nothing where the real default is `append` and stays sound elsewhere.
+_KEYED_DEDUP_DEFAULT: Mapping[str, str] = {
+    "snowflake": "merge",
+    "bigquery": "merge",
+    "redshift": "delete+insert",
+    "postgres": "delete+insert",
+}
 
 
 def _effective_strategy(strategy: str | None, adapter_type: str) -> str | None:
-    """The incremental strategy in force: the declared one, else the adapter
-    default where we know it to dedup, else ``None`` (unknown, claim nothing)."""
+    """The incremental strategy in force: the declared one, else the adapter's
+    default where we know it to dedup on a ``unique_key``, else ``None`` (unknown,
+    claim nothing). The default branch is meaningful only when a key is set, which
+    the discoverer guarantees before consulting it."""
     if strategy is not None:
         return strategy.lower()
-    if adapter_type.lower() in _MERGE_DEFAULT_ADAPTERS:
-        return "merge"
-    return None
+    return _KEYED_DEDUP_DEFAULT.get(adapter_type.lower())
 
 
 class _ConfigKeyDiscoverer:
