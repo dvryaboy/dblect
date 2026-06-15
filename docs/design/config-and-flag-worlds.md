@@ -27,7 +27,7 @@ So the compiled manifest is not "the model." It is *one compilation of the model
 
 This splits the design cleanly and sets up everything below:
 
-- **The substrate's "one world per run" posture is automatically satisfied by a manifest.** A manifest *is* a world. So the config discoverer, which reads values already resolved in that manifest, needs no enumeration machinery to do its job in the current world. This is why [#39](https://github.com/dvryaboy/dblect/issues/39) is separable and shippable now.
+- **The substrate's "one world per run" posture is automatically satisfied by a manifest.** A manifest *is* a world. So the config discoverer, which reads values already resolved in that manifest, needs no enumeration machinery to do its job in the current world. This is why [#39](https://github.com/dvryaboy/dblect/issues/39) was separable and shipped on its own in [#82](https://github.com/dvryaboy/dblect/pull/82).
 - **Reasoning across worlds needs a second front end** that sees variability before Jinja erases it. That is the Jinja source, and parsing it is exactly what [`var-inference-spec.md`](./var-inference-spec.md) proposes. The project already implies a two-front-end architecture (sqlglot over compiled SQL for structure, a Jinja AST over source for variability); the work here is to connect them.
 
 ## Theory: this is family-based static analysis
@@ -80,7 +80,7 @@ The substrate is already a parameterized abstract interpretation in the sense of
 
 ## What the substrate already provides
 
-The data model for this work is in place; the discoverers and the enumerator are not.
+The data model for this work is in place, and the config discoverer shipped in [#82](https://github.com/dvryaboy/dblect/pull/82); the compile-value discoverer and the enumerator are not yet.
 
 - **`CompileValue` provenance** carries `origin: CompileOrigin` and `world: WorldRef`. `world` is never absent: a compile value is ground truth in exactly the world the flag layer fixed. `origin` records how the value is produced and whether the framework can auto-discover it. The doc comment is already explicit that enumerability is a function of the flag's declared-or-inferred domain, not of `origin` alone (a `COMPUTED` value with a user-declared finite domain is enumerable; a `DBT_VAR` with an open domain is not).
 - **`WorldRef`** is `frozenset[tuple[str, Hashable]]` of assignments, hashable with value equality, opaque to the substrate in meaning. Facts bucket by world equality, so resolution within a world is ordinary and order-independent.
@@ -160,13 +160,13 @@ The honest framing for the cost section: the worst case is exponential in the si
 
 ## The config discoverer (#39)
 
-Config is the easy issue precisely because config values live in the manifest we already read, fixed in the current world. The discoverer is relation-scoped (config is per-model) and emits `CompileValue(origin=DBT_CONFIG, world=current)` facts.
+Config is the easy issue precisely because config values live in the manifest we already read, fixed in the current world. The discoverer is relation-scoped (config is per-model) and emits `CompileValue(origin=DBT_CONFIG, world=current)` facts. This shipped in [#82](https://github.com/dvryaboy/dblect/pull/82) as the worked example below; the rest of this section is the design it realizes and the keys still to adopt.
 
 ### Generic plumbing, per-property interpretation
 
 The reading is centralized and the interpretation is per-property, matching the issue's note that "concrete per-key mappings land as detectors adopt them." A `ConfigDiscoverer` reads `node.config` and consults a registry of interest entries. Each entry names the config key or keys it reads, the property it grounds, and a pure interpretation function from the relevant config slice (plus the adapter, for defaults) to a fact value or `None`. Returning `None` is silence: a config that does not establish the property grounds nothing, the same "absence is silence" the rest of the substrate observes. The function is pure and total within its slice, so per-discoverer property-based testing applies unchanged.
 
-This keeps config semantics next to the property that understands them. The uniqueness property knows what `unique_key` and `incremental_strategy` mean together; the discoverer framework does not need to.
+This keeps config semantics next to the property that understands them. The uniqueness property knows what `unique_key` and `incremental_strategy` mean together; the discoverer framework does not need to. [#82](https://github.com/dvryaboy/dblect/pull/82) shipped this per-property form first: a `config_key_discoverer` reads a typed `ModelConfig` slice of `node.config` and grounds the uniqueness key directly, wired into `uniqueness_property` beside the declared-key discoverers. The centralized registry of interest entries is the generalization to reach for as more keys are adopted.
 
 ### Worked example: `unique_key` x `incremental_strategy`
 
@@ -175,7 +175,7 @@ The headline mapping, and the one that makes [#39](https://github.com/dvryaboy/d
 - `merge` with a `unique_key`, or `delete+insert`: the write deduplicates on the key. The output relation is unique on it.
 - `append`, or `merge` without a `unique_key`: no deduplication. Setting `unique_key` alone enforces nothing.
 - `insert_overwrite`: partition-level replacement, ignores `unique_key`.
-- the default strategy is adapter-dependent (Snowflake, BigQuery, Redshift, and Postgres default to `merge`; Spark to `append`), so the interpretation must read the adapter, which the manifest already carries.
+- the default strategy is adapter-dependent (Snowflake and BigQuery default to `merge`; Postgres and Redshift to `delete+insert` once a `unique_key` is set; Spark to `append`), so the interpretation must read the adapter. These per-adapter defaults and the enforcement flags now live in the `AdapterProfile` registry ([#83](https://github.com/dvryaboy/dblect/pull/83)), resolved once from the manifest's adapter.
 
 The interpretation emits a candidate-key fact **only** when the pair enforces dedup, and stays silent otherwise. A `unique_key` under `append` produces no fact, which is the correct and important behavior: the project looks like it declared a key, but nothing enforces it, so claiming uniqueness would plant a wrong fact and a wrong silence downstream.
 

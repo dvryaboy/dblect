@@ -184,7 +184,7 @@ Load-bearing facts (from dbt docs):
 
 The critical, non-obvious takeaway: **setting `unique_key` does NOT by itself guarantee uniqueness.** Enforcement is a function of the (`incremental_strategy`, `unique_key`) *pair*. `unique_key` + `append` gives no enforcement (silent duplicates). `unique_key` + `merge` / `delete+insert` enforces. `merge` + no `unique_key` gives no enforcement. A `unique` data test on the key catches violations only at test time, not at write time.
 
-Adapter defaults differ: Snowflake / BigQuery / Redshift / Postgres default to `merge`; Spark defaults to `append`. The *same model* with no explicit strategy can dedup on Snowflake and silently duplicate on Spark.
+Adapter defaults differ: Snowflake and BigQuery default to `merge`; Postgres and Redshift to `delete+insert` when a `unique_key` is set (and `append` without one); Spark defaults to `append`. The *same model* with no explicit strategy can dedup on Snowflake and silently duplicate on Spark.
 
 ### Other config keys
 
