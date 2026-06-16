@@ -3,6 +3,9 @@
 from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.sql.patterns import (
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
+    SURROGATE_HASH_FUNCTIONS,
+    SURROGATE_HASH_PASSTHROUGH,
+    SURROGATE_HASH_STRUCTURAL,
     AggregateSummary,
     Finding,
     FindingKind,
@@ -27,6 +30,9 @@ from dblect.sql.patterns import (
 
 __all__ = [
     "PORTABLE_NON_DETERMINISTIC_BUILTINS",
+    "SURROGATE_HASH_FUNCTIONS",
+    "SURROGATE_HASH_PASSTHROUGH",
+    "SURROGATE_HASH_STRUCTURAL",
     "AggregateSummary",
     "Finding",
     "FindingKind",
