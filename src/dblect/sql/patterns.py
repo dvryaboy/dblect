@@ -20,7 +20,7 @@ with the per-finding ignore syntax).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -457,12 +457,6 @@ def detect_non_deterministic_function(tree: Expr) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-# The SCD-2 validity columns dbt stamps on a snapshot. A filter mentioning either
-# is the developer acknowledging temporality (current-row `dbt_valid_to IS NULL`,
-# or a `BETWEEN dbt_valid_from AND dbt_valid_to` point-in-time slice).
-_SNAPSHOT_VALIDITY_COLUMNS: frozenset[str] = frozenset({"dbt_valid_to", "dbt_valid_from"})
-
-
 def _select_predicates(select: exp.Select) -> tuple[Expr, ...]:
     """The predicate-bearing clauses of one SELECT: WHERE, every JOIN ON, QUALIFY,
     and HAVING. These are where a temporal filter on a snapshot would live; a
@@ -480,48 +474,76 @@ def _select_predicates(select: exp.Select) -> tuple[Expr, ...]:
     return tuple(out)
 
 
-def _has_validity_filter(select: exp.Select) -> bool:
-    """Whether the SELECT's predicates mention a snapshot validity column, i.e. the
-    query restricts to current or point-in-time rows rather than the full history."""
+def _enclosing_selects(node: Expr) -> Iterable[exp.Select]:
+    """Each SELECT enclosing ``node``, innermost first. A snapshot read in a CTE or
+    subquery whose rows are restricted by the outer query is safe, so the temporal
+    filter may live in any of these scopes, not only the immediately enclosing one."""
+    current = node.parent
+    while current is not None:
+        if isinstance(current, exp.Select):
+            yield current
+        current = current.parent
+
+
+def _predicates_mention(select: exp.Select, columns: frozenset[str]) -> bool:
+    """Whether the SELECT's predicates reference any of ``columns`` (case-folded)."""
     return any(
-        col.name.lower() in _SNAPSHOT_VALIDITY_COLUMNS
+        col.name.lower() in columns
         for clause in _select_predicates(select)
         for col in clause.find_all(exp.Column)
     )
 
 
+def _validity_remedy(validity: tuple[str, ...]) -> str:
+    """The remediation sentence naming a snapshot's own validity columns, so the
+    advice matches a renamed snapshot rather than always citing the dbt defaults."""
+    if len(validity) == 2:
+        valid_from, valid_to = validity
+        return (
+            f"Restrict to the current row with `{valid_to} IS NULL`, or to a point in "
+            f"time with `BETWEEN {valid_from} AND {valid_to}`."
+        )
+    named = ", ".join(f"`{c}`" for c in validity)
+    return f"Restrict on its SCD-2 validity columns ({named})."
+
+
 def detect_snapshot_temporal_filter(
-    tree: Expr, *, snapshot_names: frozenset[str]
+    tree: Expr, *, snapshots: Mapping[str, tuple[str, ...]]
 ) -> tuple[Finding, ...]:
     """Flag a reference to a snapshot whose enclosing query omits a temporal filter.
 
     A snapshot keeps every historical version of each key, so a query that reads it
-    without restricting to the current row (`dbt_valid_to IS NULL`) or a
-    point-in-time slice (`BETWEEN dbt_valid_from AND dbt_valid_to`) fans out one row
-    per version, most visibly under a JOIN. ``snapshot_names`` are the relation
-    names the manifest says are snapshots (case-folded); a reference to anything
-    else is ignored, so the detector never fires without manifest knowledge.
+    without restricting to the current row or a point-in-time slice fans out one row
+    per version, most visibly under a JOIN. ``snapshots`` maps each snapshot relation
+    name (case-folded) to its SCD-2 validity columns as ``(valid_from, valid_to)``,
+    honoring a snapshot's ``snapshot_meta_column_names`` rename. A reference to
+    anything not in the map is ignored, so the detector never fires without manifest
+    knowledge that the relation is a snapshot.
 
-    Conservative toward silence on the validity columns: if the enclosing SELECT's
-    predicates mention either column anywhere, the developer is handling
-    temporality and nothing fires. One finding per snapshot reference per scope.
+    Conservative toward silence on the validity columns: if any enclosing scope (the
+    immediate SELECT, or an outer query reading it through a CTE or subquery) filters
+    on one of that snapshot's validity columns, the developer is handling temporality
+    and nothing fires. One finding per snapshot reference per scope.
     """
-    if not snapshot_names:
+    if not snapshots:
         return ()
     out: list[Finding] = []
     seen: set[tuple[int, str]] = set()
     for table in tree.find_all(exp.Table):
         name = table.name.lower()
-        if name not in snapshot_names:
+        validity = snapshots.get(name)
+        if validity is None:
             continue
-        select = table.find_ancestor(exp.Select)
-        if select is None:
+        selects = list(_enclosing_selects(table))
+        if not selects:
             continue
-        key = (id(select), name)
-        if key in seen or _has_validity_filter(select):
-            seen.add(key)
+        key = (id(selects[0]), name)
+        if key in seen:
             continue
         seen.add(key)
+        validity_lc = frozenset(c.lower() for c in validity)
+        if any(_predicates_mention(select, validity_lc) for select in selects):
+            continue
         out.append(
             finding_at(
                 FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING,
@@ -529,9 +551,8 @@ def detect_snapshot_temporal_filter(
                     f"`{table.name}` is a dbt snapshot, read here without a filter on its "
                     "SCD-2 validity columns. It keeps every historical version per key, so "
                     "this query fans out one row per version (most visibly under a JOIN). "
-                    "Restrict to the current row with `dbt_valid_to IS NULL`, or to a "
-                    "point in time with `BETWEEN dbt_valid_from AND dbt_valid_to`. If "
-                    "reading full history is intended, suppress with `-- noqa-fixture:`."
+                    f"{_validity_remedy(validity)} If reading full history is intended, "
+                    "suppress with `-- noqa-fixture:`."
                 ),
                 node=table,
             )

@@ -182,17 +182,27 @@ def _parse_models_for_audit(
 
 def _make_snapshot_detectors(manifest: Manifest) -> tuple[Detector, ...]:
     """The snapshot temporal-filter detector, curried against the manifest's
-    snapshot relation names (by ``name``, matching the relation-graph builder).
-    Returns nothing when the project has no snapshots, so the detector never fires
-    without manifest knowledge that a referenced relation is a snapshot."""
-    names = frozenset(node.name.lower() for node in manifest.snapshots.values())
-    if not names:
+    snapshots: each relation name (by ``name``, matching the relation-graph builder)
+    mapped to its SCD-2 validity columns, so a snapshot that renamed them via
+    ``snapshot_meta_column_names`` is checked against its real column names. Returns
+    nothing when the project has no snapshots, so the detector never fires without
+    manifest knowledge that a referenced relation is a snapshot."""
+    snapshots: dict[str, tuple[str, ...]] = {}
+    for node in manifest.snapshots.values():
+        validity = node.config.snapshot_validity_columns if node.config else ()
+        snapshots[node.name.lower()] = validity or _DEFAULT_SNAPSHOT_VALIDITY
+    if not snapshots:
         return ()
 
     def snapshot_temporal(tree: Expr) -> tuple[Finding, ...]:
-        return detect_snapshot_temporal_filter(tree, snapshot_names=names)
+        return detect_snapshot_temporal_filter(tree, snapshots=snapshots)
 
     return (snapshot_temporal,)
+
+
+# Fallback validity columns for a snapshot whose config omits them (e.g. an older
+# manifest parsed before validity columns were extracted). dbt's defaults.
+_DEFAULT_SNAPSHOT_VALIDITY: tuple[str, ...] = ("dbt_valid_from", "dbt_valid_to")
 
 
 @dataclass(frozen=True, slots=True)
