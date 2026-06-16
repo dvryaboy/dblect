@@ -20,7 +20,7 @@ with the per-finding ignore syntax).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -151,9 +151,13 @@ _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
     }
 )
 
-# Names that arrive as `exp.Anonymous` (or similar) rather than a dedicated
-# sqlglot type, e.g. `now()`. Match is case-insensitive.
-_NON_DETERMINISTIC_NAMES: frozenset[str] = frozenset(
+# Function names that arrive as `exp.Anonymous` rather than a dedicated sqlglot
+# type and whose value changes per run (e.g. `now`). This is the portable baseline:
+# names that read the same across dialects. A target adapter extends it with its
+# own builtins (see `AdapterProfile.non_deterministic_builtins`), and the resolved
+# set is handed to `make_non_determinism_detector`. Matched case-insensitively, so
+# every entry must be lowercase.
+PORTABLE_NON_DETERMINISTIC_BUILTINS: frozenset[str] = frozenset(
     {"now", "current_database", "current_schema", "gen_random_uuid", "sysdate"}
 )
 
@@ -411,8 +415,10 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_non_deterministic_function(tree: Expr) -> tuple[Finding, ...]:
-    """Flag non-deterministic function calls in load-bearing positions.
+def make_non_determinism_detector(
+    non_deterministic_builtins: frozenset[str] = PORTABLE_NON_DETERMINISTIC_BUILTINS,
+) -> Callable[[Expr], tuple[Finding, ...]]:
+    """Build a detector flagging non-deterministic calls in load-bearing positions.
 
     "Load-bearing" means the function's value affects which rows go where,
     not just what gets projected. JOIN ON conditions, GROUP BY targets,
@@ -424,56 +430,78 @@ def detect_non_deterministic_function(tree: Expr) -> tuple[Finding, ...]:
 
     Functions: ``current_timestamp``, ``current_date``, ``current_time``,
     ``current_user``, ``random()``, ``uuid()``/``gen_random_uuid()``,
-    ``now()``, plus dialect-specific aliases. Matched by sqlglot expression
-    type for the typed forms and by name (case-insensitive) for
-    ``exp.Anonymous`` nodes.
+    ``now()``, plus the target adapter's own builtins. Typed forms match by
+    sqlglot expression type; ``exp.Anonymous`` calls match by name
+    (case-insensitive) against ``non_deterministic_builtins``. That set is
+    adapter-bound (``AdapterProfile.non_deterministic_builtins``), so this is a
+    ``make_*`` factory the audit builds per run rather than a bare structural
+    detector; it defaults to the portable baseline for standalone use.
+
+    This static check is a fast pre-filter over a curated, necessarily incomplete
+    list; the runtime replay-determinism loop is the completeness layer.
 
     TODO: once we read ``Node.config.materialized``, narrow the detector to
     table/incremental models (the cases where stored aggregates drift over
     time). Views are recomputed every read, so the hazard mostly evaporates.
     """
-    out: list[Finding] = []
-    for sel in sg.find_all_selects(tree):
-        scopes = _load_bearing_scopes(sel)
-        for label, scope in scopes:
-            calls = _find_non_deterministic(scope)
-            for call in calls:
-                func_name = _non_deterministic_name(call)
-                out.append(
-                    finding_at(
-                        FindingKind.NON_DETERMINISTIC_FUNCTION,
-                        message=(
-                            f"{func_name} appears in {label}; this position is "
-                            "load-bearing because the value affects which rows go where "
-                            "(filtering, grouping, ranking). Output buckets drift "
-                            "with wall-clock time. If intentional, suppress with "
-                            "`-- noqa-fixture:`; if not, bucket by the absolute "
-                            "timestamp and derive the relative measure at query time."
-                        ),
-                        node=scope,
-                    )
-                )
-    return tuple(out)
+
+    def detect(tree: Expr) -> tuple[Finding, ...]:
+        return tuple(
+            finding_at(
+                FindingKind.NON_DETERMINISTIC_FUNCTION,
+                message=(
+                    f"{_non_deterministic_name(call)} appears in {label}; this position is "
+                    "load-bearing because the value affects which rows go where (filtering, "
+                    "grouping, ranking). Output buckets drift with wall-clock time. If "
+                    "intentional, suppress with `-- noqa-fixture:`; if not, bucket by the "
+                    "absolute timestamp and derive the relative measure at query time."
+                ),
+                node=scope,
+            )
+            for sel in sg.find_all_selects(tree)
+            for label, scope in _load_bearing_scopes(sel)
+            for call in _find_non_deterministic(scope, non_deterministic_builtins)
+        )
+
+    return detect
 
 
-_ALL_DETECTORS = (
+# The dialect-agnostic structural detectors. The non-determinism detector is
+# adapter-bound, so it is built per run by `make_non_determinism_detector` and
+# composed in separately (see `scan_all` and the audit walker).
+_STRUCTURAL_DETECTORS = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
     detect_where_on_outer_joined_nullable,
-    detect_non_deterministic_function,
 )
 
 
-def scan_all(tree: Expr) -> tuple[Finding, ...]:
-    """Run every detector and return findings in detector-declaration order."""
-    return tuple(f for detector in _ALL_DETECTORS for f in detector(tree))
+def scan_all(
+    tree: Expr,
+    *,
+    non_deterministic_builtins: frozenset[str] = PORTABLE_NON_DETERMINISTIC_BUILTINS,
+) -> tuple[Finding, ...]:
+    """Run every detector and return findings in detector-declaration order.
+
+    The non-determinism check uses ``non_deterministic_builtins`` (the portable
+    baseline by default; the audit passes the resolved adapter's set).
+    """
+    structural = (f for detector in _STRUCTURAL_DETECTORS for f in detector(tree))
+    non_determinism = make_non_determinism_detector(non_deterministic_builtins)(tree)
+    return (*structural, *non_determinism)
 
 
-def all_findings(trees: Iterable[Expr]) -> tuple[Finding, ...]:
+def all_findings(
+    trees: Iterable[Expr],
+    *,
+    non_deterministic_builtins: frozenset[str] = PORTABLE_NON_DETERMINISTIC_BUILTINS,
+) -> tuple[Finding, ...]:
     """Convenience: scan a batch of parsed statements."""
-    return tuple(f for t in trees for f in scan_all(t))
+    return tuple(
+        f for t in trees for f in scan_all(t, non_deterministic_builtins=non_deterministic_builtins)
+    )
 
 
 def _order_targets(order: exp.Order | None) -> tuple[str, ...]:
@@ -548,18 +576,18 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
     return scopes
 
 
-def _find_non_deterministic(e: Expr) -> list[Expr]:
+def _find_non_deterministic(e: Expr, names: frozenset[str]) -> list[Expr]:
     """Every non-deterministic function call reachable from `e` (transitive)."""
-    return [node for node in e.walk() if _is_non_deterministic(node)]
+    return [node for node in e.walk() if _is_non_deterministic(node, names)]
 
 
-def _is_non_deterministic(node: Expr) -> bool:
+def _is_non_deterministic(node: Expr, names: frozenset[str]) -> bool:
     if type(node) in _NON_DETERMINISTIC_TYPED:
         return True
     return (
         isinstance(node, exp.Anonymous)
         and isinstance(node.this, str)
-        and node.this.lower() in _NON_DETERMINISTIC_NAMES
+        and node.this.lower() in names
     )
 
 

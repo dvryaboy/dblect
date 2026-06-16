@@ -21,6 +21,7 @@ from dblect.adapters import (
     register,
     resolve_profile,
 )
+from dblect.sql import PORTABLE_NON_DETERMINISTIC_BUILTINS
 
 # --- IncrementalStrategy.parse: normalization and the custom -> None branch ---
 
@@ -56,6 +57,7 @@ def test_effective_strategy_branches() -> None:
         not_null_enforced=True,
         key_enforced=False,
         default_incremental_strategy=IncrementalStrategy.MERGE,
+        non_deterministic_builtins=frozenset(),
     )
     assert profile.effective_strategy("append") is IncrementalStrategy.APPEND  # declared wins
     assert profile.effective_strategy("custom_macro") is None  # custom is not assumed to dedup
@@ -120,6 +122,28 @@ def test_register_makes_a_new_adapter_resolvable() -> None:
             not_null_enforced=True,
             key_enforced=True,
             default_incremental_strategy=IncrementalStrategy.MERGE,
+            non_deterministic_builtins=frozenset(),
         )
     )
     assert profile_for_adapter("widget_warehouse") is profile
+
+
+# --- per-adapter non-determinism knowledge ------------------------------------
+
+
+def test_unknown_adapter_gets_the_portable_non_determinism_baseline() -> None:
+    # An adapter dblect has no module for falls back to the portable baseline, never
+    # an empty or guessed set, so portable hazards still fire on a best-effort target.
+    assert (
+        profile_for_adapter("exotic_warehouse").non_deterministic_builtins
+        == PORTABLE_NON_DETERMINISTIC_BUILTINS
+    )
+
+
+def test_duckdb_extends_the_portable_non_determinism_baseline() -> None:
+    # The validated adapter strictly extends the baseline: it carries the whole set
+    # (baseline plus its own), so the detector reads one value and unions nothing.
+    builtins = profile_for_adapter("duckdb").non_deterministic_builtins
+    assert builtins > PORTABLE_NON_DETERMINISTIC_BUILTINS
+    assert "txid_current" in builtins  # a DuckDB builtin absent from the baseline
+    assert "txid_current" not in PORTABLE_NON_DETERMINISTIC_BUILTINS

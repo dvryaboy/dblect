@@ -2,6 +2,7 @@
 
 from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.sql.patterns import (
+    PORTABLE_NON_DETERMINISTIC_BUILTINS,
     AggregateSummary,
     Finding,
     FindingKind,
@@ -11,7 +12,6 @@ from dblect.sql.patterns import (
     WindowSummary,
     all_findings,
     detect_coalesce_on_join_key,
-    detect_non_deterministic_function,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -21,10 +21,12 @@ from dblect.sql.patterns import (
     list_group_bys,
     list_joins,
     list_windows,
+    make_non_determinism_detector,
     scan_all,
 )
 
 __all__ = [
+    "PORTABLE_NON_DETERMINISTIC_BUILTINS",
     "AggregateSummary",
     "Finding",
     "FindingKind",
@@ -35,7 +37,6 @@ __all__ = [
     "WindowSummary",
     "all_findings",
     "detect_coalesce_on_join_key",
-    "detect_non_deterministic_function",
     "detect_null_group_after_outer_join",
     "detect_unordered_aggregate",
     "detect_unordered_window",
@@ -45,6 +46,7 @@ __all__ = [
     "list_group_bys",
     "list_joins",
     "list_windows",
+    "make_non_determinism_detector",
     "parse_sql",
     "scan_all",
 ]

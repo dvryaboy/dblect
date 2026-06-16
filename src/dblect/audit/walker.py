@@ -32,24 +32,26 @@ from dblect.sql import (
     FindingKind,
     SQLParseError,
     detect_coalesce_on_join_key,
-    detect_non_deterministic_function,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
+    make_non_determinism_detector,
     parse_sql,
 )
 from dblect.uniqueness.detector import make_fact_grounded_detectors
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
+# The dialect-agnostic structural detectors. Context-bound detectors (non-determinism
+# from the resolved adapter, uniqueness and nullability grounded against declared
+# facts) are built per run in `run_audit` and appended there, so they are not listed.
 DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
     detect_where_on_outer_joined_nullable,
-    detect_non_deterministic_function,
 )
 
 
@@ -114,19 +116,24 @@ def run_audit(
     Models whose ``compiled_code`` is missing or unparseable are listed in
     the report's ``skipped`` field with a reason rather than raising.
 
-    Fact-grounded detectors run alongside the configured `detectors` list: the
-    uniqueness window order-keys and join-fanout detectors (grounded against
-    declared keys), and the nullability hazard detectors (GROUP BY, join key, and
-    NOT IN on an inherited-nullable column, grounded against the propagated
-    nullability property). All are opportunistic, silent on projects that declare
-    nothing, so they need no opt-in flag. They share the audit's pre-parsed trees,
-    so the SQL is parsed once.
+    Context-bound detectors run alongside the configured `detectors` list, each
+    built from the resolved profile and the pre-parsed trees: the non-determinism
+    detector (its builtin names come from the profile), the uniqueness window
+    order-keys and join-fanout detectors (grounded against declared keys), and the
+    nullability hazard detectors (GROUP BY, join key, and NOT IN on an
+    inherited-nullable column, grounded against the propagated nullability
+    property). The fact-grounded ones are opportunistic, silent on projects that
+    declare nothing, so they need no opt-in flag. They share the audit's pre-parsed
+    trees, so the SQL is parsed once.
     """
     parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
-    fact_grounded = make_fact_grounded_detectors(manifest, profile, parsed=trees)
-    nullability = make_nullability_detectors(manifest, profile, parsed=trees)
-    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *fact_grounded, *nullability)
+    contextual: tuple[Detector, ...] = (
+        make_non_determinism_detector(profile.non_deterministic_builtins),
+        *make_fact_grounded_detectors(manifest, profile, parsed=trees),
+        *make_nullability_detectors(manifest, profile, parsed=trees),
+    )
+    effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *contextual)
     active: list[LocatedFinding] = []
     suppressed: list[SuppressedFinding] = []
     skipped: list[SkippedModel] = []

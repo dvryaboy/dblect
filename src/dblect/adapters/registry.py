@@ -11,6 +11,7 @@ import importlib
 import pkgutil
 
 from dblect.adapters.model import AdapterProfile
+from dblect.sql import PORTABLE_NON_DETERMINISTIC_BUILTINS
 
 _PROFILES: dict[str, AdapterProfile] = {}
 _loaded = False
@@ -48,7 +49,8 @@ def _ensure_loaded() -> None:
 def _conservative(adapter_type: str, *, sqlglot_dialect: str | None = None) -> AdapterProfile:
     """The profile for an adapter dblect has no specific knowledge of: NOT NULL
     enforced (true on essentially every warehouse), PRIMARY KEY / UNIQUE advisory,
-    and no known dedup default, so an unset incremental strategy claims no key."""
+    no known dedup default (so an unset incremental strategy claims no key), and
+    only the portable non-determinism baseline."""
     return AdapterProfile(
         adapter_type=adapter_type,
         sqlglot_dialect=sqlglot_dialect if sqlglot_dialect is not None else adapter_type,
@@ -56,6 +58,7 @@ def _conservative(adapter_type: str, *, sqlglot_dialect: str | None = None) -> A
         not_null_enforced=True,
         key_enforced=False,
         default_incremental_strategy=None,
+        non_deterministic_builtins=PORTABLE_NON_DETERMINISTIC_BUILTINS,
     )
 
 

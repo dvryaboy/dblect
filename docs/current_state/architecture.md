@@ -117,7 +117,7 @@ Three modules:
 
 ### The target adapter (`src/dblect/adapters/`)
 
-A dbt project compiles against one adapter (duckdb, snowflake, bigquery, ...), and that single choice fixes everything dblect reasons about the target: which sqlglot dialect parses its compiled SQL, whether the warehouse enforces `PRIMARY KEY` / `UNIQUE` and `NOT NULL` on write, and which incremental strategy runs when a model leaves `incremental_strategy` unset. [`AdapterProfile`](../../src/dblect/adapters/model.py) gathers those facets into one value so a run reads a single coherent target rather than assembling it from independent per-facet lookups. A dbt adapter name and a sqlglot dialect name are two namespaces that overlap by name without being the same thing; the profile carries both.
+A dbt project compiles against one adapter (duckdb, snowflake, bigquery, ...), and that single choice fixes everything dblect reasons about the target: which sqlglot dialect parses its compiled SQL, whether the warehouse enforces `PRIMARY KEY` / `UNIQUE` and `NOT NULL` on write, which incremental strategy runs when a model leaves `incremental_strategy` unset, and which builtin function names the non-determinism check treats as hazardous (the portable baseline plus the adapter's own, e.g. DuckDB's `txid_current()` / `nextval()`). [`AdapterProfile`](../../src/dblect/adapters/model.py) gathers those facets into one value so a run reads a single coherent target rather than assembling it from independent per-facet lookups. A dbt adapter name and a sqlglot dialect name are two namespaces that overlap by name without being the same thing; the profile carries both.
 
 Profiles live behind a [registry](../../src/dblect/adapters/registry.py): each warehouse is a self-contained module under [`adapters/builtin/`](../../src/dblect/adapters/builtin/) that builds an `AdapterProfile` and calls `register(...)`. The registry auto-discovers those modules on first lookup, so **adding a warehouse is a new file and nothing else** (no central map to edit); an out-of-tree package extends support the same way, by calling `register` at import.
 
@@ -133,7 +133,7 @@ The analysis layer's input is compiled SQL — dbt has already rendered Jinja, s
 
 ### Detectors and findings
 
-`patterns.py` exposes the static detectors, all pure functions over a sqlglot `Expr` returning `tuple[Finding, ...]`:
+`patterns.py` exposes the structural detectors as pure functions over a sqlglot `Expr` returning `tuple[Finding, ...]`. The non-determinism check is adapter-bound (its hazardous-name set comes from the resolved `AdapterProfile`), so it ships as a `make_*` factory the audit builds per run:
 
 | Detector | What it flags |
 | --- | --- |
@@ -142,9 +142,9 @@ The analysis layer's input is compiled SQL — dbt has already rendered Jinja, s
 | `detect_unordered_window` | Any of `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` over a window with no `ORDER BY`. |
 | `detect_unordered_aggregate` | `ARRAY_AGG`/`STRING_AGG`/`GROUP_CONCAT` without `ORDER BY` or `WITHIN GROUP`. Element order across rows is undefined. |
 | `detect_where_on_outer_joined_nullable` | `WHERE <nullable-side-col> = X` (or `!=`, `<`, `>`, `IN`, `BETWEEN`, `LIKE`). Silently inverts the OUTER JOIN to INNER. `IS [NOT] NULL` and `COALESCE(col, ...)` are protected. |
-| `detect_non_deterministic_function` | `current_timestamp` / `now()` / `random()` / `uuid()` / etc. in load-bearing positions: JOIN ON, GROUP BY targets, window PARTITION BY, window ORDER BY. WHERE/HAVING are intentionally exempt (the incremental-lookback idiom). |
+| `make_non_determinism_detector(builtins)` | `current_timestamp` / `now()` / `random()` / `uuid()`, plus the resolved adapter's own builtins (e.g. DuckDB's `txid_current()`, `nextval()`), in load-bearing positions: JOIN ON, GROUP BY targets, window PARTITION BY, window ORDER BY. WHERE/HAVING are intentionally exempt (the incremental-lookback idiom). |
 
-`scan_all(parsed)` runs them all and returns concatenated findings. `all_findings(parseds)` batches over an iterable.
+`scan_all(parsed, *, non_deterministic_builtins=...)` runs them all and returns concatenated findings (the non-determinism check uses the given builtins, defaulting to the portable baseline). `all_findings(parseds)` batches over an iterable. This static check is a fast pre-filter over a curated, necessarily incomplete list; the runtime replay-determinism loop is the completeness layer.
 
 Each detector emits one or more `Finding`s:
 

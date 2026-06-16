@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dblect.adapters import AdapterProfile, IncrementalStrategy, register
+from dblect.sql import PORTABLE_NON_DETERMINISTIC_BUILTINS
 
 register(
     AdapterProfile(
@@ -11,5 +12,6 @@ register(
         key_enforced=True,
         # dbt-postgres defaults to delete+insert (not merge) once a unique_key is set
         default_incremental_strategy=IncrementalStrategy.DELETE_INSERT,
+        non_deterministic_builtins=PORTABLE_NON_DETERMINISTIC_BUILTINS,
     )
 )

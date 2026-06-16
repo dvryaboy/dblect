@@ -12,7 +12,6 @@ from dblect.sql import (
     FindingKind,
     JoinSide,
     detect_coalesce_on_join_key,
-    detect_non_deterministic_function,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -21,6 +20,7 @@ from dblect.sql import (
     list_group_bys,
     list_joins,
     list_windows,
+    make_non_determinism_detector,
     parse_sql,
     scan_all,
 )
@@ -28,6 +28,15 @@ from dblect.sql import (
 
 def _parse(sql: str) -> Expr:
     return parse_sql(sql, dialect="duckdb")
+
+
+def _non_determinism(sql: str, *, builtins: frozenset[str] | None = None) -> tuple[Finding, ...]:
+    detector = (
+        make_non_determinism_detector()
+        if builtins is None
+        else make_non_determinism_detector(builtins)
+    )
+    return detector(_parse(sql))
 
 
 def _kinds(findings: tuple[Finding, ...]) -> set[FindingKind]:
@@ -268,7 +277,7 @@ def test_where_on_right_joined_left_side_detected() -> None:
 
 def test_now_in_join_on_detected() -> None:
     sql = "select * from a join b on a.k = b.k and b.created_at < now()"
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
@@ -279,7 +288,7 @@ def test_now_in_group_by_detected() -> None:
     # is the literal 1, not the expression. So this won't fire. The pattern
     # we care about is `group by <expression containing now()>` directly.
     # (Documented because someone will inevitably wonder why it didn't trigger.)
-    assert detect_non_deterministic_function(_parse(sql)) == ()
+    assert _non_determinism(sql) == ()
 
 
 def test_now_in_explicit_group_by_expression_detected() -> None:
@@ -287,46 +296,63 @@ def test_now_in_explicit_group_by_expression_detected() -> None:
         "select date_diff('day', ts, now()) as days_ago, count(*) "
         "from t group by date_diff('day', ts, now())"
     )
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
 
 
 def test_current_timestamp_in_window_order_by_detected() -> None:
     sql = "select row_number() over (order by ts - current_timestamp) as rn from t"
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
 
 
 def test_random_in_window_partition_by_detected() -> None:
     sql = "select rank() over (partition by random() order by ts) from t"
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
 
 
 def test_now_in_where_not_detected() -> None:
     # The lookback idiom we explicitly want to leave alone.
     sql = "select * from t where ts >= now() - interval '7 days'"
-    assert detect_non_deterministic_function(_parse(sql)) == ()
+    assert _non_determinism(sql) == ()
 
 
 def test_now_in_projection_not_detected() -> None:
     # Audit columns are common and benign.
     sql = "select x, current_timestamp as loaded_at from t"
-    assert detect_non_deterministic_function(_parse(sql)) == ()
+    assert _non_determinism(sql) == ()
 
 
 def test_uuid_in_join_on_detected() -> None:
     sql = "select * from a join b on a.k = gen_random_uuid()"
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
 
 
 def test_now_function_call_alias_detected() -> None:
     # now() arrives as exp.Anonymous; current_timestamp is a typed node.
     sql = "select * from t group by now()"
-    findings = detect_non_deterministic_function(_parse(sql))
+    findings = _non_determinism(sql)
     assert len(findings) == 1
     assert "now" in findings[0].message.lower()
+
+
+def test_anonymous_builtin_fires_only_when_in_the_passed_set() -> None:
+    # txid_current() parses as exp.Anonymous in every dialect, so the name set handed
+    # to the factory is the only thing that decides whether it fires. It is absent from
+    # the portable baseline, so the default detector stays silent; an adapter that adds
+    # it (DuckDB) catches it. This is the contract the per-adapter set rides on.
+    sql = "select * from a join b on a.k = txid_current()"
+    assert _non_determinism(sql) == ()
+    assert len(_non_determinism(sql, builtins=frozenset({"txid_current"}))) == 1
+
+
+def test_baseline_builtin_fires_under_the_default_set() -> None:
+    # now() is in the portable baseline, so the default detector catches it with no
+    # adapter-specific additions.
+    sql = "select * from a join b on a.k = b.k and b.created_at < now()"
+    assert len(_non_determinism(sql)) == 1
 
 
 def test_scan_all_runs_every_detector() -> None:
