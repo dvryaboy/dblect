@@ -1,18 +1,9 @@
-"""Manifest-grounded audit detector for snapshot reads missing a temporal filter.
+"""The snapshot temporal-filter detector and its manifest-grounded constructor.
 
-A dbt snapshot keeps every historical version of each key (SCD-2), so a query that
-reads it without restricting to the current row (``dbt_valid_to IS NULL``) or a
-point-in-time slice (``BETWEEN dbt_valid_from AND dbt_valid_to``) fans out one row
-per version, most visibly under a JOIN.
-
-``detect_snapshot_temporal_filter`` judges a reference against a map of snapshot
-relation name to its SCD-2 validity columns, so it never fires without manifest
-knowledge that the relation is a snapshot and it honors a snapshot that renamed its
-validity columns via ``snapshot_meta_column_names``. ``make_snapshot_detectors``
-curries that detector against the manifest's snapshots, the same shape as the other
-manifest-grounded detector families (``make_fact_grounded_detectors``,
-``make_nullability_detectors``), so the audit walker composes it without owning any
-snapshot-specific wiring.
+``detect_snapshot_temporal_filter`` is the pure check over a parsed tree;
+``make_snapshot_detectors`` curries it against a manifest's snapshots so the audit
+walker composes it like the other detector families (``make_fact_grounded_detectors``,
+``make_nullability_detectors``). See the package docstring for what the check is for.
 """
 
 from __future__ import annotations
@@ -29,15 +20,13 @@ Detector = Callable[[Expr], tuple[Finding, ...]]
 
 
 def make_snapshot_detectors(manifest: Manifest) -> tuple[Detector, ...]:
-    """The snapshot temporal-filter detector, curried against the manifest's snapshots.
+    """Curry ``detect_snapshot_temporal_filter`` against the manifest's snapshots.
 
     Each snapshot is keyed by ``name`` (matching the relation-graph builder) and mapped
-    to its SCD-2 validity columns, so a snapshot that renamed them via
-    ``snapshot_meta_column_names`` is checked against its real column names. A snapshot
-    whose config carries no validity columns (an older manifest without the
-    ``snapshot_meta_column_names`` block) falls back to dbt's defaults. Returns nothing
-    when the project has no snapshots, so the detector never fires without manifest
-    knowledge that a referenced relation is a snapshot.
+    to its SCD-2 validity columns, so a renamed snapshot is checked against its real
+    column names. A snapshot whose config carries no validity columns (an older manifest
+    without the ``snapshot_meta_column_names`` block) falls back to dbt's defaults.
+    Returns nothing when the project has no snapshots.
     """
     snapshots: dict[str, tuple[str, ...]] = {}
     for node in manifest.snapshots.values():
@@ -57,18 +46,15 @@ def detect_snapshot_temporal_filter(
 ) -> tuple[Finding, ...]:
     """Flag a reference to a snapshot whose enclosing query omits a temporal filter.
 
-    A snapshot keeps every historical version of each key, so a query that reads it
-    without restricting to the current row or a point-in-time slice fans out one row
-    per version, most visibly under a JOIN. ``snapshots`` maps each snapshot relation
-    name (case-folded) to its SCD-2 validity columns as ``(valid_from, valid_to)``,
-    honoring a snapshot's ``snapshot_meta_column_names`` rename. A reference to
-    anything not in the map is ignored, so the detector never fires without manifest
-    knowledge that the relation is a snapshot.
+    ``snapshots`` maps each snapshot relation name (case-folded) to its SCD-2 validity
+    columns as ``(valid_from, valid_to)``, honoring a ``snapshot_meta_column_names``
+    rename. A reference to a relation not in the map is ignored, so the detector never
+    fires without manifest knowledge that the relation is a snapshot.
 
-    Conservative toward silence on the validity columns: if any enclosing scope (the
-    immediate SELECT, or an outer query reading it through a CTE or subquery) filters
-    on one of that snapshot's validity columns, the developer is handling temporality
-    and nothing fires. One finding per snapshot reference per scope.
+    Conservative toward silence: if any enclosing scope (the immediate SELECT, or an
+    outer query reading it through a CTE or subquery) filters on one of that snapshot's
+    validity columns, the developer is handling temporality and nothing fires. One
+    finding per snapshot reference per scope.
     """
     if not snapshots:
         return ()
