@@ -27,6 +27,7 @@ from dblect.adapters import AdapterProfile
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node
 from dblect.nullability.detector import make_nullability_detectors
+from dblect.snapshot import make_snapshot_detectors
 from dblect.sql import (
     Finding,
     FindingKind,
@@ -39,11 +40,6 @@ from dblect.sql import (
     make_non_determinism_detector,
     parse_sql,
 )
-
-# Manifest-driven, so it is not a public no-arg ``detect_*`` in DEFAULT_DETECTORS;
-# the walker curries it against the manifest's snapshot names (see
-# ``_make_snapshot_detectors``), the same shape as the fact-grounded detectors.
-from dblect.sql.patterns import detect_snapshot_temporal_filter
 from dblect.uniqueness.detector import make_fact_grounded_detectors
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
@@ -124,12 +120,13 @@ def run_audit(
     Context-bound detectors run alongside the configured `detectors` list, each
     built from the resolved profile and the pre-parsed trees: the non-determinism
     detector (its builtin names come from the profile), the uniqueness window
-    order-keys and join-fanout detectors (grounded against declared keys), and the
+    order-keys and join-fanout detectors (grounded against declared keys), the
     nullability hazard detectors (GROUP BY, join key, and NOT IN on an
     inherited-nullable column, grounded against the propagated nullability
-    property). The fact-grounded ones are opportunistic, silent on projects that
-    declare nothing, so they need no opt-in flag. They share the audit's pre-parsed
-    trees, so the SQL is parsed once.
+    property), and the snapshot temporal-filter detector (grounded against the
+    manifest's snapshots and their validity columns). The fact-grounded ones are
+    opportunistic, silent on projects that declare nothing, so they need no opt-in
+    flag. They share the audit's pre-parsed trees, so the SQL is parsed once.
     """
     parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
@@ -137,7 +134,7 @@ def run_audit(
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(manifest, profile, parsed=trees),
         *make_nullability_detectors(manifest, profile, parsed=trees),
-        *_make_snapshot_detectors(manifest),
+        *make_snapshot_detectors(manifest),
     )
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *contextual)
     active: list[LocatedFinding] = []
@@ -180,31 +177,6 @@ def _parse_models_for_audit(
         except SQLParseError as e:
             out[uid] = e
     return out
-
-
-def _make_snapshot_detectors(manifest: Manifest) -> tuple[Detector, ...]:
-    """The snapshot temporal-filter detector, curried against the manifest's
-    snapshots: each relation name (by ``name``, matching the relation-graph builder)
-    mapped to its SCD-2 validity columns, so a snapshot that renamed them via
-    ``snapshot_meta_column_names`` is checked against its real column names. Returns
-    nothing when the project has no snapshots, so the detector never fires without
-    manifest knowledge that a referenced relation is a snapshot."""
-    snapshots: dict[str, tuple[str, ...]] = {}
-    for node in manifest.snapshots.values():
-        validity = node.config.snapshot_validity_columns if node.config else ()
-        snapshots[node.name.lower()] = validity or _DEFAULT_SNAPSHOT_VALIDITY
-    if not snapshots:
-        return ()
-
-    def snapshot_temporal(tree: Expr) -> tuple[Finding, ...]:
-        return detect_snapshot_temporal_filter(tree, snapshots=snapshots)
-
-    return (snapshot_temporal,)
-
-
-# Fallback validity columns for a snapshot whose config omits them (e.g. an older
-# manifest parsed before validity columns were extracted). dbt's defaults.
-_DEFAULT_SNAPSHOT_VALIDITY: tuple[str, ...] = ("dbt_valid_from", "dbt_valid_to")
 
 
 @dataclass(frozen=True, slots=True)

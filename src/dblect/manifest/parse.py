@@ -449,6 +449,11 @@ def _model_config_from_parsed(node: Any) -> ModelConfig | None:
 _DEFAULT_VALID_FROM = "dbt_valid_from"
 _DEFAULT_VALID_TO = "dbt_valid_to"
 
+# The default (valid-from, valid-to) pair as one value, for callers that need a
+# snapshot's validity columns when its config carries no ``snapshot_meta_column_names``
+# block at all (older manifests, where ``_snapshot_validity_columns`` yields ``()``).
+DEFAULT_SNAPSHOT_VALIDITY_COLUMNS: tuple[str, str] = (_DEFAULT_VALID_FROM, _DEFAULT_VALID_TO)
+
 
 def _snapshot_validity_columns(raw: Any) -> tuple[str, ...]:
     """Resolve a snapshot's (valid-from, valid-to) column names from its
