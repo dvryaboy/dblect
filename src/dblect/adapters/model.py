@@ -56,6 +56,9 @@ class AdapterProfile:
     findings and never by fact resolution. ``default_incremental_strategy`` is the
     strategy in force when a model leaves ``incremental_strategy`` unset, or
     ``None`` where dblect does not know the adapter's default to deduplicate.
+    ``non_deterministic_builtins`` is the complete name set (the portable baseline
+    plus this adapter's own builtins) the non-determinism detector matches anonymous
+    function calls against; a consumer reads it whole and unions nothing.
     """
 
     adapter_type: str
@@ -64,6 +67,7 @@ class AdapterProfile:
     not_null_enforced: bool
     key_enforced: bool
     default_incremental_strategy: IncrementalStrategy | None
+    non_deterministic_builtins: frozenset[str]
 
     def effective_strategy(self, declared: str | None) -> IncrementalStrategy | None:
         """The strategy in force for a model: the declared one when set (``None`` if
