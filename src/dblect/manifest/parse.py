@@ -131,6 +131,14 @@ class ModelConfig:
     materialized: str | None = None
     incremental_strategy: str | None = None
     unique_key: tuple[str, ...] = ()
+    snapshot_validity_columns: tuple[str, ...] = ()
+    """A snapshot's SCD-2 validity columns (valid-from, valid-to), resolved.
+
+    dbt names these ``dbt_valid_from`` / ``dbt_valid_to`` by default and lets a
+    snapshot rename them via ``snapshot_meta_column_names``; this carries the
+    effective names so consumers reason about the columns the warehouse actually
+    has. Empty for non-snapshot nodes (the config block has no such key).
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,6 +437,39 @@ def _model_config_from_parsed(node: Any) -> ModelConfig | None:
         materialized=materialized,
         incremental_strategy=strategy,
         unique_key=unique_key,
+        snapshot_validity_columns=_snapshot_validity_columns(
+            getattr(config, "snapshot_meta_column_names", None)
+        ),
+    )
+
+
+# dbt's default snapshot validity column names, used for any key
+# ``snapshot_meta_column_names`` leaves unset (the common case: the block exists
+# with null values until a snapshot opts into renaming).
+_DEFAULT_VALID_FROM = "dbt_valid_from"
+_DEFAULT_VALID_TO = "dbt_valid_to"
+
+
+def _snapshot_validity_columns(raw: Any) -> tuple[str, ...]:
+    """Resolve a snapshot's (valid-from, valid-to) column names from its
+    ``snapshot_meta_column_names`` config, or ``()`` when the node is not a snapshot.
+
+    dbt attaches this block only to snapshots, with each entry either a renamed
+    column name or null (use the default). A non-string entry falls back to the
+    default, so a partial rename still yields two usable names."""
+    if raw is None:
+        return ()
+
+    def resolve(key: str, default: str) -> str:
+        if isinstance(raw, Mapping):
+            value = cast("Mapping[str, Any]", raw).get(key)
+        else:
+            value = getattr(raw, key, None)
+        return value if isinstance(value, str) and value else default
+
+    return (
+        resolve("dbt_valid_from", _DEFAULT_VALID_FROM),
+        resolve("dbt_valid_to", _DEFAULT_VALID_TO),
     )
 
 

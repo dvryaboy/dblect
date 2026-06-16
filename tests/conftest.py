@@ -21,6 +21,21 @@ def jaffle_manifest_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def snapshot_audit_manifest_path() -> Path:
+    """Manifest of the snapshot-audit fixture: two snapshots (one with default
+    validity column names, one renaming them via snapshot_meta_column_names) and
+    consumer models reading them safely and unsafely. Backs the end-to-end test
+    that the snapshot temporal-filter detector fires on real dbt-compiled SQL.
+    """
+    path = FIXTURES / "snapshot_audit" / "manifest.json"
+    if not path.exists():
+        pytest.skip(
+            "snapshot-audit fixture not present; run scripts/refresh_snapshot_audit.sh",
+        )
+    return path
+
+
+@pytest.fixture(scope="session")
 def jaffle_snowflake_meta_manifest_path() -> Path:
     """Jaffle manifest with ``metadata.adapter_type`` relabeled to ``snowflake``.
 
