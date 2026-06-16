@@ -12,6 +12,8 @@ a wrong key.
 
 from __future__ import annotations
 
+import pytest
+
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import surrogate_key_discoverer
@@ -139,6 +141,26 @@ def test_composite_key_substitutes_the_hash_member() -> None:
     )
     test = _combination("test.shop.uc", columns=["x", "sk"], target=model.unique_id)
     assert frozenset({"x", "a", "b"}) in _keys(model, test)
+
+
+@pytest.mark.parametrize(
+    "hash_expr",
+    [
+        # The hash families a BigQuery model reaches for as a surrogate key. sqlglot
+        # parses each to its own node (`SHA256` -> `SHA2Digest`, the bare digest form;
+        # `TO_HEX(SHA256(...))` -> `LowerHex` over it; `FARM_FINGERPRINT` -> its own
+        # node), so all must be recognized for the input key to ground. The MD5 forms
+        # are covered by test_unique_on_a_surrogate_hash_grounds_a_key_on_the_inputs.
+        "FARM_FINGERPRINT(CONCAT(a, b))",
+        "SHA256(CONCAT(a, b))",
+        "TO_HEX(SHA256(CONCAT(a, b)))",
+        "SHA1(CONCAT(a, b))",
+    ],
+)
+def test_bigquery_hash_families_ground_the_input_key(hash_expr: str) -> None:
+    model = _model("model.shop.m", f"SELECT {hash_expr} AS sk, a, b FROM up")
+    test = _unique("test.shop.u", column="sk", target=model.unique_id)
+    assert frozenset({"a", "b"}) in _keys(model, test)
 
 
 def test_input_key_flows_end_to_end_through_the_property() -> None:

@@ -68,7 +68,13 @@ from dblect.manifest import (
     ResourceType,
     generic_test_target_uid,
 )
-from dblect.sql import SQLParseError, parse_sql
+from dblect.sql import (
+    SURROGATE_HASH_FUNCTIONS,
+    SURROGATE_HASH_PASSTHROUGH,
+    SURROGATE_HASH_STRUCTURAL,
+    SQLParseError,
+    parse_sql,
+)
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -412,30 +418,10 @@ def config_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKe
 # conservative: only a recognized hash function over a structural combination
 # (concat, cast, coalesce, case-folding, literals) of plain columns grounds the
 # input key, and only when those inputs are themselves output columns of the
-# relation; anything opaque grounds nothing rather than a wrong key.
-
-# Hash functions whose output uniquely determines their input tuple. Resolved by
-# name so the set is stable across sqlglot versions that lack a given node.
-# Both the hex (`exp.MD5`, the `TO_HEX(MD5(...))` form) and raw-digest
-# (`exp.MD5Digest`, the bare `MD5(...)` form) spellings, plus SHA and BigQuery's
-# FARM_FINGERPRINT.
-_HASH_FUNCS: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n)
-    for n in ("MD5", "MD5Digest", "SHA", "SHA2", "FarmFingerprint")
-    if hasattr(exp, n)
-)
-# Single-argument wrappers that do not change which tuple is hashed, looked through
-# to reach the hash (e.g. `TO_HEX(MD5(...))`, `LOWER(...)`).
-_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
-)
-# Structural combinators that assemble columns into the hashed value without making
-# the input anything other than those columns.
-_STRUCTURAL: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n)
-    for n in ("Concat", "DPipe", "Cast", "TryCast", "Coalesce", "Lower", "Upper", "Trim", "Paren")
-    if hasattr(exp, n)
-)
+# relation; anything opaque grounds nothing rather than a wrong key. The hash,
+# passthrough, and structural node vocabularies are SQL-grammar facts owned by the
+# `sql` layer (SURROGATE_HASH_*), shared so this property stays independent of which
+# spellings a dialect produces.
 
 
 def _expr_args(node: Expr) -> list[Expr]:
@@ -462,7 +448,7 @@ def _pure_input_columns(node: Expr) -> frozenset[str] | None:
         return frozenset({sg.column_name(node).lower()})
     if isinstance(node, exp.Literal):
         return frozenset()
-    if isinstance(node, _STRUCTURAL):
+    if isinstance(node, SURROGATE_HASH_STRUCTURAL):
         cols: set[str] = set()
         for child in _expr_args(node):
             sub = _pure_input_columns(child)
@@ -481,15 +467,15 @@ def _surrogate_hash_inputs(expr: Expr) -> frozenset[str] | None:
     seen = 0
     while (
         node is not None
-        and not isinstance(node, _HASH_FUNCS)
-        and isinstance(node, _HASH_PASSTHROUGH)
+        and not isinstance(node, SURROGATE_HASH_FUNCTIONS)
+        and isinstance(node, SURROGATE_HASH_PASSTHROUGH)
     ):
         inner = node.this
         node = inner if isinstance(inner, Expr) else None
         seen += 1
         if seen > 4:
             return None
-    if not isinstance(node, _HASH_FUNCS):
+    if not isinstance(node, SURROGATE_HASH_FUNCTIONS):
         return None
     cols: set[str] = set()
     for child in _expr_args(node):
