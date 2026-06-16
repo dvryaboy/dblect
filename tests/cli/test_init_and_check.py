@@ -128,8 +128,74 @@ def test_check_json_format(jaffle_manifest_path: Path, runner: CliRunner, tmp_pa
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "2"
+    assert payload["schema_version"] == "3"
     assert payload["summary"]["contracts_resolved"] == 1
     # The coverage block rides alongside the summary in the schema.
     assert "resolution" in payload["coverage"]
     assert "grounding" in payload["coverage"]
+    assert payload["coverage"]["worlds"] == {"worlds_enumerated": 1, "axes_enumerated": []}
+
+
+# --- catalog wiring -------------------------------------------------------------
+
+_MINIMAL_CATALOG = """{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/catalog/v1.json",
+    "dbt_version": "1.8.0",
+    "generated_at": "2024-01-01T00:00:00Z",
+    "invocation_id": "x",
+    "env": {}
+  },
+  "nodes": {},
+  "sources": {},
+  "errors": null
+}
+"""
+
+
+def test_check_reads_catalog_when_supplied(
+    jaffle_manifest_path: Path, runner: CliRunner, tmp_path: Path
+) -> None:
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(_MINIMAL_CATALOG)
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            str(tmp_path),
+            "--manifest",
+            str(jaffle_manifest_path),
+            "--catalog",
+            str(catalog),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert f"reading catalog at {catalog}" in result.output
+
+
+def test_check_notes_when_no_catalog_is_available(
+    jaffle_manifest_path: Path, runner: CliRunner, tmp_path: Path
+) -> None:
+    # The jaffle manifest has no catalog.json beside it, so the run proceeds and
+    # says so rather than silently resolving leaves only from schema.yml.
+    result = runner.invoke(app, ["check", str(tmp_path), "--manifest", str(jaffle_manifest_path)])
+    assert result.exit_code == 0, result.output
+    assert "no catalog.json" in result.output
+
+
+def test_check_rejects_a_missing_catalog_path(
+    jaffle_manifest_path: Path, runner: CliRunner, tmp_path: Path
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            str(tmp_path),
+            "--manifest",
+            str(jaffle_manifest_path),
+            "--catalog",
+            str(tmp_path / "nope.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "catalog path does not exist" in result.output

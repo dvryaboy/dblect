@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from dbt_artifacts_parser.parser import parse_manifest  # type: ignore[import-untyped]
 
 from dblect.manifest.dag import Dag
+
+if TYPE_CHECKING:
+    from dblect.manifest.catalog import Catalog
 
 
 class ResourceType(StrEnum):
@@ -271,6 +274,37 @@ class Manifest:
             adapter_type=adapter_type,
             nodes=nodes,
         )
+
+    def merge_catalog(self, catalog: Catalog) -> Self:
+        """Return a copy whose node column sets are unioned with the catalog's
+        warehouse-introspected columns, so DAG leaves (seeds, sources) that no
+        ``schema.yml`` documents still carry a column universe.
+
+        Documented columns stay authoritative: a column the manifest already
+        carries keeps its declared :class:`Column` (matching by name
+        case-insensitively, since a warehouse may report a different case than
+        the project wrote), and the catalog adds only columns the node lacks.
+        Nodes the catalog does not cover pass through untouched.
+        """
+        merged: dict[str, Node] = {}
+        for uid, node in self.nodes.items():
+            catalog_columns = catalog.columns_by_uid.get(uid)
+            if not catalog_columns:
+                merged[uid] = node
+                continue
+            columns = dict(node.columns)
+            # Track present names case-insensitively, seeded from the documented
+            # columns and grown as catalog columns land, so two catalog entries
+            # that differ only in case (a warehouse reporting both) collapse to
+            # the first rather than duplicating.
+            present = {name.lower() for name in columns}
+            for col_name, data_type in catalog_columns.items():
+                if col_name.lower() in present:
+                    continue
+                columns[col_name] = Column(name=col_name, data_type=data_type, description=None)
+                present.add(col_name.lower())
+            merged[uid] = replace(node, columns=columns)
+        return replace(self, nodes=merged)
 
     @property
     def models(self) -> Mapping[str, Node]:

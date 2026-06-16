@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dblect.adapters import profile_for_adapter
+from dblect.adapters import AdapterProfile, profile_for_adapter
 from dblect.audit import (
     DEFAULT_DETECTORS,
     AuditReport,
@@ -89,11 +89,24 @@ def test_audit_records_parse_errors_without_blowing_up(jaffle: Manifest) -> None
     assert report.models_scanned == len(jaffle.models) - 1
 
 
-def test_custom_detector_list_only_runs_those(jaffle: Manifest) -> None:
-    # Empty detector tuple = nothing fires; still exercises the parse/scan loop.
-    report = run_audit(jaffle, _DUCKDB, detectors=())
-    assert report.findings == ()
-    assert report.models_scanned == len(jaffle.models)
+def test_empty_detector_list_gates_the_structural_detectors(jaffle: Manifest) -> None:
+    # The `detectors` arg gates the structural detectors: an empty tuple drops them,
+    # so jaffle's structural findings disappear, while the scan loop still runs over
+    # every model. The context-bound detectors (non-determinism, uniqueness,
+    # nullability) are built in run_audit and not gated by this arg.
+    structural = {
+        FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+        FindingKind.COALESCE_ON_JOIN_KEY,
+        FindingKind.UNORDERED_RANKING_WINDOW,
+        FindingKind.UNORDERED_AGGREGATE,
+        FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
+    }
+    full_kinds = {lf.finding.kind for lf in run_audit(jaffle, _DUCKDB).findings}
+    assert full_kinds & structural, "jaffle should exercise at least one structural detector"
+
+    gated = run_audit(jaffle, _DUCKDB, detectors=())
+    assert gated.models_scanned == len(jaffle.models)
+    assert {lf.finding.kind for lf in gated.findings}.isdisjoint(structural)
 
 
 def test_counts_by_kind_matches_findings(jaffle_report: AuditReport) -> None:
@@ -105,10 +118,12 @@ def test_counts_by_kind_matches_findings(jaffle_report: AuditReport) -> None:
 
 
 def test_default_detectors_includes_every_sql_detector_exactly_once() -> None:
-    # The audit layer must wire in every `detect_*` the SQL layer exports.
-    # If a new detector lands in dblect.sql but the walker forgets to add it
-    # to DEFAULT_DETECTORS, audits would silently skip it; this test catches
-    # that without pinning the count.
+    # The audit layer must wire in every structural `detect_*` the SQL layer
+    # exports. If a new one lands in dblect.sql but the walker forgets to add it to
+    # DEFAULT_DETECTORS, audits would silently skip it; this test catches that
+    # without pinning the count. Context-bound detectors are `make_*` factories
+    # (e.g. make_non_determinism_detector), built per run in run_audit, so they sit
+    # outside this guard by design.
     import dblect.sql as sql_module
 
     sql_detectors = {
@@ -274,6 +289,32 @@ def test_macro_emitted_join_visible_in_compiled_code() -> None:
     assert any(
         lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
     ), "compiled path should see the macro-emitted LEFT JOIN and flag the GROUP BY"
+
+
+def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> None:
+    # A DuckDB-only nondeterministic builtin in a load-bearing position fires under the
+    # duckdb profile and stays silent under another, proving the audit's resolved
+    # adapter's `non_deterministic_builtins` reach the non-determinism detector.
+    # txid_current() parses as exp.Anonymous in every dialect, so the resolved
+    # adapter's name set alone decides whether it fires.
+    [uid] = list(jaffle.models)[:1]
+    nodes = dict(jaffle.nodes)
+    nodes[uid] = _with_compiled_code(nodes[uid], "select * from a join b on a.k = txid_current()")
+    altered = Manifest(
+        schema_version=jaffle.schema_version,
+        adapter_type=jaffle.adapter_type,
+        nodes=nodes,
+    )
+
+    def nondet_hits(profile: AdapterProfile) -> int:
+        report = run_audit(altered, profile)
+        return sum(
+            lf.model_unique_id == uid and lf.finding.kind is FindingKind.NON_DETERMINISTIC_FUNCTION
+            for lf in report.findings
+        )
+
+    assert nondet_hits(profile_for_adapter("duckdb")) == 1
+    assert nondet_hits(profile_for_adapter("snowflake")) == 0
 
 
 def _without_sql(node: Node) -> Node:

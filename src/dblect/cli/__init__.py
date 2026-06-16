@@ -12,6 +12,7 @@ import typer
 
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
+    from dblect.manifest import Manifest
 
 app = typer.Typer(
     name="dblect",
@@ -79,6 +80,17 @@ def audit(
             ),
         ),
     ] = None,
+    catalog: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--catalog",
+            help=(
+                "Path to a catalog.json (`dbt docs generate`). Defaults to "
+                "catalog.json alongside the manifest. Supplies seed/source columns "
+                "so undocumented DAG leaves resolve; documented columns win on conflict."
+            ),
+        ),
+    ] = None,
     no_fail: Annotated[
         bool,
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
@@ -93,7 +105,6 @@ def audit(
     """Run the static structural audit over a dbt project's models."""
     from dblect.audit import run_audit
     from dblect.audit.reporter import render_json, render_text
-    from dblect.manifest import Manifest
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir,
@@ -101,8 +112,7 @@ def audit(
         dbt_executable=dbt_executable,
         command="audit",
     )
-    typer.echo(f"audit: reading manifest at {manifest_path}", err=True)
-    loaded = Manifest.from_file(manifest_path)
+    loaded = _load_manifest(manifest_path=manifest_path, explicit_catalog=catalog, command="audit")
     profile = _resolve_profile(loaded.adapter_type, dialect_override, command="audit")
     report = run_audit(loaded, profile)
     rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
@@ -138,6 +148,17 @@ def check(
         str | None,
         typer.Option("--dialect", help="Force a sqlglot dialect, overriding the manifest."),  # pyright: ignore[reportUnknownMemberType]
     ] = None,
+    catalog: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--catalog",
+            help=(
+                "Path to a catalog.json (`dbt docs generate`). Defaults to "
+                "catalog.json alongside the manifest. Supplies seed/source columns "
+                "so undocumented DAG leaves resolve; documented columns win on conflict."
+            ),
+        ),
+    ] = None,
     no_fail: Annotated[
         bool,
         typer.Option("--no-fail", help="Always exit 0, even when findings exist."),  # pyright: ignore[reportUnknownMemberType]
@@ -161,13 +182,11 @@ def check(
 
     from dblect.check import render_json, render_text, run_check
     from dblect.loader import load_declarations
-    from dblect.manifest import Manifest
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
     )
-    typer.echo(f"check: reading manifest at {manifest_path}", err=True)
-    loaded = Manifest.from_file(manifest_path)
+    loaded = _load_manifest(manifest_path=manifest_path, explicit_catalog=catalog, command="check")
     profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check")
 
     load_result = load_declarations(project_dir)
@@ -318,6 +337,43 @@ def _resolve_manifest_path(
             f"`dbt compile` succeeded but {default} is missing; check dbt's target-path config"
         )
     return default
+
+
+def _resolve_catalog_path(*, explicit: Path | None, manifest_path: Path) -> Path | None:
+    """The ``catalog.json`` to read, or ``None`` when there is none.
+
+    An explicit path must exist (a typo should fail loudly). Otherwise dblect
+    looks for ``catalog.json`` next to the manifest, where ``dbt docs generate``
+    writes it, and a miss is silent: the catalog is optional, the run proceeds on
+    documented and derived columns alone."""
+    if explicit is not None:
+        if not explicit.exists():
+            raise typer.BadParameter(f"catalog path does not exist: {explicit}")
+        return explicit
+    default = manifest_path.parent / "catalog.json"
+    return default if default.exists() else None
+
+
+def _load_manifest(*, manifest_path: Path, explicit_catalog: Path | None, command: str) -> Manifest:
+    """Load the manifest and, when a catalog is available, merge its
+    warehouse-introspected columns so seeds and sources resolve without manual
+    documentation. A missing catalog is noted, not an error: it is the difference
+    between full leaf coverage and resolving only what ``schema.yml`` documents."""
+    from dblect.manifest import Catalog, Manifest
+
+    typer.echo(f"{command}: reading manifest at {manifest_path}", err=True)
+    loaded = Manifest.from_file(manifest_path)
+    catalog_path = _resolve_catalog_path(explicit=explicit_catalog, manifest_path=manifest_path)
+    if catalog_path is not None:
+        typer.echo(f"{command}: reading catalog at {catalog_path}", err=True)
+        return loaded.merge_catalog(Catalog.from_file(catalog_path))
+    typer.echo(
+        f"{command}: no catalog.json alongside the manifest; seed/source columns come "
+        "only from schema.yml, so undocumented leaves may not resolve. Run "
+        "`dbt docs generate` or pass --catalog to cover them.",
+        err=True,
+    )
+    return loaded
 
 
 if __name__ == "__main__":

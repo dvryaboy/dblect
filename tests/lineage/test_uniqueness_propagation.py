@@ -77,6 +77,22 @@ def _source(uid: str) -> Node:
     )
 
 
+def _leaf(uid: str, *, kind: ResourceType) -> Node:
+    """A seed or snapshot leaf: a downstream model refs it by name like a source."""
+    return Node(
+        unique_id=uid,
+        name=uid.split(".")[-1],
+        resource_type=kind,
+        fqn=(uid,),
+        package_name="shop",
+        schema="analytics",
+        raw_code=None,
+        compiled_code=None,
+        original_file_path=None,
+        columns={},
+    )
+
+
 def _unique(uid: str, *, column: str, target: str) -> Node:
     return Node(
         unique_id=uid,
@@ -121,6 +137,26 @@ def test_passthrough_carries_the_source_key() -> None:
         _model("model.shop.stg", "SELECT id, amount FROM orders"),
     )
     assert keys["model.shop.stg"] == CandidateKeySet.of(_key("id"))
+
+
+def test_unique_test_on_a_seed_flows_into_a_model_that_refs_it() -> None:
+    seed = _leaf("seed.shop.country_codes", kind=ResourceType.SEED)
+    keys = _keys(
+        seed,
+        _unique("test.shop.u", column="code", target=seed.unique_id),
+        _model("model.shop.stg_countries", "SELECT code, name FROM country_codes"),
+    )
+    assert keys["model.shop.stg_countries"] == CandidateKeySet.of(_key("code"))
+
+
+def test_unique_test_on_a_snapshot_flows_into_a_model_that_refs_it() -> None:
+    snap = _leaf("snapshot.shop.orders_snapshot", kind=ResourceType.SNAPSHOT)
+    keys = _keys(
+        snap,
+        _unique("test.shop.u", column="dbt_scd_id", target=snap.unique_id),
+        _model("model.shop.current_orders", "SELECT dbt_scd_id, amount FROM orders_snapshot"),
+    )
+    assert keys["model.shop.current_orders"] == CandidateKeySet.of(_key("dbt_scd_id"))
 
 
 def test_projection_rename_remaps_the_key() -> None:
