@@ -1,8 +1,10 @@
 # Var inference: the Jinja front end
 
-Status: design
+Status: implemented in [#104](https://github.com/dvryaboy/dblect/pull/104), split off `main` ahead of the rest of this stream
 Audience: engineers implementing the source-Jinja walker for var discovery
 Part of: [the var-inference plan](./plan.md)
+
+The parsing environment (`src/dblect/varinf/environment.py`), the context-carrying walker (`walker.py`), and the `VarUsage` / `UsageContext` contracts (`usage.py`) land in #104, with the rule-by-rule pins and two property tests (discovery completeness against an independent `find_all` oracle, and totality on arbitrary input) in `tests/varinf/`. Two boundaries are deferred and noted under [Open questions](#open-questions): `is_incremental()` and the `SqlLiteral` position hint.
 
 This stream turns a node's source Jinja into a structured record of every `var()` and `env_var()` reference it makes directly (macro indirection is the [macro-following](./macro-following.md) stream). It is the second of dblect's two front ends: sqlglot over compiled SQL for structure, and this Jinja AST over source for the variability compiled SQL has already erased.
 
@@ -25,7 +27,9 @@ A probe of `jinja2.Environment().parse()` established that the parser yields a c
 | `MacroArg(macro, position)` | the `var` `Call` is an argument of another `Call` whose name is not `var` / `env_var` |
 | inline `var(name, default)` | the `Call` carries a second `Const` argument |
 
-`env_var` versus `var` is the callee name on the `Call`. `is_incremental()` is a `Call` to a bare name, discoverable the same way and relevant as an always-present control-flow axis. `config()`, `ref()`, `source()`, `{{ this }}`, whitespace control, `{% set %}`, and boolean `and` / `or` all parse cleanly and are simply not `var` / `env_var` calls, so the walker ignores them.
+`env_var` versus `var` is the callee name on the `Call`. `config()`, `ref()`, `source()`, `{{ this }}`, whitespace control, `{% set %}`, and boolean `and` / `or` all parse cleanly and are simply not `var` / `env_var` calls, so the walker ignores them.
+
+`is_incremental()` is also a `Call` to a bare name, and the walker sees it the same way, but it does not emit a `VarUsage` for it: it is not a var, it is an always-present control-flow axis whose type (`bool`), domain (first-run versus steady-state), and trigger (incremental materialization) are all known a priori. It enters the world system through bounded re-compilation keyed on `materialized == 'incremental'`, not through discovery, so forcing it into the var-shaped `VarUsage` would muddy that contract. If the per-model responsiveness map ever needs to know which models branch on it, that is a separate control-flow marker, not a `VarUsage`. The same holds for `target.name`.
 
 The control-flow versus value-substitution signal, which the [classification](./inference-and-classification.md) stream and #99 / #100 depend on, is recoverable from the AST alone: a `var` `Call` reached under an `If.test`, a `For.iter`, or a branch-steering `Compare` is control-flow; one reached only under an `Output` or a plain expression is value-substitution. No text heuristics are needed for that decision.
 
@@ -80,7 +84,9 @@ The walker emits `VarUsage` records as specified in [`var-inference-spec.md`](..
 
 ## Open questions
 
-- **Column position in source locations.** jinja2 AST nodes carry `lineno` but not column. Whether to recover column by re-lexing or to accept line-only locations in v1.
+- **`SqlLiteral` position hint.** The spec's `SqlLiteral(position)` distinguishes quoted-string, numeric, and identifier positions, which type inference reads (a numeric `LIMIT` position infers numeric, a quoted position infers `str`). Deciding that needs the SQL context around the interpolation, which the Jinja AST does not carry: an `Output` node knows it interpolates a value, not what SQL token surrounds it. #104 emits `SqlLiteral(UNKNOWN)` and defers the refinement (recovering the surrounding text, or a light re-lex) rather than guessing. Until then a value-substitution var still types from its other usages and from its declared default.
+- **Column position in source locations.** jinja2 AST nodes carry `lineno` but not column. Whether to recover column by re-lexing or to accept line-only locations in v1 (#104 takes line-only).
+- **`is_incremental()` and `target` as control-flow markers.** The walker recognizes these but emits no `VarUsage` (they are not vars). They are handled as always-present axes by bounded re-compilation. Whether the front end should additionally emit a non-var control-flow marker per model to feed per-model responsiveness ([#99](https://github.com/dvryaboy/dblect/issues/99)) is deferred to the always-present-axis stream that owns them.
 - **Vars in seeds and sources.** The spec defers these. They have no `raw_code` to walk, so they are out of this stream's reach regardless; if they are wanted, they enter through config rather than the Jinja walk.
 
 ## References
