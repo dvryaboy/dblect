@@ -425,7 +425,7 @@ def _macro_from_parsed(uid: str, m: Any) -> Macro:
 # which the parser's enum rejects. dblect never reads this field, so unmodeled
 # values are dropped before the parse rather than allowed to fail it, keeping the
 # parse total in the same spirit as the ``from_raw`` enums above. Remove this once
-# the parser models the value (https://github.com/yu-iskw/dbt-artifacts-parser/issues/219).
+# the parser models the value (tracked in #106; upstream dbt-artifacts-parser#219).
 _MODELED_SUPPORTED_LANGUAGES = frozenset({"python", "sql"})
 
 

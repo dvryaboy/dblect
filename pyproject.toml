@@ -38,7 +38,7 @@ dependencies = [
 # The earlier `function`-materialization `javascript` language (dbt 1.9+) is a
 # value the parser also does not model, handled by a tolerant read in
 # dblect.manifest.parse rather than a cap. Lift this cap when a parser release
-# lands. See https://github.com/yu-iskw/dbt-artifacts-parser/issues/219.
+# lands. Tracked in #106; upstream https://github.com/yu-iskw/dbt-artifacts-parser/issues/219.
 dbt-core = ["dbt-core>=1.8,<1.11.8"]
 
 [project.scripts]
