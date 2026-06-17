@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +14,14 @@ from dblect.manifest import Manifest, ResourceType
 @pytest.fixture(scope="module")
 def jaffle(jaffle_manifest_path: Path) -> Manifest:
     return Manifest.from_file(jaffle_manifest_path)
+
+
+@pytest.fixture(scope="module")
+def jaffle_raw_macros(jaffle_manifest_path: Path) -> dict[str, Any]:
+    """The manifest's raw ``macros`` block, the source of truth the typed
+    registry is checked against."""
+    raw: dict[str, Any] = json.loads(jaffle_manifest_path.read_text())
+    return raw["macros"]
 
 
 def test_loads_schema_version(jaffle: Manifest) -> None:
@@ -107,6 +117,40 @@ def test_seeds_have_no_dependencies(jaffle: Manifest) -> None:
     for n in jaffle.seeds.values():
         # Seeds are root nodes in the data-flow DAG.
         assert n.depends_on == frozenset()
+
+
+def test_macro_registry_has_entry_per_raw_macro(
+    jaffle: Manifest, jaffle_raw_macros: dict[str, Any]
+) -> None:
+    # The registry is a faithful transcription of the manifest's `macros`
+    # block: one entry per raw macro, keyed by unique_id.
+    assert set(jaffle.macros) == set(jaffle_raw_macros)
+
+
+def test_macro_registry_transcribes_fields(
+    jaffle: Manifest, jaffle_raw_macros: dict[str, Any]
+) -> None:
+    for uid, raw in jaffle_raw_macros.items():
+        macro = jaffle.macros[uid]
+        assert macro.unique_id == uid
+        assert macro.name == raw["name"]
+        assert macro.package_name == raw["package_name"]
+        # The source body is what macro-following expands; it must survive.
+        assert macro.macro_sql == raw["macro_sql"]
+        assert macro.macro_sql, f"{uid} should carry a non-empty source body"
+
+
+def test_macro_registry_transcribes_macro_dependencies(
+    jaffle: Manifest, jaffle_raw_macros: dict[str, Any]
+) -> None:
+    # `depends_on.macros` is the edge set macro-following walks; pin that it
+    # round-trips into `depends_on_macros` for every macro that declares one.
+    saw_dependency = False
+    for uid, raw in jaffle_raw_macros.items():
+        expected = frozenset(raw.get("depends_on", {}).get("macros", []) or [])
+        assert jaffle.macros[uid].depends_on_macros == expected
+        saw_dependency = saw_dependency or bool(expected)
+    assert saw_dependency, "fixture should exercise at least one macro-to-macro edge"
 
 
 def test_jaffle_tests_round_trip_with_default_test_config(jaffle: Manifest) -> None:
