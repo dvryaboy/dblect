@@ -16,6 +16,7 @@ skipped, where vars do not live.
 
 from __future__ import annotations
 
+from functools import cache
 from typing import ClassVar
 
 from jinja2 import Environment, nodes
@@ -65,3 +66,15 @@ def make_environment() -> Environment:
         # off so no behavior depends on it.
         autoescape=False,
     )
+
+
+@cache
+def shared_environment() -> Environment:
+    """The environment the walker parses with, materialized once on first use.
+
+    Building an environment wires three extensions, and the walker parses one
+    environment per node otherwise. The environment only ever ``parse``s (it never
+    renders and holds no per-source state), so a single instance serves every walk.
+    Callers that want an isolated environment build one with :func:`make_environment`.
+    """
+    return make_environment()

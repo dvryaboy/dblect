@@ -112,7 +112,14 @@ class Comparison:
 
 @dataclass(frozen=True, slots=True)
 class InSet:
-    """The ``var`` call is tested for membership: ``var('x') in ['a', 'b']``."""
+    """The ``var`` call is tested for membership: ``var('x') in ['a', 'b']``.
+
+    Both ``in`` and ``not in`` fold to this shape, and the record does not carry
+    which. The finite set of values that steer the branch is the same either way,
+    so world enumeration tries ``elements`` (plus an out-of-set value) regardless
+    of the membership direction. A consumer that ever needs the polarity would add
+    an explicit flag here; nothing downstream reads it today.
+    """
 
     elements: tuple[LiteralValue, ...]
 
@@ -123,6 +130,12 @@ class Arithmetic:
 
     ``other`` is the literal operand when the other side is a ``Const``; ``None``
     when it is a non-literal expression (the operator is still recorded).
+
+    ``other`` does not record which side the var sat on, so a non-commutative
+    operator does not distinguish ``var('x') - 1`` from ``1 - var('x')``. The
+    operator class is what the type and domain inference downstream wants from an
+    arithmetic context; recovering exact operand order is a noted follow-up if a
+    consumer ever needs it.
     """
 
     op: ArithOp

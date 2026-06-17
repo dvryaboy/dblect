@@ -14,6 +14,9 @@ with jinja2's own vocabulary, so the drift surfaces here instead of in the field
 
 from __future__ import annotations
 
+# ``_compare_operators`` is jinja2's own compare-op set. It is a private symbol, so a
+# jinja2 release that renames it breaks this import; the fix is to re-pin against the
+# new name, the same drift signal these tests exist to surface.
 from jinja2.parser import _compare_operators
 
 from dblect.varinf.usage import ArithOp, ComparisonOp

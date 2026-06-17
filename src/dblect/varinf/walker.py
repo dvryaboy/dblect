@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from jinja2 import TemplateError, nodes
 
-from dblect.varinf.environment import make_environment
+from dblect.varinf.environment import shared_environment
 from dblect.varinf.usage import (
     Arithmetic,
     ArithOp,
@@ -85,9 +85,8 @@ def walk_source(source: str, *, unique_id: str, file_path: str | None = None) ->
     source path stamped onto each usage's location. A parse failure yields a
     :class:`WalkResult` carrying one :class:`OpaqueNode` and no usages.
     """
-    env = make_environment()
     try:
-        template = env.parse(source)
+        template = shared_environment().parse(source)
     except (TemplateError, SyntaxError, ValueError) as exc:
         # Degrade, don't lie: a body we cannot parse becomes one diagnostic, never a
         # crash and never a silent miss.
@@ -178,6 +177,9 @@ class _Walker:
         if op in ("in", "notin"):
             # Membership reads as a domain only with the var on the left and a
             # literal collection on the right; ``'a' in var('x')`` is a different shape.
+            # ``in`` and ``notin`` both fold to InSet: the values that steer the branch
+            # are the same set either way, so enumeration does not need the polarity
+            # (see InSet).
             if left_var in _VAR_BUILTINS and isinstance(left, nodes.Call):
                 elements = _const_sequence(right)
                 if elements is not None:
@@ -199,7 +201,9 @@ class _Walker:
     def _visit_arith(self, expr: nodes.BinExpr) -> None:
         op = _ARITH_OPS.get(type(expr))
         if op is None:
-            # An unmapped BinExpr (e.g. string concat) is not arithmetic; recurse.
+            # Defensive: every arithmetic BinExpr is mapped and And / Or are handled
+            # as boolean before reaching here, so this fires only if a future jinja2
+            # adds a BinExpr subclass. Recurse so its vars are still discovered.
             for child in expr.iter_child_nodes():
                 self.visit(child, default=Unknown())
             return
@@ -222,6 +226,17 @@ class _Walker:
         for keyword in call.kwargs:
             self._visit_arg(keyword.value, callee, position)
             position += 1
+        # ``*args`` / ``**kwargs`` splats carry no knowable per-arg position, so we
+        # recurse for completeness (a var inside is found and classified Unknown)
+        # rather than inventing a MacroArg index for it.
+        self._visit_splats(call)
+
+    def _visit_splats(self, call: nodes.Call) -> None:
+        """Walk a call's ``*args`` / ``**kwargs`` expressions, when present."""
+        if call.dyn_args is not None:
+            self.visit(call.dyn_args, default=Unknown())
+        if call.dyn_kwargs is not None:
+            self.visit(call.dyn_kwargs, default=Unknown())
 
     def _visit_arg(self, arg: nodes.Expr, callee: str, position: int) -> None:
         builtin = _call_name(arg)
@@ -249,6 +264,7 @@ class _Walker:
             self.visit(extra, default=Unknown())
         for keyword in call.kwargs:
             self.visit(keyword.value, default=Unknown())
+        self._visit_splats(call)
 
 
 # A sentinel distinguishing "no literal operand" from a literal whose value is

@@ -91,6 +91,13 @@ def test_in_set() -> None:
     assert u.context == InSet(("us", "eu"))
 
 
+def test_not_in_set_folds_to_same_membership_shape() -> None:
+    # `not in` records the same InSet as `in`: the values that steer the branch are
+    # the same set either way, so enumeration is unaffected by the polarity.
+    u = one("{% if var('region') not in ['us', 'eu'] %}a{% endif %}")
+    assert u.context == InSet(("us", "eu"))
+
+
 def test_arithmetic() -> None:
     u = one("{{ var('n') + 1 }}")
     assert u.context == Arithmetic(ArithOp.ADD, 1)
@@ -122,6 +129,14 @@ def test_unmodeled_binop_still_discovers_vars_as_unknown() -> None:
     # arithmetic. The bounded op vocabulary costs classification fidelity here, not
     # completeness: both vars are still found, as the honest Unknown fallback.
     found = usages("{{ var('a') ~ var('b') }}")
+    assert {u.var_name for u in found} == {"a", "b"}
+    assert all(u.context == Unknown() for u in found)
+
+
+def test_var_in_splat_args_is_discovered() -> None:
+    # A var inside a ``*args`` / ``**kwargs`` splat carries no knowable arg
+    # position, so it is found and classified Unknown rather than dropped.
+    found = usages("{{ f(*[var('a')], **{'k': var('b')}) }}")
     assert {u.var_name for u in found} == {"a", "b"}
     assert all(u.context == Unknown() for u in found)
 

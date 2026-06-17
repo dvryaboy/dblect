@@ -48,6 +48,9 @@ def _extend(children: st.SearchStrategy[str]) -> st.SearchStrategy[str]:
         children.map(lambda c: f"({c} | upper)"),
         st.tuples(children, children, children).map(lambda t: f"({t[0]} if {t[1]} else {t[2]})"),
         st.lists(children, min_size=1, max_size=3).map(lambda xs: "f(" + ", ".join(xs) + ")"),
+        # ``*args`` splat: a var inside reaches the call through dyn_args, the path the
+        # plain positional arm does not exercise.
+        st.lists(children, min_size=1, max_size=2).map(lambda xs: "f(*[" + ", ".join(xs) + "])"),
         st.lists(children, min_size=1, max_size=3).map(lambda xs: "[" + ", ".join(xs) + "]"),
         st.tuples(children, st.lists(_literals, min_size=1, max_size=3)).map(
             lambda t: f"({t[0]} in [" + ", ".join(t[1]) + "])"
