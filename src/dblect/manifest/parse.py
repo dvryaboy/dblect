@@ -278,6 +278,7 @@ class Manifest:
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> Self:
         """Parse a raw manifest dict (already loaded as JSON)."""
+        _drop_unmodeled_supported_languages(raw)
         parsed = parse_manifest(raw)
         nodes: dict[str, Node] = {}
 
@@ -417,6 +418,34 @@ def _macro_from_parsed(uid: str, m: Any) -> Macro:
         macro_sql=m.macro_sql,
         depends_on_macros=frozenset(depends_on_macros),
     )
+
+
+# The macro/node ``supported_languages`` values dbt-artifacts-parser models. dbt
+# 1.9+ ships a ``function`` materialization macro that also lists ``javascript``,
+# which the parser's enum rejects. dblect never reads this field, so unmodeled
+# values are dropped before the parse rather than allowed to fail it, keeping the
+# parse total in the same spirit as the ``from_raw`` enums above. Remove this once
+# the parser models the value (https://github.com/yu-iskw/dbt-artifacts-parser/issues/219).
+_MODELED_SUPPORTED_LANGUAGES = frozenset({"python", "sql"})
+
+
+def _drop_unmodeled_supported_languages(raw: dict[str, Any]) -> None:
+    """Filter ``supported_languages`` lists under ``macros`` and ``nodes`` to the
+    values the manifest parser models, mutating ``raw`` in place."""
+    for section in ("macros", "nodes"):
+        entries = raw.get(section)
+        if not isinstance(entries, dict):
+            continue
+        for entry in cast("dict[str, Any]", entries).values():
+            if not isinstance(entry, dict):
+                continue
+            languages = cast("dict[str, Any]", entry).get("supported_languages")
+            if isinstance(languages, list):
+                entry["supported_languages"] = [
+                    language
+                    for language in cast("list[Any]", languages)
+                    if language in _MODELED_SUPPORTED_LANGUAGES
+                ]
 
 
 def _source_from_parsed(uid: str, s: Any) -> Node:

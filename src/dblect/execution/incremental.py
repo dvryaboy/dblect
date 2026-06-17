@@ -31,11 +31,11 @@ from typing import Any, cast
 
 import yaml
 
-from dblect.execution.run import (
-    _profile_name_from_project,
-    _purge_dbt_outputs,
-    _run_dbt,
-    _write_profile,
+from dblect.execution.project_env import (
+    profile_name_from_project,
+    purge_dbt_outputs,
+    run_dbt,
+    write_profile,
 )
 from dblect.lineage.facts.model import WorldRef
 from dblect.manifest import Manifest
@@ -99,19 +99,19 @@ def compile_incremental_worlds(
     project_yml = project_dir / "dbt_project.yml"
     if not project_yml.exists():
         raise FileNotFoundError(f"dbt_project.yml not found in {project_dir}")
-    profile = _profile_name_from_project(project_yml)
+    profile = profile_name_from_project(project_yml)
     macro_subdir = _first_macro_path(project_yml)
 
     with tempfile.TemporaryDirectory(prefix="dblect-worlds-") as tmp:
         tmp_root = Path(tmp)
         work = tmp_root / "project"
         shutil.copytree(project_dir, work, dirs_exist_ok=False)
-        _purge_dbt_outputs(work)
+        purge_dbt_outputs(work)
 
         profiles_dir = tmp_root / "profiles"
         profiles_dir.mkdir()
         duckdb_path = tmp_root / "warehouse.duckdb"
-        _write_profile(profiles_dir, profile, duckdb_path)
+        write_profile(profiles_dir, profile, duckdb_path)
         env = {**os.environ, "DBT_PROFILES_DIR": str(profiles_dir)}
 
         macro_dir = work / macro_subdir
@@ -140,7 +140,7 @@ def _compile_world(
     """Write the override for ``value``, compile, and harvest the manifest. A
     non-zero compile or a missing manifest yields an opaque world, never a raise."""
     macro_path.write_text(_override_macro(value))
-    proc = _run_dbt(dbt, ["compile", "--project-dir", str(work)], env=env)
+    proc = run_dbt(dbt, ["compile", "--project-dir", str(work)], env=env)
     if proc.returncode != 0:
         return CompiledWorld(world=world, manifest=None, error=_dbt_error(proc.stdout, proc.stderr))
     manifest_path = work / "target" / "manifest.json"
