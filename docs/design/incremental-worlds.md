@@ -23,17 +23,16 @@ The axis is present for a project exactly when at least one model is incremental
 
 ## Obtaining both worlds
 
-Both worlds come from `dbt compile` alone, with no build and no warehouse data. The lever is that `is_incremental()` is a macro, and a root-project macro of the same name shadows dbt's built-in for the bare `{{ is_incremental() }}` call that incremental models use. The world-compiler injects an override that returns a dblect-controlled var:
+Both worlds come from `dbt compile` alone, with no build and no warehouse data. The lever is that `is_incremental()` is a macro, and a root-project macro of the same name shadows dbt's built-in for the bare `{{ is_incremental() }}` call that incremental models use. The world-compiler injects an override whose body is a constant for the world being compiled:
 
 ```jinja
-{% macro is_incremental() %}
-    {{ return(var('dblect_force_incremental', false)) }}
-{% endmacro %}
+{# steady-state world #}   {% macro is_incremental() %}{{ return(true) }}{% endmacro %}
+{# full-refresh world #}   {% macro is_incremental() %}{{ return(false) }}{% endmacro %}
 ```
 
-Compiling with that var false yields the full-refresh world, and with it true yields the steady-state world. Because the override returns the value directly, neither compile runs an introspective query or depends on a relation existing: `ref()` and `{{ this }}` resolve to relation names at parse, so the steady-state SELECT compiles even though nothing has been built. The override forces every incremental model the same way in one compile, which is exactly the global run-mode world the [world model](#the-world-model-one-global-run-mode-axis) describes.
+Writing the `true` body yields the steady-state world and the `false` body the full-refresh world. Because the override returns the value directly, neither compile runs an introspective query or depends on a relation existing: `ref()` and `{{ this }}` resolve to relation names at parse, so the steady-state SELECT compiles even though nothing has been built. The override forces every incremental model the same way in one compile, which is exactly the global run-mode world the [world model](#the-world-model-one-global-run-mode-axis) describes. The override body carries no `var()` or `env_var()`, so it is inert to var discovery and reserves no var name (see [Relationship to var support](#relationship-to-var-support)).
 
-Two probes established this. The first confirmed the underlying dbt behavior: compiling a model twice against a persistent DuckDB produced the relation-absent SELECT and then, once the relation existed, the same SELECT with its watermark branch (`where event_time > (select max(event_time) from <this>)`). The second confirmed the path the stream adopts: with the override macro in place and no seed, no run, and an empty warehouse, `dbt compile --vars '{dblect_force_incremental: false}'` and the same with `true` produced the full-refresh and steady-state SELECTs respectively. Keeping compilation data-free preserves dblect's static posture, since the analyzer never needs a populated warehouse to reach a world.
+Two probes established this. The first confirmed the underlying dbt behavior: compiling a model twice against a persistent DuckDB produced the relation-absent SELECT and then, once the relation existed, the same SELECT with its watermark branch (`where event_time > (select max(event_time) from <this>)`). The second confirmed the path the stream adopts: with a constant `is_incremental()` override in place and no seed, no run, and an empty warehouse, compiling once with the `false` body and once with the `true` body produced the full-refresh and steady-state SELECTs respectively. Keeping compilation data-free preserves dblect's static posture, since the analyzer never needs a populated warehouse to reach a world.
 
 What we read from each compilation is the model's compiled SELECT, which is what the sqlglot-based detectors already analyze (`Node.analysis_sql`). The DML wrapper dbt adds around the SELECT (a CREATE-AS for the full build, a MERGE or DELETE+INSERT for the incremental apply) is not in the compiled SELECT and does not need to be here: its main analytic consequence, whether a merge-with-key dedups, is already carried by the enforcement facts the config discoverer derives from the materialization ([`config-and-flag-worlds.md`](./config-and-flag-worlds.md), the `unique_key` x `incremental_strategy` worked example). So the per-world SELECT is the right input, and the DML semantics stay with the property that understands them.
 
@@ -42,7 +41,7 @@ What we read from each compilation is the model's compiled SELECT, which is what
 The execution substrate in `run.py` already does most of the setup: it copies the project to a temp directory, writes any seed and source fixtures, generates a `profiles.yml` pointing at an ephemeral DuckDB, and invokes dbt. The world-compiler reuses that setup and adds a small amount on top:
 
 - Drop the `is_incremental()` override macro into the copied project's macro path.
-- Run `dbt compile` twice against the ephemeral warehouse, once with `dblect_force_incremental` false and once true. No seed, no run, no data.
+- Run `dbt compile` twice against an ephemeral DuckDB connection, once with the override's `false` body and once with the `true` body. No seed, no run, no data, and no connection to the project's real warehouse.
 - Read each world's compiled SQL through the existing `Manifest` reader: each compile writes a `target/manifest.json`, and `Node.compiled_code` already carries the per-world SELECT.
 
 A world is therefore just a `Manifest` produced by the reader the project already uses, so no new artifact format or graph abstraction is introduced.
@@ -55,6 +54,14 @@ Reusing real dbt keeps fidelity high: the SQL we analyze is the SQL dbt produces
 
 - An explicit `{{ dbt.is_incremental() }}` namespaced call, or a project that already defines its own `is_incremental`, is not shadowed by our injection. The steady-state world for such a model degrades to opaque, and its full-refresh world still compiles.
 - A branch that introspects the existing relation at compile (`dbt_utils.star(this)`, `on_schema_change` handling) needs the relation to exist with its schema, which the data-free compile does not provide. These degrade to opaque, or can fall back to a build-based compile (build once so the relation exists, then compile) if that coverage is later wanted. The build-based fallback is the first probe's path, kept available for the schema-introspecting minority.
+
+## Relationship to var support
+
+This axis shares a substrate with the var-inference layer, and the constant override is chosen so the two stay cleanly separated.
+
+The override body contains no `var()` or `env_var()`, so it adds nothing to the project's var namespace: there is no reserved var to collide with a user's vars, and nothing for var discovery to mistake for a project var. Var discovery reads the project's source through the [Jinja front end](https://github.com/dvryaboy/dblect/pull/104), never the world-compiled copy, so the injected macro is invisible to it regardless. The incremental axis therefore leaves var discovery and inference untouched.
+
+Looking ahead, the world-compiler is the same component the control-flow flag evaluation ([#100](https://github.com/dvryaboy/dblect/issues/100)) will reuse. Both reduce to "compile the project under a forced world configuration, then harvest the manifest." For the incremental axis the forced configuration is the constant `is_incremental()` override; for a control-flow flag it is a var set to that world's value, passed to the same compile. A combined world applies both and harvests one manifest, and both feed the one `enumerate_worlds`. The incremental axis stays a single global run-mode axis (two worlds), the flag worlds compose as further axes, and cone scoping ([#99](https://github.com/dvryaboy/dblect/issues/99)) bounds the product. Building one world-compiler here that takes a world configuration, rather than an incremental-only mechanism, is what lets the flag layer reuse it.
 
 ## Wiring into the checker
 
@@ -100,7 +107,7 @@ The mixed-state worlds (a model backfilling while its siblings are steady-state,
 - **`target` dispatch** is the sibling always-present axis (a small closed set of targets rather than two run modes). The world-compiler generalizes to it cleanly (compile once per target), and it is a natural follow-up, kept out of this stream to ship the incremental axis early.
 - **Mixed and per-model incremental states** are deferred to the cone refinement above. The first delivery is the global two-world default.
 - **DML-level semantics** (merge versus delete+insert versus insert) stay with the config-derived enforcement facts ([#39](https://github.com/dvryaboy/dblect/issues/39)); this stream analyzes the compiled SELECT per world.
-- **Non-DuckDB compilation.** The substrate compiles against DuckDB for fidelity and speed. Compilation of the SELECT is largely adapter-independent; where an adapter's dispatch changes the compiled SQL, that is the `target`/adapter concern, tracked with the dispatch axis rather than here.
+- **No real-warehouse connection.** Compilation runs against an ephemeral DuckDB connection, never the project's Snowflake, BigQuery, or Databricks target. This is the deliberate stance: the stream stays data-free and connection-free until there is a concrete reason to require otherwise. Because `dbt compile` renders Jinja without executing model SQL, warehouse-specific SQL in a model body renders fine (it is text); a model whose adapter-dispatched macro lacks a DuckDB implementation degrades to opaque rather than failing the run. Compiling against the project's real adapter is a future option for higher absolute fidelity, taken when we have to rather than by default.
 
 ## Testing posture
 
@@ -120,7 +127,7 @@ The macro-override path settled the questions an earlier draft carried as open. 
 
 - **Scope of the override's reach.** The bare `{{ is_incremental() }}` call is shadowed by the injected macro (confirmed). The boundary is an explicit `{{ dbt.is_incremental() }}` call or a project that already defines its own `is_incremental`. How common these are in practice, and whether to detect a pre-existing project definition and adapt (rather than always inject and risk a collision), shapes how often the steady-state world degrades to opaque.
 - **Schema-introspecting branches.** A branch that reads the existing relation's columns at compile (`dbt_utils.star(this)`, `on_schema_change`) cannot be reached data-free. Whether the build-based fallback is worth building for this minority, or whether degrading them to opaque is acceptable coverage for the first delivery.
-- **Var-name collision.** `dblect_force_incremental` is a reserved var the override reads. Confirm it cannot clash with a project's own vars, or namespace it so it cannot.
+- **Cross-adapter compile fidelity.** Compiling a non-DuckDB-target project against the ephemeral DuckDB connection renders model SQL faithfully (it is text) but resolves adapter-dispatched macros to their DuckDB variants. Since both worlds share the same substrate, this is common-mode and largely cancels in the cross-world difference the stream reports; the open piece is bounding where it does not (a dispatched macro that appears only in the steady-state branch) and deciding the threshold at which a real-adapter compile becomes worth requiring.
 
 ## References
 
