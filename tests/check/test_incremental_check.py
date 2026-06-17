@@ -5,6 +5,11 @@ The cross-world differencing itself is pinned without dbt in
 ``tests/check/test_worlds.py`` (``world_varying``); here we pin the orchestration:
 both worlds are compiled and checked, tagged by their ``WorldRef``, and a project
 with no contracts produces nothing world-varying.
+
+The end-to-end demonstration (a contract whose finding holds in one world and not
+the other) needs a fixture carrying documented columns or domain types for the
+analyzer to resolve against; the compiled manifests here carry none, so it is left
+to a richer fixture.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ import pytest
 pytest.importorskip("dbt")
 
 from dblect.adapters import profile_for_adapter
+from dblect.check.incremental import check_incremental_worlds
 from dblect.execution.incremental import FULL_REFRESH_WORLD, STEADY_STATE_WORLD
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -33,8 +39,6 @@ def incremental_project_dir() -> Path:
 
 
 def test_both_worlds_are_compiled_and_checked(incremental_project_dir: Path) -> None:
-    from dblect.check.incremental import check_incremental_worlds
-
     result = check_incremental_worlds(incremental_project_dir, _DUCKDB)
 
     assert result.analyzed_worlds == frozenset({FULL_REFRESH_WORLD, STEADY_STATE_WORLD})
@@ -44,8 +48,6 @@ def test_both_worlds_are_compiled_and_checked(incremental_project_dir: Path) -> 
 def test_project_without_contracts_has_no_cross_world_findings(
     incremental_project_dir: Path,
 ) -> None:
-    from dblect.check.incremental import check_incremental_worlds
-
     result = check_incremental_worlds(incremental_project_dir, _DUCKDB)
 
     # The fixture declares no contracts, so the worlds differ in SQL but nothing the
