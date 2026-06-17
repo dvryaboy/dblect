@@ -83,6 +83,16 @@ class EnumeratedFindings:
                 out.setdefault(finding, set()).add(result.world)
         return {finding: frozenset(worlds) for finding, worlds in out.items()}
 
+    def world_varying(self) -> Mapping[CheckFinding, frozenset[WorldRef]]:
+        """The findings that hold in some enumerated worlds but not all, each mapped
+        to the worlds it holds under. This is the cross-world signal :meth:`by_finding`
+        describes: a finding present in every enumerated world is world-invariant (the
+        single-manifest analyzer already reports it) and is excluded here."""
+        analyzed = frozenset(result.world for result in self.per_world)
+        return {
+            finding: worlds for finding, worlds in self.by_finding().items() if worlds != analyzed
+        }
+
 
 def _world_facts(
     graphs: CheckGraphs, world: WorldRef, compile_facts: tuple[CompileFact, ...]
