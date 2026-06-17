@@ -25,9 +25,8 @@ from dblect.varinf.environment import make_environment
 from dblect.varinf.usage import (
     Arithmetic,
     ArithOp,
+    Comparison,
     ComparisonOp,
-    Equality,
-    Inequality,
     InSet,
     LiteralValue,
     MacroArg,
@@ -60,15 +59,18 @@ _ARITH_OPS: dict[type[nodes.BinExpr], ArithOp] = {
     nodes.Pow: ArithOp.POW,
 }
 
-# Jinja ordering-comparison op names to our enum, and how each flips when the
-# literal is written on the left (``100 < var('x')`` is ``var('x') > 100``).
-_ORDER_OPS: dict[str, ComparisonOp] = {
-    "lt": ComparisonOp.LT,
-    "gt": ComparisonOp.GT,
-    "lteq": ComparisonOp.LTEQ,
-    "gteq": ComparisonOp.GTEQ,
-}
-_FLIPPED_ORDER: dict[ComparisonOp, ComparisonOp] = {
+# ComparisonOp's values are jinja2's own compare op-names (see usage.py), so a
+# string is a comparison we model exactly when it parses to a member. Deriving the
+# set from the enum keeps one source of truth; membership (in/notin) is a different
+# shape, classified as InSet before this set is consulted.
+_COMPARISON_OP_VALUES: frozenset[str] = frozenset(op.value for op in ComparisonOp)
+
+# How each comparison flips when the literal is written on the left
+# (``100 < var('x')`` is ``var('x') > 100``). Equality is symmetric, so eq/ne map
+# to themselves. Total over ComparisonOp and its own inverse.
+_FLIPPED_COMPARISON: dict[ComparisonOp, ComparisonOp] = {
+    ComparisonOp.EQ: ComparisonOp.EQ,
+    ComparisonOp.NE: ComparisonOp.NE,
     ComparisonOp.LT: ComparisonOp.GT,
     ComparisonOp.GT: ComparisonOp.LT,
     ComparisonOp.LTEQ: ComparisonOp.GTEQ,
@@ -87,8 +89,8 @@ def walk_source(source: str, *, unique_id: str, file_path: str | None = None) ->
     try:
         template = env.parse(source)
     except (TemplateError, SyntaxError, ValueError) as exc:
-        # Degrade-not-lie: an un-enumerated tag or malformed body costs coverage,
-        # recorded as one honest diagnostic, never a crash and never a silent miss.
+        # Degrade, don't lie: a body we cannot parse becomes one diagnostic, never a
+        # crash and never a silent miss.
         reason = f"{type(exc).__name__}: {exc}"
         return WalkResult(opaque=OpaqueNode(unique_id=unique_id, reason=reason))
 
@@ -112,12 +114,6 @@ class _Walker:
         if builtin in _VAR_BUILTINS:
             assert isinstance(node, nodes.Call)
             self._emit(node, builtin, default)
-            # A var's inline default (``var('x', <expr>)``) or any further argument
-            # can itself contain a var; the name argument is arg0, already consumed.
-            for extra in node.args[1:]:
-                self.visit(extra, default=Unknown())
-            for keyword in node.kwargs:
-                self.visit(keyword.value, default=Unknown())
             return
 
         match node:
@@ -191,17 +187,13 @@ class _Walker:
         var_call, builtin, literal = _split_var_and_literal(left, left_var, right, right_var)
         if var_call is None or builtin is None or isinstance(literal, _NoLiteral):
             return None, None, None
-        var_on_left = left_var in _VAR_BUILTINS
 
-        if op in ("eq", "ne"):
-            # == and != carry the same type, domain, and control-flow signal: the
-            # literal is an observed domain member either way.
-            return Equality(literal), var_call, builtin
-        if op in _ORDER_OPS:
-            cmp_op = _ORDER_OPS[op]
-            if not var_on_left:
-                cmp_op = _FLIPPED_ORDER[cmp_op]
-            return Inequality(literal, cmp_op), var_call, builtin
+        if op in _COMPARISON_OP_VALUES:
+            cmp_op = ComparisonOp(op)
+            if left_var not in _VAR_BUILTINS:
+                # Literal on the left: rewrite to the var-on-left orientation.
+                cmp_op = _FLIPPED_COMPARISON[cmp_op]
+            return Comparison(literal, cmp_op), var_call, builtin
         return None, None, None
 
     def _visit_arith(self, expr: nodes.BinExpr) -> None:
@@ -239,16 +231,24 @@ class _Walker:
             self.visit(arg, default=Unknown())
 
     def _emit(self, call: nodes.Call, builtin: str, context: UsageContext) -> None:
+        """Record one var usage, then walk its arguments past the name.
+
+        Every classified emission funnels through here, so the inline-default walk
+        lives in one place: ``var('x', <default>)`` can carry another var whatever
+        the outer var's position. The default is walked even when the outer name is
+        dynamic and its own usage skipped, the inner var being real either way.
+        """
         name = _string_arg0(call)
-        if name is None:
-            # A dynamic var name (``var(some_expr)``) is not knowable statically;
-            # skip rather than key a usage by a name we do not have.
-            return
-        kind = VarKind.VAR if builtin == "var" else VarKind.ENV_VAR
-        location = SourceLocation(file=self.file, line=call.lineno)
-        self.usages.append(
-            VarUsage(var_name=name, var_kind=kind, context=context, location=location)
-        )
+        if name is not None:
+            kind = VarKind.VAR if builtin == "var" else VarKind.ENV_VAR
+            location = SourceLocation(file=self.file, line=call.lineno)
+            self.usages.append(
+                VarUsage(var_name=name, var_kind=kind, context=context, location=location)
+            )
+        for extra in call.args[1:]:
+            self.visit(extra, default=Unknown())
+        for keyword in call.kwargs:
+            self.visit(keyword.value, default=Unknown())
 
 
 # A sentinel distinguishing "no literal operand" from a literal whose value is

@@ -14,10 +14,9 @@ import pytest
 from dblect.varinf import (
     Arithmetic,
     ArithOp,
+    Comparison,
     ComparisonOp,
     Confidence,
-    Equality,
-    Inequality,
     InSet,
     MacroArg,
     SqlLiteral,
@@ -62,29 +61,29 @@ def test_for_iterable_is_control_flow() -> None:
 
 def test_equality_string() -> None:
     u = one("{% if var('env') == 'prod' %}a{% endif %}")
-    assert u.context == Equality("prod")
+    assert u.context == Comparison("prod", ComparisonOp.EQ)
 
 
 def test_equality_bool() -> None:
     u = one("{% if var('enabled') == true %}a{% endif %}")
-    assert u.context == Equality(True)
+    assert u.context == Comparison(True, ComparisonOp.EQ)
 
 
-def test_inequality_literal_negation_treated_as_equality() -> None:
-    # != carries the same type/domain/control-flow signal as ==.
+def test_not_equal_is_preserved_as_its_own_op() -> None:
+    # != keeps its operator; it is no longer folded into equality.
     u = one("{% if var('env') != 'dev' %}a{% endif %}")
-    assert u.context == Equality("dev")
+    assert u.context == Comparison("dev", ComparisonOp.NE)
 
 
 def test_inequality_numeric() -> None:
     u = one("{% if var('threshold') > 100 %}a{% endif %}")
-    assert u.context == Inequality(100, ComparisonOp.GT)
+    assert u.context == Comparison(100, ComparisonOp.GT)
 
 
-def test_inequality_flips_when_literal_on_left() -> None:
+def test_comparison_flips_when_literal_on_left() -> None:
     # 100 < var('x')  is  var('x') > 100
     u = one("{% if 100 < var('threshold') %}a{% endif %}")
-    assert u.context == Inequality(100, ComparisonOp.GT)
+    assert u.context == Comparison(100, ComparisonOp.GT)
 
 
 def test_in_set() -> None:
@@ -118,11 +117,20 @@ def test_unknown_position() -> None:
     assert u.context == Unknown()
 
 
+def test_unmodeled_binop_still_discovers_vars_as_unknown() -> None:
+    # `~` is jinja2 string concat, a BinExpr the walker does not model as
+    # arithmetic. The bounded op vocabulary costs classification fidelity here, not
+    # completeness: both vars are still found, as the honest Unknown fallback.
+    found = usages("{{ var('a') ~ var('b') }}")
+    assert {u.var_name for u in found} == {"a", "b"}
+    assert all(u.context == Unknown() for u in found)
+
+
 def test_env_var_kind() -> None:
     u = one("{% if env_var('DEBUG') == 'true' %}a{% endif %}")
     assert u.var_name == "DEBUG"
     assert u.var_kind is VarKind.ENV_VAR
-    assert u.context == Equality("true")
+    assert u.context == Comparison("true", ComparisonOp.EQ)
 
 
 def test_inline_default_does_not_break_name() -> None:
@@ -133,8 +141,15 @@ def test_inline_default_does_not_break_name() -> None:
 
 def test_nested_var_in_inline_default_is_found() -> None:
     # var('a', var('b')) carries a second var in its default; both are discovered.
+    # Exhaustive coverage of the outer positions lives in the walker property tests.
     found = usages("{{ var('a', var('b')) }}")
     assert {u.var_name for u in found} == {"a", "b"}
+
+
+def test_nested_var_found_even_when_outer_name_is_dynamic() -> None:
+    # The outer var's name is not a literal, so it is skipped, but the inner
+    # default var is a real reference and must not be lost with it.
+    assert {u.var_name for u in usages("{{ var(dyn, var('b')) }}")} == {"b"}
 
 
 def test_dynamic_var_name_is_skipped() -> None:
@@ -178,12 +193,14 @@ def test_unparseable_body_degrades_to_opaque() -> None:
 @pytest.mark.parametrize(
     ("op_text", "expected"),
     [
+        ("==", ComparisonOp.EQ),
+        ("!=", ComparisonOp.NE),
         ("<", ComparisonOp.LT),
         (">", ComparisonOp.GT),
         ("<=", ComparisonOp.LTEQ),
         (">=", ComparisonOp.GTEQ),
     ],
 )
-def test_each_ordering_operator(op_text: str, expected: ComparisonOp) -> None:
+def test_each_comparison_operator(op_text: str, expected: ComparisonOp) -> None:
     u = one(f"{{% if var('x') {op_text} 5 %}}a{{% endif %}}")
-    assert u.context == Inequality(5, expected)
+    assert u.context == Comparison(5, expected)

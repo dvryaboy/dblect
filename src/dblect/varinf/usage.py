@@ -8,10 +8,10 @@ of small frozen records (one per syntactic shape) rather than a string tag, so a
 consumer matches over real variants and the type checker enforces exhaustiveness.
 
 The control-flow versus value-substitution distinction the world enumerator
-hinges on is read off the variant: :class:`TruthyTest`, :class:`Equality`,
-:class:`Inequality`, :class:`InSet`, and :class:`Arithmetic` are the
-branch-steering shapes; :class:`SqlLiteral` and :class:`MacroArg` are value
-substitution; :class:`Unknown` is the honest fallback.
+hinges on is read off the variant: :class:`TruthyTest`, :class:`Comparison`,
+:class:`InSet`, and :class:`Arithmetic` are the branch-steering shapes;
+:class:`SqlLiteral` and :class:`MacroArg` are value substitution; :class:`Unknown`
+is the honest fallback.
 """
 
 from __future__ import annotations
@@ -49,8 +49,12 @@ class Confidence(StrEnum):
 
 
 class ComparisonOp(StrEnum):
-    """The ordering comparisons :class:`Inequality` covers, named as Jinja names them."""
+    """The comparisons :class:`Comparison` covers, named as Jinja names them. The
+    members are exactly jinja2's compare-operator vocabulary, so the two stay in
+    lockstep (pinned in the op-vocabulary tests)."""
 
+    EQ = "eq"
+    NE = "ne"
     LT = "lt"
     GT = "gt"
     LTEQ = "lteq"
@@ -70,13 +74,12 @@ class ArithOp(StrEnum):
 
 
 class LiteralPosition(StrEnum):
-    """A best-effort hint about where an interpolated value lands in the SQL.
+    """Where an interpolated value lands in the SQL, when the walker can tell.
 
-    ``STRING_QUOTED`` is the only position the front end commits to in v1, read
-    from the template text immediately around the interpolation (a value wrapped
-    in matching quotes). Numeric and identifier positions need SQL-level context
-    the Jinja AST does not carry, so they stay ``UNKNOWN`` here and are a noted
-    follow-up rather than a guess.
+    The front end leaves this ``UNKNOWN`` today. Telling a quoted string from a
+    numeric or bare-identifier slot needs SQL-level context the Jinja AST does not
+    carry; the finer positions are reserved for a walker that re-reads the
+    surrounding template text, a noted follow-up rather than a guess.
     """
 
     STRING_QUOTED = "string_quoted"
@@ -92,18 +95,15 @@ class TruthyTest:
 
 
 @dataclass(frozen=True, slots=True)
-class Equality:
-    """The ``var`` call is compared for equality against a literal: ``var('x') == 'a'``."""
+class Comparison:
+    """The ``var`` call is compared against a literal: ``var('x') == 'a'``,
+    ``var('x') != 'dev'``, ``var('x') > 100``.
 
-    operand: LiteralValue
-
-
-@dataclass(frozen=True, slots=True)
-class Inequality:
-    """The ``var`` call is ordered against a literal: ``var('x') > 100``.
-
-    ``op`` is the comparison as written with the ``var`` call on the left; the
-    walker normalizes a literal-on-the-left form to the equivalent left-hand op.
+    ``op`` is the comparison as written with the ``var`` call on the left; a
+    literal-on-the-left form (``100 < var('x')``) is normalized to the equivalent
+    left-hand op (``var('x') > 100``). Equality and ordering share one shape so the
+    operator, not the variant, carries the distinction, and the op vocabulary
+    mirrors jinja2's exactly.
     """
 
     operand: LiteralValue
@@ -156,7 +156,7 @@ class Unknown:
 # The syntactic position of a ``var`` call. Consumers match over the variants;
 # adding a shape is a new member here plus the match arms that need it.
 UsageContext: TypeAlias = (
-    TruthyTest | Equality | Inequality | InSet | Arithmetic | SqlLiteral | MacroArg | Unknown
+    TruthyTest | Comparison | InSet | Arithmetic | SqlLiteral | MacroArg | Unknown
 )
 
 

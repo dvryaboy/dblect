@@ -52,6 +52,10 @@ def _extend(children: st.SearchStrategy[str]) -> st.SearchStrategy[str]:
         st.tuples(children, st.lists(_literals, min_size=1, max_size=3)).map(
             lambda t: f"({t[0]} in [" + ", ".join(t[1]) + "])"
         ),
+        # A var carrying a nested expression as its inline default. This places a
+        # var (and any var the default holds) under every outer position the
+        # recursion reaches, the shape that exposed the inline-default drop.
+        st.tuples(st.sampled_from(_VAR_NAMES), children).map(lambda t: f"var('{t[0]}', {t[1]})"),
     )
 
 
@@ -95,6 +99,47 @@ def _ground_truth(source: str) -> Counter[tuple[str, str]]:
 def test_walker_discovers_every_static_var(source: str) -> None:
     result = walk_source(source, unique_id="model.test.m", file_path="models/m.sql")
     assert result.parsed, f"generator emitted unparseable Jinja: {source!r} -> {result.opaque}"
+    walked: Counter[tuple[str, str]] = Counter(
+        (u.var_kind.value, u.var_name) for u in result.usages
+    )
+    assert walked == _ground_truth(source), source
+
+
+# Each position classifies the outer var through a specialized emit (comparison or
+# membership against a literal, arithmetic, a macro argument) that does not descend
+# the var's own arguments, so each is a place an inline-default var can be dropped.
+# ``$E`` marks the slot, replaced by hand since Jinja's braces rule out str.format.
+_DEFAULT_BEARING_POSITIONS = (
+    "{{ $E }}",
+    "{% if $E == 'x' %}y{% endif %}",
+    "{% if $E != 'x' %}y{% endif %}",
+    "{% if $E > 5 %}y{% endif %}",
+    "{% if $E in ['x'] %}y{% endif %}",
+    "{{ $E + 1 }}",
+    "{{ f($E) }}",
+    "{{ f(k=$E) }}",
+)
+
+
+@given(
+    outer=st.sampled_from(_VAR_NAMES),
+    inner=st.sampled_from(_VAR_NAMES),
+    template=st.sampled_from(_DEFAULT_BEARING_POSITIONS),
+)
+def test_inline_default_var_survives_every_outer_position(
+    outer: str, inner: str, template: str
+) -> None:
+    """A var in an inline default is discovered no matter the outer var's position.
+
+    The broad completeness generator produces this shape only by chance, so this
+    property exercises it directly: an outer var carrying a nested default var,
+    dropped into each position that classifies the outer var through a specialized
+    emit. Checked against the same flat ``find_all`` oracle, with multiplicity, so
+    ``var('a', var('a'))`` must surface twice.
+    """
+    source = template.replace("$E", f"var('{outer}', var('{inner}'))")
+    result = walk_source(source, unique_id="model.test.m")
+    assert result.parsed, source
     walked: Counter[tuple[str, str]] = Counter(
         (u.var_kind.value, u.var_name) for u in result.usages
     )
