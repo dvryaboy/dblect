@@ -152,6 +152,27 @@ class Column:
 
 
 @dataclass(frozen=True, slots=True)
+class Macro:
+    """A macro definition as carried in the manifest's ``macros`` block.
+
+    The source body (`macro_sql`) is what the var-inference macro-following
+    engine expands to reach `var()` calls; `depends_on_macros` is the
+    macro-to-macro edge set that walk recurses through. This view is a faithful
+    transcription of the manifest entry; resolving a name to a definition (the
+    bare-name-then-package lookup) lands with macro-following, which defines what
+    that resolution must satisfy.
+    """
+
+    unique_id: str
+    name: str
+    package_name: str
+    macro_sql: str
+    depends_on_macros: frozenset[str] = field(
+        default_factory=cast("type[frozenset[str]]", frozenset)
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Node:
     """A node in the project's data-flow DAG.
 
@@ -241,6 +262,12 @@ class Manifest:
     schema_version: str
     adapter_type: str
     nodes: Mapping[str, Node]
+    macros: Mapping[str, Macro] = field(default_factory=cast("type[dict[str, Macro]]", dict))
+    """Macro definitions keyed by unique_id, the input macro-following expands.
+
+    Defaults to empty so manifests built before this view existed (and tests
+    that construct a `Manifest` directly) stay valid without restating it.
+    """
 
     @classmethod
     def from_file(cls, path: Path) -> Self:
@@ -269,10 +296,16 @@ class Manifest:
         adapter_type = getattr(parsed.metadata, "adapter_type", None)
         if not isinstance(adapter_type, str) or not adapter_type:
             raise ValueError("manifest is missing metadata.adapter_type")
+
+        # Macros live under their own top-level `macros` block, separate from
+        # the data-flow `nodes`. They carry no edges into the DAG; the registry
+        # is consumed by macro-following, not by lineage.
+        macros = {uid: _macro_from_parsed(uid, m) for uid, m in (parsed.macros or {}).items()}
         return cls(
             schema_version=schema_version,
             adapter_type=adapter_type,
             nodes=nodes,
+            macros=macros,
         )
 
     def merge_catalog(self, catalog: Catalog) -> Self:
@@ -368,6 +401,21 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
+    )
+
+
+def _macro_from_parsed(uid: str, m: Any) -> Macro:
+    """Map a dbt-artifacts-parser macro (any schema version) into our `Macro`."""
+    depends_on = getattr(m, "depends_on", None)
+    depends_on_macros: tuple[str, ...] = ()
+    if depends_on is not None:
+        depends_on_macros = tuple(getattr(depends_on, "macros", ()) or ())
+    return Macro(
+        unique_id=uid,
+        name=m.name,
+        package_name=m.package_name,
+        macro_sql=m.macro_sql,
+        depends_on_macros=frozenset(depends_on_macros),
     )
 
 
