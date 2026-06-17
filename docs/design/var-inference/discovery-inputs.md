@@ -12,7 +12,7 @@ This stream covers the two external surfaces the analysis reads before it walks 
 
 ### Design
 
-Add a typed `Macro` to the manifest view and a name-indexed registry on `Manifest`:
+Add a typed `Macro` to the manifest view and a unique-id-indexed registry on `Manifest`:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -24,16 +24,23 @@ class Macro:
     depends_on_macros: frozenset[str] = frozenset()
 ```
 
-`Manifest` gains a `macros: Mapping[str, Macro]` populated from `parsed.macros` in `from_raw`, alongside the existing node and source population. A lookup helper resolves a macro name to its definition, with the package-qualification rule dbt uses (a bare name resolves within the project first, then packages; a `package.name` reference resolves directly). The registry is the input macro-following consumes; this stream owns producing it, not walking it.
+`Manifest` gains a `macros: Mapping[str, Macro]` populated from `parsed.macros` in `from_raw`, alongside the existing node and source population, keyed by `unique_id` (the manifest's own key, unambiguous across packages). The registry is the input macro-following consumes; this stream owns producing it, not walking it.
+
+Status: implemented in [#103](https://github.com/dvryaboy/dblect/pull/103), split off `main` ahead of the rest of this stream. The `Macro` dataclass, the `macros` mapping on `Manifest`, and the `from_raw` wiring land in [`manifest/parse.py`](../../../src/dblect/manifest/parse.py), exported from the manifest package, with round-trip tests against the fixture in [`tests/manifest/test_parse.py`](../../../tests/manifest/test_parse.py).
+
+### Deferred to macro-following: name resolution
+
+A call site names a macro by bare name or `package.name`, not by `unique_id`, so the walker needs a lookup that resolves a name to a definition with the package-qualification rule dbt uses (a bare name resolves within the project first, then packages; a `package.name` reference resolves directly). That resolution is deferred to [macro-following](./macro-following.md): its contract is defined by how the walker dispatches, so it is built and tested alongside its only consumer rather than pinned ahead of it here. The registry as landed carries `name` and `package_name` on every entry, which is everything the resolver needs as input.
 
 ### Why it is separable
 
-It touches one file, adds a dataclass and a mapping, and changes no existing behavior. It can ship ahead of the walker. Its contract is a faithful transcription of the manifest's macro block into the typed view.
+It touches one file, adds a dataclass and a mapping, and changes no existing behavior. It shipped ahead of the walker. Its contract is a faithful transcription of the manifest's macro block into the typed view.
 
 ### Testing
 
-- A round-trip test against the fixture manifest asserting the registry has an entry per macro in the raw JSON, with `macro_sql` non-empty for the project's own macros.
-- A name-resolution test pinning the bare-name-then-package lookup order and the `package.name` direct path.
+- A round-trip test against the fixture manifest asserting the registry has an entry per macro in the raw JSON, with the `name`, `package_name`, `macro_sql`, and `depends_on.macros` edge set transcribed faithfully and `macro_sql` non-empty.
+
+The name-resolution test moves with the resolver to [macro-following](./macro-following.md).
 
 ## The project configuration reader
 

@@ -6,13 +6,17 @@ Part of: [the var-inference plan](./plan.md)
 
 Many `var()` calls are reached only through macros: a model calls `{{ get_flag('include_tax') }}`, and the `var()` lives inside `get_flag`'s body. This stream follows those calls. It is separable from direct-usage discovery in the [front end](./jinja-frontend.md) and can land after it; a project whose vars are all referenced directly is fully handled without this stream, which covers the majority of small projects.
 
-The engine walks over already-parsed ASTs. The [front end](./jinja-frontend.md) configures the parsing environment and the [discovery-inputs](./discovery-inputs.md) stream supplies the macro registry, so this stream's job is the expansion and recursion logic, not parsing.
+The engine walks over already-parsed ASTs. The [front end](./jinja-frontend.md) configures the parsing environment and the [discovery-inputs](./discovery-inputs.md) stream supplies the macro registry (implemented in [#103](https://github.com/dvryaboy/dblect/pull/103): `Manifest.macros`, keyed by `unique_id`), so this stream's job is the expansion and recursion logic, not parsing.
+
+### Inherited from discovery-inputs: name resolution
+
+The registry is keyed by `unique_id`, but a call site names a macro by bare name or `package.name`. discovery-inputs deferred the name-to-definition resolver here on purpose, since its contract is fixed by how this walker dispatches rather than by the manifest shape. This stream implements it: a resolver over `Manifest.macros` that applies dbt's package-qualification rule (a bare name resolves within the project first, then packages; a `package.name` reference resolves directly), returning the `Macro` or signalling no match (an opaque usage, not an error). The registry already carries `name` and `package_name` on every entry, so this is pure lookup logic with no new manifest reading. Its test (the bare-name-then-package order and the `package.name` direct path) lands with it here.
 
 ## The walk
 
 When the AST walk encounters a `Call` whose callee names a macro in the registry (rather than `var` / `env_var`), the engine:
 
-1. Looks the macro up in the registry (a dictionary access; no scanning).
+1. Resolves the callee name to a registry entry through the name resolver above (bare-name-then-package, or `package.name` direct).
 2. Takes the macro's already-parsed body AST.
 3. Substitutes the call-site arguments for the macro's parameters (lexical substitution, described below).
 4. Walks into the substituted body, continuing to collect `VarUsage` records, with the macro name pushed onto the trail.
@@ -61,6 +65,7 @@ The unifying rule is the spec's: a usage we cannot resolve statically is recorde
 
 ## Testing
 
+- A name-resolution test (inherited from discovery-inputs) pinning the bare-name-then-package lookup order and the `package.name` direct path over `Manifest.macros`, plus a no-match yielding an opaque usage.
 - Per-shape unit tests: a macro that wraps a `var()`, a macro that takes a `var()` as an argument, a macro with a literal-argument conditional (one branch walked), a macro with a non-literal conditional (both branches walked, partial confidence).
 - A cycle test: two mutually recursive macros, asserting the engine terminates and marks the usage opaque rather than looping.
 - A depth test: a chain past the limit, asserting it stops and marks opaque.
@@ -71,7 +76,7 @@ These pin the engine's contracts at the boundary (what usages come out, with wha
 
 ## Open questions
 
-- **Macro `depends_on.macros` versus walking.** The manifest records each macro's macro dependencies. Whether to use that edge set to bound or pre-filter the walk, or to walk purely from the body AST. Walking from the body is simpler and authoritative; the edge set may be a useful cross-check.
+- **Macro `depends_on.macros` versus walking.** The manifest records each macro's macro dependencies, now surfaced as `Macro.depends_on_macros`. Whether to use that edge set to bound or pre-filter the walk, or to walk purely from the body AST. Walking from the body is simpler and authoritative; the edge set may be a useful cross-check.
 - **Argument binding fidelity.** dbt macros support defaults and `**kwargs`-style varargs in some patterns. How faithfully v1 binds these versus degrading to opaque on the exotic ones.
 
 ## References
