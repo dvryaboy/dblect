@@ -33,7 +33,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dbt-core = ["dbt-core>=1.8"]
+# Capped below 1.11.8: dbt 1.11.8 adds a macro `config` block that
+# dbt-artifacts-parser 0.13.2 rejects as an extra field (it needs a ManifestV13).
+# The earlier `function`-materialization `javascript` language (dbt 1.9+) is a
+# value the parser also does not model, handled by a tolerant read in
+# dblect.manifest.parse rather than a cap. Lift this cap when a parser release
+# lands. See https://github.com/yu-iskw/dbt-artifacts-parser/issues/219.
+dbt-core = ["dbt-core>=1.8,<1.11.8"]
 
 [project.scripts]
 dblect = "dblect.cli:app"
@@ -49,7 +55,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "pyright>=1.1.380",
-    "dbt-core>=1.8",
+    # See the cap rationale under [project.optional-dependencies] (parser #219).
+    "dbt-core>=1.8,<1.11.8",
     "dbt-duckdb>=1.8",
 ]
 
