@@ -50,11 +50,34 @@ Each world's compiled SELECTs build a per-world view of the project that the exi
 
 Coverage reporting states, per contract, whether both incremental worlds were analyzed or only one was reachable, so a one-world result is a stated number rather than a silent assumption. This mirrors the coverage posture the flag layer already takes.
 
+## When the branch adds structure, not just a filter
+
+A watermark filter is the common shape, but an `{% if is_incremental() %}` branch can add substantial SQL: a join to a state or lookup table, extra selected columns, a new upstream `ref`, a different grain. A worked example:
+
+```sql
+select s.*, st.last_seen
+from {{ ref('source') }} s
+{% if is_incremental() %}
+  left join {{ ref('state_table') }} st on s.id = st.id
+  where s.updated_at > (select max(updated_at) from {{ this }})
+{% endif %}
+```
+
+The steady-state world differs from the full-refresh world in structure, not only in row count: a new join, a new column, a new dependency, and the nullability a `left join` injects.
+
+This is the case the two-world compilation most wants to catch, and it handles it by construction. Each world is compiled in full and analyzed through the same detectors, which are SQL-in and indifferent to how large the difference is; there is no diff size that defeats the approach. The cross-world differencing then surfaces exactly what changed:
+
+- a candidate key that holds in full-refresh but fans out under the steady-state join (a multiplicity finding in one world),
+- a column that is `not null` in full-refresh but nullable under a steady-state `left join` (the INNER-versus-LEFT shape [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) names),
+- a column or upstream dependency present in only one world (a schema or lineage difference, reported per world).
+
+Per-world lineage comes for free: each compilation's own `depends_on`, and the compiled SQL's own refs, describe that world's DAG, so a state table referenced only in the steady-state branch is an upstream in that world and absent in the other. The single-manifest audit is most blind precisely here, so this class is where the stream pays off most.
+
 ## Keeping the axis cheap, and the mixed-state refinement
 
-Two worlds for the whole project is already cheap. Two properties keep it cheap even as projects grow, and both reuse machinery the var-inference layer is building rather than adding new analysis.
+The base cost is fixed: two whole-project compilations and the detectors over two project views, no matter how much any branch diverges. The structure-adding case above costs no more than a watermark case, since it is still two worlds. Two optimizations reduce the cross-world comparison and bound the later per-model refinement, and both reuse machinery the var-inference layer is building. Neither is load-bearing for correctness, which always rests on analyzing both worlds in full.
 
-**Most incremental branches do not move structural properties.** The common incremental branch adds a watermark filter, `where updated_at > (select max(updated_at) from {{ this }})`. That changes which rows the model produces, so it moves freshness, completeness, cardinality, and row-count properties. It typically leaves the SELECT structurally identical for the column set, the column types, the candidate key, and the nullability that joins inject. So for a uniqueness, type, or structural-nullability contract, the two worlds compile to SQL that is equivalent with respect to that property, and the axis collapses for that contract. Per-property scoping (the cone taken over the property's own provenance, as [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) describes under property-dependence) recognizes this and reports the collapse, so the expensive comparison runs only where the property can actually flip.
+**Skip the comparison only where the worlds are provably equivalent for a property.** When a branch is watermark-only, the two compiled SELECTs are structurally identical for the column set, the types, the candidate key, and the join-injected nullability, differing only in a row-filtering predicate. A uniqueness, type, or structural-nullability contract then agrees across the two worlds by construction, so the comparison is redundant and is reported as a collapse rather than run. This shortcut is taken only when the equivalence is evident from the two compiled SELECTs in hand, never as an assumption about what branches usually do. A branch that adds a join or a column is not equivalent, so it gets the full comparison and surfaces the findings above. Per-property scoping (the cone taken over the property's own provenance, as [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) describes under property-dependence) is what recognizes the equivalence per property.
 
 **Cone scoping bounds which models a contract sees.** A contract depends only on the incremental models in its lineage cone. Intersecting the cone with the incremental-model set ([#99](https://github.com/dvryaboy/dblect/issues/99)) means a contract never pays for incremental models it does not descend from.
 
@@ -72,14 +95,15 @@ The mixed-state worlds (a model backfilling while its siblings are steady-state,
 Following the project's testing norms: pin contracts at the boundary, prefer property-based and exhaustive tests where they fit, avoid mocking and test theater.
 
 - A small committed incremental dbt-project fixture (an incremental model with a watermark branch over a seed), the cleaned-up form of the probe project, shared with downstream streams that need an incremental project.
-- A world-compiler test asserting the two worlds' compiled SELECT for that model differ by exactly the `is_incremental()` branch (the watermark filter present in steady-state, absent in full-refresh). This pins the mechanism the probe validated.
+- A structure-adding fixture whose `is_incremental()` branch joins a state table, so the steady-state world has an extra dependency, an extra column, and a `left join`. This is the case that exercises the cross-world findings the design turns on.
+- A world-compiler test asserting the two worlds' compiled SELECT for the watermark model differ by exactly the `is_incremental()` branch, and a test that the structure-adding model's steady-state world carries the join and column its full-refresh world lacks. These pin the mechanism the probe validated.
 - A degrade-not-lie test asserting a model whose compilation fails in one world is recorded as opaque for that world rather than aborting the run.
-- An end-to-end test asserting a contract that holds in one world and breaks in the other surfaces as a cross-world finding carrying the world it holds in, and that a contract holding in both is reported once, unchanged from the single-manifest path.
+- End-to-end cross-world findings: a candidate key that fans out under the steady-state join, and a column nullable only under the steady-state `left join`, each surfaced as a finding carrying the world it holds in. A contract holding in both worlds is reported once, unchanged from the single-manifest path.
 
 ## Open questions
 
 - **Harvest source.** Whether to read the compiled SELECT from `target/compiled/*.sql` or from the per-world `manifest.json` `compiled_code`. Both carry the same SELECT; the manifest keeps everything in one artifact the project already parses, the compiled tree is simpler to read per model. A probe of both informs the choice.
-- **Fixture data provision for steady-state.** The steady-state world needs the relations to exist, so the incremental models must build once, which needs upstream seed and source data. The substrate already writes fixtures; the open piece is how a project under check (rather than a test fixture) supplies enough data to build, and whether an empty build suffices to make `is_incremental()` true.
+- **Data provision for steady-state.** The steady-state world needs relations to exist, so the incremental models must build once, which needs upstream seed and source data. A branch that joins a state or lookup table raises the bar: that relation, and `{{ this }}` itself, must resolve and build for the steady-state compile to succeed, not only the model's ordinary upstreams. The substrate already writes fixtures; the open piece is how a project under check (rather than a test fixture) supplies enough data, and whether an empty build of the extra relations suffices to reach the branch.
 - **Full-refresh determinism.** `--full-refresh` is the deterministic full world; confirm it produces the same SELECT as a true first run across adapters and dbt versions, so the two paths to the full world agree.
 - **Per-world project view.** How to represent two compiled views of the project for the detectors without duplicating the whole graph build, reusing as much of the single-world path as possible.
 
