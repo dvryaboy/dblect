@@ -321,9 +321,9 @@ Registration happens via `__init_subclass__`. When the class definition is execu
 
 dblect consumes dbt's manifest as the single source of truth for project structure. Two integration patterns, both supported:
 
-*Pattern A (convenient default).* `dblect audit` invokes `dbt parse` if the manifest is stale, reads the resulting `target/manifest.json`, then loads dblect declarations. One command from the user's perspective. Adds `dbt-core` as a Python dependency.
+*Pattern A (convenient default).* `dblect check` invokes `dbt parse` if the manifest is stale, reads the resulting `target/manifest.json`, then loads dblect declarations. One command from the user's perspective. Adds `dbt-core` as a Python dependency.
 
-*Pattern B (explicit).* The user runs `dbt parse` (or any dbt command that writes a manifest) themselves; `dblect audit --manifest path/to/manifest.json` consumes the existing one. Uses `dbt-artifacts-parser` instead of full `dbt-core`. Fits well in CI environments where dbt and dblect run in separate stages.
+*Pattern B (explicit).* The user runs `dbt parse` (or any dbt command that writes a manifest) themselves; `dblect check --manifest path/to/manifest.json` consumes the existing one. Uses `dbt-artifacts-parser` instead of full `dbt-core`. Fits well in CI environments where dbt and dblect run in separate stages.
 
 The full load sequence:
 
@@ -342,7 +342,7 @@ parse manifest
 
 This approach needs no code generation, with the tradeoff that editors offer limited autocomplete on the proxy because `__getattr__` returns a generic type.
 
-For richer editor experience, the framework reads the manifest and writes a `dblect/_stubs/models.py` file with concrete class definitions. This happens automatically as part of `dblect init` and re-runs whenever the manifest changes (the next `dblect audit` or `dblect check` regenerates if stale):
+For richer editor experience, the framework reads the manifest and writes a `dblect/_stubs/models.py` file with concrete class definitions. This happens automatically as part of `dblect init` and re-runs whenever the manifest changes (the next `dblect check` regenerates if stale):
 
 ```python
 # auto-generated; do not edit
