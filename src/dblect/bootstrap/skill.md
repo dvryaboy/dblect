@@ -42,18 +42,36 @@ refinements, and the fact-returning contracts below.
 
 ## Step 1: orient
 
-Confirm you are in a dbt project (a `dbt_project.yml` exists) and that dblect has
-a manifest to read. If `target/manifest.json` is missing, run `dbt compile`
-yourself, or let `dblect init` produce it for you (it falls back to `dbt compile`):
+First confirm how dblect is invoked here. Run `dblect --help`. If it is not on the
+PATH, it may live in the project's virtualenv (`.venv/bin/dblect`) or be run through
+the project's runner (`uv run dblect`, `poetry run dblect`). Settle this once and use
+that form throughout; do not search the filesystem for the package.
+
+Confirm you are in a dbt project (a `dbt_project.yml` exists) and that dblect has a
+manifest to read. If `target/manifest.json` is missing, run `dbt compile` yourself,
+or let `dblect init` produce it for you (it falls back to `dbt compile`):
 
 ```text
 dblect init .
 ```
 
-`init` scaffolds the `dblect/` declaration tree and writes `dblect/_stubs/models.py`,
-generated from the manifest. **Read that stubs file.** It lists every model and its
-columns under their real names. Every type and column you bind must match a name in
-there, so use it as your source of truth and never invent a column.
+`init` scaffolds the `dblect/` declaration tree and writes `dblect/_stubs/models.py`.
+
+**Get the column names right, because every binding depends on them.** dblect
+resolves a declared column against the project's compiled columns. Two sources feed
+that resolution, and they differ in coverage:
+
+- `schema.yml` lists only the columns a human documented. The generated stubs are
+  built from it, so they can be blind to undocumented columns (a `stg_payments.amount`
+  that no one wrote a description for) and can carry a stale name (a column renamed in
+  the SQL but not in `schema.yml`). Treat the stubs as a starting hint, not gospel.
+- `target/catalog.json` is the warehouse's own account of every column dbt actually
+  emitted. It is the ground truth. dblect reads it when it sits beside the manifest.
+
+So produce the catalog before you rely on resolution. If the models are built,
+`dbt docs generate` writes `target/catalog.json`; if not, `dbt build` first. Without
+it, undocumented leaf columns (seeds, sources) will not resolve and your bindings
+will look like they are missing when they are merely unseen.
 
 Read the project structure: the `models/` tree (usually split into `staging/` and
 `marts/`), each model's `.sql`, and the `schema.yml` files that carry column
@@ -104,10 +122,16 @@ confirm ...` comment so a human can check it.
 
 ## Step 4: write the declarations
 
-Put domain types in `dblect/types.py` and contracts under `dblect/contracts/`.
-`src/dblect/demo/library.py` and the runnable examples in
-`tests/fixtures/scenarios/cases/*/dblect/` are the canonical templates; copy their
-shape.
+Put domain types in `dblect/types.py` and contracts under `dblect/contracts/`. The
+examples below are the templates; copy their shape rather than reading dblect's own
+source to reverse-engineer it.
+
+**Layout and discovery.** Every `.py` module under `dblect/` is imported, and any
+`ModelContract` subclass defined anywhere in that tree registers itself. You do not
+wire up imports or a registry. A natural split is one module per model group
+(`dblect/contracts/staging.py`, `dblect/contracts/marts.py`), or one per model for a
+small project; the location does not matter, only that the class is defined under
+`dblect/`.
 
 `Money` is the worked example: an amount and the currency it is denominated in, so
 a sum that mixes currencies stops being well typed. It ships in `dblect.demo`.
@@ -156,6 +180,36 @@ class StgPayments(ModelContract):
     amount: Money.refine(currency=Currency.USD)
 ```
 
+**Know the binding rule, or your columns will silently collapse.** This is the one
+mechanic worth getting right before you write a contract. A domain type binds its
+*magnitude facet* (for `Money`, the field named `amount`) to a warehouse column, and
+by default that column is the one named the same as the facet: `amount`. The contract
+*field name* on the left does not drive the binding.
+
+So when a model has several money columns whose names are not `amount`, annotating
+each with a bare type points all of them at one phantom column called `amount`. They
+collapse together and resolve to nothing. Map each one explicitly with `.columns(...)`,
+naming the real column the magnitude lives in:
+
+```python
+from dblect import ModelContract
+from dblect.demo import Currency, Money
+
+MoneyUSD = Money.refine(currency=Currency.USD)
+
+class Orders(ModelContract):
+    dbt_model = "orders"
+    # `amount` is literally named amount, so the bare refinement binds it.
+    amount: MoneyUSD
+    # These are not named `amount`, so map the magnitude facet to the real column.
+    credit_card_amount: MoneyUSD.columns(amount="credit_card_amount")
+    coupon_amount: MoneyUSD.columns(amount="coupon_amount")
+    bank_transfer_amount: MoneyUSD.columns(amount="bank_transfer_amount")
+```
+
+The rule in one line: bind with the bare type only when the column is named after the
+facet; otherwise reach for `.columns(amount="real_column_name")`.
+
 **Add a functional-dependency fact when a rollup needs it.** A `@contract` method
 that returns a fact lets the analyzer discharge an obligation it could not see on
 its own. The canonical one: every payment on an order shares the order's currency,
@@ -187,7 +241,19 @@ Run the checker:
 dblect check .
 ```
 
-Read the findings and loop. Two kinds matter here:
+**Read the coverage line before the findings.** The check reports how much of what
+you declared actually resolved, and that is your first diagnostic. The key counter is
+the number of contract columns that resolved against the compiled SQL. If it is lower
+than the number of columns you declared, some bindings did not land, even when no
+finding fired. The two usual causes are the binding-rule collapse above (a money
+column not mapped with `.columns(...)`, so it pointed at a phantom `amount`) and a
+missing `catalog.json` (an undocumented column that cannot resolve until the catalog
+exists). A grounding count like `domain_type 7/27` is expected and fine: it means you
+typed 7 of 27 columns, which is the point, you type only the columns that carry
+meaning. Chase the resolved-columns count up to the number you declared; do not chase
+grounding up to the total.
+
+Then read the findings and loop. Two kinds matter here:
 
 - **Contract issues** mean a declaration does not line up with the manifest:
   `unresolved_model` (a misspelled or renamed model), `unknown_column` (a column
