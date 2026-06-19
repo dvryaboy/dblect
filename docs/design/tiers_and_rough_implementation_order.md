@@ -24,7 +24,7 @@ The user's interaction is one command:
 dblect init
 ```
 
-`dblect init` scaffolds the project (lays down `dblect/`, adds dblect to the project's dependency manifest, runs the package manager, generates editor stubs from the manifest), parses dbt, and runs the audit end-to-end. First findings land in under a minute on typical projects. Subsequent runs use `dblect audit` (re-runs the audit on the existing scaffolding) or `dblect check` (the contracts pipeline introduced once contracts are declared).
+`dblect init` scaffolds the project (lays down `dblect/`, adds dblect to the project's dependency manifest, runs the package manager, generates editor stubs from the manifest), parses dbt, and runs the audit end-to-end. First findings land in under a minute on typical projects. Subsequent runs use `dblect check`, which runs the structural audit immediately and adds the declaration-level contract checks once contracts are declared.
 
 Internally, dblect does the following:
 
@@ -249,7 +249,7 @@ A few capabilities apply across all layers rather than belonging to one:
 
 **MCP server.** Exposes dblect's analytical primitives as tools for LLM-environment integration: `read_dbt_manifest`, `analyze_model`, `propose_focus_chain`, `run_audit`, `check_contracts`, `generate_counterexample`. Lets Claude Code or any agentic environment drive declaration drafting, audit triage, contract setup. Independent of the CLI; same primitives, different interface.
 
-**CLI.** Standalone CLI for headless and CI use. v1 verbs: `init` (bootstrap-to-first-findings, one shot), `audit` (re-run the audit), `check` (run contracts once they are declared, with `--flag-world` for selecting subsets), `show-case` (materialize a stored counterexample locally). `focus` (interactive contract drafting) and `impact --flag X` (flag-flip preflight) are slotted but deferred. Required for CI integration; sufficient for users who prefer not to drive via an LLM environment.
+**CLI.** Standalone CLI for headless and CI use. v1 verbs: `init` (bootstrap-to-first-findings, one shot), `check` (run the structural audit immediately and the contract checks once contracts are declared, with `--flag-world` for selecting subsets), `show-case` (materialize a stored counterexample locally). `focus` (interactive contract drafting) and `impact --flag X` (flag-flip preflight) are slotted but deferred. Required for CI integration; sufficient for users who prefer not to drive via an LLM environment.
 
 **Ignore mechanism.** Findings can be muted via `# noqa-fixture: <reason>` comments (the canonical syntax, same flavor as `# noqa: ...` in linters) or YAML config entries. Requires a reason; muted findings are reviewable in PR; mutes don't silently propagate.
 
@@ -275,7 +275,7 @@ Order respects dependencies. Each milestone ends in a state where dblect does so
 7. **Equivalence-aware diffing.** Multiset, order-up-to-ties, set equivalence. Becomes load-bearing in later phases.
 8. **Replay determinism via differential execution.**
 9. **Static ambiguous-ordering detection.** Pattern matching on the SQL AST.
-10. **Report generation, ignore mechanism (`# noqa-fixture`), CLI basics (`init`, `audit`).**
+10. **Report generation, ignore mechanism (`# noqa-fixture`), CLI basics (`init`, `check`).**
 
 **Milestone:** `dblect init` ships against real dbt projects, finds real bugs end-to-end.
 

@@ -44,7 +44,7 @@ $ dblect init
 [dblect] Parsing dbt project (dbt parse)... done in 1.8s
 [dblect] Generated stubs for 5 dbt models → dblect/_stubs/models.py
 
-[dblect] Running audit:
+[dblect] Running check:
   ✓ Static SQL analysis            5 models       0.4s
   ✓ Ambiguous-ordering detection   5 models       0.2s
   ✓ Replay determinism             5/5 ran        2.1s
@@ -63,10 +63,10 @@ $ dblect init
           Suggested: filter `where orders.customer_id is not null` before the
                      GROUP BY, or declare the orphan-handling intent explicitly.
 
-[dblect] Full report: .dblect/audit-2026-05-20-101522.html
+[dblect] Full report: .dblect/check-2026-05-20-101522.html
 
 [dblect] Next steps:
-  • Re-run audit anytime:  dblect audit
+  • Re-run anytime:        dblect check
   • Declare types:         edit dblect/types.py
   • Add contracts:         dblect focus <model>
 ```

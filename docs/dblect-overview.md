@@ -4,7 +4,7 @@ A semantic correctness framework for dbt analytics pipelines. It adds a typed de
 
 ## Using it
 
-Run `dblect init` inside your dbt project. It scaffolds the `dblect/` directory, bootstraps dblect as a project dev dependency, parses your dbt project, generates editor stubs, and runs the zero-declaration audit. First real findings land in under a minute on typical projects, with zero declarations required. The audit catches ordering hazards, replay-determinism issues, and foreign-key fanout risks. `dblect audit` re-runs the audit on demand thereafter.
+Run `dblect init` inside your dbt project. It scaffolds the `dblect/` directory, bootstraps dblect as a project dev dependency, parses your dbt project, generates editor stubs, and runs the zero-declaration audit. First real findings land in under a minute on typical projects, with zero declarations required. The audit catches ordering hazards, replay-determinism issues, and foreign-key fanout risks. `dblect check` re-runs it on demand thereafter, and reports meaning-level findings once you declare types.
 
 From there:
 
