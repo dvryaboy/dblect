@@ -127,6 +127,11 @@ def run_audit(
     manifest's snapshots and their validity columns). The fact-grounded ones are
     opportunistic, silent on projects that declare nothing, so they need no opt-in
     flag. They share the audit's pre-parsed trees, so the SQL is parsed once.
+
+    This is the structural family alone. A consumer that needs every family's
+    findings over a manifest (any multi-world or finding-threading path) calls
+    :func:`dblect.analysis.analyze` instead, which carries both families so a family
+    is never dropped by being forgotten.
     """
     parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}

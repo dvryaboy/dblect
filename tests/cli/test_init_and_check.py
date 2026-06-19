@@ -61,9 +61,12 @@ def _project_with_contract(tmp_path: Path, body: str) -> Path:
     return tmp_path
 
 
-def test_check_clean_project_exits_zero(
+def test_check_valid_contract_yields_no_declaration_finding(
     jaffle_manifest_path: Path, runner: CliRunner, tmp_path: Path
 ) -> None:
+    # A contract that lines up with the manifest produces no declaration finding. The
+    # unified command still runs the structural family over jaffle (which carries a
+    # known hazard), so --no-fail is needed to assert content regardless of that.
     project = _project_with_contract(
         tmp_path,
         "from dblect import ModelContract\n"
@@ -72,9 +75,11 @@ def test_check_clean_project_exits_zero(
         "    dbt_model = 'stg_payments'\n"
         "    amount: Money.refine(currency=Currency.USD)\n",
     )
-    result = runner.invoke(app, ["check", str(project), "--manifest", str(jaffle_manifest_path)])
+    result = runner.invoke(
+        app, ["check", str(project), "--manifest", str(jaffle_manifest_path), "--no-fail"]
+    )
     assert result.exit_code == 0, result.output
-    assert "0 findings" in result.output
+    assert "declaration findings:" not in result.output
 
 
 def test_check_contract_issue_exits_non_zero(
@@ -124,12 +129,23 @@ def test_check_json_format(jaffle_manifest_path: Path, runner: CliRunner, tmp_pa
     )
     result = runner.invoke(
         app,
-        ["check", str(project), "--manifest", str(jaffle_manifest_path), "--format", "json"],
+        [
+            "check",
+            str(project),
+            "--manifest",
+            str(jaffle_manifest_path),
+            "--format",
+            "json",
+            "--no-fail",
+        ],
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "3"
+    assert payload["schema_version"] == "1"
     assert payload["summary"]["contracts_resolved"] == 1
+    # A contract that lines up yields no declaration finding; the structural family is
+    # what the unified command adds on top.
+    assert payload["summary"]["declaration"] == 0
     # The coverage block rides alongside the summary in the schema.
     assert "resolution" in payload["coverage"]
     assert "grounding" in payload["coverage"]
@@ -167,6 +183,7 @@ def test_check_reads_catalog_when_supplied(
             str(jaffle_manifest_path),
             "--catalog",
             str(catalog),
+            "--no-fail",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -178,7 +195,9 @@ def test_check_notes_when_no_catalog_is_available(
 ) -> None:
     # The jaffle manifest has no catalog.json beside it, so the run proceeds and
     # says so rather than silently resolving leaves only from schema.yml.
-    result = runner.invoke(app, ["check", str(tmp_path), "--manifest", str(jaffle_manifest_path)])
+    result = runner.invoke(
+        app, ["check", str(tmp_path), "--manifest", str(jaffle_manifest_path), "--no-fail"]
+    )
     assert result.exit_code == 0, result.output
     assert "no catalog.json" in result.output
 

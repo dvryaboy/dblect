@@ -169,7 +169,12 @@ def run_check(
     resolution only, never on grounding.
 
     The single-world entry: it builds the graphs once and propagates the base world,
-    the same sequence the enumerator runs per world."""
+    the same sequence the enumerator runs per world.
+
+    This is the declaration-level family alone. A consumer that needs every family's
+    findings over a manifest (any multi-world or finding-threading path) calls
+    :func:`dblect.analysis.analyze` instead, which carries both families so a family
+    is never dropped by being forgotten."""
     graphs = build_check_graphs(manifest, profile, registry=registry)
     world = propagate_world(graphs, base_world_facts(graphs.resolved))
 

@@ -35,11 +35,11 @@ def version() -> None:
 
 
 @app.command()
-def audit(
+def check(
     project_dir: Annotated[
         Path,
         typer.Argument(  # pyright: ignore[reportUnknownMemberType]
-            help="Path to a dbt project (the directory holding dbt_project.yml).",
+            help="Path to a dbt project (the directory holding dbt_project.yml, and dblect/ if present).",
         ),
     ] = Path("."),
     manifest: Annotated[
@@ -101,68 +101,6 @@ def audit(
             ),
         ),
     ] = False,
-) -> None:
-    """Run the static structural audit over a dbt project's models."""
-    from dblect.audit import run_audit
-    from dblect.audit.reporter import render_json, render_text
-
-    manifest_path = _resolve_manifest_path(
-        project_dir=project_dir,
-        explicit=manifest,
-        dbt_executable=dbt_executable,
-        command="audit",
-    )
-    loaded = _load_manifest(manifest_path=manifest_path, explicit_catalog=catalog, command="audit")
-    profile = _resolve_profile(loaded.adapter_type, dialect_override, command="audit")
-    report = run_audit(loaded, profile)
-    rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
-    typer.echo(rendered)
-    if report.findings and not no_fail:
-        raise typer.Exit(code=1)
-
-
-@app.command()
-def check(
-    project_dir: Annotated[
-        Path,
-        typer.Argument(  # pyright: ignore[reportUnknownMemberType]
-            help="Path to a dbt project (the directory holding dbt_project.yml and dblect/).",
-        ),
-    ] = Path("."),
-    manifest: Annotated[
-        Path | None,
-        typer.Option(  # pyright: ignore[reportUnknownMemberType]
-            "--manifest",
-            help="Path to a manifest.json. Defaults to <project_dir>/target/manifest.json.",
-        ),
-    ] = None,
-    dbt_executable: Annotated[
-        str,
-        typer.Option("--dbt-executable", help="dbt CLI for the fallback `dbt compile`."),  # pyright: ignore[reportUnknownMemberType]
-    ] = "dbt",
-    output_format: Annotated[
-        OutputFormat,
-        typer.Option("--format", "-f", help="`text` for terminals, `json` for CI / editors."),  # pyright: ignore[reportUnknownMemberType]
-    ] = OutputFormat.TEXT,
-    dialect_override: Annotated[
-        str | None,
-        typer.Option("--dialect", help="Force a sqlglot dialect, overriding the manifest."),  # pyright: ignore[reportUnknownMemberType]
-    ] = None,
-    catalog: Annotated[
-        Path | None,
-        typer.Option(  # pyright: ignore[reportUnknownMemberType]
-            "--catalog",
-            help=(
-                "Path to a catalog.json (`dbt docs generate`). Defaults to "
-                "catalog.json alongside the manifest. Supplies seed/source columns "
-                "so undocumented DAG leaves resolve; documented columns win on conflict."
-            ),
-        ),
-    ] = None,
-    no_fail: Annotated[
-        bool,
-        typer.Option("--no-fail", help="Always exit 0, even when findings exist."),  # pyright: ignore[reportUnknownMemberType]
-    ] = False,
     resolution_floor: Annotated[
         float | None,
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
@@ -177,11 +115,18 @@ def check(
         ),
     ] = None,
 ) -> None:
-    """Load a project's contracts, propagate, and report declaration-level findings."""
+    """Check a dbt project: structural hazards and declaration-level contracts.
+
+    Both detector families run over the project. The structural family needs only the
+    compiled SQL, so it reports on any project. The declaration family resolves the
+    contracts under ``<project_dir>/dblect/`` if present; with none declared it simply
+    reports zero contracts resolved rather than nothing to do.
+    """
     from dataclasses import replace
 
-    from dblect.check import render_json, render_text, run_check
+    from dblect.analysis import analyze
     from dblect.loader import load_declarations
+    from dblect.report import render_json, render_text
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
@@ -190,15 +135,13 @@ def check(
     profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check")
 
     load_result = load_declarations(project_dir)
-    report = replace(
-        run_check(
-            loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
-        ),
-        load_issues=load_result.issues,
+    report = analyze(
+        loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
     )
+    report = replace(report, check=replace(report.check, load_issues=load_result.issues))
     rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
     typer.echo(rendered)
-    if report.has_findings and not no_fail:
+    if (report.findings or report.check.load_issues) and not no_fail:
         raise typer.Exit(code=1)
 
 
