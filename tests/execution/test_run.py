@@ -78,16 +78,15 @@ def test_run_error_surfaces_dbt_compile_failure(jaffle_project_dir: Path, tmp_pa
 
     broken = tmp_path / "broken_project"
     shutil.copytree(jaffle_project_dir, broken)
-    # Break customers.sql so dbt-compile / dbt-run fails loudly.
+    # Break customers.sql so the dbt build fails loudly.
     customers = broken / "models" / "customers.sql"
     customers.write_text("select * from {{ ref('does_not_exist') }}")
 
     with pytest.raises(RunError) as excinfo:
         run_model(broken, "customers")
-    # dbt parses the full project at the start of every subcommand, so a
-    # broken `ref` surfaces during `dbt seed` (the first thing we run)
-    # rather than waiting for `dbt run`.
-    assert excinfo.value.phase is Phase.SEED
+    # dbt parses the full project before doing any work, so a broken `ref`
+    # surfaces while the single `dbt build` is starting up.
+    assert excinfo.value.phase is Phase.BUILD
     assert excinfo.value.returncode != 0
 
 

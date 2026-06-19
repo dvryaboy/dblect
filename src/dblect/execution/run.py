@@ -10,9 +10,12 @@ The contract:
   fixture map (seed/source name → list of row dicts), copies the project to
   a temporary working directory, writes any provided fixtures into ``seeds/``
   as CSV, writes a generated ``profiles.yml`` pointing at an ephemeral
-  DuckDB file, runs ``dbt seed`` then ``dbt run --select +<model>``, and
-  finally reads the produced table back through the DuckDB driver.
-* Subprocess failures during seed or run raise `RunError`, carrying the
+  DuckDB file, runs ``dbt build --select +<model>`` (seeds and models build
+  together in DAG order; data and unit tests are excluded so a declared test
+  never gates materialisation), and finally reads the produced table back
+  through the DuckDB driver. One ``dbt build`` invocation replaces a separate
+  ``dbt seed`` and ``dbt run``, so the project is parsed once rather than twice.
+* Subprocess failures during the build raise `RunError`, carrying the
   phase, exit code, stdout, and stderr. Compilation errors, missing
   upstreams, and SQL errors all surface this way: dbt formats them into
   stderr and we don't swallow it.
@@ -47,8 +50,7 @@ from dblect.execution.project_env import (
 class Phase(StrEnum):
     """Which stage of `run_model` failed when a `RunError` was raised."""
 
-    SEED = "seed"
-    RUN = "run"
+    BUILD = "build"
     QUERY = "query"
 
 
@@ -75,10 +77,8 @@ class RunResult:
     model_name: str
     columns: tuple[str, ...]
     rows: tuple[tuple[Any, ...], ...]
-    seed_stdout: str
-    seed_stderr: str
-    run_stdout: str
-    run_stderr: str
+    build_stdout: str
+    build_stderr: str
 
     @property
     def row_count(self) -> int:
@@ -107,8 +107,8 @@ def run_model(
         model_name: dbt name of the model to materialise (e.g., ``"customers"``).
             Upstream seeds and models are built automatically via the ``+`` selector.
         fixtures: Optional mapping of seed name → list of row dicts. Each
-            mapped seed is rewritten as a CSV under ``seeds/`` before
-            ``dbt seed`` runs; unmapped seeds use the project's existing CSVs.
+            mapped seed is rewritten as a CSV under ``seeds/`` before the
+            build runs; unmapped seeds use the project's existing CSVs.
         profile_name: Profile name to write into the generated ``profiles.yml``.
             Defaults to the ``profile:`` value in ``dbt_project.yml``.
         dbt_executable: Path or name of the dbt CLI. Useful when dbt is
@@ -118,11 +118,11 @@ def run_model(
 
     Returns:
         A `RunResult` carrying the model's columns, rows, and the captured
-        seed/run subprocess output.
+        ``dbt build`` subprocess output.
 
     Raises:
-        RunError: If ``dbt seed`` or ``dbt run`` returns non-zero, or if the
-            produced table can't be read from DuckDB.
+        RunError: If ``dbt build`` returns non-zero, or if the produced table
+            can't be read from DuckDB.
         FileNotFoundError: If `project_dir` doesn't exist or doesn't contain
             ``dbt_project.yml``.
     """
@@ -147,27 +147,27 @@ def run_model(
 
         env = {**os.environ, "DBT_PROFILES_DIR": str(profiles_dir)}
 
-        seed_proc = run_dbt(
-            dbt_executable,
-            ["seed", "--project-dir", str(work_project)],
-            env=env,
-        )
-        if seed_proc.returncode != 0:
-            raise RunError(Phase.SEED, seed_proc.returncode, seed_proc.stdout, seed_proc.stderr)
-
-        run_proc = run_dbt(
+        # One `dbt build` seeds and runs the model's ancestry in DAG order. Data and
+        # unit tests are excluded so a declared test failing on the materialised rows
+        # never blocks the run; the harness reports the table, and the analysis layer
+        # judges it.
+        build_proc = run_dbt(
             dbt_executable,
             [
-                "run",
+                "build",
                 "--project-dir",
                 str(work_project),
                 "--select",
                 f"+{model_name}",
+                "--exclude-resource-type",
+                "test",
+                "--exclude-resource-type",
+                "unit_test",
             ],
             env=env,
         )
-        if run_proc.returncode != 0:
-            raise RunError(Phase.RUN, run_proc.returncode, run_proc.stdout, run_proc.stderr)
+        if build_proc.returncode != 0:
+            raise RunError(Phase.BUILD, build_proc.returncode, build_proc.stdout, build_proc.stderr)
 
         try:
             columns, rows = _query_table(duckdb_path, model_name)
@@ -182,10 +182,8 @@ def run_model(
             model_name=model_name,
             columns=columns,
             rows=rows,
-            seed_stdout=seed_proc.stdout,
-            seed_stderr=seed_proc.stderr,
-            run_stdout=run_proc.stdout,
-            run_stderr=run_proc.stderr,
+            build_stdout=build_proc.stdout,
+            build_stderr=build_proc.stderr,
         )
 
 

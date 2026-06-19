@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import duckdb
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -136,9 +137,11 @@ def _manifest(s: NullScenario) -> Manifest:
     )
 
 
-@given(_null_scenario())
+@given(s=_null_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_non_null_columns_are_never_null_over_materialized_rows(s: NullScenario) -> None:
+def test_non_null_columns_are_never_null_over_materialized_rows(
+    oracle_con: duckdb.DuckDBPyConnection, s: NullScenario
+) -> None:
     """Every output column the analyzer calls NON_NULL has no nulls in the duckdb
     materialization. The check never recomputes which columns should be nullable; the
     data is the judge."""
@@ -148,7 +151,7 @@ def test_non_null_columns_are_never_null_over_materialized_rows(s: NullScenario)
         c for c in _OUTPUT_COLS if anns[ColumnRef(model, c)].value is Nullability.NON_NULL
     ]
     tables: list[Table] = [("bt", ("bk", "bv"), s.rows_bt), ("jt", ("jk", "jv"), s.rows_jt)]
-    with materialized(tables, _null_sql(s)) as con:
+    with materialized(oracle_con, tables, _null_sql(s)) as con:
         for col in non_null_cols:
             nulls = scalar(con, f"SELECT COUNT(*) FROM _m WHERE {col} IS NULL")
             assert nulls == 0, (

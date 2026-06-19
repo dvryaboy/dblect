@@ -58,6 +58,7 @@ dev = [
     # See the cap rationale under [project.optional-dependencies] (parser #219).
     "dbt-core>=1.8,<1.11.8",
     "dbt-duckdb>=1.8",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.hatch.version]
