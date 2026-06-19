@@ -1,28 +1,13 @@
-"""Check a project across its incremental worlds.
+"""Check a project across its incremental worlds: compile both ways, run both
+detector families (:func:`~dblect.check.run.run_check` and
+:func:`~dblect.audit.run_audit`) over each, and difference the findings.
 
-The incremental axis compiles a project two ways (full-refresh and steady-state)
-via :func:`dblect.execution.incremental.compile_incremental_worlds`, runs the
-project's detectors over each, and differences the findings: a finding that holds
-in one world and not the other is the cross-world signal this stream surfaces,
-while a finding present in both worlds is one the single-manifest analysis already
-reports.
-
-Both finding families run per world. :func:`dblect.check.run.run_check` carries
-the declaration-level findings (contract resolution, domain-type contradictions,
-not-well-typed aggregations), and :func:`dblect.audit.run_audit` carries the
-SQL-structural findings (join fan-out, window order, nullability hazards, and the
-rest). The classic incremental hazard lives in the structural family: a key the
-full-refresh build keeps unique is fanned out by a steady-state-only join, so the
-join-fan-out detector fires in steady-state alone.
-
-These are control-flow worlds (the SQL itself differs between them), so each world
-is built and checked independently from its own manifest, unlike the shared build
-the value-substitution enumerator (:func:`dblect.check.worlds.enumerate_worlds`)
-uses. Because the SQL differs, a finding's human-readable message and its line
-span drift between worlds even when the underlying issue is the same, so the
-cross-world diff keys on a stable :data:`FindingIdentity` rather than on whole
-finding equality. (The two finding representations and this shared identity are
-the subject of the unification discussed in issue #107.)
+These are control-flow worlds, so each is built independently from its own manifest
+(the shared-build enumerator in :mod:`dblect.check.worlds` serves value-substitution
+worlds, where the SQL is identical). Because the SQL differs, a finding's message
+and line span drift between worlds even when the issue is the same, so the diff keys
+on a stable :data:`FindingIdentity` rather than whole-finding equality. Issue #107
+tracks unifying the two finding representations this identity spans.
 """
 
 from __future__ import annotations
@@ -55,14 +40,11 @@ FindingIdentity = tuple[Hashable, ...]
 
 
 def finding_identity(finding: IncrementalFinding) -> FindingIdentity:
-    """The stable cross-world identity of ``finding``.
-
-    For a declaration-level finding it is the kind, model, column, and contract:
-    the location the finding lands on, without the rendered message. For a
-    structural finding it is the kind, model, and the rendered offending SQL
-    snippet, which is stable for the shared portions of two compilations while the
-    line span is not. A snippet present only in one world (a steady-state-only
-    join) therefore has no match in the other and surfaces as world-varying.
+    """The stable cross-world identity of ``finding``: where it lands and what it is,
+    without the message or line span that differ between two compilations. A
+    declaration-level finding keys on kind/model/column/contract; a structural one on
+    kind/model and the rendered offending snippet. A snippet present in one world only
+    (a steady-state-only join) has no match in the other, so it surfaces as varying.
     """
     if isinstance(finding, CheckFinding):
         return ("check", finding.kind, finding.model_unique_id, finding.column, finding.contract)

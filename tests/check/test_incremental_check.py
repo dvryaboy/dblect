@@ -21,7 +21,7 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.audit import LocatedFinding
-from dblect.check.incremental import check_incremental_worlds
+from dblect.check.incremental import IncrementalWorldCheck, check_incremental_worlds
 from dblect.execution.incremental import FULL_REFRESH_WORLD, STEADY_STATE_WORLD
 from dblect.sql import FindingKind
 from dblect.types import isolated_registry
@@ -37,26 +37,23 @@ def incremental_project_dir() -> Path:
     return path
 
 
-def test_both_worlds_are_compiled_and_checked(incremental_project_dir: Path, dbt_cli: str) -> None:
+@pytest.fixture(scope="module")
+def result(incremental_project_dir: Path, dbt_cli: str) -> IncrementalWorldCheck:
+    # No contracts: the signal comes from the dbt-test-declared keys and the SQL the
+    # two worlds compile to, not from a declaration layered on top. An isolated
+    # registry keeps contracts from other test modules out.
     with isolated_registry() as registry:
-        result = check_incremental_worlds(
+        return check_incremental_worlds(
             incremental_project_dir, _DUCKDB, registry=registry, dbt_executable=dbt_cli
         )
 
+
+def test_both_worlds_are_compiled_and_checked(result: IncrementalWorldCheck) -> None:
     assert result.analyzed_worlds == frozenset({FULL_REFRESH_WORLD, STEADY_STATE_WORLD})
     assert not result.opaque_worlds
 
 
-def test_steady_state_fan_out_is_the_cross_world_finding(
-    incremental_project_dir: Path, dbt_cli: str
-) -> None:
-    # No contracts: the signal comes from the dbt-test-declared keys and the SQL the
-    # two worlds compile to, not from a declaration layered on top.
-    with isolated_registry() as registry:
-        result = check_incremental_worlds(
-            incremental_project_dir, _DUCKDB, registry=registry, dbt_executable=dbt_cli
-        )
-
+def test_steady_state_fan_out_is_the_cross_world_finding(result: IncrementalWorldCheck) -> None:
     (varying,) = result.cross_world_findings()
     assert varying.worlds == frozenset({STEADY_STATE_WORLD})
 

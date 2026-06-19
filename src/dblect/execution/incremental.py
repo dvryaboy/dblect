@@ -1,22 +1,16 @@
-"""Compile a dbt project into its incremental worlds, data-free.
+"""Compile a dbt project into its full-refresh and steady-state worlds, data-free.
 
-A dbt incremental model compiles two ways: a full-refresh form whose
-``{% if is_incremental() %}`` branch is absent, and a steady-state form where it
-is present. A single manifest captures one. This module produces both from
-``dbt compile`` alone, with no build and no connection to the project's real
-warehouse, by shadowing ``is_incremental()`` with a constant-returning macro and
-compiling once per value against an ephemeral DuckDB connection.
+Both worlds come from ``dbt compile`` alone, with no build and no connection to the
+project's real warehouse: the module shadows ``is_incremental()`` with a
+constant-returning macro and compiles once per value against an ephemeral DuckDB.
+``ref()`` and ``{{ this }}`` resolve at parse, so the steady-state SELECT compiles
+with nothing built. Each world is read back as an ordinary
+:class:`~dblect.manifest.Manifest`.
 
-``ref()`` and ``{{ this }}`` resolve to relation names at parse, so the
-steady-state SELECT compiles even though nothing has been built. Each world is
-read back through the ordinary :class:`~dblect.manifest.Manifest` reader, so a
-world is just a ``Manifest`` the rest of the pipeline already understands.
-
-The reach of the override is the bare ``{{ is_incremental() }}`` call. A model
-that calls ``dbt.is_incremental()`` explicitly, or a branch that introspects the
-existing relation's schema at compile, is not reached by the data-free path; the
-compile that does not reach it degrades rather than misleads (its world is
-reported with an error and the other world still stands).
+The override reaches the bare ``{{ is_incremental() }}`` call. A model that calls
+``dbt.is_incremental()`` explicitly, or a branch that introspects the existing
+relation's schema at compile, is not reached and degrades to an opaque world
+(reported with its error) while the other world still stands.
 """
 
 from __future__ import annotations
