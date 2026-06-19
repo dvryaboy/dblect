@@ -182,6 +182,21 @@ def test_mixed_currency_sum_is_flagged() -> None:
     assert agg[0].column == "total"
 
 
+def test_mixed_currency_sum_message_names_the_columns() -> None:
+    # The finding names what the coherence guard reasoned about: the aggregate and
+    # the column it reduced, the per-row companion that varies, and the grouping that
+    # fails to hold it constant, so a reader can act without opening the model (#109).
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(_agg_manifest(), _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert "amount" in agg.message  # the reduced column
+    assert "currency" in agg.message  # the per-row companion that varies
+    assert "country" in agg.message  # the grouping that does not hold it constant
+
+
 def test_sum_over_a_case_expression_is_not_flagged() -> None:
     # `sum(CASE WHEN ... THEN amount ELSE 0 END)` clears to naked at the CASE (it
     # mixes money with a dimensionless 0), which is a different concern than a

@@ -49,6 +49,7 @@ from dblect.lineage.graph import (
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
+    companion_columns,
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
@@ -59,7 +60,7 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
-from dblect.lineage.property import propagate
+from dblect.lineage.property import COLUMNREF_META_KEY, propagate
 from dblect.manifest import Manifest
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
@@ -373,40 +374,95 @@ def _aggregation_findings(
         if ann.value != NAKED:
             continue
         derivation = column_graph.derivation(ref)
-        if derivation is None or not _reduces_a_bare_column(derivation):
+        if derivation is None:
             continue
         operands = column_graph.edges.get(ref, frozenset())
-        if any(annotations.get(up, _NO_ANN).value != NAKED for up in operands):
-            out.append(
-                CheckFinding(
-                    kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
-                    message=(
-                        f"reducing {ref.column!r} mixes a per-row companion that nothing holds "
-                        "constant per group; the sum is not well typed"
-                    ),
-                    model_unique_id=ref.source.unique_id,
-                    file_path=_file_of(manifest, ref.source),
-                    column=ref.column,
-                )
+        tagged = frozenset(up for up in operands if annotations.get(up, _NO_ANN).value != NAKED)
+        agg = _culprit_aggregate(derivation, tagged) if tagged else None
+        if agg is None:
+            continue
+        out.append(
+            CheckFinding(
+                kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+                message=_aggregation_message(ref, agg, annotations),
+                model_unique_id=ref.source.unique_id,
+                file_path=_file_of(manifest, ref.source),
+                column=ref.column,
             )
+        )
     return out
 
 
-def _reduces_a_bare_column(derivation: Expr) -> bool:
-    """Whether a projection is a non-windowed aggregate (one the coherence guard
-    judged) directly over a bare column.
+_GENERIC_AGG_MESSAGE = (
+    "reducing {col!r} mixes a per-row companion that nothing holds constant per group; "
+    "the aggregation is not well typed"
+)
 
-    Restricting to a bare-column operand keeps the finding precise. An aggregate
-    over an expression, ``sum(CASE WHEN ... THEN amount ELSE 0 END)`` being the
-    common one, already clears to naked at the expression because it mixes a
-    magnitude with a dimensionless literal, which is a different concern than a
-    companion that is not constant per group. The operand column carrying a tag
-    that the reduction cleared is the signal that names a mixed-currency sum.
-    """
-    return any(
-        isinstance(aggregation_site_meta(agg), AggregationSite) and isinstance(agg.this, exp.Column)
-        for agg in derivation.find_all(exp.AggFunc)
+
+def _aggregation_message(
+    output: ColumnRef,
+    agg: exp.AggFunc,
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+) -> str:
+    """Name what the coherence guard reasoned about: the aggregate and the column it
+    reduced, the per-row companion that is not held constant, and the grouping that
+    fails to hold it.
+
+    Faithful by construction: it reads the same ``AggregationSite`` the builder
+    stamped (and the guard judged) and the same ``companion_columns`` the guard
+    called, so the message describes the decision rather than re-deriving it. When the
+    reduced operand carries no tag or the companion cannot be pinpointed (an
+    unmodelled shape), it falls back to the generic wording rather than guess."""
+    operand = agg.this.meta.get(COLUMNREF_META_KEY)
+    if not isinstance(operand, ColumnRef) or operand not in annotations:
+        return _GENERIC_AGG_MESSAGE.format(col=output.column)
+    site = aggregation_site_meta(agg)
+    pinned: frozenset[ColumnRef] = site.pinned if site is not None else frozenset()
+    group_refs = site.group_refs if site is not None else None
+
+    companions = companion_columns(annotations[operand].value)
+    # A companion in the group key or pinned by the scope's WHERE is held constant;
+    # the rest are what the grouping leaves varying. If subtracting empties the set
+    # (an exotic multi-companion shape), name the companions rather than nothing.
+    held: frozenset[ColumnRef] = pinned | (group_refs or frozenset())
+    varying = frozenset(c for c in companions if c not in held) or companions
+    if not varying:
+        return _GENERIC_AGG_MESSAGE.format(col=output.column)
+
+    func = agg.key  # the lowercased aggregate name: "sum", "avg", ...
+    companion_list = ", ".join(repr(c.column) for c in sorted(varying, key=lambda r: r.column))
+    one = len(varying) == 1
+    word, verb = ("companion", "is") if one else ("companions", "are")
+    if group_refs:
+        groups = ", ".join(repr(g.column) for g in sorted(group_refs, key=lambda r: r.column))
+        tail = f"grouping on {groups}"
+    else:
+        tail = "the grouping, which does not resolve to columns,"
+    return (
+        f"reducing {output.column!r} with {func}({operand.column}): its per-row {word} "
+        f"{companion_list} {verb} not held constant by {tail}; the aggregation is not well typed"
     )
+
+
+def _culprit_aggregate(derivation: Expr, tagged: frozenset[ColumnRef]) -> exp.AggFunc | None:
+    """The bare-column aggregate the finding is about: a non-windowed aggregate over a
+    single column in ``tagged``, carrying the stamped site the coherence guard judged.
+
+    Restricting to a bare-column operand keeps the finding precise. An aggregate over
+    an expression (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already clears to
+    naked at the expression by mixing a magnitude with a dimensionless literal, a
+    different concern than a companion that is not constant per group. Which aggregate
+    *functions* carry the coherence obligation (combining vs selecting vs counting) is
+    the substrate's classification, refined separately."""
+    for agg in derivation.find_all(exp.AggFunc):
+        if not isinstance(agg.this, exp.Column):
+            continue
+        if not isinstance(aggregation_site_meta(agg), AggregationSite):
+            continue
+        operand = agg.this.meta.get(COLUMNREF_META_KEY)
+        if isinstance(operand, ColumnRef) and operand in tagged:
+            return agg
+    return None
 
 
 # --- helpers --------------------------------------------------------------------
