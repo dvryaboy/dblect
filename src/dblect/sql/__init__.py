@@ -1,5 +1,10 @@
 """SQL static-analysis layer over sqlglot."""
 
+from dblect.sql.aggregates import (
+    PORTABLE_AGGREGATE_BEHAVIOR,
+    AggregateBehavior,
+    aggregate_behavior,
+)
 from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.sql.patterns import (
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
@@ -29,10 +34,12 @@ from dblect.sql.patterns import (
 )
 
 __all__ = [
+    "PORTABLE_AGGREGATE_BEHAVIOR",
     "PORTABLE_NON_DETERMINISTIC_BUILTINS",
     "SURROGATE_HASH_FUNCTIONS",
     "SURROGATE_HASH_PASSTHROUGH",
     "SURROGATE_HASH_STRUCTURAL",
+    "AggregateBehavior",
     "AggregateSummary",
     "Finding",
     "FindingKind",
@@ -41,6 +48,7 @@ __all__ = [
     "JoinSummary",
     "SQLParseError",
     "WindowSummary",
+    "aggregate_behavior",
     "all_findings",
     "detect_coalesce_on_join_key",
     "detect_null_group_after_outer_join",

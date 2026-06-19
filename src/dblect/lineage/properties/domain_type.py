@@ -56,6 +56,7 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OuterJoinNull
+from dblect.sql import PORTABLE_AGGREGATE_BEHAVIOR, AggregateBehavior
 from dblect.sql import _sqlglot as sg
 
 # --- unit and tag identities -------------------------------------------------
@@ -524,17 +525,34 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[
     return Annotation(NAKED, Opacity.IMPLICIT, provisional=child.provisional)
 
 
-DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = {
-    exp.Sum: AggregateRule(core=_passthrough_core),
-    exp.Avg: AggregateRule(core=_passthrough_core),
-    exp.Min: AggregateRule(core=_passthrough_core),
-    exp.Max: AggregateRule(core=_passthrough_core),
-    exp.Count: AggregateRule(core=_count_core),
-    # An approximate distinct count is a cardinality like COUNT: a tag-free number,
-    # not a value in the input's domain. Without this rule the single-operand fold
-    # would carry the input's tag straight through the sketch (#90).
-    exp.ApproxDistinct: AggregateRule(core=_count_core),
-}
+def _aggregate_rules(
+    classification: Mapping[type[exp.AggFunc], AggregateBehavior],
+    *,
+    guard: CoherenceGuard[DomainTag, FDSet] | None,
+) -> dict[type[exp.AggFunc], AggregateRule[DomainTag]]:
+    """Turn a reduction-behavior classification into the property's aggregate rules.
+
+    ``COUNT`` yields a tag-free cardinality whatever it counts, so it has no companion
+    to discharge and never carries the guard. ``COMBINE`` and ``SELECT`` both keep the
+    magnitude's tag, and when ``guard`` is armed both clear it to top where a per-row
+    companion is not held constant per group: for ``COMBINE`` that cleared result is the
+    mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
+    widen-to-top of a tag-blind selection (``min`` over mixed currencies), caught later
+    where a definite tag is required. The produce rule is the same for both; the finding
+    tells them apart. Classifying aggregate behavior is the single source of truth, in
+    :mod:`dblect.sql.aggregates`."""
+    rules: dict[type[exp.AggFunc], AggregateRule[DomainTag]] = {}
+    for agg_type, behavior in classification.items():
+        if behavior is AggregateBehavior.COUNT:
+            rules[agg_type] = AggregateRule(core=_count_core)
+        else:
+            rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
+    return rules
+
+
+DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = _aggregate_rules(
+    PORTABLE_AGGREGATE_BEHAVIOR, guard=None
+)
 
 
 def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
@@ -582,17 +600,11 @@ def join_key_conflicts(
 def _guarded_aggregates(
     fd: PropertyRef[FDSet, SourceRef],
 ) -> Mapping[type[exp.AggFunc], AggregateRule[DomainTag]]:
-    """The aggregate catalog with the coherence obligation armed on the combining
-    aggregates. ``sum`` and ``avg`` synthesize a new value out of many, so a
-    varying tag corrupts the result and the guard clears it unless discharged.
-    ``min``/``max`` select an existing value and ``count`` ignores values, so
-    they keep their unguarded rules."""
+    """The aggregate catalog with the coherence obligation armed. ``COMBINE`` and
+    ``SELECT`` aggregates clear a magnitude whose per-row companion is not held constant
+    per group; ``COUNT`` keeps its unguarded cardinality rule. See :func:`_aggregate_rules`."""
     guard = CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
-    return {
-        **DOMAIN_TYPE_AGGREGATES,
-        exp.Sum: AggregateRule(core=_passthrough_core, coherence=guard),
-        exp.Avg: AggregateRule(core=_passthrough_core, coherence=guard),
-    }
+    return _aggregate_rules(PORTABLE_AGGREGATE_BEHAVIOR, guard=guard)
 
 
 # --- the property ------------------------------------------------------------

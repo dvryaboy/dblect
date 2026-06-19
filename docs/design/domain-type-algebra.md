@@ -219,6 +219,14 @@ than a scatter of flags:
   comparing a dimensioned value against an un-dimensioned one, the same obligation the
   join-key-types row raises for two *disagreeing* known tags, extended to the no-claim
   side.
+- **Tag-blind `min`/`max` selection.** A selecting aggregate picks an existing value by a
+  comparison, so `min(amount)`/`max(amount)` over a group whose currency is not held
+  constant chooses the smallest or largest *number* across mixed currencies. Lenient
+  treats the result as the real value it is and widens its tag to top (the
+  selection rule above), saying nothing at the operation. Strict raises a finding: this is
+  the ordering-against-a-`Top`-operand divergence applied to the comparison a selection is
+  built on, not a separate flag. The classification that names `min`/`max` as selecting is
+  in `dblect.sql.aggregates`.
 
 Multiplication and division are deliberately absent from this list, but for a different
 reason than addition. `*` and `/` carry no agreement requirement at all (any two units
