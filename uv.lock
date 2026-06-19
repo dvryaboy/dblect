@@ -309,6 +309,7 @@ dbt-core = [
 dev = [
     { name = "dbt-core" },
     { name = "dbt-duckdb" },
+    { name = "jsonschema" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -331,6 +332,7 @@ provides-extras = ["dbt-core"]
 dev = [
     { name = "dbt-core", specifier = ">=1.8,<1.11.8" },
     { name = "dbt-duckdb", specifier = ">=1.8" },
+    { name = "jsonschema", specifier = ">=4.0" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
