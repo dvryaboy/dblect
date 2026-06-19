@@ -66,7 +66,7 @@ For a magnitude `m` carrying a set of tags, where a dimensional tag (a unit) doe
 | `min(m)`, `max(m)`, `order by m`, top-n windows | nothing forced | a real value of the type, but its tag widens to the join of the inputs (top when they differ) |
 | render as money at an exposure | every tag present and single-valued | leaves the typed world |
 
-Three kinds of reduction over a tagged magnitude behave differently, and the difference is whether the operation inspects, combines, or selects values. `count` ignores values, so it is always safe regardless of tags. `sum` and `avg` combine values into a new one, so they take the hard rule above: a varying tag corrupts the magnitude (dollars added to euros are in no currency), which is why they must be discharged. `min`, `max`, ordering, and top-n selection pick an existing value rather than synthesizing one, so the magnitude they return is real; only its tag is uncertain, because the comparison that chose it was tag-blind. They therefore widen the result tag to the join of the inputs (top when the inputs disagree) rather than failing at the operation, and that widened tag is caught by the ordinary checks wherever a definite tag is later required: assignment to a typed column, a later combine, or rendering at an exposure. The same discharges that make a `sum` sound (the tag in the group key, pinned, or functionally determined) make the selection meaningful too, since they hold the tag constant across what is compared.
+Three kinds of reduction over a tagged magnitude behave differently, and the difference is whether the operation ignores, combines, or selects values. `count` ignores values, so it is always safe regardless of tags. `sum` and `avg` combine values into a new one, so they take the hard rule above: a varying tag corrupts the magnitude (dollars added to euros are in no currency), which is why they must be discharged. `min`, `max`, ordering, and top-n selection pick an existing value rather than synthesizing one, so the magnitude they return is real; only its tag is uncertain, because the comparison that chose it was tag-blind. They therefore widen the result tag to the join of the inputs (top when the inputs disagree) rather than failing at the operation, and that widened tag is caught by the ordinary checks wherever a definite tag is later required: assignment to a typed column, a later combine, or rendering at an exposure. The same discharges that make a `sum` sound (the tag in the group key, pinned, or functionally determined) make the selection meaningful too, since they hold the tag constant across what is compared.
 
 Multiplication and division are the generic part, and they are why a dimensional tag is worth separating from a nominal one. They are the operations of the free abelian group of units (Kennedy): `*` adds unit exponents and `/` subtracts them, with no per-case knowledge beyond the operands' own dimensions. `money<usd> / money<usd>` cancels to a dimensionless ratio; an `ExchangeRate` typed `eur/usd` times a `MoneyUSD` gives `MoneyEUR`, the `usd` exponents cancelling; and `money * money` is `usd^2`, which is not an error at the multiply but a well-typed value nobody usually wants, flagged only where a `usd^2` is later used as money. A reversed conversion is caught for free this way: multiplying by a rate typed the wrong direction (`usd/eur`) yields `usd^2 eur^-1`, which the same downstream check flags. A nominal tag has no exponents, so it simply rides through a scalar multiply (`revenue * 0.9` keeps its tax status) and widens to top if two nominally-tagged operands are multiplied together.
 
@@ -219,6 +219,14 @@ than a scatter of flags:
   comparing a dimensioned value against an un-dimensioned one, the same obligation the
   join-key-types row raises for two *disagreeing* known tags, extended to the no-claim
   side.
+- **Tag-blind `min`/`max` selection.** A selecting aggregate picks an existing value by a
+  comparison, so `min(amount)`/`max(amount)` over a group whose currency is not held
+  constant chooses the smallest or largest *number* across mixed currencies. Lenient
+  treats the result as the real value it is and widens its tag to top (the
+  selection rule above), saying nothing at the operation. Strict raises a finding: this is
+  the ordering-against-a-`Top`-operand divergence applied to the comparison a selection is
+  built on, not a separate flag. The classification that names `min`/`max` as selecting is
+  in `dblect.sql.aggregates`.
 
 Multiplication and division are deliberately absent from this list, but for a different
 reason than addition. `*` and `/` carry no agreement requirement at all (any two units

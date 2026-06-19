@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from functools import reduce
-from typing import Final, final
+from typing import Final, assert_never, final
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
@@ -56,6 +56,7 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OuterJoinNull
+from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
 
 # --- unit and tag identities -------------------------------------------------
@@ -524,17 +525,34 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[
     return Annotation(NAKED, Opacity.IMPLICIT, provisional=child.provisional)
 
 
-DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = {
-    exp.Sum: AggregateRule(core=_passthrough_core),
-    exp.Avg: AggregateRule(core=_passthrough_core),
-    exp.Min: AggregateRule(core=_passthrough_core),
-    exp.Max: AggregateRule(core=_passthrough_core),
-    exp.Count: AggregateRule(core=_count_core),
-    # An approximate distinct count is a cardinality like COUNT: a tag-free number,
-    # not a value in the input's domain. Without this rule the single-operand fold
-    # would carry the input's tag straight through the sketch (#90).
-    exp.ApproxDistinct: AggregateRule(core=_count_core),
-}
+def _aggregate_rules(
+    *,
+    guard: CoherenceGuard[DomainTag, FDSet] | None,
+) -> dict[type[exp.AggFunc], AggregateRule[DomainTag]]:
+    """Turn the reduction-behavior classification into the property's aggregate rules.
+
+    ``COUNT`` yields a tag-free cardinality whatever it counts, so it has no companion
+    to discharge and never carries the guard. ``COMBINE`` and ``SELECT`` both keep the
+    magnitude's tag, and when ``guard`` is armed both clear it to top where a per-row
+    companion is not held constant per group: for ``COMBINE`` that cleared result is the
+    mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
+    widen-to-top of a tag-blind selection (``min`` over mixed currencies), caught later
+    where a definite tag is required. The produce rule is the same for both; the finding
+    tells them apart. The classification (:data:`AGGREGATE_BEHAVIORS`) is the single
+    source of truth, in :mod:`dblect.sql.aggregates`."""
+    rules: dict[type[exp.AggFunc], AggregateRule[DomainTag]] = {}
+    for agg_type, behavior in AGGREGATE_BEHAVIORS.items():
+        # COMBINE and SELECT deliberately share one produce rule (the finding tells them
+        # apart downstream); the match is closed by ``assert_never`` so a new behavior is a
+        # typecheck error here rather than a silent fall-through into the guarded rule.
+        match behavior:
+            case AggregateBehavior.COUNT:
+                rules[agg_type] = AggregateRule(core=_count_core)
+            case AggregateBehavior.COMBINE | AggregateBehavior.SELECT:
+                rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
+            case _:
+                assert_never(behavior)
+    return rules
 
 
 def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
@@ -579,22 +597,6 @@ def join_key_conflicts(
     return tuple(out)
 
 
-def _guarded_aggregates(
-    fd: PropertyRef[FDSet, SourceRef],
-) -> Mapping[type[exp.AggFunc], AggregateRule[DomainTag]]:
-    """The aggregate catalog with the coherence obligation armed on the combining
-    aggregates. ``sum`` and ``avg`` synthesize a new value out of many, so a
-    varying tag corrupts the result and the guard clears it unless discharged.
-    ``min``/``max`` select an existing value and ``count`` ignores values, so
-    they keep their unguarded rules."""
-    guard = CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
-    return {
-        **DOMAIN_TYPE_AGGREGATES,
-        exp.Sum: AggregateRule(core=_passthrough_core, coherence=guard),
-        exp.Avg: AggregateRule(core=_passthrough_core, coherence=guard),
-    }
-
-
 # --- the property ------------------------------------------------------------
 
 
@@ -632,18 +634,23 @@ def domain_type_property(
     bridge. No semiring: a confluence widens by the lattice ``join``, which is the
     correct "keep only what both arms agree on" for tags.
 
-    Passing the functional-dependency property's ref arms the coherence guard on
-    ``sum`` and ``avg``: an aggregate over a per-row companion tag keeps its tag
-    only where the group key holds the companion constant (membership, a pin, or
-    an FD entailment at the aggregation input) and clears to top otherwise. The
-    edge is declared in ``depends_on``, so the registry evaluates dependencies
-    first and the guard's read is always answered.
+    Passing the functional-dependency property's ref arms the coherence guard on the
+    combining and selecting aggregates: such an aggregate over a per-row companion tag
+    keeps its tag only where the group key holds the companion constant (membership, a
+    pin, or an FD entailment at the aggregation input) and clears to top otherwise. The
+    edge is declared in ``depends_on``, so the registry evaluates dependencies first and
+    the guard's read is always answered.
     """
+    guard = (
+        None
+        if fd is None
+        else CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
+    )
     return column_property(
         name="domain_type",
         lattice=DOMAIN_TYPE_LATTICE,
         operators=DOMAIN_TYPE_OPERATORS,
-        aggregates=DOMAIN_TYPE_AGGREGATES if fd is None else _guarded_aggregates(fd),
+        aggregates=_aggregate_rules(guard=guard),
         ground=ground,
         depends_on=() if fd is None else (fd,),
     )

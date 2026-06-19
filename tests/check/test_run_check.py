@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
+
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
@@ -195,6 +197,96 @@ def test_mixed_currency_sum_message_names_the_columns() -> None:
     assert "amount" in agg.message  # the reduced column
     assert "currency" in agg.message  # the per-row companion that varies
     assert "country" in agg.message  # the grouping that does not hold it constant
+
+
+def _one_agg_manifest(sql_fn: str) -> Manifest:
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+        ),
+        _node(
+            "model.shop.agg",
+            kind=ResourceType.MODEL,
+            sql=f"SELECT country, {sql_fn}(amount) AS v FROM payments GROUP BY country",
+            columns=_cols(country="VARCHAR", v="DECIMAL"),
+        ),
+    )
+    return Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+
+# Two non-sum representatives: `avg` is a different sqlglot node than `sum`, and `median`
+# a structurally distinct one, enough to confirm the path fires and the message renders
+# the actual aggregate rather than a hard-coded "sum". The full breadth of which
+# aggregates combine is pinned cheaply at the classification boundary in
+# tests/sql/test_aggregates.py, so it is not re-run through the check pipeline here.
+@pytest.mark.parametrize("sql_fn", ["AVG", "MEDIAN"])
+def test_combining_aggregates_over_mixed_currency_are_flagged(sql_fn: str) -> None:
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(_one_agg_manifest(sql_fn), _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert "currency" in agg.message
+    assert sql_fn.lower() in agg.message
+
+
+def test_counting_aggregate_is_not_flagged() -> None:
+    # Counting money is always well typed: count ignores values, so currency is
+    # irrelevant. Only the combining class carries the obligation.
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(_one_agg_manifest("COUNT"), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+def test_selecting_aggregate_is_not_flagged_under_lenient() -> None:
+    # min/max return a real input value rather than synthesizing one, so under the lenient
+    # default they do not raise the not-well-typed finding (their result tag widens to top
+    # and is caught later where a definite tag is required). An eager finding for the
+    # tag-blind comparison is the strict-mode question, tracked separately (#116).
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(_one_agg_manifest("MIN"), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+def test_collection_aggregate_over_a_tagged_column_is_not_flagged() -> None:
+    # array_agg gathers values into a list rather than reducing a magnitude, so it carries
+    # no currency obligation and is left unclassified (lenient).
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+        ),
+        _node(
+            "model.shop.amounts_by_country",
+            kind=ResourceType.MODEL,
+            sql="SELECT country, array_agg(amount) AS amounts FROM payments GROUP BY country",
+            columns=_cols(country="VARCHAR", amounts="DECIMAL[]"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 
 def test_sum_over_a_case_expression_is_not_flagged() -> None:

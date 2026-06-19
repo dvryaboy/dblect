@@ -62,6 +62,7 @@ from dblect.lineage.properties.functional_dependency import (
 )
 from dblect.lineage.property import COLUMNREF_META_KEY, propagate
 from dblect.manifest import Manifest
+from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -145,7 +146,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         store.record(fd_prop.name, scope, ann)
 
     dt_prop = domain_type_property(
-        domain_type_grounding(_by_scope(facts.tag_facts)), fd=fd_prop.ref
+        domain_type_grounding(_by_scope(facts.tag_facts)),
+        fd=fd_prop.ref,
     )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
     domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx)
@@ -207,7 +209,11 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     findings: list[CheckFinding] = []
     findings.extend(_contradiction_findings(graphs.manifest, world.domain_type))
     findings.extend(
-        _aggregation_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+        _aggregation_findings(
+            graphs.manifest,
+            world.domain_type,
+            graphs.column_build.graph,
+        )
     )
     return findings
 
@@ -444,17 +450,24 @@ def _aggregation_message(
     )
 
 
-def _culprit_aggregate(derivation: Expr, tagged: frozenset[ColumnRef]) -> exp.AggFunc | None:
-    """The bare-column aggregate the finding is about: a non-windowed aggregate over a
-    single column in ``tagged``, carrying the stamped site the coherence guard judged.
+def _culprit_aggregate(
+    derivation: Expr,
+    tagged: frozenset[ColumnRef],
+) -> exp.AggFunc | None:
+    """The bare-column **combining** aggregate the finding is about: a non-windowed
+    ``COMBINE`` aggregate over a single column in ``tagged``, carrying the stamped site
+    the coherence guard judged.
 
-    Restricting to a bare-column operand keeps the finding precise. An aggregate over
-    an expression (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already clears to
-    naked at the expression by mixing a magnitude with a dimensionless literal, a
-    different concern than a companion that is not constant per group. Which aggregate
-    *functions* carry the coherence obligation (combining vs selecting vs counting) is
-    the substrate's classification, refined separately."""
+    Only combining aggregates carry the obligation (the classification lives in
+    :mod:`dblect.sql.aggregates`): a ``SELECT`` like ``min``/``max`` returns a real value
+    and merely widens its tag, and a ``COUNT`` is a tag-free cardinality, so neither is a
+    not-well-typed reduction. Restricting to a bare-column operand keeps it precise: an
+    aggregate over an expression (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already
+    clears to naked at the expression by mixing a magnitude with a dimensionless literal,
+    a different concern than a companion that is not constant per group."""
     for agg in derivation.find_all(exp.AggFunc):
+        if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
+            continue
         if not isinstance(agg.this, exp.Column):
             continue
         if not isinstance(aggregation_site_meta(agg), AggregationSite):

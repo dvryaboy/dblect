@@ -102,5 +102,18 @@ tagged yet; this section accumulates the work that a first release will carry.
   reasoned about: the aggregate and the column it reduced, the per-row companion
   that is not held constant, and the grouping that fails to hold it, instead of
   a generic message (#109).
+- Aggregate behavior is now a first-class combine/select/count classification
+  (`dblect.sql.aggregates`), the single source of truth for both arming the
+  coherence guard and the not-well-typed finding. Keying on the sqlglot node type
+  covers every dialect at once; `min`/`max` are classified as selecting aggregates
+  and widen their result tag to top on a varying companion under the lenient
+  default (#115).
+
+### Fixed
+
+- `count` (and `count_if`, `approx_count_distinct`) over a typed magnitude no
+  longer raises a spurious `aggregation_not_well_typed` finding. Conversely,
+  `stddev`, `variance`, `kurtosis`, `skewness`, `median`, `mode`, and the
+  quantile/percentile family now correctly flag a mixed-currency reduction (#115).
 
 [Unreleased]: https://github.com/dvryaboy/dblect/commits/main
