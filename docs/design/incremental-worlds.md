@@ -1,9 +1,9 @@
 # Incremental worlds: checking incremental models in both compilations
 
-Status: design
-Audience: engineers building the world-compiler and wiring the incremental axis into the checker. It builds on the world theory in [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) (how a configuration becomes facts and what it means to check across more than one world), the execution substrate in [`src/dblect/execution/run.py`](../../src/dblect/execution/run.py), and the world enumerator in [`src/dblect/check/worlds.py`](../../src/dblect/check/worlds.py).
+Status: implemented (global two-world default). The mixed-state and cone refinements remain forward-looking.
+Audience: engineers working on the world-compiler and the incremental check. It builds on the world theory in [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) (how a configuration becomes facts and what it means to check across more than one world) and the execution substrate in [`src/dblect/execution/run.py`](../../src/dblect/execution/run.py). The as-built code is [`src/dblect/execution/incremental.py`](../../src/dblect/execution/incremental.py) (the world-compiler) and [`src/dblect/check/incremental.py`](../../src/dblect/check/incremental.py) (the per-world check and cross-world diff).
 
-A dbt incremental model compiles to two different SQL statements: a first-run / full-refresh form that builds over all rows, and a steady-state form whose `{% if is_incremental() %}` branch is present. The dbt docs require both to be valid, so both are reachable by construction, yet a single manifest captures exactly one. This stream compiles a project both ways and runs the existing detectors over each, so a contract that holds in one world and breaks in the other becomes a finding instead of a blind spot.
+A dbt incremental model compiles to two different SQL statements: a first-run / full-refresh form that builds over all rows, and a steady-state form whose `{% if is_incremental() %}` branch is present. The dbt docs require both to be valid, so both are reachable by construction, yet a single manifest captures exactly one. This stream compiles a project both ways and runs the project's detectors over each: both the declaration-level checker (`run_check`) and the SQL-structural audit (`run_audit`). A finding that holds in one world and breaks in the other becomes a cross-world finding instead of a blind spot. The hazard this most wants to catch lives in the structural family, where a key the full-refresh build keeps unique is fanned out by a steady-state-only join.
 
 This is the first of the always-present control-flow axes named in [`config-and-flag-worlds.md`](./config-and-flag-worlds.md). It is deliberately scoped ahead of the rest of the var-inference layer because it applies to any project with an incremental model, asks the developer for nothing, and rests on machinery that already exists.
 
@@ -11,7 +11,9 @@ This is the first of the always-present control-flow axes named in [`config-and-
 
 [`config-and-flag-worlds.md`](./config-and-flag-worlds.md) names the gap precisely: the current static analyzer is sound and useful, and it analyzes one compilation of every model that branches on configuration. For an incremental model that compilation is whichever branch dbt last produced, so any hazard (or any clean bill) in the unexercised branch is invisible. That doc also names the remedy and its cost: `is_incremental()` "has exactly two states ... so even before a general enumerator exists, compiling those specific worlds (two for incremental ...) closes the highest-frequency control-flow gap at a fixed, small cost."
 
-Two pieces this stream leans on are already built. The config discoverer ([#39](https://github.com/dvryaboy/dblect/issues/39)) reads `materialized` and `incremental_strategy` from `node.config` into a typed `ModelConfig`, which tells us which models are incremental. The world enumerator (`enumerate_worlds` in `check/worlds.py`) takes a `WorldRef → compile facts` mapping and produces cross-world findings; it is source-agnostic, so the always-present axis feeds it the same way a hand-declared flag does.
+Two pieces this stream leans on are already built. The config discoverer ([#39](https://github.com/dvryaboy/dblect/issues/39)) reads `materialized` and `incremental_strategy` from `node.config` into a typed `ModelConfig`, which tells us which models are incremental. The execution substrate ([`run.py`](../../src/dblect/execution/run.py)) already copies a project to a temp tree, writes a `profiles.yml` against an ephemeral DuckDB, and invokes dbt; the world-compiler reuses that setup.
+
+These are control-flow worlds: the SQL itself differs between full-refresh and steady-state. That sets them apart from the value-substitution worlds the fact-level enumerator (`enumerate_worlds` in `check/worlds.py`) serves, where one shared build is re-grounded per world because the SQL is identical and only grounded values differ. A control-flow world cannot share a build, so each world here is compiled and analyzed independently from its own `Manifest`, and the cross-world diff (below) reconciles the two finding sets.
 
 ## The world model: one global run-mode axis
 
@@ -65,9 +67,16 @@ Looking ahead, the world-compiler is the same component the control-flow flag ev
 
 ## Wiring into the checker
 
-Each world is a `Manifest`, so the existing analysis pipeline runs over it unchanged, reusing the whole single-world path rather than a parallel one. The findings from each world carry that world's `WorldRef`, and `enumerate_worlds` differences them: a finding present in steady-state but absent in full-refresh (or the reverse) is surfaced as a cross-world finding, with the world it holds in named. A finding present in both worlds is the same finding the single-manifest analyzer reports today, so the incremental axis strictly adds coverage rather than changing existing behavior.
+Each world is a `Manifest`, so the existing analysis runs over it unchanged. `check_incremental_worlds` runs both detector families per world and keeps each world's findings under its `WorldRef`:
 
-Coverage reporting states, per contract, whether both incremental worlds were analyzed or only one was reachable, so a one-world result is a stated number rather than a silent assumption. This mirrors the coverage posture the flag layer already takes.
+- `run_check` ([`check/run.py`](../../src/dblect/check/run.py)) carries the declaration-level findings: contract resolution, domain-type contradictions, not-well-typed aggregations.
+- `run_audit` ([`audit/walker.py`](../../src/dblect/audit/walker.py)) carries the SQL-structural findings: join fan-out, window order, the nullability hazards, and the rest. The structure-adding case below is where this family earns its keep.
+
+The two finding representations stay distinct (a declaration-level `CheckFinding` located by model and column, a structural `Finding` located by a span in one compiled statement); [#107](https://github.com/dvryaboy/dblect/issues/107) tracks whether to unify them. The cross-world diff treats them uniformly through a stable `FindingIdentity`. A finding present in steady-state but absent in full-refresh (or the reverse) is surfaced as a cross-world finding, with the world it holds in named; a finding present in both worlds is the same one the single-manifest analysis reports today, so the incremental axis strictly adds coverage.
+
+The identity matters because these are control-flow worlds: the same issue renders with a different message and a different line span in each world, since the surrounding SQL differs. Keying the diff on a representation that ignores the volatile parts (kind, model, and column for a `CheckFinding`; kind, model, and the rendered offending snippet for a structural one) keeps one issue from being reported twice as world-varying. A whole-finding-equality diff would mistake the message drift for a difference.
+
+A world whose compile did not succeed is omitted from the per-world findings and surfaced through `opaque_worlds`, so a one-world result is stated rather than allowed to masquerade as cross-world agreement. This mirrors the degrade-not-lie posture the rest of the analyzer takes.
 
 ## When the branch adds structure, not just a filter
 
@@ -111,13 +120,14 @@ The mixed-state worlds (a model backfilling while its siblings are steady-state,
 
 ## Testing posture
 
-Following the project's testing norms: pin contracts at the boundary, prefer property-based and exhaustive tests where they fit, avoid mocking and test theater.
+Following the project's testing norms: pin contracts at the boundary, prefer property-based and exhaustive tests where they fit, avoid mocking and test theater. What is in place:
 
-- A small committed incremental dbt-project fixture (an incremental model with a watermark branch over a seed), the cleaned-up form of the probe project, shared with downstream streams that need an incremental project.
-- A structure-adding fixture whose `is_incremental()` branch joins a state table, so the steady-state world has an extra dependency, an extra column, and a `left join`. This is the case that exercises the cross-world findings the design turns on.
-- A world-compiler test asserting that compiling with `dblect_force_incremental` false and true, against an empty warehouse with no build, yields the watermark model's two worlds differing by exactly the `is_incremental()` branch, and that the structure-adding model's steady-state world carries the join and column its full-refresh world lacks. These pin the data-free mechanism the second probe validated.
-- Degrade-not-lie tests for the shapes the override does not reach: a model that calls `dbt.is_incremental()` explicitly, and a branch that introspects the relation schema, each yielding an opaque steady-state world while the full-refresh world still compiles, rather than a wrong answer or an aborted run.
-- End-to-end cross-world findings: a candidate key that fans out under the steady-state join, and a column nullable only under the steady-state `left join`, each surfaced as a finding carrying the world it holds in. A contract holding in both worlds is reported once, unchanged from the single-manifest path.
+- A committed incremental dbt-project fixture (`tests/fixtures/incremental/`): a watermark model (`inc_watermark`) and a structure-adding model (`inc_stateful`) whose `is_incremental()` branch joins a `state` history log, so the steady-state world has an extra dependency, an extra column, and a `left join`. `state` carries its own surrogate key and several rows per `id`, which is what makes the steady-state join fan out.
+- World-compiler tests (`tests/execution/test_incremental.py`) asserting that the two compiles, against an empty warehouse with no build, yield the watermark model's two worlds differing by exactly the `is_incremental()` branch, and that the structure-adding model's steady-state world carries the join, the extra column, and the new dependency its full-refresh world lacks. These pin the data-free mechanism the probes validated.
+- The cross-world diff itself, pinned without dbt (`tests/check/test_cross_world.py`): a finding in one world only is surfaced, a finding in every world is world-invariant, and a finding whose message and line span drift between worlds is recognized as one issue rather than a false flip.
+- The end-to-end cross-world finding (`tests/check/test_incremental_check.py`, dbt-gated): the steady-state-only join fans out a key the full-refresh build keeps unique, and the join-fan-out detector fires in steady-state alone. The cross-world diff surfaces exactly that one finding, carrying the world it holds in.
+
+The dbt-gated tests resolve the CLI through the shared `dbt_cli` fixture, so they run under `uv run` and can be made to fail (rather than skip) in CI by setting `DBLECT_REQUIRE_DBT`. Degrade-not-lie tests for the shapes the override does not reach (an explicit `dbt.is_incremental()` call, a schema-introspecting branch) are a natural next addition; the opaque-world path they exercise is already in place.
 
 ## Resolved by the probes
 

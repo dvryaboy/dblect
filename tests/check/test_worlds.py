@@ -208,33 +208,3 @@ def test_cross_world_disagreement_is_data_not_error() -> None:
         f for f in by_finding if f.kind is CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
     )
     assert by_finding[contradiction] == frozenset({world_eur})
-
-
-def test_world_varying_flags_findings_holding_in_a_strict_subset() -> None:
-    # world_varying is the cross-world signal: a finding present in some enumerated
-    # worlds but not all. A finding present in every world is world-invariant and is
-    # excluded. This is the differencing the incremental world check reads.
-    from dblect.check.findings import CheckFinding
-    from dblect.check.worlds import EnumeratedFindings, WorldResult
-
-    w_full = WorldRef(frozenset({("is_incremental", False)}))
-    w_steady = WorldRef(frozenset({("is_incremental", True)}))
-    shared = CheckFinding(
-        kind=CheckFindingKind.CONTRACT_ISSUE, message="shared", model_unique_id="model.p.m"
-    )
-    steady_only = CheckFinding(
-        kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
-        message="steady only",
-        model_unique_id="model.p.m",
-    )
-
-    enumerated = EnumeratedFindings(
-        (
-            WorldResult(world=w_full, findings=(shared,)),
-            WorldResult(world=w_steady, findings=(shared, steady_only)),
-        )
-    )
-
-    varying = enumerated.world_varying()
-    assert shared not in varying
-    assert varying == {steady_only: frozenset({w_steady})}

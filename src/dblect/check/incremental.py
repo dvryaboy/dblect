@@ -2,28 +2,39 @@
 
 The incremental axis compiles a project two ways (full-refresh and steady-state)
 via :func:`dblect.execution.incremental.compile_incremental_worlds`, runs the
-single-world checker over each, and differences the findings: a finding that
-holds in one world and not the other is the cross-world signal this stream
-surfaces, while a finding present in both worlds is the one the single-manifest
-analyzer already reports.
+project's detectors over each, and differences the findings: a finding that holds
+in one world and not the other is the cross-world signal this stream surfaces,
+while a finding present in both worlds is one the single-manifest analysis already
+reports.
 
-These are control-flow worlds (the SQL itself differs), so each world is built
-and checked independently from its own manifest, rather than the shared build the
-value-substitution enumerator (:func:`dblect.check.worlds.enumerate_worlds`) uses.
-The differencing is the same :meth:`~dblect.check.worlds.EnumeratedFindings.world_varying`
-view, here over per-world builds.
+Both finding families run per world. :func:`dblect.check.run.run_check` carries
+the declaration-level findings (contract resolution, domain-type contradictions,
+not-well-typed aggregations), and :func:`dblect.audit.run_audit` carries the
+SQL-structural findings (join fan-out, window order, nullability hazards, and the
+rest). The classic incremental hazard lives in the structural family: a key the
+full-refresh build keeps unique is fanned out by a steady-state-only join, so the
+join-fan-out detector fires in steady-state alone.
+
+These are control-flow worlds (the SQL itself differs between them), so each world
+is built and checked independently from its own manifest, unlike the shared build
+the value-substitution enumerator (:func:`dblect.check.worlds.enumerate_worlds`)
+uses. Because the SQL differs, a finding's human-readable message and its line
+span drift between worlds even when the underlying issue is the same, so the
+cross-world diff keys on a stable :data:`FindingIdentity` rather than on whole
+finding equality. (The two finding representations and this shared identity are
+the subject of the unification discussed in issue #107.)
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from dblect.adapters import AdapterProfile
+from dblect.audit import LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding
 from dblect.check.run import run_check
-from dblect.check.worlds import EnumeratedFindings, WorldResult
 from dblect.execution.incremental import (
     CompiledWorld,
     IncrementalWorldCompilation,
@@ -32,19 +43,89 @@ from dblect.execution.incremental import (
 from dblect.lineage.facts.model import WorldRef
 from dblect.types import ContractRegistry
 
+# A finding observed in one world: either a declaration-level finding from
+# ``run_check`` or a located SQL-structural finding from ``run_audit``.
+IncrementalFinding = CheckFinding | LocatedFinding
+
+# A world-independent identity for a finding, used to recognize "the same finding
+# in two worlds" while ignoring the parts that drift between two compilations: the
+# free-text message and (for structural findings) the line span. Two findings with
+# equal identity are treated as the same issue across worlds.
+FindingIdentity = tuple[Hashable, ...]
+
+
+def finding_identity(finding: IncrementalFinding) -> FindingIdentity:
+    """The stable cross-world identity of ``finding``.
+
+    For a declaration-level finding it is the kind, model, column, and contract:
+    the location the finding lands on, without the rendered message. For a
+    structural finding it is the kind, model, and the rendered offending SQL
+    snippet, which is stable for the shared portions of two compilations while the
+    line span is not. A snippet present only in one world (a steady-state-only
+    join) therefore has no match in the other and surfaces as world-varying.
+    """
+    if isinstance(finding, CheckFinding):
+        return ("check", finding.kind, finding.model_unique_id, finding.column, finding.contract)
+    inner = finding.finding
+    return ("audit", inner.kind, finding.model_unique_id, inner.sql_snippet)
+
+
+@dataclass(frozen=True, slots=True)
+class CrossWorldFinding:
+    """A finding that holds in a strict subset of the analyzed worlds.
+
+    ``worlds`` are the worlds the finding holds under, and ``representative`` is one
+    world's instance of it for display (the message and span are that world's). A
+    finding present in every analyzed world is world-invariant and is not a
+    ``CrossWorldFinding``; the single-manifest analysis already reports it.
+    """
+
+    identity: FindingIdentity
+    representative: IncrementalFinding
+    worlds: frozenset[WorldRef]
+
+
+def cross_world_findings(
+    per_world: Mapping[WorldRef, Sequence[IncrementalFinding]],
+) -> tuple[CrossWorldFinding, ...]:
+    """The findings holding in a strict subset of ``per_world``'s worlds.
+
+    Findings are grouped by :func:`finding_identity` so a message or line span that
+    drifts between the two compiled SQLs is not mistaken for a distinct finding. The
+    result is ordered deterministically by identity.
+    """
+    analyzed = frozenset(per_world)
+    worlds_by_identity: dict[FindingIdentity, set[WorldRef]] = {}
+    representative: dict[FindingIdentity, IncrementalFinding] = {}
+    for world, findings in per_world.items():
+        for finding in findings:
+            identity = finding_identity(finding)
+            worlds_by_identity.setdefault(identity, set()).add(world)
+            representative.setdefault(identity, finding)
+    varying = [
+        CrossWorldFinding(
+            identity=identity,
+            representative=representative[identity],
+            worlds=frozenset(worlds),
+        )
+        for identity, worlds in worlds_by_identity.items()
+        if frozenset(worlds) != analyzed
+    ]
+    return tuple(sorted(varying, key=lambda finding: str(finding.identity)))
+
 
 @dataclass(frozen=True, slots=True)
 class IncrementalWorldCheck:
     """The result of checking a project across its incremental worlds: the per-world
     findings and the compilation that produced them (for opaque-world diagnostics)."""
 
-    enumerated: EnumeratedFindings
+    per_world: Mapping[WorldRef, tuple[IncrementalFinding, ...]]
     compilation: IncrementalWorldCompilation
 
     @property
     def analyzed_worlds(self) -> frozenset[WorldRef]:
         """The worlds that compiled and were checked."""
-        return frozenset(result.world for result in self.enumerated.per_world)
+        return frozenset(self.per_world)
 
     @property
     def opaque_worlds(self) -> tuple[CompiledWorld, ...]:
@@ -54,10 +135,10 @@ class IncrementalWorldCheck:
         worlds = (self.compilation.full_refresh, self.compilation.steady_state)
         return tuple(world for world in worlds if not world.ok)
 
-    def cross_world_findings(self) -> Mapping[CheckFinding, frozenset[WorldRef]]:
-        """The findings that hold in some analyzed worlds but not all, each mapped to
-        the worlds it holds under: the "holds in one world, fails in the other" signal."""
-        return self.enumerated.world_varying()
+    def cross_world_findings(self) -> tuple[CrossWorldFinding, ...]:
+        """The findings that hold in some analyzed worlds but not all: the "holds in
+        one world, breaks in the other" signal."""
+        return cross_world_findings(self.per_world)
 
 
 def check_incremental_worlds(
@@ -77,13 +158,9 @@ def check_incremental_worlds(
     :attr:`IncrementalWorldCheck.opaque_worlds`.
     """
     compilation = compile_incremental_worlds(project_dir, dbt_executable=dbt_executable)
-    results = tuple(
-        WorldResult(
-            world=world,
-            findings=tuple(run_check(manifest, profile, registry=registry).findings),
-        )
-        for world, manifest in compilation.manifests().items()
-    )
-    return IncrementalWorldCheck(
-        enumerated=EnumeratedFindings(per_world=results), compilation=compilation
-    )
+    per_world: dict[WorldRef, tuple[IncrementalFinding, ...]] = {}
+    for world, manifest in compilation.manifests().items():
+        check = run_check(manifest, profile, registry=registry)
+        audit = run_audit(manifest, profile)
+        per_world[world] = (*check.findings, *audit.findings)
+    return IncrementalWorldCheck(per_world=per_world, compilation=compilation)

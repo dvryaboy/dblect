@@ -118,6 +118,10 @@ def compile_incremental_worlds(
         macro_dir.mkdir(parents=True, exist_ok=True)
         macro_path = macro_dir / _OVERRIDE_MACRO_FILE
 
+        # The two compiles share one work tree, override file, and
+        # ``target/manifest.json``, so they must run sequentially: each harvests its
+        # manifest into memory before the next overwrites the override and the
+        # output. Parallelizing them would need separate work trees per world.
         return IncrementalWorldCompilation(
             full_refresh=_compile_world(
                 work, macro_path, FULL_REFRESH_WORLD, value=False, dbt=dbt_executable, env=env

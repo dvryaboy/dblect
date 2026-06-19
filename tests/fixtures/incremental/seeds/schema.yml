@@ -1,0 +1,20 @@
+version: 2
+
+# `events` is one row per id; `state` is a history log with its own surrogate key
+# `state_id`, so it carries several rows per `id`. The incremental join in
+# `inc_stateful` keys on `id` alone, which does not cover `state`'s key, so that
+# join can multiply rows. Declaring these keys is what lets the uniqueness
+# detector see the steady-state fan-out the full-refresh build never reaches.
+seeds:
+  - name: events
+    columns:
+      - name: id
+        data_tests:
+          - unique
+          - not_null
+  - name: state
+    columns:
+      - name: state_id
+        data_tests:
+          - unique
+          - not_null

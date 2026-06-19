@@ -131,6 +131,9 @@ def test_unknown_macro_supported_language_is_tolerated(jaffle_manifest_path: Pat
     manifest = Manifest.from_raw(raw)
 
     assert target_uid in manifest.macros
+    # The tolerant read is copy-on-write: the caller's dict keeps its original
+    # (unmodeled) value, so reusing it across parses is safe.
+    assert raw["macros"][target_uid]["supported_languages"] == ["sql", "python", "javascript"]
 
 
 def test_macro_registry_has_entry_per_raw_macro(
