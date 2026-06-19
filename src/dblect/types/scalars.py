@@ -4,13 +4,23 @@ A domain type's field is read by what it *is*, not annotated by hand. The
 classification is the seam between the author's ordinary Python annotations and
 the substrate's tag algebra (``docs/design/domain-type-algebra.md``):
 
-* a numeric :class:`Decimal` (or ``Decimal(p, s)``) or a :class:`Count` is a
-  **magnitude**, the field a tag rides on;
+* a numeric :class:`Decimal` (or ``Decimal(p, s)``), a :class:`Count`, or a
+  floating-point ``float`` / :class:`Float` is a **magnitude**, the field a tag
+  rides on;
 * a :class:`~dblect.types.enums.UnitEnum` (a currency) is a **unit**, the
   dimensional companion of the magnitude;
 * a :class:`~dblect.types.enums.NominalEnum`, a ``bool``, a ``str``, or a
   :class:`Varchar` is a **nominal** category, carried by equality;
-* a :class:`Date` (and other inert scalars) carries **no** tag.
+* a :class:`Date`, a :class:`Timestamp` / ``datetime``, and a bare integer
+  (``int`` / :class:`Integer` / :class:`BigInt`) carry **no** tag.
+
+A bare integer is the one scalar whose role its algebra does not settle: an
+integer is algebraically a perfect quantity, yet by role it is as often an
+identifier or a calendar year, which are tags. The lenient default reads it as
+opaque (inert), making no claim either way; a measure is spelled ``Count`` /
+``Decimal`` and an identifier or year carries its own domain type. A future
+strict mode rejects a bare integer instead, per the lenient/strict switch in
+``docs/design/domain-type-algebra.md``.
 
 Each field becomes one :class:`FieldDef`. The kinds are what
 ``docs/design/declaration-dsl.md`` calls the magnitude/tag classification
@@ -20,6 +30,7 @@ Each field becomes one :class:`FieldDef`. The kinds are what
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum, auto
 
 from dblect.types.enums import NominalEnum, UnitEnum
@@ -70,8 +81,28 @@ class Count:
     """A dimensionless magnitude: a row or item count."""
 
 
+class Float:
+    """A floating-point magnitude type. Unlike a bare integer, a float has no
+    identifier or calendar-year role to confuse it with, so it is a magnitude."""
+
+
+class Integer:
+    """A bare integer column. Inert under the lenient default: an integer is
+    algebraically a quantity yet by role often an identifier or a year, so it
+    makes no domain claim. Spell a measure ``Count`` / ``Decimal`` and an
+    identifier or year with its domain type."""
+
+
+class BigInt:
+    """A 64-bit integer column. Inert, the wide sibling of :class:`Integer`."""
+
+
 class Date:
     """A calendar date. Inert: it carries no domain tag of its own."""
+
+
+class Timestamp:
+    """A date-time. Inert, the timestamp sibling of :class:`Date`."""
 
 
 class Varchar:
@@ -93,6 +124,8 @@ def classify(name: str, annotation: object) -> FieldDef:
         )
     if annotation is Count:
         return FieldDef(name, FieldKind.MAGNITUDE)
+    if annotation is float or annotation is Float:
+        return FieldDef(name, FieldKind.MAGNITUDE)
     if isinstance(annotation, type) and issubclass(annotation, UnitEnum):
         return FieldDef(name, FieldKind.UNIT, enum=annotation)
     if isinstance(annotation, type) and issubclass(annotation, NominalEnum):
@@ -101,9 +134,15 @@ def classify(name: str, annotation: object) -> FieldDef:
         return FieldDef(name, FieldKind.NOMINAL, pytype=bool)
     if annotation is str or annotation is Varchar:
         return FieldDef(name, FieldKind.NOMINAL, pytype=str)
-    if annotation is Date:
+    if annotation is Date or annotation is Timestamp or annotation is datetime:
+        return FieldDef(name, FieldKind.INERT)
+    # Lenient default: a bare integer makes no domain claim, so it is inert. A
+    # future strict mode rejects it here and teaches Count/Decimal or a domain
+    # type; see the lenient/strict switch in domain-type-algebra.md.
+    if annotation is int or annotation is Integer or annotation is BigInt:
         return FieldDef(name, FieldKind.INERT)
     raise DomainTypeError(
         f"field {name!r}: {annotation!r} is not a domain field type "
-        "(use Decimal/Count, a UnitEnum or NominalEnum subclass, bool, str, or Date)"
+        "(use Decimal/Count/Float, a UnitEnum or NominalEnum subclass, bool, str, "
+        "int, Date, or Timestamp)"
     )

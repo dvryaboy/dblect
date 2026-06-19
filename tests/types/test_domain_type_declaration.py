@@ -9,15 +9,21 @@ the same move; combining facets is multiple inheritance with agreement
 required where two bases fix the same field.
 """
 
+from datetime import datetime
+
 import pytest
 
 from dblect.demo import Country, Currency, Money
 from dblect.types import (
+    BigInt,
     Date,
     Decimal,
     DomainType,
     DomainTypeError,
     FieldKind,
+    Float,
+    Integer,
+    Timestamp,
 )
 
 
@@ -66,6 +72,46 @@ def test_parameterized_decimal_carries_precision_and_scale() -> None:
     field = Price.spec().fields["amount"]
     assert field.kind is FieldKind.MAGNITUDE
     assert (field.precision, field.scale) == (18, 2)
+
+
+def test_float_is_a_magnitude() -> None:
+    # A floating-point column is unambiguously a measure: floats are not used as
+    # identifiers or calendar years, so both the builtin and the marker sum.
+    class Reading(DomainType):
+        celsius: float
+        kelvin: Float
+
+    spec = Reading.spec()
+    assert spec.fields["celsius"].kind is FieldKind.MAGNITUDE
+    assert spec.fields["kelvin"].kind is FieldKind.MAGNITUDE
+
+
+def test_timestamp_is_inert_like_date() -> None:
+    # Timestamp is the date-time sibling of Date: it carries no tag of its own.
+    class Event(DomainType):
+        occurred_at: Timestamp
+        ingested_at: datetime
+
+    spec = Event.spec()
+    assert spec.fields["occurred_at"].kind is FieldKind.INERT
+    assert spec.fields["ingested_at"].kind is FieldKind.INERT
+
+
+def test_bare_integer_is_inert_lenient_default() -> None:
+    # An integer is algebraically a quantity yet by role often an identifier or a
+    # calendar year, so a bare int makes no domain claim. The lenient default
+    # accepts it as opaque (INERT): not summable as a magnitude, no tag imposed.
+    # A measure is spelled Count/Decimal; an id or year carries its domain type.
+    # (Strict mode rejects bare int instead; tracked on the lenient/strict issue.)
+    class Account(DomainType):
+        user_id: int
+        signup_year: Integer
+        external_ref: BigInt
+
+    spec = Account.spec()
+    assert spec.fields["user_id"].kind is FieldKind.INERT
+    assert spec.fields["signup_year"].kind is FieldKind.INERT
+    assert spec.fields["external_ref"].kind is FieldKind.INERT
 
 
 def test_unsupported_annotation_is_an_authoring_error() -> None:

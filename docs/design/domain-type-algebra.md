@@ -202,11 +202,12 @@ codebase being onboarded, where most columns are still untagged and an eager fin
 every contact with an untyped magnitude would bury the real ones.
 
 A future strict mode would keep the same lattice and the same produce rules everywhere
-the operands carry claims, and differ only in how it treats a `Top` operand under an
+the operands carry claims, and differ mainly in how it treats a `Top` operand under an
 operator that requires agreement: where lenient widens, strict raises a finding, on the
 reading that the author was obliged to tag every magnitude that reaches such an operator.
-The divergence points, recorded as they are found so the mode is a coherent switch rather
-than a scatter of flags:
+One further divergence fires earlier, at declaration time rather than over a `Top`
+operand: whether a bare integer is accepted at all. The divergence points, recorded as
+they are found so the mode is a coherent switch rather than a scatter of flags:
 
 - **Additive `Top` operand.** `money + untagged` (and `-`). Lenient produces `Top` (the
   sum carries no dimensional claim, no finding). Strict treats adding an un-dimensioned
@@ -227,6 +228,15 @@ than a scatter of flags:
   the ordering-against-a-`Top`-operand divergence applied to the comparison a selection is
   built on, not a separate flag. The classification that names `min`/`max` as selecting is
   in `dblect.sql.aggregates`.
+- **Bare-integer field declaration.** A bare `int` / `Integer` / `BigInt` is algebraically
+  a perfect quantity yet by role as often an identifier or a calendar year, both tags, so
+  its role is the one a scalar's algebra does not settle. Lenient classifies it as inert,
+  making no claim either way (a measure is spelled `Count` / `Decimal`, an identifier or
+  year carries its domain type). Strict rejects it at the declaration and teaches the
+  choice, on the reading that the author was obliged to name the role rather than leave a
+  warehouse integer to default. This is the one divergence that escalates an *acceptance*
+  rather than a widening, and the only one that fires when a contract is read rather than
+  when an expression is typed; the classifier is `dblect.types.scalars`.
 
 Multiplication and division are deliberately absent from this list, but for a different
 reason than addition. `*` and `/` carry no agreement requirement at all (any two units

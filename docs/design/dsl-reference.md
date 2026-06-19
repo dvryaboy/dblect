@@ -79,8 +79,16 @@ Used directly as a column's type.
 - `Count`. A count magnitude, always safe to sum.
 - `Money`. `amount: Decimal` together with `currency: Currency`. Starter vocabulary in `dblect.demo`.
 - `Currency`, `Country`. Enum tags (ISO 4217, ISO 3166), shipped in `dblect.demo` as illustrative slices. A project declares its own by subclassing the `UnitEnum` / `NominalEnum` markers in `dblect.types`.
-- `Decimal(precision, scale)`, `Date`, `Timestamp`, `Varchar`, `Integer`, `BigInt`,
-  `Boolean`, `Uuid`, `Json`. Base SQL types with convenience constructors.
+- `Decimal(precision, scale)`, `Float`, `Count` are magnitudes (summable). `Date`,
+  `Timestamp` (and the Python `datetime`) are inert, carrying no tag. `Varchar` (and
+  `str`) and `bool` are nominal tags.
+- `Integer`, `BigInt`, and a bare `int` are inert under the lenient default: an integer
+  is algebraically a quantity yet by role often an identifier or a year, so it makes no
+  domain claim. Spell a measure `Count` / `Decimal` and an identifier or year with its
+  domain type. A future strict mode rejects a bare integer instead (see
+  [domain-type-algebra.md](domain-type-algebra.md), "Lenient and strict modes").
+- `Uuid`, `Json`, and other semi-structured or specialized types (`interval`, `binary`,
+  `geography`) are not yet accepted; their spellings are still open.
 
 ---
 
