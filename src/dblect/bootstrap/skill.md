@@ -12,33 +12,55 @@ test becomes a key fact; a `relationships` test becomes a foreign-key edge; an
 that.** Re-declaring keys and foreign keys that a dbt test already states adds
 noise and no signal.
 
-What no dbt test can express, and what you are here to add, is *semantics*: that a
-column is money in some currency, that a revenue figure is net of tax rather than
-gross, that two amounts are the same kind of quantity and may be summed together.
-That is the layer dblect propagates along the DAG to catch a meaning shift (a
-currency creeping in upstream, a net figure flowing into a gross contract) before
-it reaches a dashboard.
+What no dbt test can express, and what you are here to add, is *meaning*: the column
+whose type is richer than its SQL type, so that two values which are both
+numerically valid still are not interchangeable. dblect propagates that meaning
+along the DAG and reports where it shifts (a value changing kind upstream so a
+downstream column no longer holds what it claims) before it reaches a dashboard.
+
+Money is the clearest case (a revenue figure quietly going from net to gross, a
+currency creeping in), and it is the example most of this guide is written around.
+It is one instance of a general idea, not the whole of it.
 
 ## What is in scope
 
-Declare these, and nothing more:
+Two kinds of meaning propagate along the DAG today. They are what you declare:
 
-- **Domain types** on the columns whose meaning matters: money, rates, anything
-  where two numerically valid values are not comparable.
-- **Refinements** that fix a meaning-bearing parameter (single currency, net vs
-  gross, tax inclusive or not).
-- **Functional-dependency facts** that let a rollup stay well typed (for example,
-  every payment on an order shares the order's currency).
+- **A magnitude carrying a unit.** A summable quantity together with the tag that
+  says what it is measured in, so two values in different units stop being
+  interchangeable. Money in a currency is the canonical case, and the one most of
+  this guide is written around; a physical quantity in a unit, or a rate, is the same
+  shape. Expressed as a `DomainType` (a magnitude facet plus a `UnitEnum` or
+  `NominalEnum` tag facet), with **refinements** that fix a meaning-bearing parameter
+  (single currency, net vs gross, tax inclusive or not). This is what catches a unit
+  changing upstream (`domain_type_contradiction`) and a mixed-unit sum
+  (`aggregation_not_well_typed`).
+- **A structural invariant over columns.** A functional dependency (an
+  `ad -> adset -> campaign` hierarchy where one identifier determines another, or
+  every payment on an order sharing the order's currency) or the grain. These let a
+  rollup stay well typed. Expressed as `determines` and `grain` facts, **not** as
+  types.
 
-Leave out anything you cannot ground in the project's real semantics. A vouched
-declaration that the data does not support is worse than no declaration: dblect
-trusts it and propagates it. When you are unsure what a column means, ask the user
-rather than guess (see "Interview the user").
+A note on closed categories (a `status`, `channel`, `platform`, `country` drawn from
+a fixed set). The membership check you would reach for is already covered for free:
+an `accepted_values` dbt test on the column becomes a value domain with no
+declaration from you. A standalone category column does not yet propagate as a tag on
+its own (only a magnitude's tag facet does), so do not mint a bare enum type on a
+status column expecting it to catch a meaning shift. A category earns a declaration
+only when it rides on a magnitude as that magnitude's unit, as `currency` does on
+`Money`.
 
-Two surfaces are deliberately out of scope for this pass, because they do not yet
-run on the `dblect check` path: configuration flags (`DomainFlag`) and runnable
-contract predicates (an equality with `.within(...)`). Stick to domain types,
-refinements, and the fact-returning contracts below.
+Restraint is part of the job. Type a column only when one of the two kinds above
+genuinely lives in it. A bare identifier is not a type; a key or foreign key is
+already read from your dbt test; an unconstrained free-text or one-off numeric column
+is just its SQL type. A vouched declaration the data does not support is worse than
+none, because dblect trusts it and propagates it. When in doubt, leave it, or ask the
+user rather than guess (see "Interview the user").
+
+Two further surfaces are out of scope for this pass, because they do not run on the
+`dblect check` path yet: configuration flags (`DomainFlag`) and runnable contract
+predicates (an equality with `.within(...)`). Stick to domain types, refinements, and
+the fact-returning contracts below.
 
 ## Step 1: orient
 
@@ -81,25 +103,30 @@ what a column means.
 ## Step 2: find the loaded columns
 
 Walk the models and macros looking for columns whose meaning is richer than their
-SQL type. The high-value candidates:
+SQL type, across the two kinds that propagate. The high-value candidates:
 
-- **Money and revenue.** Any `amount`, `price`, `revenue`, `cost`, `total`, or
-  `value` column. The meaning that matters is the hidden parameters: which currency,
-  net or gross, tax inclusive or exclusive, before or after discounts. A `Decimal`
-  tells you none of this.
-- **Currencies and units.** A `currency` column, or a money column that should carry
-  one. This is the tag that makes a mixed-currency sum ill typed.
-- **Rates and percentages.** A `rate`, `pct`, or `ratio` column. What is the base,
-  and what window does it cover.
-- **Keys and grain, only where semantics add something.** The grain (one row per
-  order, or per order line) when a rollup depends on it. Skip keys and foreign keys
-  a dbt test already declares.
+- **Magnitudes and their units.** Any `amount`, `price`, `revenue`, `cost`, `spend`,
+  `total`, or `value` column, and the unit that qualifies it: the `currency` it is
+  in, whether it is net or gross, tax inclusive or exclusive, before or after
+  discounts. A `Decimal` records none of this. Rates and ratios (`cpc`, `ctr`,
+  `rate`, `pct`) are magnitudes too: ask what the base is and what window it covers.
+- **Hierarchies and grain.** A containment chain such as `ad` within `adset` within
+  `campaign`, or `order_line` within `order`, where one identifier determines
+  another. And the grain itself (one row per order, or per order line) when a rollup
+  depends on it. Skip plain keys and foreign keys a dbt test already declares; the
+  value here is the functional dependency the hierarchy implies, not the keys.
+
+Closed-set columns (`status`, `channel`, `platform`, `country`) are worth noticing
+but usually not worth declaring: an `accepted_values` test already guards the set for
+free, and a standalone category does not propagate on its own. Spend the effort on
+the two kinds above.
 
 Read the SQL to form a hypothesis. A `sum(amount)` grouped by `order_id` tells you
 the author believes an order's payments are summable. A currency conversion macro
-tells you money flows across currencies. Trace a money column from its source
-through staging into the marts, and watch for the point where its meaning could
-change without the type following.
+tells you money flows across currencies. A `group by campaign_id` over an
+`ad`-grained model relies on each ad belonging to one campaign. Trace a loaded
+column from its source through staging into the marts, and watch for the point where
+its meaning could change without the type following.
 
 ## Step 3: infer what you can, interview for the rest
 
@@ -211,9 +238,9 @@ The rule in one line: bind with the bare type only when the column is named afte
 facet; otherwise reach for `.columns(amount="real_column_name")`.
 
 **Add a functional-dependency fact when a rollup needs it.** A `@contract` method
-that returns a fact lets the analyzer discharge an obligation it could not see on
-its own. The canonical one: every payment on an order shares the order's currency,
-so summing an order's payments is well defined.
+that returns a fact lets the analyzer discharge an obligation it could not see on its
+own. The canonical one: every payment on an order shares the order's currency, so
+summing an order's payments is well defined.
 
 ```python
 from dblect import ModelContract, contract
@@ -227,6 +254,27 @@ class StgPayments(ModelContract):
     def one_currency_per_order(self):
         # The order_id determines the currency, so the per-order rollup is sound.
         return self.order_id.determines(self.currency)
+```
+
+A containment hierarchy is the same fact, applied to identifiers. If each ad belongs
+to one adset and each adset to one campaign, then spend summed at the ad level keeps
+its campaign, and a `group by campaign_id` stays well defined:
+
+```python
+from dblect import ModelContract, contract
+
+class FctAdSpend(ModelContract):
+    dbt_model = "fct_ad_spend"
+
+    # One fact per method: each step of ad -> adset -> campaign is its own
+    # functional dependency.
+    @contract
+    def ad_in_one_adset(self):
+        return self.ad_id.determines(self.adset_id)
+
+    @contract
+    def adset_in_one_campaign(self):
+        return self.adset_id.determines(self.campaign_id)
 ```
 
 The fact vocabulary you can return is small and structural: `determines` (a
