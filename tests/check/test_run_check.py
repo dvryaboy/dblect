@@ -14,9 +14,11 @@ single-currency project stays quiet.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 
 import pytest
+import sqlglot.expressions as exp
 
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
@@ -24,6 +26,7 @@ from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
+from dblect.sql import PORTABLE_AGGREGATE_BEHAVIOR, AggregateBehavior
 from dblect.types import ModelContract
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -219,7 +222,9 @@ def _one_agg_manifest(sql_fn: str) -> Manifest:
     )
 
 
-@pytest.mark.parametrize("sql_fn", ["AVG", "STDDEV", "VARIANCE", "MEDIAN", "MODE"])
+@pytest.mark.parametrize(
+    "sql_fn", ["AVG", "STDDEV", "VARIANCE", "KURTOSIS", "SKEWNESS", "MEDIAN", "MODE"]
+)
 def test_combining_aggregates_over_mixed_currency_are_flagged(sql_fn: str) -> None:
     # The obligation is not special to sum: every combining aggregate synthesizes a new
     # value out of many, so a varying companion corrupts it. The message names the actual
@@ -275,6 +280,53 @@ def test_selecting_aggregates_are_not_flagged_under_lenient(sql_fn: str) -> None
         amount: Money.columns(amount="amount", currency="currency")
 
     report = run_check(_one_agg_manifest(sql_fn), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+def test_collection_aggregate_over_a_tagged_column_is_not_flagged() -> None:
+    # array_agg gathers values into a list rather than reducing a magnitude, so it carries
+    # no currency obligation and is left unclassified (lenient).
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+        ),
+        _node(
+            "model.shop.amounts_by_country",
+            kind=ResourceType.MODEL,
+            sql="SELECT country, array_agg(amount) AS amounts FROM payments GROUP BY country",
+            columns=_cols(country="VARCHAR", amounts="DECIMAL[]"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+def test_adapter_classification_is_honored() -> None:
+    # The finding (and the guard) read the resolved adapter's classification, so an
+    # adapter that reclassifies an aggregate changes what fires. Reclassifying sum as a
+    # selecting aggregate makes the mixed-currency sum widen instead of flag, proving the
+    # per-dialect map is threaded rather than a hard-coded global.
+    sum_as_select: dict[type[exp.AggFunc], AggregateBehavior] = dict(
+        PORTABLE_AGGREGATE_BEHAVIOR
+    ) | {exp.Sum: AggregateBehavior.SELECT}
+    profile = dataclasses.replace(_DUCKDB, aggregate_behavior=sum_as_select)
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(_agg_manifest(), profile)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 

@@ -46,12 +46,22 @@ class AggregateBehavior(Enum):
 
 
 # The portable base: aggregates whose behavior is the same on every warehouse. A dialect
-# adapter merges its own entries onto this (``PORTABLE_AGGREGATE_BEHAVIOR | {...}``). The
-# percentile/quantile family and the two-argument statistical aggregates (corr, covar,
-# regr*) reduce a magnitude that does not sit at ``this``, so they are deliberately left
-# out until that shape is modelled rather than guessed at.
+# adapter merges its own entries onto this (``PORTABLE_AGGREGATE_BEHAVIOR | {...}``).
+#
+# Deliberately left unclassified (no magnitude obligation, so the lenient default is
+# correct and an explicit entry would only add noise):
+#   * collection aggregates (``array_agg``/``list``, ``string_agg``, ``histogram``) gather
+#     values into a container rather than reducing a magnitude;
+#   * boolean (``bool_and``/``logical_and``, ``bool_or``) and bitwise (``bit_and/or/xor``)
+#     folds operate on non-magnitude domains;
+#   * two-argument statistical aggregates (``corr``, ``covar_*``, ``regr_*``) produce a
+#     scale-invariant or product-typed result whose coherence is a separate question.
+# Dialect aggregates sqlglot parses as anonymous (duckdb ``product``, ``geometric_mean``,
+# ``favg``, ``fsum``, ``mad``, ``entropy``, ...) cannot be type-keyed at all; classifying
+# them by name is tracked in #119.
 PORTABLE_AGGREGATE_BEHAVIOR: Mapping[type[exp.AggFunc], AggregateBehavior] = {
-    # COMBINE: synthesize a new value out of many.
+    # COMBINE: synthesize a new value out of many (a total, mean, spread, moment, middle,
+    # or quantile). Mixing units across the reduced rows corrupts the result.
     exp.Sum: AggregateBehavior.COMBINE,
     exp.Avg: AggregateBehavior.COMBINE,
     exp.Stddev: AggregateBehavior.COMBINE,
@@ -59,9 +69,16 @@ PORTABLE_AGGREGATE_BEHAVIOR: Mapping[type[exp.AggFunc], AggregateBehavior] = {
     exp.StddevSamp: AggregateBehavior.COMBINE,
     exp.Variance: AggregateBehavior.COMBINE,
     exp.VariancePop: AggregateBehavior.COMBINE,
+    exp.Kurtosis: AggregateBehavior.COMBINE,
+    exp.Skewness: AggregateBehavior.COMBINE,
     exp.Median: AggregateBehavior.COMBINE,
     exp.Mode: AggregateBehavior.COMBINE,
-    # SELECT: return one of the input values.
+    exp.Quantile: AggregateBehavior.COMBINE,
+    exp.ApproxQuantile: AggregateBehavior.COMBINE,
+    exp.PercentileCont: AggregateBehavior.COMBINE,
+    exp.PercentileDisc: AggregateBehavior.COMBINE,
+    # SELECT: return one of the input values (bigquery ``max_by``/``min_by`` parse to
+    # ``ArgMax``/``ArgMin``). The value is real; only its tag is uncertain.
     exp.Min: AggregateBehavior.SELECT,
     exp.Max: AggregateBehavior.SELECT,
     exp.ArgMin: AggregateBehavior.SELECT,

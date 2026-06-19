@@ -550,11 +550,6 @@ def _aggregate_rules(
     return rules
 
 
-DOMAIN_TYPE_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[DomainTag]] = _aggregate_rules(
-    PORTABLE_AGGREGATE_BEHAVIOR, guard=None
-)
-
-
 def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
     """The per-row companion columns a tag's meaning rests on: every ``PerRow``
     unit in the dimension and every ``PerRow`` nominal binding. These are what an
@@ -597,16 +592,6 @@ def join_key_conflicts(
     return tuple(out)
 
 
-def _guarded_aggregates(
-    fd: PropertyRef[FDSet, SourceRef],
-) -> Mapping[type[exp.AggFunc], AggregateRule[DomainTag]]:
-    """The aggregate catalog with the coherence obligation armed. ``COMBINE`` and
-    ``SELECT`` aggregates clear a magnitude whose per-row companion is not held constant
-    per group; ``COUNT`` keeps its unguarded cardinality rule. See :func:`_aggregate_rules`."""
-    guard = CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
-    return _aggregate_rules(PORTABLE_AGGREGATE_BEHAVIOR, guard=guard)
-
-
 # --- the property ------------------------------------------------------------
 
 
@@ -635,6 +620,7 @@ def domain_type_property(
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
     *,
     fd: PropertyRef[FDSet, SourceRef] | None = None,
+    classification: Mapping[type[exp.AggFunc], AggregateBehavior] = PORTABLE_AGGREGATE_BEHAVIOR,
 ) -> Property[DomainTag, ColumnRef]:
     """The column-scoped domain-type property over a caller-supplied grounding.
 
@@ -644,18 +630,27 @@ def domain_type_property(
     bridge. No semiring: a confluence widens by the lattice ``join``, which is the
     correct "keep only what both arms agree on" for tags.
 
-    Passing the functional-dependency property's ref arms the coherence guard on
-    ``sum`` and ``avg``: an aggregate over a per-row companion tag keeps its tag
-    only where the group key holds the companion constant (membership, a pin, or
-    an FD entailment at the aggregation input) and clears to top otherwise. The
-    edge is declared in ``depends_on``, so the registry evaluates dependencies
-    first and the guard's read is always answered.
+    ``classification`` is the aggregate reduction-behavior table the aggregate catalog is
+    built from; it defaults to the portable base and a run passes the resolved adapter's
+    map so a dialect's own typed aggregates are classified.
+
+    Passing the functional-dependency property's ref arms the coherence guard on the
+    combining and selecting aggregates: such an aggregate over a per-row companion tag
+    keeps its tag only where the group key holds the companion constant (membership, a
+    pin, or an FD entailment at the aggregation input) and clears to top otherwise. The
+    edge is declared in ``depends_on``, so the registry evaluates dependencies first and
+    the guard's read is always answered.
     """
+    guard = (
+        None
+        if fd is None
+        else CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
+    )
     return column_property(
         name="domain_type",
         lattice=DOMAIN_TYPE_LATTICE,
         operators=DOMAIN_TYPE_OPERATORS,
-        aggregates=DOMAIN_TYPE_AGGREGATES if fd is None else _guarded_aggregates(fd),
+        aggregates=_aggregate_rules(classification, guard=guard),
         ground=ground,
         depends_on=() if fd is None else (fd,),
     )

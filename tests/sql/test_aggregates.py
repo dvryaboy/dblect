@@ -15,39 +15,63 @@ import sqlglot.expressions as exp
 from dblect.sql import AggregateBehavior, aggregate_behavior
 
 
-def _agg(sql_fn: str) -> exp.AggFunc:
-    tree = sqlglot.parse_one(f"SELECT {sql_fn}(x) AS v FROM t GROUP BY k", dialect="duckdb")
+def _agg(call: str) -> exp.AggFunc:
+    tree = sqlglot.parse_one(f"SELECT {call} AS v FROM t GROUP BY k", dialect="duckdb")
     aggs = list(tree.find_all(exp.AggFunc))
-    assert len(aggs) == 1, f"{sql_fn} did not parse to a single aggregate: {aggs}"
+    assert len(aggs) == 1, f"{call} did not parse to a single aggregate: {aggs}"
     return aggs[0]
 
 
 def test_combining_aggregates_combine() -> None:
-    # Synthesize a new value out of many: a total, a mean, a spread, a middle. These are
-    # the ones a varying per-row companion corrupts, so they carry the obligation.
-    for fn in ("SUM", "AVG", "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "MEDIAN", "MODE"):
-        assert aggregate_behavior(_agg(fn)) is AggregateBehavior.COMBINE, fn
+    # Synthesize a new value out of many: a total, a mean, a spread, a moment, a middle,
+    # a quantile. These are the ones a varying per-row companion corrupts.
+    calls = (
+        "sum(x)",
+        "avg(x)",
+        "stddev(x)",
+        "stddev_pop(x)",
+        "variance(x)",
+        "kurtosis(x)",
+        "skewness(x)",
+        "median(x)",
+        "mode(x)",
+        "quantile(x, 0.5)",
+        "percentile_cont(x, 0.5)",
+        "approx_quantile(x, 0.5)",
+    )
+    for call in calls:
+        assert aggregate_behavior(_agg(call)) is AggregateBehavior.COMBINE, call
 
 
 def test_selecting_aggregates_select() -> None:
     # Return one of the input values: the value is real, only its tag is uncertain.
-    for fn in ("MIN", "MAX", "ANY_VALUE"):
-        assert aggregate_behavior(_agg(fn)) is AggregateBehavior.SELECT, fn
+    # bigquery max_by/min_by parse to arg_max/arg_min.
+    for call in ("min(x)", "max(x)", "any_value(x)", "arg_max(x, y)", "arg_min(x, y)"):
+        assert aggregate_behavior(_agg(call)) is AggregateBehavior.SELECT, call
 
 
 def test_counting_aggregates_count() -> None:
     # Ignore the magnitude, yield a cardinality. Always safe whatever they count.
-    for fn in ("COUNT", "COUNT_IF"):
-        assert aggregate_behavior(_agg(fn)) is AggregateBehavior.COUNT, fn
+    for call in ("count(x)", "count_if(x > 0)"):
+        assert aggregate_behavior(_agg(call)) is AggregateBehavior.COUNT, call
 
 
-def test_unclassified_aggregate_is_none() -> None:
-    # The classification is an explicit allowlist; an aggregate with no entry is left
-    # unclassified, which the lenient default reads as "no obligation" rather than
-    # guessing. corr() reduces two columns and is deliberately not classified yet.
-    tree = sqlglot.parse_one("SELECT corr(x, y) AS v FROM t GROUP BY k", dialect="duckdb")
-    [corr] = list(tree.find_all(exp.AggFunc))
-    assert aggregate_behavior(corr) is None
+def test_no_magnitude_obligation_families_are_unclassified() -> None:
+    # Collection, boolean, bitwise, and two-argument statistical aggregates carry no
+    # magnitude obligation, so they are deliberately left unclassified; the lenient
+    # default reads that as "nothing to discharge" rather than guessing.
+    for call in ("array_agg(x)", "string_agg(x, ',')", "bool_and(x)", "bit_xor(x)", "corr(x, y)"):
+        assert aggregate_behavior(_agg(call)) is None, call
+
+
+def test_classification_argument_overrides_the_default() -> None:
+    # A run passes the resolved adapter's map; the lookup honors it over the portable
+    # base. This is the seam a dialect adapter extends through.
+    custom: dict[type[exp.AggFunc], AggregateBehavior] = {exp.Sum: AggregateBehavior.SELECT}
+    assert aggregate_behavior(_agg("sum(x)"), custom) is AggregateBehavior.SELECT
+    # an aggregate absent from the override map is unclassified under it, not fetched
+    # from the portable base
+    assert aggregate_behavior(_agg("avg(x)"), custom) is None
 
 
 def test_lookup_walks_the_mro() -> None:
