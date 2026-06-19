@@ -12,7 +12,7 @@ dblect reads the SQL your models compile to (after dbt has rendered Jinja, so it
 
 **A typed declaration layer.** You annotate the columns that matter with semantic types and contracts written in Pydantic-flavored Python.  Just annotate what you need; dblect propagates those types along the dbt DAG using column-level lineage, so a claim you make on one staging model is carried through to all models downstream. dblect understands the effects of operations like joining, grouping, and distincting - no need to re-annotate.
 
-Findings come out in the same shape as your linter or type checker, with `text` for terminals and `json` for CI and editors.
+Findings come out in the same shape as your linter or type checker, with `text` for terminals, `json` for CI and editors, and `sarif` for GitHub code scanning and other SARIF-aware surfaces.
 
 ## What it catches
 

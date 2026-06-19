@@ -24,6 +24,7 @@ app = typer.Typer(
 class OutputFormat(StrEnum):
     TEXT = "text"
     JSON = "json"
+    SARIF = "sarif"
 
 
 @app.command()
@@ -65,7 +66,10 @@ def check(
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
             "--format",
             "-f",
-            help="Output format. `text` is for terminals; `json` is for CI / editors.",
+            help=(
+                "Output format. `text` is for terminals; `json` is for CI / editors; "
+                "`sarif` is SARIF 2.1.0 for GitHub code scanning and similar surfaces."
+            ),
         ),
     ] = OutputFormat.TEXT,
     dialect_override: Annotated[
@@ -124,9 +128,11 @@ def check(
     """
     from dataclasses import replace
 
+    from dblect import __version__
     from dblect.analysis import analyze
     from dblect.loader import load_declarations
     from dblect.report import render_json, render_text
+    from dblect.sarif import render_sarif
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
@@ -139,7 +145,13 @@ def check(
         loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
     )
     report = replace(report, check=replace(report.check, load_issues=load_result.issues))
-    rendered = render_json(report) if output_format is OutputFormat.JSON else render_text(report)
+    match output_format:
+        case OutputFormat.JSON:
+            rendered = render_json(report)
+        case OutputFormat.SARIF:
+            rendered = render_sarif(report, version=__version__)
+        case OutputFormat.TEXT:
+            rendered = render_text(report)
     typer.echo(rendered)
     if (report.findings or report.check.load_issues) and not no_fail:
         raise typer.Exit(code=1)

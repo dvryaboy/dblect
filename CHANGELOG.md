@@ -86,6 +86,11 @@ tagged yet; this section accumulates the work that a first release will carry.
 - Text and JSON reporters under one versioned schema, with a non-zero exit on
   unsuppressed findings and a `--no-fail` override. Status messages go to
   stderr so stdout is a clean report.
+- A SARIF 2.1.0 reporter (`--format sarif`) so findings render as pull-request
+  annotations on GitHub code scanning and other SARIF-aware surfaces. Each
+  finding becomes a result keyed by a family-namespaced rule id, suppressed
+  findings carry their justification, and models the analysis could not read
+  surface as notifications.
 - A validated-adapter gate, with `--dialect` as the operator's opt-in
   acknowledgment that detector behavior is best-effort off the validated set.
 - A library of demo scenarios: developer-introduced bugs that `dblect check`

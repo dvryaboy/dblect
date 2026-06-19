@@ -55,6 +55,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "pyright>=1.1.380",
+    # Validates the SARIF reporter output against the vendored SARIF 2.1.0 schema.
+    "jsonschema>=4.0",
     # See the cap rationale under [project.optional-dependencies] (parser #219).
     "dbt-core>=1.8,<1.11.8",
     "dbt-duckdb>=1.8",
