@@ -18,9 +18,14 @@ The classification keys on the sqlglot expression *type*, the same key the propa
 aggregate dispatch already uses, and is the single source of truth for both arming the
 coherence guard and the not-well-typed finding. It is an explicit allowlist: an
 aggregate with no entry is left unclassified, which the lenient default reads as "no
-obligation" rather than guessing. A dialect adapter extends the portable base with its
-own aggregates the same way :data:`PORTABLE_NON_DETERMINISTIC_BUILTINS` is extended,
-carrying the merged map on its :class:`~dblect.adapters.AdapterProfile`.
+obligation" rather than guessing.
+
+Keying on the node type covers every dialect at once, since the type is dialect-neutral:
+bigquery ``min_by``/``max_by`` arrive as ``ArgMin``/``ArgMax`` and duckdb
+``median``/``quantile``/... have dedicated nodes, all classified here. The aggregates a
+dialect leaves as ``exp.Anonymous`` (duckdb ``product``, ``geometric_mean``, ``favg``,
+``fsum``, ``mad``, ``entropy``, ...) carry no type to key on; classifying those by name
+is tracked in #119.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from enum import Enum, auto
 import sqlglot.expressions as exp
 
 __all__ = [
-    "PORTABLE_AGGREGATE_BEHAVIOR",
+    "AGGREGATE_BEHAVIORS",
     "AggregateBehavior",
     "aggregate_behavior",
 ]
@@ -45,9 +50,6 @@ class AggregateBehavior(Enum):
     COUNT = auto()
 
 
-# The portable base: aggregates whose behavior is the same on every warehouse. A dialect
-# adapter merges its own entries onto this (``PORTABLE_AGGREGATE_BEHAVIOR | {...}``).
-#
 # Deliberately left unclassified (no magnitude obligation, so the lenient default is
 # correct and an explicit entry would only add noise):
 #   * collection aggregates (``array_agg``/``list``, ``string_agg``, ``histogram``) gather
@@ -59,7 +61,7 @@ class AggregateBehavior(Enum):
 # Dialect aggregates sqlglot parses as anonymous (duckdb ``product``, ``geometric_mean``,
 # ``favg``, ``fsum``, ``mad``, ``entropy``, ...) cannot be type-keyed at all; classifying
 # them by name is tracked in #119.
-PORTABLE_AGGREGATE_BEHAVIOR: Mapping[type[exp.AggFunc], AggregateBehavior] = {
+AGGREGATE_BEHAVIORS: Mapping[type[exp.AggFunc], AggregateBehavior] = {
     # COMBINE: synthesize a new value out of many (a total, mean, spread, moment, middle,
     # or quantile). Mixing units across the reduced rows corrupts the result.
     exp.Sum: AggregateBehavior.COMBINE,
@@ -93,20 +95,13 @@ PORTABLE_AGGREGATE_BEHAVIOR: Mapping[type[exp.AggFunc], AggregateBehavior] = {
 }
 
 
-def aggregate_behavior(
-    agg: exp.AggFunc,
-    classification: Mapping[type[exp.AggFunc], AggregateBehavior] = PORTABLE_AGGREGATE_BEHAVIOR,
-) -> AggregateBehavior | None:
-    """The behavior class of ``agg`` under ``classification``, or ``None`` if unclassified.
+def aggregate_behavior(agg: exp.AggFunc) -> AggregateBehavior | None:
+    """The behavior class of ``agg``, or ``None`` if it is unclassified.
 
     Lookup walks the type's MRO so a rule on a base aggregate catches its subclasses,
-    matching the propagator's own aggregate dispatch. ``classification`` defaults to the
-    portable base; a run passes the resolved adapter's merged map to honor dialect
-    extensions."""
+    matching the propagator's own aggregate dispatch."""
     for cls in type(agg).__mro__:
-        if not issubclass(cls, exp.AggFunc):
-            break  # left the AggFunc hierarchy; MRO bases past here are never aggregates
-        behavior = classification.get(cls)
+        behavior = AGGREGATE_BEHAVIORS.get(cls)
         if behavior is not None:
             return behavior
     return None

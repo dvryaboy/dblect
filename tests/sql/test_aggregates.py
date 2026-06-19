@@ -64,16 +64,6 @@ def test_no_magnitude_obligation_families_are_unclassified() -> None:
         assert aggregate_behavior(_agg(call)) is None, call
 
 
-def test_classification_argument_overrides_the_default() -> None:
-    # A run passes the resolved adapter's map; the lookup honors it over the portable
-    # base. This is the seam a dialect adapter extends through.
-    custom: dict[type[exp.AggFunc], AggregateBehavior] = {exp.Sum: AggregateBehavior.SELECT}
-    assert aggregate_behavior(_agg("sum(x)"), custom) is AggregateBehavior.SELECT
-    # an aggregate absent from the override map is unclassified under it, not fetched
-    # from the portable base
-    assert aggregate_behavior(_agg("avg(x)"), custom) is None
-
-
 def test_lookup_walks_the_mro() -> None:
     # A subclass of a classified aggregate inherits its behavior, matching the
     # propagator's own MRO-based aggregate dispatch.

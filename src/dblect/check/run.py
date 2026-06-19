@@ -81,7 +81,6 @@ class CheckGraphs:
     relation_build: RelationBuildResult
     column_build: BuildResult
     contracts_resolved: int
-    aggregate_behavior: Mapping[type[exp.AggFunc], AggregateBehavior]
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +124,6 @@ def build_check_graphs(
         relation_build=relation_build,
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
-        aggregate_behavior=profile.aggregate_behavior,
     )
 
 
@@ -150,7 +148,6 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     dt_prop = domain_type_property(
         domain_type_grounding(_by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
-        classification=graphs.aggregate_behavior,
     )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
     domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx)
@@ -216,7 +213,6 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             graphs.manifest,
             world.domain_type,
             graphs.column_build.graph,
-            graphs.aggregate_behavior,
         )
     )
     return findings
@@ -376,11 +372,9 @@ def _aggregation_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     column_graph: ColumnLineageGraph,
-    classification: Mapping[type[exp.AggFunc], AggregateBehavior],
 ) -> list[CheckFinding]:
     """One finding per aggregate output whose tag cleared to naked while an operand
-    it summed still carried one: a reduction the algebra cannot call well typed.
-    ``classification`` is the resolved adapter's aggregate behavior table."""
+    it summed still carried one: a reduction the algebra cannot call well typed."""
     out: list[CheckFinding] = []
     for ref, ann in _sorted(annotations):
         if ann.value != NAKED:
@@ -390,7 +384,7 @@ def _aggregation_findings(
             continue
         operands = column_graph.edges.get(ref, frozenset())
         tagged = frozenset(up for up in operands if annotations.get(up, _NO_ANN).value != NAKED)
-        agg = _culprit_aggregate(derivation, tagged, classification) if tagged else None
+        agg = _culprit_aggregate(derivation, tagged) if tagged else None
         if agg is None:
             continue
         out.append(
@@ -459,22 +453,20 @@ def _aggregation_message(
 def _culprit_aggregate(
     derivation: Expr,
     tagged: frozenset[ColumnRef],
-    classification: Mapping[type[exp.AggFunc], AggregateBehavior],
 ) -> exp.AggFunc | None:
     """The bare-column **combining** aggregate the finding is about: a non-windowed
     ``COMBINE`` aggregate over a single column in ``tagged``, carrying the stamped site
     the coherence guard judged.
 
-    Only combining aggregates carry the obligation (``classification`` is the resolved
-    adapter's behavior table, from :mod:`dblect.sql.aggregates`): a ``SELECT`` like
-    ``min``/``max`` returns a real value and merely widens its tag, and a ``COUNT`` is a
-    tag-free cardinality, so neither is a not-well-typed reduction. Restricting to a
-    bare-column operand keeps it precise: an aggregate over an expression
-    (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already clears to naked at the
-    expression by mixing a magnitude with a dimensionless literal, a different concern
-    than a companion that is not constant per group."""
+    Only combining aggregates carry the obligation (the classification lives in
+    :mod:`dblect.sql.aggregates`): a ``SELECT`` like ``min``/``max`` returns a real value
+    and merely widens its tag, and a ``COUNT`` is a tag-free cardinality, so neither is a
+    not-well-typed reduction. Restricting to a bare-column operand keeps it precise: an
+    aggregate over an expression (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already
+    clears to naked at the expression by mixing a magnitude with a dimensionless literal,
+    a different concern than a companion that is not constant per group."""
     for agg in derivation.find_all(exp.AggFunc):
-        if aggregate_behavior(agg, classification) is not AggregateBehavior.COMBINE:
+        if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
             continue
         if not isinstance(agg.this, exp.Column):
             continue

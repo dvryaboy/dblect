@@ -36,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from functools import reduce
-from typing import Final, final
+from typing import Final, assert_never, final
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
@@ -56,7 +56,7 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OuterJoinNull
-from dblect.sql import PORTABLE_AGGREGATE_BEHAVIOR, AggregateBehavior
+from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
 
 # --- unit and tag identities -------------------------------------------------
@@ -526,11 +526,10 @@ def _count_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[
 
 
 def _aggregate_rules(
-    classification: Mapping[type[exp.AggFunc], AggregateBehavior],
     *,
     guard: CoherenceGuard[DomainTag, FDSet] | None,
 ) -> dict[type[exp.AggFunc], AggregateRule[DomainTag]]:
-    """Turn a reduction-behavior classification into the property's aggregate rules.
+    """Turn the reduction-behavior classification into the property's aggregate rules.
 
     ``COUNT`` yields a tag-free cardinality whatever it counts, so it has no companion
     to discharge and never carries the guard. ``COMBINE`` and ``SELECT`` both keep the
@@ -539,14 +538,20 @@ def _aggregate_rules(
     mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
     widen-to-top of a tag-blind selection (``min`` over mixed currencies), caught later
     where a definite tag is required. The produce rule is the same for both; the finding
-    tells them apart. Classifying aggregate behavior is the single source of truth, in
-    :mod:`dblect.sql.aggregates`."""
+    tells them apart. The classification (:data:`AGGREGATE_BEHAVIORS`) is the single
+    source of truth, in :mod:`dblect.sql.aggregates`."""
     rules: dict[type[exp.AggFunc], AggregateRule[DomainTag]] = {}
-    for agg_type, behavior in classification.items():
-        if behavior is AggregateBehavior.COUNT:
-            rules[agg_type] = AggregateRule(core=_count_core)
-        else:
-            rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
+    for agg_type, behavior in AGGREGATE_BEHAVIORS.items():
+        # COMBINE and SELECT deliberately share one produce rule (the finding tells them
+        # apart downstream); the match is closed by ``assert_never`` so a new behavior is a
+        # typecheck error here rather than a silent fall-through into the guarded rule.
+        match behavior:
+            case AggregateBehavior.COUNT:
+                rules[agg_type] = AggregateRule(core=_count_core)
+            case AggregateBehavior.COMBINE | AggregateBehavior.SELECT:
+                rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
+            case _:
+                assert_never(behavior)
     return rules
 
 
@@ -620,7 +625,6 @@ def domain_type_property(
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
     *,
     fd: PropertyRef[FDSet, SourceRef] | None = None,
-    classification: Mapping[type[exp.AggFunc], AggregateBehavior] = PORTABLE_AGGREGATE_BEHAVIOR,
 ) -> Property[DomainTag, ColumnRef]:
     """The column-scoped domain-type property over a caller-supplied grounding.
 
@@ -629,10 +633,6 @@ def domain_type_property(
     the only part that varies between a synthetic-fact test and the eventual contract
     bridge. No semiring: a confluence widens by the lattice ``join``, which is the
     correct "keep only what both arms agree on" for tags.
-
-    ``classification`` is the aggregate reduction-behavior table the aggregate catalog is
-    built from; it defaults to the portable base and a run passes the resolved adapter's
-    map so a dialect's own typed aggregates are classified.
 
     Passing the functional-dependency property's ref arms the coherence guard on the
     combining and selecting aggregates: such an aggregate over a per-row companion tag
@@ -650,7 +650,7 @@ def domain_type_property(
         name="domain_type",
         lattice=DOMAIN_TYPE_LATTICE,
         operators=DOMAIN_TYPE_OPERATORS,
-        aggregates=_aggregate_rules(classification, guard=guard),
+        aggregates=_aggregate_rules(guard=guard),
         ground=ground,
         depends_on=() if fd is None else (fd,),
     )

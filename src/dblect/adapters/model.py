@@ -8,13 +8,8 @@ themselves with the registry, so adding a warehouse never edits this file.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-
-import sqlglot.expressions as exp
-
-from dblect.sql import PORTABLE_AGGREGATE_BEHAVIOR, AggregateBehavior
 
 
 class IncrementalStrategy(StrEnum):
@@ -64,10 +59,6 @@ class AdapterProfile:
     ``non_deterministic_builtins`` is the complete name set (the portable baseline
     plus this adapter's own builtins) the non-determinism detector matches anonymous
     function calls against; a consumer reads it whole and unions nothing.
-    ``aggregate_behavior`` is the complete aggregate reduction-behavior classification
-    (the portable base merged with this adapter's own typed aggregates) the domain-type
-    coherence guard and the not-well-typed finding read; it defaults to the portable base,
-    which already covers the aggregates every warehouse shares.
     """
 
     adapter_type: str
@@ -77,9 +68,6 @@ class AdapterProfile:
     key_enforced: bool
     default_incremental_strategy: IncrementalStrategy | None
     non_deterministic_builtins: frozenset[str]
-    aggregate_behavior: Mapping[type[exp.AggFunc], AggregateBehavior] = field(
-        default_factory=lambda: PORTABLE_AGGREGATE_BEHAVIOR
-    )
 
     def effective_strategy(self, declared: str | None) -> IncrementalStrategy | None:
         """The strategy in force for a model: the declared one when set (``None`` if

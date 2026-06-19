@@ -1,7 +1,7 @@
 """SQL static-analysis layer over sqlglot."""
 
 from dblect.sql.aggregates import (
-    PORTABLE_AGGREGATE_BEHAVIOR,
+    AGGREGATE_BEHAVIORS,
     AggregateBehavior,
     aggregate_behavior,
 )
@@ -34,7 +34,7 @@ from dblect.sql.patterns import (
 )
 
 __all__ = [
-    "PORTABLE_AGGREGATE_BEHAVIOR",
+    "AGGREGATE_BEHAVIORS",
     "PORTABLE_NON_DETERMINISTIC_BUILTINS",
     "SURROGATE_HASH_FUNCTIONS",
     "SURROGATE_HASH_PASSTHROUGH",
