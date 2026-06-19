@@ -45,9 +45,21 @@ from dblect.types.contract import (
 from dblect.types.domain import DomainSpec, DomainType, DomainTypeMeta
 from dblect.types.enums import NominalEnum, UnitEnum
 from dblect.types.errors import DomainTypeError
-from dblect.types.scalars import Count, Date, Decimal, FieldDef, FieldKind, Varchar
+from dblect.types.scalars import (
+    BigInt,
+    Count,
+    Date,
+    Decimal,
+    FieldDef,
+    FieldKind,
+    Float,
+    Integer,
+    Timestamp,
+    Varchar,
+)
 
 __all__ = [
+    "BigInt",
     "BoundTag",
     "ColumnConstraint",
     "Constraints",
@@ -66,9 +78,11 @@ __all__ = [
     "Field",
     "FieldDef",
     "FieldKind",
+    "Float",
     "ForeignKey",
     "ForeignKeyDecl",
     "ForeignKeyEdge",
+    "Integer",
     "IssueCode",
     "ModelContract",
     "NominalEnum",
@@ -77,6 +91,7 @@ __all__ = [
     "ResolvedContracts",
     "ResolvedPredicate",
     "ScalarDecl",
+    "Timestamp",
     "UnitEnum",
     "Varchar",
     "active_registry",
