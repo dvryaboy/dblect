@@ -131,11 +131,10 @@ def _predicted_factor(dimension: Dimension) -> float:
     return factor
 
 
-def _materialize(s: Scenario, *, scaled: bool) -> list[float]:
-    con = duckdb.connect(":memory:")
+def _materialize(con: duckdb.DuckDBPyConnection, s: Scenario, *, scaled: bool) -> list[float]:
     try:
         cols_ddl = ", ".join(f"{c} DOUBLE" for c in s.columns)
-        con.execute(f"CREATE TABLE t (rid INTEGER, {cols_ddl})")
+        con.execute(f"CREATE OR REPLACE TABLE t (rid INTEGER, {cols_ddl})")
         placeholders = ", ".join(["?"] * (len(s.columns) + 1))
         payload = [
             [
@@ -151,16 +150,18 @@ def _materialize(s: Scenario, *, scaled: bool) -> list[float]:
         result = con.execute(f"SELECT r FROM ({_model_sql(s)}) sub ORDER BY rid").fetchall()
         return [float(r[0]) for r in result]
     finally:
-        con.close()
+        con.execute("DROP TABLE IF EXISTS t")
 
 
 def _scale_value(value: float, currency: str, scaled: bool) -> float:
     return value * _SCALES[currency] if scaled else value
 
 
-@given(_scenario())
+@given(s=_scenario())
 @settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_dimension_claim_predicts_unit_rescaling(s: Scenario) -> None:
+def test_dimension_claim_predicts_unit_rescaling(
+    oracle_con: duckdb.DuckDBPyConnection, s: Scenario
+) -> None:
     """The analyzer's output dimension predicts exactly how the materialized result
     transforms under independent rescaling of the declared units, with naked columns held
     fixed (the analyzer claimed nothing about them). A conflict or naked output carries no
@@ -169,8 +170,8 @@ def test_dimension_claim_predicts_unit_rescaling(s: Scenario) -> None:
     if not isinstance(value, Tagged) or not isinstance(value.dimension, Dimension):
         return  # conflict (mixed currency), naked, or polymorphic: no monomial to witness
     factor = _predicted_factor(value.dimension)
-    raw = _materialize(s, scaled=False)
-    rescaled = _materialize(s, scaled=True)
+    raw = _materialize(oracle_con, s, scaled=False)
+    rescaled = _materialize(oracle_con, s, scaled=True)
     assert len(raw) == len(rescaled)
     for original, scaled_result in zip(raw, rescaled, strict=True):
         expected = original * factor

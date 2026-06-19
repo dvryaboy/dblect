@@ -39,6 +39,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import duckdb
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -72,10 +73,15 @@ def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
     return activated[SourceRef(SourceKind.MODEL, _MODEL_UID)].keys
 
 
-def _assert_keys_sound(tables: Sequence[Table], model_sql: str, keys: frozenset[Key]) -> None:
+def _assert_keys_sound(
+    con: duckdb.DuckDBPyConnection,
+    tables: Sequence[Table],
+    model_sql: str,
+    keys: frozenset[Key],
+) -> None:
     """Materialize ``tables`` and the model in duckdb; assert every key in ``keys`` has
     as many distinct key tuples as the model has rows (so it is genuinely unique)."""
-    with materialized(tables, model_sql) as con:
+    with materialized(con, tables, model_sql) as con:
         total = scalar(con, "SELECT COUNT(*) FROM _m")
         for key in keys:
             cols = ", ".join(sorted(key))
@@ -259,9 +265,11 @@ def _scenario_manifest(s: Scenario) -> Manifest:
     )
 
 
-@given(_scenario())
+@given(s=_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_unconditional_promoted_keys_are_unique_over_materialized_rows(s: Scenario) -> None:
+def test_unconditional_promoted_keys_are_unique_over_materialized_rows(
+    oracle_con: duckdb.DuckDBPyConnection, s: Scenario
+) -> None:
     """Every key the analyzer promotes for a filter/join/group/distinct model is
     genuinely unique over the duckdb-materialized rows. The test never recomputes
     which keys should survive; the data is the judge."""
@@ -271,7 +279,7 @@ def test_unconditional_promoted_keys_are_unique_over_materialized_rows(s: Scenar
         assert key <= output_cols, f"key {sorted(key)} not in outputs {sorted(output_cols)}"
     data_by_name = dict(s.data)
     tables: list[Table] = [(src.name, src.columns, data_by_name[src.name]) for src in s.sources]
-    _assert_keys_sound(tables, _scenario_sql(s.model), keys)
+    _assert_keys_sound(oracle_con, tables, _scenario_sql(s.model), keys)
 
 
 # --- conditional activation -------------------------------------------------------
@@ -341,13 +349,15 @@ def _cond_manifest(s: CondScenario) -> Manifest:
     )
 
 
-@given(_cond_scenario())
+@given(s=_cond_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_conditionally_activated_keys_are_unique_over_materialized_rows(s: CondScenario) -> None:
+def test_conditionally_activated_keys_are_unique_over_materialized_rows(
+    oracle_con: duckdb.DuckDBPyConnection, s: CondScenario
+) -> None:
     """A conditional ``unique`` key promoted by activation is genuinely unique over the
     materialized rows. The source data honors the conditional declaration, so an
     over-eager activation (promoting the key when the model filter does not restrict to
     the predicate subset) surfaces as a duplicate the data check catches."""
     keys = _promoted_keys(_cond_manifest(s))
     tables: list[Table] = [("orders", ("id", "g"), s.rows)]
-    _assert_keys_sound(tables, _cond_sql(s), keys)
+    _assert_keys_sound(oracle_con, tables, _cond_sql(s), keys)

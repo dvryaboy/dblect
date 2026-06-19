@@ -131,10 +131,11 @@ def _claimed(s: Scenario) -> FDSet:
     return anns[_MODEL].value
 
 
-def _materialize(s: Scenario) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
-    con = duckdb.connect(":memory:")
+def _materialize(
+    con: duckdb.DuckDBPyConnection, s: Scenario
+) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
     try:
-        con.execute("CREATE TABLE t (g INTEGER, x INTEGER, y INTEGER)")
+        con.execute("CREATE OR REPLACE TABLE t (g INTEGER, x INTEGER, y INTEGER)")
         if s.rows:
             con.executemany("INSERT INTO t VALUES (?, ?, ?)", [list(r) for r in s.rows])
         cursor = con.execute(_model_sql(s))
@@ -143,7 +144,7 @@ def _materialize(s: Scenario) -> tuple[tuple[str, ...], list[tuple[object, ...]]
         names = tuple(str(d[0]).lower() for d in description)
         return names, [tuple(r) for r in cursor.fetchall()]
     finally:
-        con.close()
+        con.execute("DROP TABLE IF EXISTS t")
 
 
 def _fd_holds(
@@ -162,16 +163,18 @@ def _fd_holds(
     return None
 
 
-@given(_scenario())
+@given(s=_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_every_claimed_fd_holds_on_the_data(s: Scenario) -> None:
+def test_every_claimed_fd_holds_on_the_data(
+    oracle_con: duckdb.DuckDBPyConnection, s: Scenario
+) -> None:
     claimed = _claimed(s)
     assert not claimed.is_bottom
     if s.group_cols:
         # Anti-vacuity: a GROUP BY always yields at least the group-key dependency,
         # so a walk that silently claims nothing cannot pass on silence alone.
         assert claimed.fds
-    names, rows = _materialize(s)
+    names, rows = _materialize(oracle_con, s)
     for fd in claimed.fds:
         assert {fd.dependent, *fd.determinant} <= set(names), (
             f"claimed FD names a column the result lacks: {fd} vs {names} for sql={_model_sql(s)!r}"
@@ -305,11 +308,12 @@ def _join_claimed(s: JoinScenario) -> FDSet:
     return anns[_JOIN_MODEL].value
 
 
-def _join_materialize(s: JoinScenario) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
-    con = duckdb.connect(":memory:")
+def _join_materialize(
+    con: duckdb.DuckDBPyConnection, s: JoinScenario
+) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
     try:
-        con.execute("CREATE TABLE pay (k INTEGER, a INTEGER)")
-        con.execute("CREATE TABLE dim (k INTEGER, g INTEGER, v INTEGER)")
+        con.execute("CREATE OR REPLACE TABLE pay (k INTEGER, a INTEGER)")
+        con.execute("CREATE OR REPLACE TABLE dim (k INTEGER, g INTEGER, v INTEGER)")
         if s.rows_pay:
             con.executemany("INSERT INTO pay VALUES (?, ?)", [list(r) for r in s.rows_pay])
         if s.rows_dim:
@@ -320,12 +324,15 @@ def _join_materialize(s: JoinScenario) -> tuple[tuple[str, ...], list[tuple[obje
         names = tuple(str(d[0]).lower() for d in description)
         return names, [tuple(r) for r in cursor.fetchall()]
     finally:
-        con.close()
+        con.execute("DROP TABLE IF EXISTS pay")
+        con.execute("DROP TABLE IF EXISTS dim")
 
 
-@given(_join_scenario())
+@given(s=_join_scenario())
 @settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_every_claimed_join_fd_holds_on_the_data(s: JoinScenario) -> None:
+def test_every_claimed_join_fd_holds_on_the_data(
+    oracle_con: duckdb.DuckDBPyConnection, s: JoinScenario
+) -> None:
     claimed = _join_claimed(s)
     assert not claimed.is_bottom
     selected = dict(s.projection)
@@ -342,7 +349,7 @@ def test_every_claimed_join_fd_holds_on_the_data(s: JoinScenario) -> None:
             # The padded side's drop is the contract: NULL padding can break the
             # dependency, so the walk must stay silent about it.
             assert out_fd not in claimed.fds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
-    names, rows = _join_materialize(s)
+    names, rows = _join_materialize(oracle_con, s)
     for fd in claimed.fds:
         assert {fd.dependent, *fd.determinant} <= set(names), (
             f"claimed FD names a column the result lacks: {fd} vs {names} for sql={_join_sql(s)!r}"

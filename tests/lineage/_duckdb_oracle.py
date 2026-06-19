@@ -24,24 +24,34 @@ Table = tuple[str, tuple[str, ...], Sequence[Sequence[object]]]
 
 @contextmanager
 def materialized(
-    tables: Sequence[Table], model_sql: str
+    con: duckdb.DuckDBPyConnection, tables: Sequence[Table], model_sql: str
 ) -> Generator[duckdb.DuckDBPyConnection, None, None]:
-    """Create ``tables`` in an in-memory duckdb, materialize ``model_sql`` as ``_m``,
-    and yield the connection for the caller to query. The connection is closed on exit.
+    """Create ``tables`` on ``con``, materialize ``model_sql`` as ``_m``, and yield the
+    connection for the caller to query.
+
+    The connection is shared across Hypothesis examples (the ``oracle_con`` fixture), so
+    tables are created with ``CREATE OR REPLACE`` and dropped on exit: each example sees
+    a clean slate without paying to open a fresh in-memory database, which dominated
+    these PBTs' runtime.
     """
-    con = duckdb.connect(":memory:")
+    created: list[str] = []
     try:
         for name, cols, rows in tables:
-            con.execute(f"CREATE TABLE {name} ({', '.join(f'{c} INTEGER' for c in cols)})")
+            con.execute(
+                f"CREATE OR REPLACE TABLE {name} ({', '.join(f'{c} INTEGER' for c in cols)})"
+            )
+            created.append(name)
             if rows:
                 placeholders = ", ".join(["?"] * len(cols))
                 con.executemany(
                     f"INSERT INTO {name} VALUES ({placeholders})", [list(r) for r in rows]
                 )
-        con.execute(f"CREATE TABLE _m AS {model_sql}")
+        con.execute(f"CREATE OR REPLACE TABLE _m AS {model_sql}")
+        created.append("_m")
         yield con
     finally:
-        con.close()
+        for name in reversed(created):
+            con.execute(f"DROP TABLE IF EXISTS {name}")
 
 
 def scalar(con: duckdb.DuckDBPyConnection, query: str) -> int:
