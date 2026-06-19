@@ -2,22 +2,33 @@
 
 A description of what's built right now, not what's planned. Forward-looking work (typed contracts, runtime PBT, replay-determinism, generator framework, multi-table coordinated generation, MCP) lives in [docs/design/](../design/) and is not implemented yet.
 
-What exists today is the **static structural-hazards analyzer**: one command that reads a dbt project, parses each model's SQL, runs structural detectors over every model, and prints findings the user can navigate to and act on. It earns its keep against a real dbt project before any types or contracts are declared.
+What exists today is the **static analyzer**: one command (`dblect check`) that reads a dbt project and runs both detector families over it, the structural hazard detectors over every model's SQL and the declaration-level contract checks where contracts are declared, then prints findings the user can navigate to and act on. The structural family earns its keep against a real dbt project before any types or contracts are declared; the declaration family adds to it once contracts exist.
 
 ## What you can do with it today
 
 ```bash
-$ dblect audit path/to/dbt-project
-audit: scanned 5 models, 1 finding
+$ dblect check path/to/dbt-project
+dblect: 1 finding over 5 models (0 contracts resolved, 5 scanned, 0 predicate(s) collected)
 
-models/customers.sql  (model.jaffle_shop.customers)
-  L44  null_group_after_outer_join
-      GROUP BY orders.customer_id references column(s) from nullable
-      join side (orders); unmatched rows collapse into a NULL group
-      snippet: orders.customer_id
+coverage:
+  resolution: 100.0% of columns (27/27)
+  grounding: domain_type 0/27; functional_dependency 0/5
+  contract columns checkable: 0/0
+  worlds: 1 (base); no flag axes enumerated
+
+structural findings:
+  models/customers.sql  (model.jaffle_shop.customers)
+    L44  null_group_after_outer_join
+        GROUP BY orders.customer_id references column(s) from nullable
+        join side (orders); unmatched rows collapse into a NULL group
+        snippet: orders.customer_id
 ```
 
-Exit code is `1` when unsuppressed findings exist (or `0` with `--no-fail`). `--format json` produces a documented schema for CI consumption.
+One command runs both detector families: the structural hazards (which need only the
+compiled SQL, so they report on any project) and the declaration-level contracts under
+`<project_dir>/dblect/` (which report zero contracts resolved when none are declared).
+Exit code is `1` when unsuppressed findings exist (or `0` with `--no-fail`). `--format
+json` produces a documented schema for CI consumption.
 
 ## Layout
 
@@ -27,16 +38,20 @@ src/dblect/
 ├── sql/               # parse compiled SQL, walk the AST, detect hazards
 ├── uniqueness/        # audit detectors (window order-keys, join fanout) over substrate keys
 ├── lineage/           # lineage graphs + the facts substrate + one property propagator
-├── audit/             # orchestrate detectors over a manifest, render output
+├── audit/             # orchestrate the structural detectors over a manifest
+├── check/             # resolve declaration contracts, propagate, report declaration findings
+├── analysis.py        # the one door: run both detector families, return one report
+├── report.py          # render an AnalysisReport (both families) as text or JSON
 ├── cli/               # the `dblect` typer app
-└── execution/         # run dbt models in DuckDB (used for execution tests; not on the audit path)
+└── execution/         # run dbt models in DuckDB (used for execution tests; not on the check path)
 ```
 
 Each package has a focused job and clean exports through its `__init__.py`. Internals live in `_*.py` modules.
 
 ## Data flow
 
-The audit pipeline:
+The check pipeline (the structural family shown in full; the declaration family's
+`run_check` propagation joins at the `analyze()` merge):
 
 ```
 dbt project
@@ -82,7 +97,12 @@ AuditReport
     │   - suppressed: tuple[SuppressedFinding, ...]
     │   - skipped: tuple[SkippedModel, ...]
     │
-    │  (d) render_text() or render_json()
+    │  (d) dblect.analysis.analyze() merges this with run_check()'s
+    │      CheckReport into one AnalysisReport (both detector families)
+    ▼
+AnalysisReport
+    │
+    │  (e) dblect.report.render_text() or render_json()
     ▼
 stdout
 ```
@@ -224,11 +244,12 @@ The where-provenance scenario tests in `tests/lineage/test_where_provenance.py` 
 
 ## The audit layer (`src/dblect/audit/`)
 
-Three modules:
+Two modules:
 
 - [**`walker.py`**](../../src/dblect/audit/walker.py): `run_audit(manifest)` iterates models, runs detectors, applies suppression.
 - [**`suppress.py`**](../../src/dblect/audit/suppress.py): parses `-- noqa-fixture:` directives, matches them to findings.
-- [**`reporter.py`**](../../src/dblect/audit/reporter.py): `render_text` and `render_json`.
+
+Rendering is no longer audit-specific: the unified reporter ([`src/dblect/report.py`](../../src/dblect/report.py)) renders an `AnalysisReport` carrying both families. See **The unified report** below.
 
 ### Walker
 
@@ -258,46 +279,62 @@ Syntax in SQL files:
 
 `SuppressionDirective(line, kind, reason)` and `directive_matches(directive, finding)` and `apply(findings, directives)` are the building blocks; the walker glues them together.
 
-### Reporters
+### The unified report
 
-**Text** ([`render_text`](../../src/dblect/audit/reporter.py)):
+The reporter ([`src/dblect/report.py`](../../src/dblect/report.py)) renders an `AnalysisReport` (both families) for a terminal or for CI. One summary, one coverage block, and one JSON schema, so a reader and a machine consumer each see every finding in one place. Each family keeps its natural rendering: the structural family is grouped by model and line-located with the offending snippet; the declaration family is located by model, column, and contract, where a line span would not make sense.
 
-- Summary: `audit: scanned N models, M findings[, K suppressed][, L skipped]` (pluralized).
-- Findings grouped by model (sorted by unique_id), within a model sorted by line. Each finding renders as `L{start}` or `L{start}-{end}`, the kind name, the wrapped message, and the snippet.
-- Suppressed block (when populated): one line per silenced finding showing path, line range, kind, and reason.
-- Skipped block (when populated): one line per skipped model with the reason.
-- Findings with no line provenance render as `L?`.
+**Text** ([`render_text`](../../src/dblect/report.py)):
 
-**JSON** ([`render_json`](../../src/dblect/audit/reporter.py)):
+- Summary: `dblect: N findings over M models (C contracts resolved, S scanned, P predicate(s) collected)` (pluralized).
+- Coverage block (resolution, grounding, worlds), so thin coverage cannot hide behind a short finding list.
+- `structural findings:` block, grouped by model (sorted by unique_id), within a model sorted by line. Each renders as `L{start}` or `L{start}-{end}`, the kind name, the wrapped message, and the snippet. No line provenance renders as `L?`.
+- `declaration findings:` block: each renders as the kind name, the model (and `.column` when present), the message, and the file path.
+- Suppressed, skipped, load-issue, and `could not analyze` blocks when populated.
+
+**JSON** ([`render_json`](../../src/dblect/report.py)):
 
 ```json
 {
   "schema_version": "1",
-  "summary": { "models_scanned": 5, "findings": 1, "suppressed": 0, "skipped": 0 },
-  "findings":   [ /* flat finding objects with model_unique_id, file_path, kind, line_start, line_end, message, sql_snippet */ ],
+  "summary": { "findings": 1, "structural": 1, "declaration": 0, "models_analyzed": 5, "models_scanned": 5, "contracts_resolved": 0, "predicates_collected": 0, "suppressed": 0, "skipped": 0, "load_issues": 0, "unbuilt": 0 },
+  "coverage": { "resolution": { /* ... */ }, "grounding": { /* ... */ }, "worlds": { /* ... */ } },
+  "findings":   [ /* each tagged "family": "structural" | "declaration"; locator fields not relevant to a family are null */ ],
   "suppressed": [ /* finding object + nested "suppression": { "reason": ..., "directive_line": ... } */ ],
-  "skipped":    [ /* { "unique_id": ..., "reason": ... } */ ]
+  "skipped":    [ /* { "unique_id": ..., "reason": ... } */ ],
+  "load_issues":[ /* { "module": ..., "message": ... } */ ],
+  "unbuilt":    [ /* { "unique_id": ..., "reason": ... } */ ]
 }
 ```
 
 Keys are sorted for stable diffs. The `schema_version` field exists so consumers can branch on incompatible changes; bumps will be deliberate.
 
+## The analysis door (`src/dblect/analysis.py`)
+
+Two detector families surface findings: `run_check` (declaration-level, located by model/column/contract) and `run_audit` (SQL-structural, located by a span). [`analyze(manifest, profile)`](../../src/dblect/analysis.py) runs both and returns an `AnalysisReport` whose merged `findings` carry both families, plus each family's own report for the family-specific extras (coverage, suppression).
+
+This is the one door for any consumer that needs every family's findings (the CLI, the incremental-worlds cross-world diff, the world axes to come), so a consumer never enumerates the families itself and cannot silently drop one. `AnalysisFinding` is a sealed union (`CheckFinding | LocatedFinding`); per-family handling uses `match` with `assert_never`, so adding a third family is a type error at every site rather than a quiet coverage gap. `cross_world_identity` lives here too: a finding's identity across two compilations of the same project, ignoring the message and line span that drift between compiled SQLs.
+
+`analyze` is the only production caller of `run_check` and `run_audit`; the CLI and the incremental check both go through the door. The two remain the entry points to two distinct subsystems, each with its own contract beyond "produce findings": `run_audit` carries a configurable detector set and `-- noqa-fixture:` suppression, `run_check` carries the resolution floor and coverage. Those contracts are what `tests/audit/` and `tests/check/` pin, and they hold whether or not `analyze` exists, so the two are real boundaries rather than alternative doors. `analyze` is the single door for any consumer that needs every family; the two subsystem entries are not re-exported as top-level `dblect` API, and their docstrings point a both-families consumer back to `analyze`.
+
 ## The CLI (`src/dblect/cli/`)
 
-A `typer.Typer` app registered as the `dblect` console script. Two commands today:
+A `typer.Typer` app registered as the `dblect` console script. Commands today:
 
 - **`dblect version`**: prints the installed version.
-- **`dblect audit [PROJECT_DIR]`**: runs the audit.
+- **`dblect check [PROJECT_DIR]`**: runs both detector families over the project (via [the analysis door](#the-analysis-door-srcdblectanalysispy)) and renders the unified report.
+- **`dblect init [PROJECT_DIR]`**: scaffolds the `dblect/` declaration tree and writes the model stubs.
 
-Audit options:
+Check options:
 
 | Option | Default | Notes |
 | --- | --- | --- |
-| `PROJECT_DIR` positional | `.` | Where `dbt_project.yml` lives. |
+| `PROJECT_DIR` positional | `.` | Where `dbt_project.yml` lives (and `dblect/` if contracts are declared). |
 | `--manifest PATH` | _(unset)_ | Skip resolution and load this file directly. |
 | `--dbt-executable NAME` | `dbt` | Used only by the fallback `dbt compile`. |
 | `--format text\|json -f` | `text` | Reporter selection. Status messages always go to stderr; stdout is the report. |
 | `--dialect NAME` | _(unset)_ | Force a sqlglot dialect, overriding the manifest's `adapter_type`. Required when the adapter is not in dblect's validated set; passing the flag is the operator's acknowledgment that detector behavior is best-effort. |
+| `--catalog PATH` | _(beside manifest)_ | A `catalog.json` supplying seed/source columns so undocumented DAG leaves resolve. |
+| `--resolution-floor FLOAT` | _(unset)_ | Minimum share (0..1) of column references lineage must resolve; below it a `RESOLUTION_BELOW_FLOOR` finding fires so thin coverage is not read as a clean bill. |
 | `--no-fail` | _(off)_ | Force exit 0 even when findings exist. Default is exit 1 on any unsuppressed finding. |
 
 **Manifest resolution** (first wins):
@@ -314,13 +351,13 @@ Each failure mode raises `typer.BadParameter` with an actionable message. The "n
 
 `RunError` carries `phase` (`"seed"` / `"run"` / `"query"`), exit code, stdout, stderr, so callers can branch on what failed without parsing dbt's output.
 
-**This harness is not on the `dblect audit` path** today. It's the substrate the runtime-PBT and replay-determinism layers will sit on once those land. Right now it's exercised by `tests/execution/test_run.py` against the vendored jaffle fixture, confirming the harness works end-to-end so the runtime layer has something to build on.
+**This harness is not on the `dblect check` path** today. It's the substrate the runtime-PBT and replay-determinism layers will sit on once those land. Right now it's exercised by `tests/execution/test_run.py` against the vendored jaffle fixture, confirming the harness works end-to-end so the runtime layer has something to build on.
 
 ## The incremental-worlds check (`src/dblect/check/incremental.py`)
 
 A dbt incremental model compiles two ways: a full-refresh form and a steady-state form whose `{% if is_incremental() %}` branch is present. A single manifest captures one, so a hazard in the unexercised branch is invisible. [`compile_incremental_worlds`](../../src/dblect/execution/incremental.py) produces both from `dbt compile` alone, data-free, by shadowing `is_incremental()` with a constant-returning macro and compiling once per value against an ephemeral DuckDB. Each world is read back as an ordinary `Manifest`.
 
-[`check_incremental_worlds`](../../src/dblect/check/incremental.py) runs both detector families over each world (`run_check` for the declaration-level findings, `run_audit` for the SQL-structural ones) and differences the two finding sets. Because these are control-flow worlds, the same issue renders with a different message and line span in each world, so the diff keys on a stable `FindingIdentity` that ignores those volatile parts. A finding holding in one world and not the other is the cross-world signal; one holding in both is what the single-manifest analysis already reports. The headline hazard it catches: a key the full-refresh build keeps unique is fanned out by a steady-state-only join, so the join-fan-out detector fires in steady-state alone. See [incremental-worlds.md](./incremental-worlds.md) for the macro-shadowing mechanism, the override's reach, and the planned refinements.
+[`check_incremental_worlds`](../../src/dblect/check/incremental.py) runs the project's detectors over each world through [the analysis door](#the-analysis-door-srcdblectanalysispy) (`analyze`, so both families are present by construction) and differences the per-world finding sets. Because these are control-flow worlds, the same issue renders with a different message and line span in each world, so the diff keys on the stable `cross_world_identity` that ignores those volatile parts. A finding holding in one world and not the other is the cross-world signal; one holding in both is what the single-manifest analysis already reports. The headline hazard it catches: a key the full-refresh build keeps unique is fanned out by a steady-state-only join, so the join-fan-out detector fires in steady-state alone. See [incremental-worlds.md](./incremental-worlds.md) for the macro-shadowing mechanism, the override's reach, and the planned refinements.
 
 ## Tests
 
@@ -331,14 +368,16 @@ tests/manifest/    - manifest parsing + DAG topology (incl. PBT over generated a
 tests/sql/         - sqlglot parsing wrapper, structural detectors (incl. PBT on parse round-trips)
 tests/uniqueness/  - the window order-keys and join-fanout detectors over substrate keys
 tests/lineage/     - lattice + semiring laws (PBT), where-provenance, nullability, uniqueness propagation, synthetic-DAG PBT incl. CTEs
-tests/audit/       - walker, suppression directives, text + JSON reporters
+tests/audit/       - walker, suppression directives
 tests/check/       - contract resolution, world enumeration, incremental worlds + cross-world diff
 tests/cli/         - end-to-end CLI via typer.testing.CliRunner
 tests/execution/   - real-dbt run + incremental world-compiler against committed fixtures
+tests/test_analysis.py - the analysis door surfaces both detector families
+tests/test_report.py   - the unified reporter renders both families (text + JSON)
 tests/test_smoke.py - package import + CLI module load
 ```
 
-Hypothesis property-based tests cover DAG topology, parse round-trips, the lattice and semiring laws, the uniqueness JOIN-coverage and GROUP BY rules, and end-to-end lineage propagation on synthetic dbt-shaped DAGs (including CTE-collapse cases that previously dropped multi-source intermediates). The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect audit` flow against the same fixture.
+Hypothesis property-based tests cover DAG topology, parse round-trips, the lattice and semiring laws, the uniqueness JOIN-coverage and GROUP BY rules, and end-to-end lineage propagation on synthetic dbt-shaped DAGs (including CTE-collapse cases that previously dropped multi-source intermediates). The jaffle fixture (`tests/fixtures/`) carries a real `manifest.json` plus the underlying project, so detector tests can verify findings on actual dbt code rather than only synthetic SQL. End-to-end CLI tests use `typer.testing.CliRunner` to exercise the `dblect check` flow against the same fixture.
 
 Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression module are pure functions, which makes testing rigorous: same inputs always give the same outputs, no mocking needed.
 

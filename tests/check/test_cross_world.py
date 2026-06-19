@@ -9,9 +9,10 @@ same issue and is not mistaken for a world-varying one.
 
 from __future__ import annotations
 
+from dblect.analysis import AnalysisFinding
 from dblect.audit import LocatedFinding
 from dblect.check.findings import CheckFinding, CheckFindingKind
-from dblect.check.incremental import IncrementalFinding, cross_world_findings
+from dblect.check.incremental import cross_world_findings
 from dblect.execution.incremental import FULL_REFRESH_WORLD, STEADY_STATE_WORLD
 from dblect.sql import Finding, FindingKind
 
@@ -45,7 +46,7 @@ def test_finding_in_one_world_only_is_cross_world() -> None:
     fanout = _located(
         "join to state can multiply rows", snippet="JOIN state ON e.id = s.id", line_start=9
     )
-    per_world: dict[object, list[IncrementalFinding]] = {
+    per_world: dict[object, list[AnalysisFinding]] = {
         FULL_REFRESH_WORLD: [],
         STEADY_STATE_WORLD: [fanout],
     }
@@ -58,7 +59,7 @@ def test_finding_in_one_world_only_is_cross_world() -> None:
 
 def test_finding_in_every_world_is_world_invariant() -> None:
     shared = _contradiction("declared usd contradicted")
-    per_world: dict[object, list[IncrementalFinding]] = {
+    per_world: dict[object, list[AnalysisFinding]] = {
         FULL_REFRESH_WORLD: [shared],
         STEADY_STATE_WORLD: [shared],
     }
@@ -79,7 +80,7 @@ def test_message_and_line_drift_do_not_create_a_false_flip() -> None:
     )
     contradiction_full = _contradiction("declared usd contradicted by usd-eur")
     contradiction_steady = _contradiction("declared usd contradicted by gbp")
-    per_world: dict[object, list[IncrementalFinding]] = {
+    per_world: dict[object, list[AnalysisFinding]] = {
         FULL_REFRESH_WORLD: [full, contradiction_full],
         STEADY_STATE_WORLD: [steady, contradiction_steady],
     }
