@@ -25,13 +25,31 @@ from dblect.check.findings import CheckFinding
 JSON_SCHEMA_VERSION = "1"
 
 
+def _partition_by_family(
+    findings: Sequence[AnalysisFinding],
+) -> tuple[list[LocatedFinding], list[CheckFinding]]:
+    """Split ``findings`` into (structural, declaration), exhaustively. The ``match``
+    is closed by ``assert_never`` so adding a third family is a typecheck error here,
+    not a finding rendered in no block while still counted in the summary."""
+    structural: list[LocatedFinding] = []
+    declaration: list[CheckFinding] = []
+    for finding in findings:
+        match finding:
+            case LocatedFinding():
+                structural.append(finding)
+            case CheckFinding():
+                declaration.append(finding)
+            case _:
+                assert_never(finding)
+    return structural, declaration
+
+
 # --- text --------------------------------------------------------------------
 
 
 def render_text(report: AnalysisReport) -> str:
     """Render ``report`` as plain text for a terminal."""
-    structural = [f for f in report.findings if isinstance(f, LocatedFinding)]
-    declaration = [f for f in report.findings if isinstance(f, CheckFinding)]
+    structural, declaration = _partition_by_family(report.findings)
 
     sections: list[str] = [_summary_line(report), _coverage_block(report)]
     if report.check.load_issues:
@@ -267,14 +285,14 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
     """Render ``report`` as a stable JSON document. Each finding carries a ``family``
     discriminator (``structural`` or ``declaration``); the locator fields not relevant
     to a family are ``null``."""
-    structural = sum(isinstance(f, LocatedFinding) for f in report.findings)
+    structural, declaration = _partition_by_family(report.findings)
     res, g, w = report.check.resolution, report.check.grounding, report.check.worlds
     payload: JsonReport = {
         "schema_version": JSON_SCHEMA_VERSION,
         "summary": {
             "findings": len(report.findings),
-            "structural": structural,
-            "declaration": len(report.findings) - structural,
+            "structural": len(structural),
+            "declaration": len(declaration),
             "models_analyzed": report.check.models_analyzed,
             "models_scanned": report.audit.models_scanned,
             "contracts_resolved": report.check.contracts_resolved,
