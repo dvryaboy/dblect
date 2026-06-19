@@ -36,14 +36,20 @@ The `left join` keeps every payment, even ones whose `order_id` finds no matchin
 The same pass also flags a `WHERE` on the nullable side of an outer join (silently inverts it to an inner join, dropping the very rows the outer join meant to keep), `COALESCE` on a join key (masks "no match" as a real value), window and `array_agg`/`string_agg` calls with no `ORDER BY` (nondeterministic output), nondeterministic builtins like `current_timestamp()` in join keys or partition clauses, joins that fan out because the joined-in side is not unique on the join key, and reads of a dbt snapshot with no temporal filter (you get every historical version of every row, not the current state). These need nothing declared: dblect uses whatever keys your `schema.yml` and native constraints already assert and stays quiet where it has no grounds to speak.
 
 ```
-$ dblect audit .
-audit: scanned 5 models, 1 finding
+$ dblect check .
+dblect: 1 finding over 5 models (0 contracts resolved, 5 scanned, 0 predicate(s) collected)
 
-models/customers.sql  (model.jaffle_shop.customers)
-  L44  null_group_after_outer_join
-      GROUP BY orders.customer_id references column(s) from nullable join side
-      (orders); unmatched rows collapse into a NULL group
-      snippet: orders.customer_id
+coverage:
+  resolution: 100.0% of columns (27/27)
+  grounding: domain_type 0/27; functional_dependency 0/5
+  contract columns checkable: 0/0
+  worlds: 1 (base); no flag axes enumerated
+
+structural findings:
+  models/customers.sql  (model.jaffle_shop.customers)
+    L44  null_group_after_outer_join
+        GROUP BY orders.customer_id references column(s) from nullable join side (orders); unmatched rows collapse into a NULL group
+        snippet: orders.customer_id
 ```
 
 ### You can suppress these warnings
@@ -56,8 +62,8 @@ Sometimes the catch-all bucket is on purpose: orphaned payments get pooled delib
 ```
 
 ```
-$ dblect audit .
-audit: scanned 5 models, 0 findings, 1 suppressed
+$ dblect check .
+dblect: 0 findings over 5 models (0 contracts resolved, 5 scanned, 0 predicate(s) collected)
 
 suppressed:
   models/customers.sql:L44  null_group_after_outer_join  -- unmatched payments are intentionally pooled; handled downstream
@@ -99,11 +105,11 @@ A single day holds payments in several currencies, so `sum(amount)` adds dollars
 
 ```
 $ dblect check .
-checked 1 contracts over 4 models: 1 finding
+dblect: 1 finding over 4 models (1 contracts resolved, 4 scanned, 0 predicate(s) collected)
 
-aggregation_not_well_typed  model.jaffle_shop.total_daily_revenue.revenue
-      reducing 'revenue' with sum(amount): its per-row companion 'currency' is not held
-      constant by grouping on 'order_date'; the aggregation is not well typed
+declaration findings:
+  aggregation_not_well_typed  model.jaffle_shop.total_daily_revenue.revenue
+      reducing 'revenue' with sum(amount): its per-row companion 'currency' is not held constant by grouping on 'order_date'; the aggregation is not well typed
       models/marts/total_daily_revenue.sql
 ```
 
@@ -144,12 +150,12 @@ Finding line numbers refer to the compiled SQL the analyzer parsed, not to the o
 Inside any dbt project:
 
 ```bash
-dblect audit .       # structural hazards, no declarations needed
+dblect check .       # structural hazards, zero declarations needed
 dblect init .        # scaffold dblect/ and generate editor stubs from your manifest
-dblect check .       # propagate the types you declare and report meaning-level findings
+dblect check .       # now also reports meaning-level findings from the types you declared
 ```
 
-`dblect audit` produces findings in under a minute on typical projects. From there, declare semantic types on the columns that matter and run `dblect check` in CI.
+`dblect check` produces structural findings in under a minute on typical projects, with no declarations required. From there, declare semantic types on the columns that matter and run `dblect check` in CI.
 
 See the [demo walkthrough](docs/design/demo_walkthrough.md) for an end-to-end tour against `jaffle_shop_duckdb`, and [docs/current_state/architecture.md](docs/current_state/architecture.md) for what is built today.
 
