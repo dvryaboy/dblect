@@ -102,7 +102,8 @@ $ dblect check .
 checked 1 contracts over 4 models: 1 finding
 
 aggregation_not_well_typed  model.jaffle_shop.total_daily_revenue.revenue
-      reducing 'revenue' mixes a per-row companion that nothing holds constant per group; the sum is not well typed
+      reducing 'revenue' with sum(amount): its per-row companion 'currency' is not held
+      constant by grouping on 'order_date'; the aggregation is not well typed
       models/marts/total_daily_revenue.sql
 ```
 
