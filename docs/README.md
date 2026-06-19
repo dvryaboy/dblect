@@ -8,11 +8,12 @@ Three buckets, each answering a different question.
 
 ## What's *built* today: current state
 
-- [**current_state/architecture.md**](current_state/architecture.md): a walkthrough of the code as it stands: manifest ingestion (including dbt tests + constraints) → SQL parsing → structural detectors → uniqueness facts (declarations + structural proof) and the uniqueness-aware detector → audit walker → CLI + reporters. Reads bottom-up from a fresh checkout. Start here if you want to navigate the source or extend a detector.
+- [**current_state/capabilities.md**](current_state/capabilities.md): the status view. What works end to end today, what is scaffolded but not yet load-bearing, what the runtime half still lacks, and the concrete distance to a usable 0.1.0. Start here for "how far along is this."
+- [**current_state/architecture.md**](current_state/architecture.md): a walkthrough of the code as it stands: manifest ingestion (including dbt tests + constraints) → SQL parsing → structural detectors → the lineage substrate → uniqueness, nullability, and snapshot detectors → the domain-type declaration family → audit walker → CLI + reporters. Reads bottom-up from a fresh checkout. Start here if you want to navigate the source or extend a detector.
 
 ## What's *designed but not built*: forward-looking
 
-Working design notes for the layers above the current static analyzer. These describe the intended shape; the code that implements them mostly doesn't exist yet.
+Working design notes for the layers above the current static analyzer. These describe the intended shape. Several have since landed as static implementations (the semantic-types and typed-contract DSL, var discovery); the runtime-execution and generator pieces are still ahead. See [current_state/capabilities.md](current_state/capabilities.md) for the built-vs-designed ledger.
 
 - [**design/dblect_technical_intro.md**](design/dblect_technical_intro.md): the typed contracts and semantic-types DSL. Style A (decorated methods on `ModelContract` subclasses), the type registry, refinements, flag-conditional types.
 - [**design/tiers_and_rough_implementation_order.md**](design/tiers_and_rough_implementation_order.md): the three tiers of developer investment (audit / semantic types / focused contracts) and the implementation sequence across them.

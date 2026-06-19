@@ -1,8 +1,8 @@
 # dblect: current architecture
 
-A description of what's built right now, not what's planned. Forward-looking work (typed contracts, runtime PBT, replay-determinism, generator framework, multi-table coordinated generation, MCP) lives in [docs/design/](../design/) and is not implemented yet.
+A description of what's built right now, not what's planned. The forward-looking work that genuinely does not exist yet is the **runtime half**: property-based execution, replay-determinism via differential runs, the generator framework, multi-table coordinated generation, and the MCP server. Those live in [docs/design/](../design/). The typed-contract and semantic-types DSL described there *is* implemented as a static layer (the declaration family below); what is not yet built is running its contracts against generated data. For a capability-by-capability map of what works end to end today and the distance to a 0.1.0 release, see [capabilities.md](./capabilities.md).
 
-What exists today is the **static analyzer**: one command (`dblect check`) that reads a dbt project and runs both detector families over it, the structural hazard detectors over every model's SQL and the declaration-level contract checks where contracts are declared, then prints findings the user can navigate to and act on. The structural family earns its keep against a real dbt project before any types or contracts are declared; the declaration family adds to it once contracts exist.
+What exists today is the **static analyzer**: one command (`dblect check`) that reads a dbt project and runs both detector families over it, the structural hazard detectors over every model's SQL and the declaration-level (domain-type and contract) checks where declarations exist, then prints findings the user can navigate to and act on. The structural family earns its keep against a real dbt project before any types or contracts are declared; the declaration family adds to it once declarations exist, and it is the layer that catches the headline meaning-shift bug (a column's revenue type flipping net to gross upstream) at PR-review time, statically, with no execution.
 
 ## What you can do with it today
 
@@ -35,11 +35,18 @@ json` produces a documented schema for CI consumption.
 ```
 src/dblect/
 ├── manifest/          # parse manifest.json into typed Node + DAG, surface dbt tests + constraints
+├── adapters/          # per-warehouse AdapterProfile (dialect, write enforcement, hazardous builtins)
 ├── sql/               # parse compiled SQL, walk the AST, detect hazards
 ├── uniqueness/        # audit detectors (window order-keys, join fanout) over substrate keys
+├── nullability/       # NULL-hazard detectors (group-by / join-key / NOT-IN over nullable upstreams)
+├── snapshot/          # snapshot-model temporal-filter detector
 ├── lineage/           # lineage graphs + the facts substrate + one property propagator
+├── types/             # the domain-type DSL: DomainType, refinements, scalars, fact bridge
+├── contracts/         # ModelContract, @contract methods, column proxies, expression AST, stub generation
+├── varinf/            # discover dbt var()/env_var() usage from source Jinja (flag-world scaffolding)
+├── demo/              # the worked Money/Currency example domain used by walkthroughs and tests
 ├── audit/             # orchestrate the structural detectors over a manifest
-├── check/             # resolve declaration contracts, propagate, report declaration findings
+├── check/             # resolve declarations, propagate domain-type + functional-dependency properties, report
 ├── analysis.py        # the one door: run both detector families, return one report
 ├── report.py          # render an AnalysisReport (both families) as text or JSON
 ├── cli/               # the `dblect` typer app
@@ -212,6 +219,32 @@ The facts themselves come from declarations (`unique`, dbt-utils `unique_combina
 
 Both detectors are enabled by default. Because they're opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from them. Findings of kinds `NON_UNIQUE_WINDOW_ORDER_KEYS` and `JOIN_FANOUT` are suppressible via the standard `-- noqa-fixture:` syntax.
 
+## The nullability layer (`src/dblect/nullability/`)
+
+Nullability is a column-scoped property on the same substrate: which columns can carry a NULL, tracking outer-join introductions across the model graph. The discoverers ground it from declarations (`not_null` tests, native `NOT NULL` constraints) and the propagator taints columns that an outer join can leave unmatched. The detectors here consume that property to flag three hazards the structural pass cannot see without provenance:
+
+- **`null_group_on_nullable_key`**: a `GROUP BY` over a column the lineage knows is nullable, so unmatched rows collapse into one NULL group. (The structural `null_group_after_outer_join` is the syntax-only sibling; this one fires on cross-model nullability.)
+- **`join_on_nullable_key`**: a join whose key column is nullable, where NULLs never match and rows drop silently.
+- **`not_in_nullable_subquery`**: `<col> NOT IN (SELECT <nullable> ...)`, the SQL footgun where a single NULL in the subquery makes the whole predicate return no rows.
+
+Like the uniqueness detectors, these are opportunistic: with no grounded nullability they stay silent rather than guess.
+
+## The snapshot detector (`src/dblect/snapshot/`)
+
+dbt snapshots capture slowly-changing dimensions, and a snapshot whose query lacks a temporal filter re-captures unchanged history on every run. `snapshot_temporal_filter_missing` flags a snapshot model whose SQL has no filter on its updated-at / check column. The detector assembly lives in its own package so the audit walker stays agnostic to snapshot specifics.
+
+## The declaration family (`src/dblect/types/`, `contracts/`, `check/`)
+
+The declaration family is the static realization of the semantic-types and typed-contract DSL from [docs/design/](../design/). It is the half of the analyzer that catches meaning shifts rather than SQL-shape hazards, and it runs through the same lineage substrate as the structural family.
+
+- [**`types/`**](../../src/dblect/types/): the domain-type DSL. `DomainType` is a Pydantic-shaped class whose fields are typed scalars (`Decimal(18, 2)`, enums, ...); `refine(...)` pins parameters to make a refinement (`Money.refine(currency=USD)`). `bridge.py` lowers a declared type into the facts the substrate grounds from.
+- [**`contracts/`**](../../src/dblect/contracts/): `ModelContract` binds a domain type to a dbt model's columns; `@contract`-decorated methods build boolean expressions over column proxies (`proxy.py`, `ast.py`, `compile.py`) without importing sqlglot. `stubs.py` generates the editor `models` stubs `dblect init` writes.
+- [**`check/`**](../../src/dblect/check/): `run_check` resolves the declarations against the manifest, propagates two properties over the substrate (a relation-scoped **functional-dependency** property, then a column-scoped **domain-type** property that reads it), and lets the findings fall out of what the substrate concluded: a declaration that does not resolve is a `CONTRACT_ISSUE`; a column whose inferred type contradicts its declared type is a `DOMAIN_TYPE_CONTRADICTION` (currency creep) reported wherever the taint reached; a reduction over one field of a multi-field type whose other fields are not held constant is an `AGGREGATION_NOT_WELL_TYPED` (the mixed-currency sum). `coverage.py` reports resolution and grounding so a clean report cannot hide thin coverage; `RESOLUTION_BELOW_FLOOR` fires when lineage resolves too little of the project.
+
+Contract predicates (the `@contract` method bodies) are **collected and counted, not executed** today: running them needs materialized data, which belongs to the runtime loop. The static check stays static, so this family verifies type *propagation* and *coherence*, not value-level contract satisfaction.
+
+`varinf/` sits alongside as a discovery pass: it walks source Jinja for `var()` / `env_var()` usage and builds a typed environment. It is the scaffolding the flag-world layer will enumerate over; it does not emit findings yet.
+
 ## The lineage substrate (`src/dblect/lineage/`)
 
 Most SQL footguns only become visible when you know where a column's *values* came from. Does this `LEFT JOIN ... WHERE upstream NOT IN (...)` silently drop rows because some upstream value is NULL? Is the column you're ranking on actually unique in the source, or did a CTE reshuffle it? Did an aggregate flatten away a key the next window function expects? Answering any of these means walking back from an output column, through the model graph, to the real source columns its values originated in, and reasoning about what happened along the way.
@@ -383,13 +416,12 @@ Strict pyright and ruff in CI. The detectors, uniqueness layer, and suppression 
 
 ## What's deliberately not here yet
 
-Forward-looking pieces that are designed but not built. See [docs/design/](../design/) for each:
+Forward-looking pieces that are designed but not built. The semantic-types DSL, the `@contract` declaration layer, `dblect init` with stub generation, and var/env_var discovery have all landed since the first draft of this doc; what remains unbuilt is the entire **runtime half** and the operator-facing tooling around it. See [docs/design/](../design/) for each, and [capabilities.md](./capabilities.md) for the full built-vs-unbuilt ledger:
 
-- **Semantic types** and the typed-contract DSL (the semantic-types and focused-contracts layers in the design docs).
-- **Runtime checks**: replay-determinism via differential execution, heuristic invariants (row-count sanity, PK uniqueness, monotonicity), generator-driven structural PBT.
-- **Generator framework**: contract-directed generation, intent catalog, multi-table coordinated generation.
-- **Flag/var inference**: discovering dbt vars from SQL and scaffolding typed flag declarations.
-- **`dblect init`**: scaffolds `dblect/`, generates editor stubs from the manifest, integrates with the project's package manager.
-- **MCP server**, **HTML reports**, **SARIF output**, **YAML suppression config**.
+- **Contract verification (execution)**: `dblect check` *collects and counts* contract predicates today but does not run them. Executing a contract needs materialized data, which is the runtime loop below.
+- **Runtime checks**: replay-determinism via differential execution, heuristic invariants (row-count sanity, PK uniqueness, monotonicity), generator-driven structural PBT. The DuckDB execution harness exists but is not on the check path.
+- **Generator framework**: contract-directed generation, intent catalog, multi-table coordinated generation. This is the largest single body of remaining work.
+- **Flag/var worlds on the check path**: var/env_var *discovery* ships (`varinf/`), and fact-level flag-world plumbing is wired, but world enumeration and per-contract world scoping do not yet drive findings (issues #98–#100).
+- **MCP server**, **HTML reports**, **SARIF output**, **YAML suppression config**, **change-impact / flag-flip preflight CLI**.
 
 Each of those is its own body of work. The current static analyzer is independent of them. It's the layer everything else builds on top of.
