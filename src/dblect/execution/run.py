@@ -27,16 +27,21 @@ from __future__ import annotations
 import csv
 import os
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import duckdb
-import yaml  # type: ignore[import-untyped]
+
+from dblect.execution.project_env import (
+    profile_name_from_project,
+    purge_dbt_outputs,
+    run_dbt,
+    write_profile,
+)
 
 
 class Phase(StrEnum):
@@ -125,24 +130,24 @@ def run_model(
     project_yml = project_dir / "dbt_project.yml"
     if not project_yml.exists():
         raise FileNotFoundError(f"dbt_project.yml not found in {project_dir}")
-    profile = profile_name or _profile_name_from_project(project_yml)
+    profile = profile_name or profile_name_from_project(project_yml)
 
     with tempfile.TemporaryDirectory(prefix="dblect-exec-") as tmp:
         tmp_root = Path(tmp)
         work_project = tmp_root / "project"
         shutil.copytree(project_dir, work_project, dirs_exist_ok=False)
-        _purge_dbt_outputs(work_project)
+        purge_dbt_outputs(work_project)
         if fixtures is not None:
             _write_fixture_seeds(work_project, fixtures)
 
         profiles_dir = tmp_root / "profiles"
         profiles_dir.mkdir()
         duckdb_path = tmp_root / "warehouse.duckdb"
-        _write_profile(profiles_dir, profile, duckdb_path)
+        write_profile(profiles_dir, profile, duckdb_path)
 
         env = {**os.environ, "DBT_PROFILES_DIR": str(profiles_dir)}
 
-        seed_proc = _run_dbt(
+        seed_proc = run_dbt(
             dbt_executable,
             ["seed", "--project-dir", str(work_project)],
             env=env,
@@ -150,7 +155,7 @@ def run_model(
         if seed_proc.returncode != 0:
             raise RunError(Phase.SEED, seed_proc.returncode, seed_proc.stdout, seed_proc.stderr)
 
-        run_proc = _run_dbt(
+        run_proc = run_dbt(
             dbt_executable,
             [
                 "run",
@@ -182,25 +187,6 @@ def run_model(
             run_stdout=run_proc.stdout,
             run_stderr=run_proc.stderr,
         )
-
-
-def _profile_name_from_project(project_yml: Path) -> str:
-    cfg: Any = yaml.safe_load(project_yml.read_text())
-    if not isinstance(cfg, Mapping):
-        raise ValueError(f"{project_yml} does not parse to a mapping")
-    cfg_typed: Mapping[str, object] = cast("Mapping[str, object]", cfg)
-    profile = cfg_typed.get("profile")
-    if not isinstance(profile, str) or not profile:
-        raise ValueError(f"{project_yml} missing or invalid `profile:` key")
-    return profile
-
-
-def _purge_dbt_outputs(project: Path) -> None:
-    """Remove `target/`, `logs/`, and `dbt_packages/` so each run starts clean."""
-    for name in ("target", "logs", "dbt_packages"):
-        stale = project / name
-        if stale.exists():
-            shutil.rmtree(stale, ignore_errors=True)
 
 
 def _write_fixture_seeds(
@@ -238,34 +224,6 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def _write_profile(profiles_dir: Path, profile_name: str, duckdb_path: Path) -> None:
-    content = (
-        f"{profile_name}:\n"
-        f"  target: dev\n"
-        f"  outputs:\n"
-        f"    dev:\n"
-        f"      type: duckdb\n"
-        f"      path: {duckdb_path}\n"
-        f"      threads: 2\n"
-    )
-    (profiles_dir / "profiles.yml").write_text(content)
-
-
-def _run_dbt(
-    dbt_executable: str,
-    args: Sequence[str],
-    *,
-    env: Mapping[str, str],
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [dbt_executable, *args],
-        env=dict(env),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
 
 
 def _query_table(

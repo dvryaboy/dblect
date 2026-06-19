@@ -316,6 +316,12 @@ Each failure mode raises `typer.BadParameter` with an actionable message. The "n
 
 **This harness is not on the `dblect audit` path** today. It's the substrate the runtime-PBT and replay-determinism layers will sit on once those land. Right now it's exercised by `tests/execution/test_run.py` against the vendored jaffle fixture, confirming the harness works end-to-end so the runtime layer has something to build on.
 
+## The incremental-worlds check (`src/dblect/check/incremental.py`)
+
+A dbt incremental model compiles two ways: a full-refresh form and a steady-state form whose `{% if is_incremental() %}` branch is present. A single manifest captures one, so a hazard in the unexercised branch is invisible. [`compile_incremental_worlds`](../../src/dblect/execution/incremental.py) produces both from `dbt compile` alone, data-free, by shadowing `is_incremental()` with a constant-returning macro and compiling once per value against an ephemeral DuckDB. Each world is read back as an ordinary `Manifest`.
+
+[`check_incremental_worlds`](../../src/dblect/check/incremental.py) runs both detector families over each world (`run_check` for the declaration-level findings, `run_audit` for the SQL-structural ones) and differences the two finding sets. Because these are control-flow worlds, the same issue renders with a different message and line span in each world, so the diff keys on a stable `FindingIdentity` that ignores those volatile parts. A finding holding in one world and not the other is the cross-world signal; one holding in both is what the single-manifest analysis already reports. The headline hazard it catches: a key the full-refresh build keeps unique is fanned out by a steady-state-only join, so the join-fan-out detector fires in steady-state alone. See [incremental-worlds.md](./incremental-worlds.md) for the macro-shadowing mechanism, the override's reach, and the planned refinements.
+
 ## Tests
 
 The test suite is organized by package:
@@ -326,8 +332,9 @@ tests/sql/         - sqlglot parsing wrapper, structural detectors (incl. PBT on
 tests/uniqueness/  - the window order-keys and join-fanout detectors over substrate keys
 tests/lineage/     - lattice + semiring laws (PBT), where-provenance, nullability, uniqueness propagation, synthetic-DAG PBT incl. CTEs
 tests/audit/       - walker, suppression directives, text + JSON reporters
+tests/check/       - contract resolution, world enumeration, incremental worlds + cross-world diff
 tests/cli/         - end-to-end CLI via typer.testing.CliRunner
-tests/execution/   - real-dbt run against the vendored jaffle project
+tests/execution/   - real-dbt run + incremental world-compiler against committed fixtures
 tests/test_smoke.py - package import + CLI module load
 ```
 

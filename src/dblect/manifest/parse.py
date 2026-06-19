@@ -278,6 +278,7 @@ class Manifest:
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> Self:
         """Parse a raw manifest dict (already loaded as JSON)."""
+        raw = _drop_unmodeled_supported_languages(raw)
         parsed = parse_manifest(raw)
         nodes: dict[str, Node] = {}
 
@@ -417,6 +418,55 @@ def _macro_from_parsed(uid: str, m: Any) -> Macro:
         macro_sql=m.macro_sql,
         depends_on_macros=frozenset(depends_on_macros),
     )
+
+
+# The macro/node ``supported_languages`` values dbt-artifacts-parser models. dbt
+# 1.9+ ships a ``function`` materialization macro that also lists ``javascript``,
+# which the parser's enum rejects. dblect never reads this field, so unmodeled
+# values are dropped before the parse rather than allowed to fail it, keeping the
+# parse total in the same spirit as the ``from_raw`` enums above. Remove this once
+# the parser models the value (tracked in #106; upstream dbt-artifacts-parser#219).
+_MODELED_SUPPORTED_LANGUAGES = frozenset({"python", "sql"})
+
+
+def _drop_unmodeled_supported_languages(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return ``raw`` with ``supported_languages`` under ``macros`` and ``nodes``
+    filtered to the values the manifest parser models.
+
+    The input is left untouched: only the sections and entries that actually carry
+    an unmodeled value are copied (copy-on-write), and ``raw`` itself is returned
+    unchanged when nothing needs filtering, so a caller that reuses the dict is not
+    surprised by a mutation.
+    """
+    patched: dict[str, Any] | None = None
+    for section in ("macros", "nodes"):
+        entries = raw.get(section)
+        if not isinstance(entries, dict):
+            continue
+        entries_typed = cast("dict[str, Any]", entries)
+        new_entries: dict[str, Any] | None = None
+        for uid, entry in entries_typed.items():
+            if not isinstance(entry, dict):
+                continue
+            entry_typed = cast("dict[str, Any]", entry)
+            languages = entry_typed.get("supported_languages")
+            if not isinstance(languages, list):
+                continue
+            kept = [
+                language
+                for language in cast("list[Any]", languages)
+                if language in _MODELED_SUPPORTED_LANGUAGES
+            ]
+            if kept == languages:
+                continue
+            if new_entries is None:
+                new_entries = dict(entries_typed)
+            new_entries[uid] = {**entry_typed, "supported_languages": kept}
+        if new_entries is not None:
+            if patched is None:
+                patched = dict(raw)
+            patched[section] = new_entries
+    return patched if patched is not None else raw
 
 
 def _source_from_parsed(uid: str, s: Any) -> Node:

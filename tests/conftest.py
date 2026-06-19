@@ -2,11 +2,38 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import shutil
 from pathlib import Path
 
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session")
+def dbt_cli() -> str:
+    """The dbt CLI to drive the execution-harness tests, or skip if it is absent.
+
+    Under ``uv run`` the console script lives in the project venv and is on PATH, so
+    these tests run in the normal workflow; outside it (a bare ``python`` with no dbt
+    installed) they skip. Set ``DBLECT_REQUIRE_DBT`` to turn the skip into a failure,
+    so CI cannot silently drop this coverage when the dbt install regresses. Tests
+    pass the returned path as ``dbt_executable`` so they exercise the resolved
+    interpreter rather than whatever bare ``dbt`` PATH happens to hold.
+    """
+    importable = importlib.util.find_spec("dbt") is not None
+    executable = shutil.which("dbt")
+    if importable and executable is not None:
+        return executable
+    reason = (
+        "dbt unavailable: needs dbt-core/dbt-duckdb importable and the dbt CLI on PATH "
+        "(run under `uv run pytest`)"
+    )
+    if os.environ.get("DBLECT_REQUIRE_DBT"):
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 @pytest.fixture(scope="session")

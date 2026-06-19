@@ -1,0 +1,5 @@
+name: incremental_fixture
+version: "1.0"
+profile: incremental_fixture
+model-paths: ["models"]
+seed-paths: ["seeds"]

@@ -1,8 +1,9 @@
 """End-to-end tests for the DuckDB execution harness.
 
-These tests require ``dbt-core`` and ``dbt-duckdb`` to be importable; they
-skip otherwise. The ``dbt`` CLI must also be on ``PATH``. Both are pinned in
-dblect's dev dependency group, so CI installs them automatically.
+These tests drive the dbt CLI through the shared ``dbt_cli`` fixture, so they run
+under ``uv run`` and skip where dbt is absent (see ``tests/conftest.py``). dbt-core
+and dbt-duckdb are pinned in dblect's dev dependency group, so CI installs them
+automatically.
 
 The vendored project under ``tests/fixtures/jaffle_project/`` is the
 canonical exercise; everything else is a variation on its inputs.
@@ -15,16 +16,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("dbt")
-
 
 @pytest.fixture(scope="session")
-def jaffle_project_dir() -> Path:
+def jaffle_project_dir(dbt_cli: str) -> Path:
     path = Path(__file__).parent.parent / "fixtures" / "jaffle_project"
     if not (path / "dbt_project.yml").exists():
         pytest.skip(f"jaffle_project fixture missing at {path}")
-    if shutil.which("dbt") is None:
-        pytest.skip("dbt CLI not on PATH")
     return path
 
 

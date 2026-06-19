@@ -119,6 +119,23 @@ def test_seeds_have_no_dependencies(jaffle: Manifest) -> None:
         assert n.depends_on == frozenset()
 
 
+def test_unknown_macro_supported_language_is_tolerated(jaffle_manifest_path: Path) -> None:
+    # dbt 1.9+ ships a `function` materialization macro whose supported_languages
+    # include `javascript`, a value dbt-artifacts-parser 0.13.2 does not model.
+    # dblect never reads this field, so the parse must stay total by dropping the
+    # unmodeled entry rather than raising, the same posture as the from_raw enums.
+    raw = json.loads(jaffle_manifest_path.read_text())
+    target_uid = next(iter(raw["macros"]))
+    raw["macros"][target_uid]["supported_languages"] = ["sql", "python", "javascript"]
+
+    manifest = Manifest.from_raw(raw)
+
+    assert target_uid in manifest.macros
+    # The tolerant read is copy-on-write: the caller's dict keeps its original
+    # (unmodeled) value, so reusing it across parses is safe.
+    assert raw["macros"][target_uid]["supported_languages"] == ["sql", "python", "javascript"]
+
+
 def test_macro_registry_has_entry_per_raw_macro(
     jaffle: Manifest, jaffle_raw_macros: dict[str, Any]
 ) -> None:
