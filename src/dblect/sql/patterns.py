@@ -47,6 +47,46 @@ class FindingKind(StrEnum):
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
+# Kinds whose right resolution is "confirm it's deliberate and record why", not
+# "fix a bug". The static analyser cannot read intent, so these flag patterns that
+# a typed contract or a human note can legitimately bless. The reporter points the
+# reader at the `-- noqa-fixture:` suppression syntax for exactly these, so the set
+# lives here next to FindingKind and is consumed through `is_intent_dependent`,
+# never re-spelled at a call site. Always-a-bug kinds (a malformed suppression
+# directive, a join fan-out, a NOT IN over a nullable subquery) are absent on
+# purpose: there is no "intentional" form of them to record.
+INTENT_DEPENDENT_KINDS: frozenset[FindingKind] = frozenset(
+    {
+        FindingKind.NON_DETERMINISTIC_FUNCTION,
+        FindingKind.COALESCE_ON_JOIN_KEY,
+        FindingKind.UNORDERED_RANKING_WINDOW,
+        FindingKind.UNORDERED_AGGREGATE,
+    }
+)
+
+
+def is_intent_dependent(kind: FindingKind) -> bool:
+    """True if `kind` flags a pattern that a deliberate choice can legitimately bless.
+
+    The single source of truth for which findings the reporter points at the
+    `-- noqa-fixture:` suppression mechanism. Defined over the closed `FindingKind`
+    set, so a new kind is classified here or it is not classified at all.
+    """
+    return kind in INTENT_DEPENDENT_KINDS
+
+
+def suppression_hint(kind: FindingKind) -> str:
+    """The copy-pasteable suppression nudge for an intent-dependent `kind`.
+
+    Authored once and substituted with the finding's real kind value, so the
+    line it prints is exactly what the suppression scanner accepts:
+    ``-- noqa-fixture: <kind>: <reason>``. Advice, not observation, so the
+    reporter appends it at render time rather than baking it into
+    ``Finding.message``.
+    """
+    return f"If this is intentional, record it with `-- noqa-fixture: {kind.value}: <reason>`."
+
+
 @dataclass(frozen=True, slots=True)
 class Finding:
     """A single static-analysis observation about a SQL statement.

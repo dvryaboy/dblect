@@ -10,22 +10,31 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from dblect.analysis import AnalysisReport
 from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
 from dblect.report import render_json, render_text
-from dblect.sql import Finding, FindingKind
+from dblect.sql import Finding, FindingKind, suppression_hint
+from dblect.sql.patterns import INTENT_DEPENDENT_KINDS
 from dblect.types import IssueCode
 
 _MODEL = "model.p.m"
 
+_INTENT_DEPENDENT_SORTED: list[FindingKind] = sorted(INTENT_DEPENDENT_KINDS, key=lambda k: k.value)
 
-def _structural(message: str = "join can multiply rows") -> LocatedFinding:
+
+def _structural(
+    message: str = "join can multiply rows",
+    *,
+    kind: FindingKind = FindingKind.JOIN_FANOUT,
+) -> LocatedFinding:
     return LocatedFinding(
         model_unique_id=_MODEL,
         file_path="models/m.sql",
         finding=Finding(
-            kind=FindingKind.JOIN_FANOUT,
+            kind=kind,
             message=message,
             sql_snippet="JOIN state ON e.id = s.id",
             line_start=9,
@@ -153,3 +162,36 @@ def test_json_tags_each_finding_with_its_family() -> None:
     # the check-family coverage block rides along
     assert "resolution" in payload["coverage"]
     assert payload["coverage"]["worlds"] == {"worlds_enumerated": 1, "axes_enumerated": []}
+
+
+# --- the noqa-fixture suppression hint ---------------------------------------
+
+
+@pytest.mark.parametrize("kind", _INTENT_DEPENDENT_SORTED)
+def test_text_appends_suppression_hint_for_intent_dependent_kinds(kind: FindingKind) -> None:
+    text = render_text(_report(structural=(_structural(kind=kind),)))
+    # The hint the reader sees is the exact copy-pasteable line for this kind.
+    assert suppression_hint(kind) in text
+
+
+def test_text_omits_hint_for_always_a_bug_kind() -> None:
+    text = render_text(_report(structural=(_structural(kind=FindingKind.MALFORMED_SUPPRESSION),)))
+    assert "noqa-fixture" not in text
+
+
+def test_text_omits_hint_for_declaration_findings() -> None:
+    # Declaration findings are not structural hazards; the suppression mechanism
+    # does not apply, so the hint must not leak into their block.
+    text = render_text(_report(declaration=(_declaration(),)))
+    assert "noqa-fixture" not in text
+
+
+def test_json_message_stays_the_pure_observation() -> None:
+    # The hint is presentation: it rides the text reporter, never the JSON
+    # `message`, which remains the detector's observation verbatim.
+    observation = "ARRAY_AGG has no ORDER BY; element order across rows is undefined"
+    structural = (_structural(message=observation, kind=FindingKind.UNORDERED_AGGREGATE),)
+    payload = json.loads(render_json(_report(structural=structural)))
+    [finding] = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert finding["message"] == observation
+    assert "noqa-fixture" not in finding["message"]
