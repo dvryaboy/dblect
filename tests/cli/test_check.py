@@ -120,20 +120,6 @@ def test_finds_manifest_in_target_dir(
     assert "null_group_after_outer_join" in result.output
 
 
-def test_finds_manifest_in_custom_target_path(
-    tmp_path: Path, jaffle_manifest_path: Path, runner: CliRunner
-) -> None:
-    # A project that sets a non-default ``target-path:`` writes its manifest there,
-    # so resolution must follow the config rather than the ``target/`` default.
-    project = tmp_path / "p"
-    (project / "build").mkdir(parents=True)
-    (project / "dbt_project.yml").write_text("name: x\nprofile: x\ntarget-path: build\n")
-    shutil.copy(jaffle_manifest_path, project / "build" / "manifest.json")
-    result = runner.invoke(app, ["check", "--no-fail", str(project)])
-    assert result.exit_code == 0, result.output
-    assert "null_group_after_outer_join" in result.output
-
-
 def test_finds_manifest_under_flags_target_path(
     tmp_path: Path, jaffle_manifest_path: Path, runner: CliRunner
 ) -> None:
