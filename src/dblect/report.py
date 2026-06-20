@@ -19,6 +19,7 @@ from typing import TypedDict, assert_never
 from dblect.analysis import AnalysisFinding, AnalysisReport
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding
+from dblect.sql import FindingKind, suppression_hint
 
 # Fresh schema for the unified report. Both families and the coverage block live
 # under one document; consumers branch on ``family`` per finding.
@@ -139,6 +140,13 @@ def _render_structural(lf: LocatedFinding) -> str:
     )
     body_lines: list[str] = [head]
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
+    # The suppression nudge is presentation, not observation, so it lives here rather
+    # than in `Finding.message` (the JSON `message` stays the pure observation). Every
+    # structural finding is line-suppressible, so the hint rides all of them. The lone
+    # exception is a malformed suppression directive: telling the reader to suppress it
+    # with another directive would be circular.
+    if lf.finding.kind is not FindingKind.MALFORMED_SUPPRESSION:
+        body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
     snippet = lf.finding.sql_snippet.strip()
     if snippet:
         body_lines.append(indent(f"snippet: {snippet}", "    "))

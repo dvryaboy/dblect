@@ -47,6 +47,11 @@ class FindingKind(StrEnum):
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
+def suppression_hint(kind: FindingKind) -> str:
+    # The suggested directive must stay valid suppression syntax (round-trip tested).
+    return f"If this is intentional, record it with `-- noqa-fixture: {kind.value}: <reason>`."
+
+
 @dataclass(frozen=True, slots=True)
 class Finding:
     """A single static-analysis observation about a SQL statement.
