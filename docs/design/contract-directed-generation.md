@@ -102,6 +102,16 @@ Nine intents. Each is a generation template that fixes shape on specific columns
 
 A typical model with 2–3 contracts ends up running 4–8 intent-driven test budgets, plus a happy-path baseline. The framework runs them in parallel; each one shrinks independently to a minimal counterexample if it fails.
 
+## Static findings as intent seeds
+
+The reframe above treats a contract as a generator specification. A static hazard finding is a second source of the same information, and it is often a sharper one. When the static layer flags `where_on_outer_joined_nullable`, `join_on_nullable_key`, or `null_group_on_nullable_key`, it has already localized the exact join or predicate, the exact columns involved, and (for the WHERE case) a concrete suggested fix. That is precisely the input an intent needs. A finding on an outer-joined nullable side selects the Orphan and NullKey intents on that specific join; a fanout finding selects Fanout; an ordering finding selects OrderingTie. The static finding picks the intent and pins its parameters, so the generator runs one targeted budget against one join rather than searching the shape space for a contract.
+
+This complements the contract-directed path rather than replacing it. Contract-directed generation searches broadly for whatever shape breaks a declared property. Finding-seeded generation starts from a specific suspect the static analyzer already surfaced and confirms it. The two share the same intent catalog, fill layer, and example memory; they differ only in what supplies the generation target.
+
+The finding-seeded path also carries the property in the zero-declaration audit case. Where contract-directed generation needs a user-declared contract to falsify, a hazard finding ships with an implicit property derived from its own suggested remediation. For `where_on_outer_joined_nullable` the property is a differential: run the model as written and again with the suggested guard applied, and compare the row sets. An outer join that the WHERE has quietly demoted to inner shows a non-empty delta under an Orphan witness; a join that was genuinely inner all along shows none. The delta is both the proof and the triage signal. A non-empty delta is an active defect with a concrete witness row; an empty delta today marks the finding as dormant, which is exactly the latent-versus-active distinction a reader otherwise has to reason out by hand. This is the same spirit as the validation-mode story of running samples against the real warehouse: the static layer proposes, and a small generated or sampled run disposes.
+
+A practical sequencing note: this path reuses the v1 intent catalog and example memory directly, so it can ship as a thin adapter from finding kind to intent selection once the generator core lands, without waiting on the full contract DSL.
+
 ## What v1 commits to
 
 The v1 scope on the generator side:
