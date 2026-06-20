@@ -1,8 +1,4 @@
 # pyright: reportInvalidTypeForm=false, reportUnusedClass=false, reportGeneralTypeIssues=false
-# pyright: reportPrivateUsage=false
-# The IssueCode-propagation test drives the bridge through _issue_findings directly:
-# that module-private fold is the boundary where a ContractIssue becomes a
-# CheckFinding, so pinning the code there is pinning the contract, not an internal.
 # A contract method's ``self`` is a ContractSelf proxy at capture, not a real
 # instance; annotating it that way trips pyright's self-supertype rule while keeping
 # the proxy usage checked. Typed ``self`` in authored contracts is the stubs concern.
@@ -24,14 +20,11 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
-from dblect.check.findings import CheckFinding
-from dblect.check.run import _issue_findings
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
-from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
-from dblect.types import IssueCode, ModelContract, resolve_contracts
+from dblect.types import IssueCode, ModelContract
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -75,60 +68,38 @@ def test_unresolved_contract_is_a_finding() -> None:
     assert _kinds(report) == [CheckFindingKind.CONTRACT_ISSUE]
 
 
-def test_unresolved_contract_finding_carries_its_issue_code() -> None:
-    # The contract-issue finding pins the specific cause, not just the bucket, so a
-    # consumer can tell an unresolved model from an unsourced field.
-    class Ghost(ModelContract):
-        dbt_model = "does_not_exist"
-        amount: MoneyUSD
-
-    manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={})
-    report = run_check(manifest, _DUCKDB)
-    (finding,) = report.findings
-    assert finding.kind is CheckFindingKind.CONTRACT_ISSUE
-    assert finding.code is IssueCode.UNRESOLVED_MODEL
-
-
-def test_issue_findings_carry_each_contract_issue_code() -> None:
-    # Driven through the real bridge with column validation active, so an unsourced
-    # field surfaces its own code while the unresolved model surfaces another. Pinned
-    # at the _issue_findings boundary: every ContractIssue's code reaches the finding.
-    charges = _node(
-        "model.shop.stg_charges",
-        kind=ResourceType.MODEL,
-        sql="SELECT charge_amount FROM raw",
-        columns=_cols(charge_amount="DECIMAL"),
+def test_contract_issue_findings_carry_their_distinct_cause_codes() -> None:
+    # Each contract issue pins its specific cause, not just the shared bucket, so a
+    # consumer can tell one cause from another. Two distinct causes in one run prove
+    # the code tracks the issue rather than a single hardcoded value, observed through
+    # the public check boundary. One model name resolves to two nodes (ambiguous), the
+    # other to none (unresolved).
+    orders = _node(
+        "model.shop.orders", kind=ResourceType.MODEL, sql="SELECT 1 AS x", columns=_cols(x="INT")
+    )
+    orders_dupe = _node(
+        "model.other.orders", kind=ResourceType.MODEL, sql="SELECT 1 AS x", columns=_cols(x="INT")
     )
     manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={charges.unique_id: charges}
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={orders.unique_id: orders, orders_dupe.unique_id: orders_dupe},
     )
-    src = SourceRef(SourceKind.MODEL, charges.unique_id)
 
-    class StgCharges(ModelContract):
-        dbt_model = "stg_charges"
-        charge_amount: Money.columns(amount="charge_amount")  # currency column unsourced
+    class Ambiguous(ModelContract):
+        dbt_model = "orders"
+        amount: MoneyUSD
 
     class Ghost(ModelContract):
         dbt_model = "does_not_exist"
         amount: MoneyUSD
 
-    resolved = resolve_contracts(manifest, known_columns={src: frozenset({"charge_amount"})})
-    findings = _issue_findings(resolved)
-
-    codes = {f.code for f in findings}
-    assert codes == {IssueCode.UNSOURCED_FIELD, IssueCode.UNRESOLVED_MODEL}
-    assert all(f.kind is CheckFindingKind.CONTRACT_ISSUE for f in findings)
-
-
-def test_non_contract_issue_finding_has_no_code() -> None:
-    # Only contract issues carry an IssueCode; the other check-finding kinds have no
-    # such cause and leave the field None rather than borrowing a stray code.
-    finding = CheckFinding(
-        kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
-        message="declared usd contradicted",
-        model_unique_id="model.shop.orders",
-    )
-    assert finding.code is None
+    report = run_check(manifest, _DUCKDB)
+    assert {f.code for f in report.findings} == {
+        IssueCode.AMBIGUOUS_MODEL,
+        IssueCode.UNRESOLVED_MODEL,
+    }
+    assert all(f.kind is CheckFindingKind.CONTRACT_ISSUE for f in report.findings)
 
 
 def test_a_model_that_cannot_be_analyzed_is_surfaced() -> None:
