@@ -24,7 +24,7 @@ import pytest
 from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import make_nullability_detectors
-from dblect.sql import FindingKind, parse_sql
+from dblect.sql import Finding, FindingKind, parse_sql
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -83,6 +83,10 @@ def _not_null(source_name: str, column: str) -> Node:
 # lkp.tag is declared not_null. stg.id comes from the required side: NON_NULL.
 _STG_SQL = "SELECT a.id AS id, b.tag AS tag FROM base a LEFT JOIN lkp b ON a.fk = b.id"
 
+# stg2.tag is NULLABLE because NULLIF can return NULL, a cause that is *not* an outer
+# join. It exercises the honest-degradation branch: the finding names no fabricated cause.
+_STG2_SQL = "SELECT a.id AS id, NULLIF(a.fk, 0) AS tag FROM base a"
+
 
 def _manifest(mart_sql: str) -> Manifest:
     nodes = [
@@ -90,21 +94,37 @@ def _manifest(mart_sql: str) -> Manifest:
         _source("lkp"),
         _source("other"),
         _not_null("base", "id"),
+        _not_null("base", "fk"),
         _not_null("lkp", "id"),
         _not_null("lkp", "tag"),
         _not_null("other", "k"),
         _model(
             "stg", _STG_SQL, depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"})
         ),
+        _model("stg2", _STG2_SQL, depends_on=frozenset({"source.shop.raw.base"})),
         _model(
             "mart",
             mart_sql,
-            depends_on=frozenset({"model.shop.stg", "source.shop.raw.other"}),
+            depends_on=frozenset({"model.shop.stg", "model.shop.stg2", "source.shop.raw.other"}),
         ),
     ]
     return Manifest(
         schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
     )
+
+
+def _join_finding(mart_sql: str) -> Finding:
+    """The single ``join_on_nullable_key`` finding ``mart`` raises (asserts exactly one)."""
+    detectors = make_nullability_detectors(_manifest(mart_sql), _DUCKDB)
+    tree = parse_sql(mart_sql, dialect="duckdb")
+    findings = [
+        f
+        for detector in detectors
+        for f in detector(tree)
+        if f.kind is FindingKind.JOIN_ON_NULLABLE_KEY
+    ]
+    assert len(findings) == 1
+    return findings[0]
 
 
 def _kinds(mart_sql: str) -> list[FindingKind]:
@@ -168,3 +188,37 @@ def test_flagged_group_key_really_carries_a_null_bucket() -> None:
         assert null_groups[0] == 1  # the unmatched row formed a phantom NULL group
     finally:
         con.close()
+
+
+# The durable guard is the upstream not_null test: it turns silent row loss into a loud
+# test failure on the producing model. The finding recommends it while keeping the local
+# filter/COALESCE options, so the reader sees both the cheapest durable guard and the
+# in-place fixes.
+def test_join_finding_recommends_an_upstream_not_null_test_and_keeps_local_fixes() -> None:
+    msg = _join_finding("SELECT s.id FROM other o JOIN stg s ON o.k = s.tag").message
+    assert "not_null" in msg  # the durable upstream guard
+    assert "stg" in msg  # named on the producing model
+    lowered = msg.lower()
+    assert "filter" in lowered  # local filter still offered
+    assert "coalesce" in lowered  # local COALESCE still offered
+
+
+# When the substrate attributes the upstream nullability to an outer join, the finding
+# names that cause so the reader does not have to rediscover it. ``stg.tag`` is the
+# optional side of stg's LEFT JOIN.
+def test_join_finding_names_outer_join_cause_when_derivable() -> None:
+    msg = _join_finding("SELECT s.id FROM other o JOIN stg s ON o.k = s.tag").message
+    # The cause names *how the column was produced*, distinct from the boilerplate that
+    # explains how the local join treats a NULL key. "produced via" is the cause marker.
+    assert "produced via" in msg.lower()
+    assert "left join" in msg.lower()
+
+
+# ``stg2.tag`` is NULLABLE via NULLIF, not an outer join. The finding must not fabricate
+# an outer-join cause it cannot support from the substrate (the silent-when-unsure posture).
+def test_join_finding_does_not_fabricate_a_cause_when_not_derivable() -> None:
+    msg = _join_finding("SELECT s.id FROM other o JOIN stg2 s ON o.k = s.tag").message
+    assert "stg2" in msg
+    assert "not_null" in msg  # the durable guard is still recommended
+    assert "left join" not in msg.lower()
+    assert "produced via" not in msg.lower()
