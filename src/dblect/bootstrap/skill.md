@@ -70,11 +70,12 @@ dblect init .
 
 `init` scaffolds the `dblect/` tree and writes `dblect/_stubs/models.py`.
 
-**Check `target-path` first.** dblect looks under `<project>/target/` by default. If
-`dbt_project.yml` sets a non-default `target-path` (e.g. `../docs`), `init` and
-`check` will not find the artifacts and `init` fails with "target/manifest.json is
-missing." Read `target-path`, and if it is not `target`, pass
-`--manifest <path>/manifest.json` and `--catalog <path>/catalog.json` on every call.
+**A non-default `target-path` is handled for you.** dblect resolves the manifest and
+catalog under the project's dbt target-path, honoring `DBT_TARGET_PATH` and a
+`target-path:` in `dbt_project.yml` (top-level or under `flags:`), and falling back to
+`<project>/target/`. A project that builds to `../docs` works with no extra flags.
+`--manifest` and `--catalog` stay available as explicit overrides for an artifact that
+lives somewhere else.
 
 **Note the Python models, because dblect cannot read them.** dblect parses compiled
 SQL, so a dbt Python model is reported under `skipped:`. This matters downstream: a
