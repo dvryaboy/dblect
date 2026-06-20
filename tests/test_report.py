@@ -17,12 +17,15 @@ from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFi
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
 from dblect.report import render_json, render_text
 from dblect.sql import Finding, FindingKind, suppression_hint
-from dblect.sql.patterns import INTENT_DEPENDENT_KINDS
 from dblect.types import IssueCode
 
 _MODEL = "model.p.m"
 
-_INTENT_DEPENDENT_SORTED: list[FindingKind] = sorted(INTENT_DEPENDENT_KINDS, key=lambda k: k.value)
+# Every structural kind carries the suppression hint except the self-referential
+# malformed-suppression finding.
+_HINTED_KINDS: list[FindingKind] = sorted(
+    (k for k in FindingKind if k is not FindingKind.MALFORMED_SUPPRESSION), key=lambda k: k.value
+)
 
 
 def _structural(
@@ -167,14 +170,16 @@ def test_json_tags_each_finding_with_its_family() -> None:
 # --- the noqa-fixture suppression hint ---------------------------------------
 
 
-@pytest.mark.parametrize("kind", _INTENT_DEPENDENT_SORTED)
-def test_text_appends_suppression_hint_for_intent_dependent_kinds(kind: FindingKind) -> None:
+@pytest.mark.parametrize("kind", _HINTED_KINDS)
+def test_text_appends_suppression_hint_for_structural_findings(kind: FindingKind) -> None:
     text = render_text(_report(structural=(_structural(kind=kind),)))
     # The hint the reader sees is the exact copy-pasteable line for this kind.
     assert suppression_hint(kind) in text
 
 
-def test_text_omits_hint_for_always_a_bug_kind() -> None:
+def test_text_omits_hint_for_malformed_suppression() -> None:
+    # Pointing a malformed suppression directive at the suppression syntax would be
+    # circular, so this lone kind carries no hint.
     text = render_text(_report(structural=(_structural(kind=FindingKind.MALFORMED_SUPPRESSION),)))
     assert "noqa-fixture" not in text
 

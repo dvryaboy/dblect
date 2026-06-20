@@ -7,7 +7,6 @@ from dblect.sql.aggregates import (
 )
 from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.sql.patterns import (
-    INTENT_DEPENDENT_KINDS,
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
     SURROGATE_HASH_FUNCTIONS,
     SURROGATE_HASH_PASSTHROUGH,
@@ -26,7 +25,6 @@ from dblect.sql.patterns import (
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
     finding_at,
-    is_intent_dependent,
     list_aggregations,
     list_group_bys,
     list_joins,
@@ -38,7 +36,6 @@ from dblect.sql.patterns import (
 
 __all__ = [
     "AGGREGATE_BEHAVIORS",
-    "INTENT_DEPENDENT_KINDS",
     "PORTABLE_NON_DETERMINISTIC_BUILTINS",
     "SURROGATE_HASH_FUNCTIONS",
     "SURROGATE_HASH_PASSTHROUGH",
@@ -60,7 +57,6 @@ __all__ = [
     "detect_unordered_window",
     "detect_where_on_outer_joined_nullable",
     "finding_at",
-    "is_intent_dependent",
     "list_aggregations",
     "list_group_bys",
     "list_joins",
