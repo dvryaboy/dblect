@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Annotated
 
 import typer
 
+from dblect.bootstrap import SetupTarget
+
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
     from dblect.manifest import Manifest
@@ -197,6 +199,39 @@ def init(
     for path in (*created, stubs_path):
         typer.echo(f"init: wrote {path}")
     typer.echo("init: scaffolding complete; add contracts and run `dblect check`.")
+
+
+@app.command()
+def setup(
+    target: Annotated[
+        SetupTarget,
+        typer.Argument(  # pyright: ignore[reportUnknownMemberType]
+            help="The AI coding agent to install the bootstrap skill into.",
+        ),
+    ],
+    project_dir: Annotated[
+        Path,
+        typer.Argument(  # pyright: ignore[reportUnknownMemberType]
+            help="Project to install into (where .claude/, .cursor/, or AGENTS.md lives).",
+        ),
+    ] = Path("."),
+    print_only: Annotated[
+        bool,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--print",
+            help="Write the adapted skill to stdout instead of installing it.",
+        ),
+    ] = False,
+) -> None:
+    """Install the dblect bootstrap skill into an AI coding agent's project surface."""
+    from dblect.bootstrap import install, render
+
+    if print_only:
+        typer.echo(render(target))
+        return
+    path = install(target, project_dir)
+    typer.echo(f"setup: wrote {path}")
+    typer.echo(f"setup: open your {target.value} agent and run the dblect-bootstrap skill.")
 
 
 _STARTER_TYPES = '"""Project domain types: DomainType subclasses and named refinements."""\n'
