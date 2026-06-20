@@ -71,6 +71,10 @@ The de-duplication rule keeps them from talking over each other: a property-base
 
 Flattening an array with an inner lateral (`FROM t, UNNEST(t.arr)`, `CROSS JOIN UNNEST(...)`, `CROSS JOIN LATERAL ...`) silently drops the parent row whenever the array is empty or null. That looks like a nullability bug and is worth catching, but it is a row-preservation (cardinality) hazard, the deflation twin of join fanout: fanout multiplies rows, this annihilates them. The nullability property can prove only the null-array half of it and structurally misses the more common empty-array half (`[]` is a non-null, zero-length value), so it stays out of scope here and lives as a structural detector instead. A future collection-emptiness property could gate it precisely, reusing this engine's existential shape, once the static introducers for "can be empty" are rich enough to clear the firewall. Tracked separately as a `sql/patterns.py` detector.
 
+## Confirming a hazard at runtime
+
+A static finding here states that a hazard exists; it cannot show how many rows the hazard moves today. That blast-radius question is what separates an active defect from a dormant one, and it is easy to misjudge by reading the SQL alone. The runtime layer answers it. Each of these findings doubles as a generation seed: it has already localized the join, the columns, and (for the WHERE case) a suggested guard, which is enough to pick an intent and pin its parameters. Running the model as written against the same model with the guard applied yields a row-set delta that is both the proof and the triage signal, a non-empty delta marking an active defect with a witness row and an empty delta marking the finding dormant. See "Static findings as intent seeds" in [contract-directed-generation.md](contract-directed-generation.md) for how this rides the same intent catalog and example memory as the contract-directed path.
+
 ## Implementation sketch
 
 Grounded in the current code, the work is three slices that can land in order, each independently useful.
