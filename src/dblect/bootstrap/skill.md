@@ -60,21 +60,16 @@ Confirm how dblect is invoked: run `dblect --help`. If it is not on PATH it may 
 in `.venv/bin/dblect` or run through `uv run dblect` / `poetry run dblect`. Settle
 this once; do not search the filesystem for the package.
 
-Confirm a `dbt_project.yml` exists and dblect has a manifest. If
-`target/manifest.json` is missing, `dblect init` produces one (it falls back to
-`dbt compile`):
+Confirm a `dbt_project.yml` exists and dblect has a manifest. If no manifest exists
+yet, `dblect init` produces one (it falls back to `dbt compile`):
 
 ```text
 dblect init .
 ```
 
-`init` scaffolds the `dblect/` tree and writes `dblect/_stubs/models.py`.
-
-**Check `target-path` first.** dblect looks under `<project>/target/` by default. If
-`dbt_project.yml` sets a non-default `target-path` (e.g. `../docs`), `init` and
-`check` will not find the artifacts and `init` fails with "target/manifest.json is
-missing." Read `target-path`, and if it is not `target`, pass
-`--manifest <path>/manifest.json` and `--catalog <path>/catalog.json` on every call.
+`init` scaffolds the `dblect/` tree and writes `dblect/_stubs/models.py`. dblect finds
+the manifest and catalog under the project's dbt target-path on its own, so a
+non-default `target-path` needs no extra flags.
 
 **Note the Python models, because dblect cannot read them.** dblect parses compiled
 SQL, so a dbt Python model is reported under `skipped:`. This matters downstream: a
@@ -85,7 +80,7 @@ recognize the gap.
 **Get column names right; every binding depends on them.** Two sources feed
 resolution and differ in coverage. `schema.yml` lists only documented columns, so the
 generated stubs can be blind to an undocumented `stg_payments.amount` or carry a name
-stale against the SQL: treat them as a hint. `target/catalog.json` is the warehouse's
+stale against the SQL: treat them as a hint. `catalog.json` is the warehouse's
 account of every column dbt emitted, the ground truth, read when it sits beside the
 manifest. Produce it before relying on resolution: `dbt docs generate` writes it (or
 `dbt build` first if the models are not built). Without it, undocumented leaf columns
