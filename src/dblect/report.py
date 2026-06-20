@@ -19,10 +19,11 @@ from typing import TypedDict, assert_never
 from dblect.analysis import AnalysisFinding, AnalysisReport
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding
+from dblect.severity import severity_of
 
-# Fresh schema for the unified report. Both families and the coverage block live
-# under one document; consumers branch on ``family`` per finding.
-JSON_SCHEMA_VERSION = "1"
+# Both families and the coverage block live under one document; consumers branch on
+# ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field.
+JSON_SCHEMA_VERSION = "2"
 
 
 def _partition_by_family(
@@ -134,9 +135,8 @@ def _structural_block(findings: Sequence[LocatedFinding]) -> str:
 
 
 def _render_structural(lf: LocatedFinding) -> str:
-    head = (
-        f"{_format_line_range(lf.finding.line_start, lf.finding.line_end)}  {lf.finding.kind.value}"
-    )
+    loc = _format_line_range(lf.finding.line_start, lf.finding.line_end)
+    head = f"{loc}  {severity_of(lf).value}  {lf.finding.kind.value}"
     body_lines: list[str] = [head]
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
     snippet = lf.finding.sql_snippet.strip()
@@ -147,7 +147,7 @@ def _render_structural(lf: LocatedFinding) -> str:
 
 def _declaration_block(finding: CheckFinding) -> str:
     where = finding.model_unique_id or finding.contract or "<project>"
-    head = f"  {finding.kind.value}  {where}"
+    head = f"  {severity_of(finding).value}  {finding.kind.value}  {where}"
     if finding.column:
         head += f".{finding.column}"
     lines = [head, f"      {finding.message}"]
@@ -236,6 +236,7 @@ class JsonCoverage(TypedDict):
 class JsonFinding(TypedDict):
     family: str
     kind: str
+    severity: str
     message: str
     model_unique_id: str | None
     file_path: str | None
@@ -340,6 +341,7 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
             return {
                 "family": "declaration",
                 "kind": finding.kind.value,
+                "severity": severity_of(finding).value,
                 "message": finding.message,
                 "model_unique_id": finding.model_unique_id,
                 "file_path": finding.file_path,
@@ -354,6 +356,7 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
             return {
                 "family": "structural",
                 "kind": inner.kind.value,
+                "severity": severity_of(finding).value,
                 "message": inner.message,
                 "model_unique_id": finding.model_unique_id,
                 "file_path": finding.file_path,

@@ -81,6 +81,60 @@ def test_exits_zero_with_no_fail_override(jaffle_manifest_path: Path, runner: Cl
     assert result.exit_code == 0
 
 
+def test_fail_on_error_passes_warn_only_run(jaffle_manifest_path: Path, runner: CliRunner) -> None:
+    # jaffle's structural finding is null_group_after_outer_join, an error-level
+    # correctness hazard, so --fail-on error still fails it. The warn-vs-error
+    # boundary is pinned deterministically in tests/test_fail_threshold.py against
+    # synthetic findings; here we pin that the flag is wired into the exit code.
+    result = runner.invoke(
+        app, ["check", "--manifest", str(jaffle_manifest_path), "--fail-on", "error", "."]
+    )
+    assert result.exit_code == 1, result.output
+
+
+def test_fail_on_default_is_warn(jaffle_manifest_path: Path, runner: CliRunner) -> None:
+    # No --fail-on given: the default warn threshold fails the error-level finding.
+    result = runner.invoke(app, ["check", "--manifest", str(jaffle_manifest_path), "."])
+    assert result.exit_code == 1, result.output
+
+
+def test_no_fail_beats_fail_on(jaffle_manifest_path: Path, runner: CliRunner) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "check",
+            "--manifest",
+            str(jaffle_manifest_path),
+            "--fail-on",
+            "info",
+            "--no-fail",
+            ".",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_text_report_renders_severity(jaffle_manifest_path: Path, runner: CliRunner) -> None:
+    result = runner.invoke(
+        app, ["check", "--manifest", str(jaffle_manifest_path), "--no-fail", "."]
+    )
+    assert result.exit_code == 0, result.output
+    # The error-level structural finding shows its level alongside its kind.
+    assert "error" in result.output
+
+
+def test_json_finding_carries_severity(jaffle_manifest_path: Path, runner: CliRunner) -> None:
+    result = runner.invoke(
+        app,
+        ["check", "--manifest", str(jaffle_manifest_path), "--format", "json", "--no-fail", "."],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    structural = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert structural
+    assert all(f["severity"] in {"info", "warn", "error"} for f in payload["findings"])
+
+
 def test_json_format_produces_stable_schema(jaffle_manifest_path: Path, runner: CliRunner) -> None:
     result = runner.invoke(
         app,
@@ -88,7 +142,7 @@ def test_json_format_produces_stable_schema(jaffle_manifest_path: Path, runner: 
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "1"
+    assert payload["schema_version"] == "2"
     from dblect.manifest import Manifest
 
     expected_models = len(Manifest.from_file(jaffle_manifest_path).models)

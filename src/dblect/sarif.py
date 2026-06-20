@@ -19,17 +19,31 @@ from dblect.analysis import AnalysisFinding, AnalysisReport, cross_world_identit
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, UnbuiltModel
 from dblect.loader import LoadIssue
+from dblect.severity import Severity, severity_of
 
 SARIF_VERSION = "2.1.0"
 SARIF_SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
 _INFORMATION_URI = "https://github.com/dvryaboy/dblect"
 
-# Per-kind severity is future work; until it lands every finding reports at one level.
-_DEFAULT_LEVEL: Literal["warning"] = "warning"
 _FINGERPRINT_KEY = "dblectFindingIdentity/v1"
 
 _Level = Literal["none", "note", "warning", "error"]
 _Family = Literal["structural", "declaration"]
+
+# dblect's three levels map onto the SARIF levels a code-scanning surface renders:
+# an error stays an error, a determinism warn is a SARIF warning, and an info is a note.
+_SARIF_LEVEL: dict[Severity, _Level] = {
+    Severity.ERROR: "error",
+    Severity.WARN: "warning",
+    Severity.INFO: "note",
+}
+# The level a notification (a model the analysis could not read) reports at: a coverage
+# gap, surfaced as a warning so it is visible without being read as a finding.
+_NOTIFICATION_LEVEL: Literal["warning"] = "warning"
+
+
+def _sarif_level(finding: AnalysisFinding) -> _Level:
+    return _SARIF_LEVEL[severity_of(finding)]
 
 
 # --- SARIF object shapes (the subset dblect emits) ---------------------------
@@ -171,20 +185,24 @@ def _build_rules(
     active: list[AnalysisFinding], suppressed: list[SuppressedFinding]
 ) -> tuple[list[_ReportingDescriptor], dict[str, int]]:
     """The rules every result references, sorted by id, with an id->index map built
-    from that order so each result's ``ruleIndex`` is correct."""
-    ids = {_rule_id(f) for f in active}
-    ids.update(_rule_id(s.located) for s in suppressed)
-    rules = [_descriptor(rule_id) for rule_id in sorted(ids)]
+    from that order so each result's ``ruleIndex`` is correct. A rule id identifies one
+    kind, so the kind's severity sets the rule's default level."""
+    levels: dict[str, _Level] = {}
+    for f in active:
+        levels[_rule_id(f)] = _sarif_level(f)
+    for s in suppressed:
+        levels[_rule_id(s.located)] = _sarif_level(s.located)
+    rules = [_descriptor(rule_id, levels[rule_id]) for rule_id in sorted(levels)]
     return rules, {rule["id"]: i for i, rule in enumerate(rules)}
 
 
-def _descriptor(rule_id: str) -> _ReportingDescriptor:
+def _descriptor(rule_id: str, level: _Level) -> _ReportingDescriptor:
     _, _, kind = rule_id.partition("/")
     return {
         "id": rule_id,
         "name": _pascal_case(kind),
         "shortDescription": {"text": kind.replace("_", " ")},
-        "defaultConfiguration": {"level": _DEFAULT_LEVEL},
+        "defaultConfiguration": {"level": level},
     }
 
 
@@ -193,7 +211,7 @@ def _result_for(finding: AnalysisFinding, rule_index: dict[str, int]) -> _Result
     result: _Result = {
         "ruleId": rule_id,
         "ruleIndex": rule_index[rule_id],
-        "level": _DEFAULT_LEVEL,
+        "level": _sarif_level(finding),
         "message": {"text": _message(finding)},
         "partialFingerprints": {_FINGERPRINT_KEY: _fingerprint(finding)},
     }
@@ -316,7 +334,7 @@ def _notifications(
 def _notification(descriptor_id: str, text: str, logical_name: str) -> _Notification:
     return {
         "descriptor": {"id": descriptor_id},
-        "level": _DEFAULT_LEVEL,
+        "level": _NOTIFICATION_LEVEL,
         "message": {"text": text},
         "locations": [{"logicalLocations": [{"fullyQualifiedName": logical_name}]}],
     }
