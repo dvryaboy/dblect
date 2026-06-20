@@ -12,6 +12,7 @@ import typer
 
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
+    from dblect.analysis import AnalysisReport
     from dblect.manifest import Manifest
 
 app = typer.Typer(
@@ -118,6 +119,24 @@ def check(
             ),
         ),
     ] = None,
+    diff: Annotated[
+        str | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--diff",
+            metavar="BASE_REF",
+            help=(
+                "Limit structural findings to lines changed since BASE_REF, using "
+                "`git diff --unified=0 BASE_REF...HEAD`. A finding is kept when its "
+                "model's source file was touched and, where the compiled line numbers "
+                "can be trusted, the line span intersects the change. Structural line "
+                "numbers index the compiled SQL, so for macro-heavy models (compiled "
+                "lines differ from source) the filter falls back to file-level "
+                "membership rather than drop a real finding. Declaration findings carry "
+                "no line and pass through unchanged. Falls back to the full report when "
+                "the project is not a git checkout or BASE_REF does not resolve."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Check a dbt project: structural hazards and declaration-level contracts.
 
@@ -145,6 +164,8 @@ def check(
         loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
     )
     report = replace(report, check=replace(report.check, load_issues=load_result.issues))
+    if diff is not None:
+        report = _apply_diff_filter(report, project_dir=project_dir, base_ref=diff, command="check")
     match output_format:
         case OutputFormat.JSON:
             rendered = render_json(report)
@@ -222,6 +243,43 @@ def _scaffold_declarations(decl: Path) -> list[Path]:
         path.write_text(body)
         created.append(path)
     return created
+
+
+def _apply_diff_filter(
+    report: AnalysisReport, *, project_dir: Path, base_ref: str, command: str
+) -> AnalysisReport:
+    """Narrow ``report`` to findings on lines changed since ``base_ref``.
+
+    Degrades honestly: when the project is not a git checkout or ``base_ref`` does
+    not resolve, the changed-line map is unavailable and the full report is returned
+    unchanged, with a note on stderr so the operator knows the filter was a no-op.
+    The structural family is filtered (declaration findings carry no line and pass
+    through); both the merged ``findings`` view and the audit family's own
+    ``findings`` are narrowed so the report stays coherent.
+    """
+    from dataclasses import replace
+
+    from dblect.diff_filter import (
+        changed_lines_from_git,
+        filter_located_to_changed_lines,
+        filter_to_changed_lines,
+    )
+
+    changed = changed_lines_from_git(project_dir, base_ref)
+    if changed is None:
+        typer.echo(
+            f"{command}: --diff base ref `{base_ref}` could not be resolved against a git "
+            f"checkout at {project_dir}; reporting the full result.",
+            err=True,
+        )
+        return report
+    filtered = filter_to_changed_lines(report.findings, changed)
+    audit_findings = filter_located_to_changed_lines(report.audit.findings, changed)
+    return replace(
+        report,
+        findings=filtered,
+        audit=replace(report.audit, findings=audit_findings),
+    )
 
 
 def _resolve_profile(
