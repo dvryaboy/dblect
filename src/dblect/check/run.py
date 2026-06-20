@@ -339,6 +339,7 @@ def _issue_findings(resolved: ResolvedContracts) -> list[CheckFinding]:
             model_unique_id=None,
             contract=issue.contract,
             column=issue.field,
+            code=issue.code,
         )
         for issue in resolved.issues
     ]

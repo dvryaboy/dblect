@@ -250,11 +250,13 @@ total.
 
 Then read the findings. Three kinds matter:
 
-- **`contract_issue`**: a declaration does not line up with the manifest. The message
-  names the cause and the field, one of: an unresolved model (misspelled or renamed),
-  an unknown column (not on the model), an unsourced field (a type facet with no
-  column behind it), or an out-of-domain value. Fix the declaration to match the real
-  names in `_stubs/models.py`.
+- **`contract_issue`**: a declaration does not line up with the manifest. The head
+  names the precise cause in parentheses, e.g. `contract_issue (unsourced_field)`, and
+  the message names the field. The causes are `unresolved_model` (misspelled or
+  renamed), `ambiguous_model`, `unknown_column` (not on the model), `unsourced_field`
+  (a type facet with no column behind it), `out_of_domain_value`, and the declaration
+  and foreign-key variants. Let the parenthesized cause tell you which fix applies,
+  then correct the declaration against the real names in `_stubs/models.py`.
 - **`domain_type_contradiction`**: the meaning you declared conflicts with what the
   DAG carries (a currency creeping in where you pinned USD, a net figure flowing into
   a gross contract). The headline catch. Decide whether the declaration is stale (open

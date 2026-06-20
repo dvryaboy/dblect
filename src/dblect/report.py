@@ -147,7 +147,12 @@ def _render_structural(lf: LocatedFinding) -> str:
 
 def _declaration_block(finding: CheckFinding) -> str:
     where = finding.model_unique_id or finding.contract or "<project>"
-    head = f"  {finding.kind.value}  {where}"
+    kind = finding.kind.value
+    # A contract issue names its specific cause inline, so the reader distinguishes an
+    # unsourced field from any other contract issue without reading the body.
+    if finding.code is not None:
+        kind += f" ({finding.code.value})"
+    head = f"  {kind}  {where}"
     if finding.column:
         head += f".{finding.column}"
     lines = [head, f"      {finding.message}"]

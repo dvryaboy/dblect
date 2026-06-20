@@ -15,6 +15,7 @@ from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFi
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
 from dblect.report import render_json, render_text
 from dblect.sql import Finding, FindingKind
+from dblect.types import IssueCode
 
 _MODEL = "model.p.m"
 
@@ -78,6 +79,31 @@ def test_text_shows_both_families_under_one_report() -> None:
     # declaration family: model.column block
     assert "declaration findings:" in text
     assert "domain_type_contradiction  model.p.m.amount" in text
+
+
+def test_text_head_carries_the_issue_code_for_a_contract_issue() -> None:
+    # A contract-issue head names its cause inline, so the reader sees an unsourced
+    # field distinguished from any other contract issue without reading the body.
+    issue = CheckFinding(
+        kind=CheckFindingKind.CONTRACT_ISSUE,
+        message="field 'currency' needs column 'currency', absent from the model",
+        model_unique_id="model.p.orders",
+        column="coupon_amount",
+        contract="Orders",
+        code=IssueCode.UNSOURCED_FIELD,
+    )
+    text = render_text(_report(declaration=(issue,)))
+    assert "contract_issue (unsourced_field)  model.p.orders.coupon_amount" in text
+    # the full explanation still rides the body
+    assert "needs column 'currency'" in text
+
+
+def test_text_head_omits_code_for_a_non_contract_issue() -> None:
+    # A finding kind that carries no IssueCode renders its head with no code token,
+    # never a stray `(None)`.
+    text = render_text(_report(declaration=(_declaration(),)))
+    assert "domain_type_contradiction" in text
+    assert "domain_type_contradiction (" not in text
 
 
 def test_text_singular_plural_and_clean_report() -> None:

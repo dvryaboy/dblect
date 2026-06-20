@@ -24,7 +24,7 @@ from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
-from dblect.types import ModelContract
+from dblect.types import IssueCode, ModelContract
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -66,6 +66,40 @@ def test_unresolved_contract_is_a_finding() -> None:
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={})
     report = run_check(manifest, _DUCKDB)
     assert _kinds(report) == [CheckFindingKind.CONTRACT_ISSUE]
+
+
+def test_contract_issue_findings_carry_their_distinct_cause_codes() -> None:
+    # Each contract issue pins its specific cause, not just the shared bucket, so a
+    # consumer can tell one cause from another. Two distinct causes in one run prove
+    # the code tracks the issue rather than a single hardcoded value, observed through
+    # the public check boundary. One model name resolves to two nodes (ambiguous), the
+    # other to none (unresolved).
+    orders = _node(
+        "model.shop.orders", kind=ResourceType.MODEL, sql="SELECT 1 AS x", columns=_cols(x="INT")
+    )
+    orders_dupe = _node(
+        "model.other.orders", kind=ResourceType.MODEL, sql="SELECT 1 AS x", columns=_cols(x="INT")
+    )
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={orders.unique_id: orders, orders_dupe.unique_id: orders_dupe},
+    )
+
+    class Ambiguous(ModelContract):
+        dbt_model = "orders"
+        amount: MoneyUSD
+
+    class Ghost(ModelContract):
+        dbt_model = "does_not_exist"
+        amount: MoneyUSD
+
+    report = run_check(manifest, _DUCKDB)
+    assert {f.code for f in report.findings} == {
+        IssueCode.AMBIGUOUS_MODEL,
+        IssueCode.UNRESOLVED_MODEL,
+    }
+    assert all(f.kind is CheckFindingKind.CONTRACT_ISSUE for f in report.findings)
 
 
 def test_a_model_that_cannot_be_analyzed_is_surfaced() -> None:
