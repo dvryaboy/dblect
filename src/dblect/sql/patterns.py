@@ -48,15 +48,7 @@ class FindingKind(StrEnum):
 
 
 def suppression_hint(kind: FindingKind) -> str:
-    """The copy-pasteable nudge pointing the reader at the `-- noqa-fixture:` syntax.
-
-    The suppression mechanism silences any structural finding by line, so the hint
-    applies uniformly; the reporter shows it on each finding. Authored once and
-    substituted with the finding's real kind value, so the line it prints is exactly
-    what the suppression scanner accepts: ``-- noqa-fixture: <kind>: <reason>``.
-    Advice, not observation, so the reporter appends it at render time rather than
-    baking it into ``Finding.message``.
-    """
+    # The suggested directive must stay valid suppression syntax (round-trip tested).
     return f"If this is intentional, record it with `-- noqa-fixture: {kind.value}: <reason>`."
 
 

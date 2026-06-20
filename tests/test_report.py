@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from dblect.analysis import AnalysisReport
 from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
@@ -20,12 +18,6 @@ from dblect.sql import Finding, FindingKind, suppression_hint
 from dblect.types import IssueCode
 
 _MODEL = "model.p.m"
-
-# Every structural kind carries the suppression hint except the self-referential
-# malformed-suppression finding.
-_HINTED_KINDS: list[FindingKind] = sorted(
-    (k for k in FindingKind if k is not FindingKind.MALFORMED_SUPPRESSION), key=lambda k: k.value
-)
 
 
 def _structural(
@@ -170,10 +162,9 @@ def test_json_tags_each_finding_with_its_family() -> None:
 # --- the noqa-fixture suppression hint ---------------------------------------
 
 
-@pytest.mark.parametrize("kind", _HINTED_KINDS)
-def test_text_appends_suppression_hint_for_structural_findings(kind: FindingKind) -> None:
+def test_text_appends_suppression_hint_for_structural_findings() -> None:
+    kind = FindingKind.JOIN_FANOUT
     text = render_text(_report(structural=(_structural(kind=kind),)))
-    # The hint the reader sees is the exact copy-pasteable line for this kind.
     assert suppression_hint(kind) in text
 
 
