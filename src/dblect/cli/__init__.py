@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
+import yaml  # type: ignore[import-untyped]
 
 from dblect.bootstrap import SetupTarget
 
@@ -50,8 +53,9 @@ def check(
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
             "--manifest",
             help=(
-                "Path to a manifest.json. If omitted, dblect looks for "
-                "<project_dir>/target/manifest.json and falls back to running "
+                "Path to a manifest.json. If omitted, dblect looks under the "
+                "project's dbt target-path (honoring DBT_TARGET_PATH and "
+                "dbt_project.yml, defaulting to target/) and falls back to running "
                 "`dbt compile` to produce one."
             ),
         ),
@@ -288,6 +292,48 @@ def _resolve_profile(
     return profile
 
 
+def _target_path_from_project(project_dir: Path) -> str | None:
+    """The ``target-path`` a ``dbt_project.yml`` configures, or ``None``.
+
+    dbt accepts it top-level (``target-path:``) and, on recent versions, under
+    ``flags: {target_path: ...}``; the ``flags`` form is canonical now, so it
+    wins when both are present. A missing file, missing key, or unparseable YAML
+    yields ``None``: the caller falls back to ``target/`` and leaves any genuine
+    config error for dbt itself to report."""
+    project_yml = project_dir / "dbt_project.yml"
+    if not project_yml.exists():
+        return None
+    try:
+        parsed: object = yaml.safe_load(project_yml.read_text())
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    cfg = cast("Mapping[str, object]", parsed)
+    flags = cfg.get("flags")
+    if isinstance(flags, Mapping):
+        nested = cast("Mapping[str, object]", flags).get("target_path")
+        if isinstance(nested, str) and nested:
+            return nested
+    value = cfg.get("target-path")
+    return value if isinstance(value, str) and value else None
+
+
+def _resolve_target_dir(project_dir: Path) -> Path:
+    """The directory dbt writes compiled artifacts to, honoring a customized
+    ``target-path`` so a project that builds elsewhere works with no flags.
+
+    dbt's precedence is the ``--target-path`` CLI flag, then ``DBT_TARGET_PATH``,
+    then ``dbt_project.yml``, then the ``target/`` default. dblect has no
+    target-path flag of its own (``--manifest`` and ``--catalog`` override the
+    resolved files directly and short-circuit before this runs), so this covers
+    the env var, the project config, and the default. A relative value resolves
+    against the project directory, matching dbt."""
+    raw = os.environ.get("DBT_TARGET_PATH") or _target_path_from_project(project_dir)
+    target = Path(raw) if raw else Path("target")
+    return target if target.is_absolute() else project_dir / target
+
+
 def _resolve_manifest_path(
     *,
     project_dir: Path,
@@ -299,7 +345,7 @@ def _resolve_manifest_path(
         if not explicit.exists():
             raise typer.BadParameter(f"manifest path does not exist: {explicit}")
         return explicit
-    default = project_dir / "target" / "manifest.json"
+    default = _resolve_target_dir(project_dir) / "manifest.json"
     if default.exists():
         return default
     if not (project_dir / "dbt_project.yml").exists():
