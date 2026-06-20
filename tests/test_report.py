@@ -99,10 +99,11 @@ def test_text_head_carries_the_issue_code_for_a_contract_issue() -> None:
 
 
 def test_text_head_omits_code_for_a_non_contract_issue() -> None:
-    # A finding kind that carries no IssueCode renders without a spurious code token.
+    # A finding kind that carries no IssueCode renders its head with no code token,
+    # never a stray `(None)`.
     text = render_text(_report(declaration=(_declaration(),)))
-    assert "domain_type_contradiction  model.p.m.amount" in text
-    assert "(" not in text.split("declaration findings:")[1].splitlines()[1]
+    assert "domain_type_contradiction" in text
+    assert "domain_type_contradiction (" not in text
 
 
 def test_text_singular_plural_and_clean_report() -> None:
