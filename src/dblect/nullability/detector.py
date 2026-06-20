@@ -19,6 +19,7 @@ undeclared project sees no noise).
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from enum import StrEnum
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -27,15 +28,39 @@ from dblect.adapters import AdapterProfile
 from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import ColumnRef, SourceKind
 from dblect.lineage.properties import Nullability
-from dblect.lineage.properties.nullability import activated_nullability
+from dblect.lineage.properties.nullability import (
+    activated_nullability,
+    outer_join_nullable_columns,
+)
 from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind, finding_at
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import JoinSide
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
 # Per relation name (as it appears in compiled SQL), the columns proven NULLABLE.
 NullableByName = Mapping[str, frozenset[str]]
+
+
+class NullableCause(StrEnum):
+    """Why a column is nullable upstream, when the substrate can attribute it.
+
+    The ``*_JOIN`` causes are positive structural claims the nullability substrate already
+    derives (the column is drawn from an outer join's optional side), named by the join kind
+    that padded it. ``UNKNOWN`` is the honest fallback: the column is proven NULLABLE, but
+    the cause is not derivable here, so the finding names no cause rather than fabricating
+    one."""
+
+    LEFT_JOIN = "left_join"
+    RIGHT_JOIN = "right_join"
+    FULL_JOIN = "full_join"
+    UNKNOWN = "unknown"
+
+
+# Per relation name, the column-to-cause map for proven-NULLABLE columns whose cause the
+# substrate attributes. A column absent from the inner map reads as ``UNKNOWN``.
+CauseByName = Mapping[str, Mapping[str, NullableCause]]
 
 
 def detect_null_group_on_nullable_key(
@@ -76,7 +101,7 @@ def detect_null_group_on_nullable_key(
 
 
 def detect_join_on_nullable_key(
-    tree: Expr, *, nullable_by_name: NullableByName
+    tree: Expr, *, nullable_by_name: NullableByName, cause_by_name: CauseByName | None = None
 ) -> tuple[Finding, ...]:
     """Flag a JOIN whose equality key is a column nullable in its upstream relation.
 
@@ -87,6 +112,7 @@ def detect_join_on_nullable_key(
     structural ``coalesce_on_join_key`` and ``where_on_outer_joined_nullable``. Only
     bare-column equality keys are reasoned about.
     """
+    causes_by_relation = cause_by_name or {}
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         alias_to_rel = _alias_to_relation(sel)
@@ -101,8 +127,14 @@ def detect_join_on_nullable_key(
                 cols = sg.equality_cols_on_alias(on, alias)
                 if not cols:
                     continue
+                causes = causes_by_relation.get(relation, {})
                 out.extend(
-                    _join_finding(join, source=relation, column=column)
+                    _join_finding(
+                        join,
+                        source=relation,
+                        column=column,
+                        cause=causes.get(column, NullableCause.UNKNOWN),
+                    )
                     for column in sorted(cols & nullable)
                 )
     return tuple(out)
@@ -179,14 +211,33 @@ def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
     )
 
 
-def _join_finding(join: exp.Join, *, source: str, column: str) -> Finding:
+def _cause_clause(cause: NullableCause) -> str:
+    """The ``why nullable`` clause, when the substrate attributes a cause. Returns an empty
+    string for ``UNKNOWN`` so the message degrades honestly rather than fabricating one."""
+    match cause:
+        case NullableCause.LEFT_JOIN:
+            return " (produced via a left join, so unmatched rows leave it NULL)"
+        case NullableCause.RIGHT_JOIN:
+            return " (produced via a right join, so unmatched rows leave it NULL)"
+        case NullableCause.FULL_JOIN:
+            return " (produced via a full join, so unmatched rows leave it NULL)"
+        case NullableCause.UNKNOWN:
+            return ""
+
+
+def _join_finding(
+    join: exp.Join, *, source: str, column: str, cause: NullableCause = NullableCause.UNKNOWN
+) -> Finding:
     return finding_at(
         FindingKind.JOIN_ON_NULLABLE_KEY,
         message=(
-            f"JOIN keys on {column}, which is nullable upstream in {source!r}; NULL never "
-            f"equals NULL, so rows with a NULL {column} never match and are silently dropped "
-            f"(inner join) or left unmatched (outer join). Filter the nulls or COALESCE to a "
-            f"sentinel if the match was intended."
+            f"JOIN keys on {column}, which is nullable upstream in {source!r}"
+            f"{_cause_clause(cause)}; NULL never equals NULL, so rows with a NULL {column} "
+            f"never match and are silently dropped (inner join) or left unmatched (outer "
+            f"join). The durable guard is a not_null test on {column} in {source!r}, which "
+            f"turns this silent row loss into a loud test failure on the producing model; "
+            f"or, locally, filter the nulls or COALESCE to a sentinel if the match was "
+            f"intended."
         ),
         node=join,
     )
@@ -227,6 +278,28 @@ def _nullable_by_name(
     return {name: frozenset(cols) for name, cols in merged.items()}
 
 
+_CAUSE_OF_SIDE: Mapping[JoinSide, NullableCause] = {
+    JoinSide.LEFT: NullableCause.LEFT_JOIN,
+    JoinSide.RIGHT: NullableCause.RIGHT_JOIN,
+    JoinSide.FULL: NullableCause.FULL_JOIN,
+}
+
+
+def _cause_by_name(
+    manifest: Manifest, *, parsed: Mapping[str, Expr] | None = None
+) -> dict[str, dict[str, NullableCause]]:
+    """Index, by relation name, the attributable ``why nullable`` cause per column.
+
+    Only the outer-join cause is attributable today, read from the same structural
+    analysis the nullability taint uses (:func:`outer_join_nullable_columns`). A column
+    the substrate cannot attribute is simply absent, so the finding reads it as
+    ``UNKNOWN`` and names no cause."""
+    out: dict[str, dict[str, NullableCause]] = {}
+    for name, columns in outer_join_nullable_columns(manifest, parsed=parsed).items():
+        out[name] = {col: _CAUSE_OF_SIDE[side] for col, side in columns.items()}
+    return out
+
+
 def make_nullability_detectors(
     manifest: Manifest,
     profile: AdapterProfile,
@@ -245,12 +318,15 @@ def make_nullability_detectors(
     nullable_by_name = _nullable_by_name(
         manifest, activated_nullability(manifest, profile, parsed=parsed)
     )
+    cause_by_name = _cause_by_name(manifest, parsed=parsed)
 
     def group_by_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_null_group_on_nullable_key(tree, nullable_by_name=nullable_by_name)
 
     def join_on_nullable(tree: Expr) -> tuple[Finding, ...]:
-        return detect_join_on_nullable_key(tree, nullable_by_name=nullable_by_name)
+        return detect_join_on_nullable_key(
+            tree, nullable_by_name=nullable_by_name, cause_by_name=cause_by_name
+        )
 
     def not_in_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_not_in_nullable_subquery(tree, nullable_by_name=nullable_by_name)
