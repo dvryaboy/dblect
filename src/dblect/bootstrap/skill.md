@@ -53,9 +53,14 @@ only when it rides on a magnitude as that magnitude's unit, as `currency` does o
 Restraint is part of the job. Type a column only when one of the two kinds above
 genuinely lives in it. A bare identifier is not a type; a key or foreign key is
 already read from your dbt test; an unconstrained free-text or one-off numeric column
-is just its SQL type. A vouched declaration the data does not support is worse than
-none, because dblect trusts it and propagates it. When in doubt, leave it, or ask the
-user rather than guess (see "Interview the user").
+is just its SQL type. One more case earns a deliberate skip: a **data-dependent
+unit**, where the parameter that fixes a magnitude's meaning lives in the data rather
+than in code or a companion column. A "season wins" figure whose basis is 80 games
+some seasons and 82 others, set by the schedule, cannot be honestly pinned to either,
+and there is no column carrying the basis to bind to. Pinning it would be a vouched
+claim that is wrong half the time, so leave it untyped. A vouched declaration the
+data does not support is worse than none, because dblect trusts it and propagates it.
+When in doubt, leave it, or ask the user rather than guess (see "Interview the user").
 
 Two further surfaces are out of scope for this pass, because they do not run on the
 `dblect check` path yet: configuration flags (`DomainFlag`) and runnable contract
@@ -79,6 +84,22 @@ dblect init .
 
 `init` scaffolds the `dblect/` declaration tree and writes `dblect/_stubs/models.py`.
 
+**Check `target-path` first.** dblect looks for the manifest and catalog under
+`<project>/target/` by default. If `dbt_project.yml` sets a non-default `target-path`
+(for example `target-path: ../docs`), `init` and `check` will not find the artifacts
+there and `init` fails with "dbt compile succeeded but target/manifest.json is
+missing." Read `target-path` from `dbt_project.yml`, and if it is not `target`, pass
+`--manifest <path>/manifest.json` and `--catalog <path>/catalog.json` on **every**
+`init` and `check`. Settle this once.
+
+**List the Python models, because dblect cannot see them.** dblect analyzes a model
+by parsing its compiled SQL, so a dbt Python model (`.py`, `language: python`) cannot
+be parsed and is reported under `skipped:` with a parse-error reason. This matters
+beyond those models: a column whose lineage passes through a skipped model loses its
+provenance, which can turn a real check into a conservative artifact (see Step 5).
+Note which models are Python up front so you recognize the gap when a finding lands
+on a column downstream of one.
+
 **Get the column names right, because every binding depends on them.** dblect
 resolves a declared column against the project's compiled columns. Two sources feed
 that resolution, and they differ in coverage:
@@ -93,7 +114,9 @@ that resolution, and they differ in coverage:
 So produce the catalog before you rely on resolution. If the models are built,
 `dbt docs generate` writes `target/catalog.json`; if not, `dbt build` first. Without
 it, undocumented leaf columns (seeds, sources) will not resolve and your bindings
-will look like they are missing when they are merely unseen.
+will look like they are missing when they are merely unseen. When the stubs look
+thin or stale, read a model's real columns straight from `catalog.json`
+(`nodes.<unique_id>.columns`) rather than trusting the stub.
 
 Read the project structure: the `models/` tree (usually split into `staging/` and
 `marts/`), each model's `.sql`, and the `schema.yml` files that carry column
@@ -193,6 +216,33 @@ RevenueUSD = Money.refine(currency=Currency.USD)
 # Multi-currency: bind the currency facet to the column that records it.
 PaymentMoney = Money.columns(amount="amount", currency="currency")
 ```
+
+**A magnitude on a fixed scale is the same shape, with a one-member unit.** Money is
+the multi-unit case (the currency varies). Many loaded columns are magnitudes on a
+single fixed scale: an Elo rating, a probability on a `0..10000` integer scale, a
+score. They are not plain `Decimal`s, because an Elo is not interchangeable with a
+probability even though both are numbers. Give the magnitude its own identity with a
+`UnitEnum` that has one member, and `refine` to pin that sole unit (the same move as
+pinning a single currency). Pinning is what sources the unit facet; leave it open and
+the facet has no column behind it, which surfaces as `unsourced_field`.
+
+```python
+from dblect.types import Decimal, DomainType, UnitEnum
+
+class RatingScale(UnitEnum):
+    ELO = "elo"
+
+class Rating(DomainType):
+    value: Decimal(10, 2)
+    scale: RatingScale
+
+# Pin the sole unit. An Elo rating and a probability are now distinct types that do
+# not unify, even though both are just numbers underneath.
+EloRating = Rating.refine(scale=RatingScale.ELO)
+```
+
+For a dimensionless count (a number of games, rows, attempts), use the built-in
+`Count` magnitude rather than inventing a unit; it is always safe to sum.
 
 **Bind types to a model with a `ModelContract`.** Name the model with `dbt_model`
 and annotate each column you are typing. A contract with only column bindings and
@@ -313,6 +363,16 @@ Then read the findings and loop. Two kinds matter here:
   into a gross contract. This is the headline catch. Decide whether the declaration
   is stale (the data legitimately changed and the type should open up) or the SQL
   introduced a real bug, and fix the half that is wrong.
+- **`aggregation_not_well_typed`** means a sum or other aggregate combined values the
+  analyzer could not prove are the same kind. Often that is the real catch (a
+  mixed-currency sum). But it can also be a conservative artifact: when the group
+  shape is unresolved, or the column's lineage routes through a **skipped Python
+  model** (Step 1), the analyzer cannot prove per-group constancy and fires rather
+  than stay silent. Before acting on one, test whether it is real: does it fire
+  independent of the column it supposedly conflicts with, and does the lineage trace
+  back through a skipped model or an unresolved group? If so, it is a can't-prove
+  artifact from a lineage gap, not a meaning conflict; note it and move on rather than
+  contorting the declarations to chase it.
 
 Iterate until the contract issues are gone. A remaining `domain_type_contradiction`
 may be a true finding worth surfacing to the user rather than silencing; explain it
@@ -320,8 +380,9 @@ and let them decide.
 
 ## What good looks like
 
-A small, honest declaration layer: domain types on the money and rate columns that
-matter, refinements that pin the currency or the net/gross reading you confirmed
-with the user, and a functional-dependency fact or two where a rollup needs it. A
-handful of contracts, not a wall of them. Every binding grounded in a real column
-name and every vouched fact grounded in a real invariant of the project.
+A small, honest declaration layer: domain types on the magnitudes that carry a unit
+(money, rates, fixed-scale quantities), refinements that pin the unit or the
+net/gross reading you confirmed with the user, and a functional-dependency fact or
+two where a rollup needs it. A handful of contracts, not a wall of them. Every
+binding grounded in a real column name and every vouched fact grounded in a real
+invariant of the project.
