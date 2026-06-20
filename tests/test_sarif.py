@@ -24,6 +24,7 @@ from dblect.loader import LoadIssue
 from dblect.manifest import Manifest
 from dblect.sarif import SARIF_VERSION, render_sarif
 from dblect.sql import Finding, FindingKind
+from dblect.types import IssueCode
 
 _SCHEMA_PATH = Path(__file__).parent / "fixtures" / "sarif" / "sarif-2.1.0.schema.json"
 _VERSION = "9.9.9"
@@ -66,12 +67,23 @@ def _declaration(*, column: str | None) -> CheckFinding:
     )
 
 
+def _contract_issue() -> CheckFinding:
+    return CheckFinding(
+        kind=CheckFindingKind.CONTRACT_ISSUE,
+        message="field 'currency' needs column 'currency', absent from the model",
+        model_unique_id=None,
+        column="coupon_amount",
+        contract="Orders",
+        code=IssueCode.UNSOURCED_FIELD,
+    )
+
+
 def _every_branch_report() -> AnalysisReport:
     """A report touching each shape the reporter emits: a located and an unlocated
     structural finding, a declaration finding with and without a column, a suppressed
     finding, and each kind of unanalyzed-model notification."""
     structural = (_located(line=9), _located(line=0))
-    declaration = (_declaration(column="amount"), _declaration(column=None))
+    declaration = (_declaration(column="amount"), _declaration(column=None), _contract_issue())
     check = CheckReport(
         findings=declaration,
         load_issues=(LoadIssue(module="dblect.contracts.orders", message="ImportError"),),
@@ -93,6 +105,48 @@ def _every_branch_report() -> AnalysisReport:
 
 def test_every_emitted_shape_validates_against_the_sarif_schema() -> None:
     _validate(render_sarif(_every_branch_report(), version=_VERSION))
+
+
+def test_contract_issue_rule_id_subnamespaces_by_code_and_carries_it() -> None:
+    # Each contract-issue cause gets a stable, distinct ruleId so code scanning can
+    # group and triage by cause; the code also rides as a machine-readable property.
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(_contract_issue(),),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=1,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    report = AnalysisReport(findings=(_contract_issue(),), check=check, audit=audit)
+
+    run = _validate(render_sarif(report, version=_VERSION))["runs"][0]
+    (result,) = run["results"]
+    assert result["ruleId"] == "declaration/contract_issue/unsourced_field"
+    assert result["properties"]["code"] == "unsourced_field"
+    assert "declaration/contract_issue/unsourced_field" in {
+        r["id"] for r in run["tool"]["driver"]["rules"]
+    }
+
+
+def test_codeless_declaration_finding_keeps_its_bare_rule_id() -> None:
+    # A finding kind with no IssueCode keeps the family/kind ruleId and grows no code
+    # property, so only contract issues are sub-namespaced.
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(_declaration(column="amount"),),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=1,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    report = AnalysisReport(findings=(_declaration(column="amount"),), check=check, audit=audit)
+
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    assert result["ruleId"] == "declaration/domain_type_contradiction"
+    assert "properties" not in result
 
 
 def test_jaffle_output_validates_against_the_sarif_schema(jaffle_manifest_path: Path) -> None:

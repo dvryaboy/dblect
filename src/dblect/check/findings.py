@@ -16,6 +16,7 @@ from enum import StrEnum, auto
 
 from dblect.check.coverage import SINGLE_WORLD, GroundingCoverage, ResolutionCoverage, WorldCoverage
 from dblect.loader import LoadIssue
+from dblect.types.bridge import IssueCode
 
 
 class CheckFindingKind(StrEnum):
@@ -49,6 +50,9 @@ class CheckFinding:
     file_path: str | None = None
     column: str | None = None
     contract: str | None = None
+    code: IssueCode | None = None
+    """The specific resolution cause behind a ``CONTRACT_ISSUE``; ``None`` for the
+    other kinds, which carry no such code."""
 
 
 @dataclass(frozen=True, slots=True)
