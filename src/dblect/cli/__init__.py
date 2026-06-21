@@ -12,7 +12,9 @@ import typer
 
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
+    from dblect.analysis import AnalysisReport
     from dblect.manifest import Manifest
+    from dblect.types import ContractRegistry
 
 app = typer.Typer(
     name="dblect",
@@ -118,6 +120,32 @@ def check(
             ),
         ),
     ] = None,
+    base_manifest: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--base-manifest",
+            help=(
+                "Path to the base revision's manifest.json (for example the stored "
+                "production manifest dbt Slim CI keeps). dblect analyses it the same "
+                "way as HEAD and reports only the findings the change introduces: a "
+                "finding whose kind, model, and subject already exist in the base is "
+                "preexisting and filtered out. Because it diffs analysis results "
+                "rather than edited source lines, it catches a hazard a change "
+                "introduces through a macro or an upstream model without touching the "
+                "model's own file. Omitted, the full report is rendered."
+            ),
+        ),
+    ] = None,
+    base_catalog: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--base-catalog",
+            help=(
+                "Path to the base revision's catalog.json. Defaults to a catalog.json "
+                "beside --base-manifest. Only meaningful together with --base-manifest."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Check a dbt project: structural hazards and declaration-level contracts.
 
@@ -130,9 +158,13 @@ def check(
 
     from dblect import __version__
     from dblect.analysis import analyze
+    from dblect.baseline import introduced_findings
     from dblect.loader import load_declarations
     from dblect.report import render_json, render_text
     from dblect.sarif import render_sarif
+
+    if base_catalog is not None and base_manifest is None:
+        raise typer.BadParameter("--base-catalog has no effect without --base-manifest")
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
@@ -145,6 +177,19 @@ def check(
         loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
     )
     report = replace(report, check=replace(report.check, load_issues=load_result.issues))
+    if base_manifest is not None:
+        base = _analyze_base(
+            base_manifest=base_manifest,
+            base_catalog=base_catalog,
+            dialect_override=dialect_override,
+            registry=load_result.registry,
+            resolution_floor=resolution_floor,
+        )
+        # Narrow only the merged ``findings`` view: that is what every renderer and the
+        # exit code read. The family sub-reports keep their project-wide coverage
+        # metadata (models scanned, contracts resolved), which describes the whole run,
+        # not the introduced subset.
+        report = replace(report, findings=introduced_findings(report.findings, base.findings))
     match output_format:
         case OutputFormat.JSON:
             rendered = render_json(report)
@@ -222,6 +267,32 @@ def _scaffold_declarations(decl: Path) -> list[Path]:
         path.write_text(body)
         created.append(path)
     return created
+
+
+def _analyze_base(
+    *,
+    base_manifest: Path,
+    base_catalog: Path | None,
+    dialect_override: str | None,
+    registry: ContractRegistry,
+    resolution_floor: float | None,
+) -> AnalysisReport:
+    """Analyse the base revision's manifest the same way HEAD was analysed.
+
+    Same dialect resolution, same declarations (``registry``), and the same
+    resolution floor, so a finding's cross-world identity is comparable across the two
+    worlds. The base catalog defaults to a ``catalog.json`` beside ``base_manifest``,
+    matching the Slim CI layout where the stored manifest and catalog sit together.
+    """
+    from dblect.analysis import analyze
+
+    if not base_manifest.exists():
+        raise typer.BadParameter(f"--base-manifest path does not exist: {base_manifest}")
+    loaded = _load_manifest(
+        manifest_path=base_manifest, explicit_catalog=base_catalog, command="check (base)"
+    )
+    profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check (base)")
+    return analyze(loaded, profile, registry=registry, resolution_floor=resolution_floor)
 
 
 def _resolve_profile(
