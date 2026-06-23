@@ -78,11 +78,13 @@ def test_text_shows_both_families_under_one_report() -> None:
     assert "coverage:" in text
     # structural family: located block with the snippet
     assert "structural findings:" in text
-    assert "L9  join_fanout" in text
+    # join_fanout is an error-level correctness hazard; the level rides the head line.
+    assert "L9  error  join_fanout" in text
     assert "snippet: JOIN state ON e.id = s.id" in text
     # declaration family: model.column block
     assert "declaration findings:" in text
-    assert "domain_type_contradiction  model.p.m.amount" in text
+    # domain_type_contradiction is an error-level family default.
+    assert "error  domain_type_contradiction  model.p.m.amount" in text
 
 
 def test_text_head_carries_the_issue_code_for_a_contract_issue() -> None:
@@ -134,7 +136,7 @@ def test_json_tags_each_finding_with_its_family() -> None:
     payload = json.loads(
         render_json(_report(structural=(_structural(),), declaration=(_declaration(),)))
     )
-    assert payload["schema_version"] == "1"
+    assert payload["schema_version"] == "2"
     assert payload["summary"] == {
         "findings": 2,
         "structural": 1,
@@ -149,6 +151,8 @@ def test_json_tags_each_finding_with_its_family() -> None:
         "unbuilt": 0,
     }
     families = {f["family"]: f for f in payload["findings"]}
+    assert families["structural"]["severity"] == "error"
+    assert families["declaration"]["severity"] in {"info", "warn", "error"}
     assert families["structural"]["line_start"] == 9
     assert families["structural"]["sql_snippet"] == "JOIN state ON e.id = s.id"
     assert families["structural"]["column"] is None

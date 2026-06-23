@@ -14,6 +14,7 @@ import typer
 import yaml  # type: ignore[import-untyped]
 
 from dblect.bootstrap import SetupTarget
+from dblect.severity import Severity
 
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
@@ -103,13 +104,25 @@ def check(
             ),
         ),
     ] = None,
+    fail_on: Annotated[
+        Severity,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--fail-on",
+            help=(
+                "Severity threshold for the exit code: the run exits non-zero if any "
+                "unsuppressed finding is at or above this level, and 0 below it. "
+                "`error` is a correctness hazard, `warn` a determinism smell, `info` an "
+                "observation. `--no-fail` overrides this and always exits 0."
+            ),
+        ),
+    ] = Severity.WARN,
     no_fail: Annotated[
         bool,
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
             "--no-fail",
             help=(
-                "Always exit 0, even when findings exist. Default is to exit 1 "
-                "if any unsuppressed finding is reported."
+                "Always exit 0, even when findings exist. Overrides --fail-on. Default "
+                "is to exit non-zero per the --fail-on threshold (warn)."
             ),
         ),
     ] = False,
@@ -168,6 +181,7 @@ def check(
     from dblect.loader import load_declarations
     from dblect.report import render_json, render_text
     from dblect.sarif import render_sarif
+    from dblect.severity import exceeds_threshold
 
     if base_catalog is not None and base_manifest is None:
         raise typer.BadParameter("--base-catalog has no effect without --base-manifest")
@@ -204,7 +218,13 @@ def check(
         case OutputFormat.TEXT:
             rendered = render_text(report)
     typer.echo(rendered)
-    if (report.findings or report.check.load_issues) and not no_fail:
+    if no_fail:
+        return
+    # --no-fail wins above; otherwise the run fails when a finding meets the threshold,
+    # or when declarations failed to load (a load issue is the analysis not being able to
+    # read what it was asked to check, so it fails the run independent of any threshold).
+    crosses = exceeds_threshold(report.findings, fail_on)
+    if crosses or report.check.load_issues:
         raise typer.Exit(code=1)
 
 
