@@ -243,6 +243,12 @@ Silent degradation is sound but it can hide behind itself: a manifest where sqlg
 
 Separating the two keeps the floor from reporting thin coverage in exactly the adoption mode the design courts, where most columns legitimately carry no fact. The default posture stays silent-on-blindness for individual nodes; the floor is about the aggregate.
 
+### Compilation fidelity is the precondition for coverage
+
+The whole analysis reads `compiled_code` and assumes it faithfully represents the model. Hermetic compilation, where rendering a model needs no live warehouse, makes that assumption hold for free. A compile run that did not reach the warehouse breaks it, and the gap is surfaced rather than absorbed silently.
+
+A model can carry empty or stale `compiled_code` while its source template is non-trivial (a macro that needs `execute`-time access produced nothing at parse time), and the manifest can mark a node as not compiled outright. Reading either as an empty model would analyse SQL that never ran, so each is a resolution-coverage miss with a named cause (`stale_or_absent`, `not_compiled`): the node is skipped from lineage and the audit, and the report names it under "could not analyze" rather than counting it clean. The remedy is a warehouse-connected `dbt compile`; the gap is measurable so a partial compile cannot pass as a full one.
+
 ## What this does not cover
 
 - **Uniqueness as the first relation-scoped property.** Uniqueness is the worked example for relation-scoped facts (`Property[CandidateKeySet, SourceRef]`, value is a candidate-key set, discoverers map `unique` / `unique_combination_of_columns` / native `PRIMARY KEY` to relation facts). Its migration onto this substrate is its own change, tracked in [`#16`](https://github.com/dvryaboy/dblect/issues/16), and its relation-algebra walk and key/FD plan-independence are detailed in [`column-level-lineage.md`](./column-level-lineage.md) and [`propagation-soundness.md`](./propagation-soundness.md).

@@ -24,6 +24,28 @@ if TYPE_CHECKING:
     from dblect.manifest.catalog import Catalog
 
 
+class CompilationStatus(StrEnum):
+    """Whether a node's ``compiled_code`` faithfully represents the model.
+
+    The analysis reads ``compiled_code`` and assumes it is the rendered model. Two
+    things break that assumption, and both must surface as a coverage miss rather
+    than be analysed as if the model were empty:
+
+    * ``STALE_OR_ABSENT``: ``compiled_code`` is empty or null while the source
+      template is non-trivial. A compile run that did not reach the warehouse (a
+      macro that needs ``execute``-time access) leaves nodes in this state.
+    * ``NOT_COMPILED``: the manifest's own ``compiled`` flag marks the node as never
+      compiled, regardless of any code field.
+
+    ``COMPILED`` is the faithful case: there is compiled code, or the template was
+    trivially empty so an empty compiled body is correct.
+    """
+
+    COMPILED = "compiled"
+    STALE_OR_ABSENT = "stale_or_absent"
+    NOT_COMPILED = "not_compiled"
+
+
 class ResourceType(StrEnum):
     """dbt node kinds dblect cares about for data-flow analysis.
 
@@ -209,6 +231,28 @@ class Node:
     don't have a separate identifier concept; callers that need a
     SQL-level lookup name should prefer ``identifier or name``.
     """
+    compiled_flag: bool | None = None
+    """dbt's own ``compiled`` flag for the node, or ``None`` when the manifest
+    schema does not carry one. ``False`` is dbt saying the node was not compiled;
+    it feeds :attr:`compilation_status` directly rather than being inferred from the
+    code fields."""
+
+    @property
+    def compilation_status(self) -> CompilationStatus:
+        """How faithfully ``compiled_code`` represents this model.
+
+        ``NOT_COMPILED`` when dbt's own flag says so. Otherwise ``STALE_OR_ABSENT``
+        when there is a non-trivial source template but no compiled code (the
+        non-hermetic-compile gap), and ``COMPILED`` when there is compiled code or
+        nothing non-trivial to compile.
+        """
+        if self.compiled_flag is False:
+            return CompilationStatus.NOT_COMPILED
+        compiled = (self.compiled_code or "").strip()
+        if compiled:
+            return CompilationStatus.COMPILED
+        raw = (self.raw_code or "").strip()
+        return CompilationStatus.STALE_OR_ABSENT if raw else CompilationStatus.COMPILED
 
     @property
     def is_data_flow(self) -> bool:
@@ -386,6 +430,8 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
     depends_on = getattr(n, "depends_on", None)
     if depends_on is not None:
         depends_on_nodes = tuple(getattr(depends_on, "nodes", ()) or ())
+    raw_compiled_flag = getattr(n, "compiled", None)
+    compiled_flag = raw_compiled_flag if isinstance(raw_compiled_flag, bool) else None
     return Node(
         unique_id=uid,
         name=n.name,
@@ -402,6 +448,7 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
+        compiled_flag=compiled_flag,
     )
 
 

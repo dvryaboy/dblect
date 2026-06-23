@@ -25,7 +25,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.audit.suppress import apply, parse_directives
-from dblect.manifest import Manifest, Node
+from dblect.manifest import CompilationStatus, Manifest, Node
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
 from dblect.sql import (
@@ -190,12 +190,27 @@ class _Scanned:
     suppressed: tuple[SuppressedFinding, ...]
 
 
+# Why a node was skipped when its compiled SQL does not faithfully represent the
+# model. A node in one of these states is surfaced as skipped rather than scanned
+# as if its body were empty, the same coverage posture the lineage builder takes.
+_COMPILATION_SKIP_REASON: dict[CompilationStatus, str] = {
+    CompilationStatus.STALE_OR_ABSENT: (
+        "compiled_code is empty or stale while the source template is non-trivial; "
+        "compilation likely did not reach the warehouse (run `dbt compile` with a connection)"
+    ),
+    CompilationStatus.NOT_COMPILED: "manifest marks this node as not compiled (run `dbt compile`)",
+}
+
+
 def _scan_one(
     node: Node,
     parse_outcome: Expr | SQLParseError | None,
     *,
     detectors: Sequence[Detector],
 ) -> _Scanned | SkippedModel:
+    compilation_reason = _COMPILATION_SKIP_REASON.get(node.compilation_status)
+    if compilation_reason is not None:
+        return SkippedModel(unique_id=node.unique_id, reason=compilation_reason)
     if parse_outcome is None:
         return SkippedModel(
             unique_id=node.unique_id,
