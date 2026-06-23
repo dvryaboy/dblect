@@ -39,6 +39,7 @@ from dblect.sql.patterns import (
     list_windows,
     make_non_determinism_detector,
     scan_all,
+    suppression_code,
     suppression_hint,
 )
 
@@ -77,5 +78,6 @@ __all__ = [
     "parse_result_statement",
     "parse_sql",
     "scan_all",
+    "suppression_code",
     "suppression_hint",
 ]

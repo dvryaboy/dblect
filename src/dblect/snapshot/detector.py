@@ -83,7 +83,7 @@ def detect_snapshot_temporal_filter(
                     "SCD-2 validity columns. It keeps every historical version per key, so "
                     "this query fans out one row per version (most visibly under a JOIN). "
                     f"{_validity_remedy(validity)} If reading full history is intended, "
-                    "suppress with `-- noqa-fixture:`."
+                    "suppress with `-- noqa: DBLECT_SNAPSHOT_TEMPORAL_FILTER_MISSING`."
                 ),
                 node=table,
             )

@@ -431,3 +431,96 @@ def test_resolution_floor_is_silent_when_full_coverage_clears_it() -> None:
     report = run_check(_creep_manifest(), _DUCKDB, resolution_floor=0.99)
     assert report.resolution.fraction == 1.0
     assert CheckFindingKind.RESOLUTION_BELOW_FLOOR not in _kinds(report)
+
+
+# --- declaration-level suppression (`-- noqa`) ----------------------------------
+#
+# A team that genuinely accepts a flagged mixed-currency sum acknowledges it in the
+# model the way the structural family already does, and the finding is silenced with
+# the acknowledgement visible in review.
+
+
+def _agg_manifest_with_source(model_sql: str) -> Manifest:
+    """The mixed-currency-sum manifest, with the aggregating model's SQL supplied so a
+    suppression comment can be threaded onto a known line. ``raw_code`` carries the
+    directive (where the developer writes it); ``compiled_code`` is what the analysis
+    parses, kept identical so line numbers line up the way they do for a model with no
+    macro expansion."""
+    payments = _node(
+        "source.shop.raw.payments",
+        kind=ResourceType.SOURCE,
+        sql=None,
+        columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+    )
+    model = Node(
+        unique_id="model.shop.revenue_by_country",
+        name="revenue_by_country",
+        resource_type=ResourceType.MODEL,
+        fqn=("shop", "revenue_by_country"),
+        package_name="shop",
+        schema="analytics",
+        raw_code=model_sql,
+        compiled_code=model_sql,
+        original_file_path="models/revenue_by_country.sql",
+        columns=_cols(country="VARCHAR", total="DECIMAL"),
+    )
+    return Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={payments.unique_id: payments, model.unique_id: model},
+    )
+
+
+def _register_payments_contract() -> None:
+    """Declare ``amount`` as multi-currency money so the mixed-currency sum fires.
+    Defined per test because a contract registers on class definition, into the
+    per-test isolated registry the conftest provides."""
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+
+_MIXED_SUM_WITH_NOQA = (
+    "SELECT country,\n"
+    "  SUM(amount) AS total -- noqa: DBLECT_AGGREGATION_NOT_WELL_TYPED\n"
+    "FROM payments GROUP BY country"
+)
+_MIXED_SUM_BARE_NOQA = (
+    "SELECT country,\n  SUM(amount) AS total -- noqa\nFROM payments GROUP BY country"
+)
+_MIXED_SUM_NO_NOQA = "SELECT country,\n  SUM(amount) AS total\nFROM payments GROUP BY country"
+
+
+def test_check_finding_carries_line_provenance() -> None:
+    _register_payments_contract()
+    report = run_check(_agg_manifest_with_source(_MIXED_SUM_NO_NOQA), _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    # The SUM sits on the second line, so the finding points there rather than at the
+    # whole model. A line of 0 would mean "could not locate" and leave it unsuppressible.
+    assert agg.line_start == 2
+    assert agg.line_end >= agg.line_start
+
+
+def test_check_finding_with_matching_code_is_suppressed() -> None:
+    _register_payments_contract()
+    report = run_check(_agg_manifest_with_source(_MIXED_SUM_WITH_NOQA), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    [s] = [
+        s
+        for s in report.suppressed
+        if s.finding.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ]
+    assert not s.bare
+
+
+def test_check_finding_with_bare_noqa_is_suppressed() -> None:
+    _register_payments_contract()
+    report = run_check(_agg_manifest_with_source(_MIXED_SUM_BARE_NOQA), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    [s] = [
+        s
+        for s in report.suppressed
+        if s.finding.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ]
+    assert s.bare

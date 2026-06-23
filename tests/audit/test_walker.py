@@ -145,17 +145,14 @@ def test_located_finding_carries_file_path_for_every_scanned_model(
 
 
 def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> None:
-    # Prepend a top-level noqa-fixture so the customers null-group finding is
-    # silenced (the directive applies to the line above any finding too, but
-    # the simplest demonstration is to put it on the offending line by appending
-    # to customers.sql's GROUP BY line). Instead of touching the SQL string,
-    # we use a kind-specific directive on the very first line; it has to share
-    # a line with the finding to apply, so just put it on the GROUP BY's line.
+    # A code-specific `-- noqa` on the GROUP BY line silences the null-group finding
+    # there. The directive has to share a line with the finding (or sit one line above)
+    # to apply, so we append it to the offending GROUP BY line.
     customers = jaffle.nodes["model.jaffle_shop.customers"]
     assert customers.raw_code is not None
     suppressed_sql = customers.raw_code.replace(
         "group by orders.customer_id",
-        "group by orders.customer_id -- noqa-fixture: null_group_after_outer_join: orphan handling",
+        "group by orders.customer_id -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN",
     )
     assert suppressed_sql != customers.raw_code, "test setup failed to find target line"
     altered = Manifest(
@@ -175,39 +172,52 @@ def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> N
         and lf.finding.kind.value == "null_group_after_outer_join"
     ]
     assert null_group_hits == []
-    # And it shows up in suppressed with the reason preserved.
+    # And it shows up in suppressed, recorded as a code-specific (not bare) directive.
     suppressed_hits = [
         s for s in report.suppressed if s.located.model_unique_id == customers.unique_id
     ]
-    assert any(s.reason == "orphan handling" for s in suppressed_hits)
+    assert any(
+        not s.bare and s.located.finding.kind.value == "null_group_after_outer_join"
+        for s in suppressed_hits
+    )
 
 
-def test_bare_noqa_fixture_surfaces_as_malformed_suppression(jaffle: Manifest) -> None:
-    a_model_uid = "model.jaffle_shop.stg_customers"
-    node = jaffle.nodes[a_model_uid]
-    assert node.raw_code is not None
+def test_bare_noqa_silences_all_kinds_on_its_line(jaffle: Manifest) -> None:
+    # A bare `-- noqa` on the GROUP BY line silences every kind there, recorded as bare.
+    customers = jaffle.nodes["model.jaffle_shop.customers"]
+    assert customers.raw_code is not None
+    suppressed_sql = customers.raw_code.replace(
+        "group by orders.customer_id",
+        "group by orders.customer_id -- noqa",
+    )
+    assert suppressed_sql != customers.raw_code, "test setup failed to find target line"
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
-            a_model_uid: replace(node, raw_code="-- noqa-fixture\n" + node.raw_code),
+            customers.unique_id: replace(customers, raw_code=suppressed_sql),
         },
     )
     report = run_audit(altered, _DUCKDB)
-    [bad] = [
+    null_group_hits = [
         lf
         for lf in report.findings
-        if lf.model_unique_id == a_model_uid and lf.finding.kind.value == "malformed_suppression"
+        if lf.model_unique_id == customers.unique_id
+        and lf.finding.kind.value == "null_group_after_outer_join"
     ]
-    assert bad.finding.line_start == 1
+    assert null_group_hits == []
+    suppressed_hits = [
+        s for s in report.suppressed if s.located.model_unique_id == customers.unique_id
+    ]
+    assert any(s.bare for s in suppressed_hits)
 
 
 def test_unsuppressed_findings_in_other_models_still_fire(jaffle: Manifest) -> None:
     # Suppressing in customers.sql doesn't affect detection elsewhere.
     customers = jaffle.nodes["model.jaffle_shop.customers"]
     assert customers.raw_code is not None
-    blanket = "-- noqa-fixture: silence everything in this file\n" + customers.raw_code
+    blanket = "-- noqa\n" + customers.raw_code
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,

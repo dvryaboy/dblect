@@ -29,7 +29,7 @@ Run `dblect check <project>` and it does all of this in one pass, in seconds, wi
 - incremental worlds: an incremental model is compiled both ways (full-refresh and steady-state) and the detectors run over each, catching hazards that live only in the unexercised branch
 - adapter profiles: per-warehouse dialect, write-enforcement, and hazardous-builtin knowledge behind a registry
 - `dblect init`: scaffolds the `dblect/` tree and generates editor stubs from the manifest
-- `dblect check`: text and JSON (documented schema) reporters, coverage reporting, `-- noqa-fixture:` suppression, a resolution floor so thin coverage cannot read as a clean bill
+- `dblect check`: text and JSON (documented schema) reporters, coverage reporting, SQLFluff-compatible `-- noqa` suppression (bare `-- noqa` silences every finding on a line; `-- noqa: DBLECT_<KIND>` silences one detector and coexists with `dbt lint`), a resolution floor so thin coverage cannot read as a clean bill
 - catalog.json ingestion for seed/source leaf columns; nested-field (STRUCT) lineage
 - var/env_var discovery from source Jinja (`varinf`)
 

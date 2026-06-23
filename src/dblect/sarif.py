@@ -20,6 +20,7 @@ from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, UnbuiltModel
 from dblect.loader import LoadIssue
 from dblect.severity import Severity, severity_of
+from dblect.sql import suppression_code
 
 SARIF_VERSION = "2.1.0"
 SARIF_SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -233,7 +234,8 @@ def _suppressed_result(s: SuppressedFinding, rule_index: dict[str, int]) -> _Res
     # A suppressed finding is still a result, so a surface can show what was triaged
     # away rather than silently dropping it.
     result = _result_for(s.located, rule_index)
-    result["suppressions"] = [{"kind": "inSource", "justification": s.reason}]
+    via = "noqa" if s.bare else f"noqa: {suppression_code(s.located.finding.kind)}"
+    result["suppressions"] = [{"kind": "inSource", "justification": f"{via} @ L{s.directive_line}"}]
     return result
 
 

@@ -95,7 +95,7 @@ For each model:
     │   - DEFAULT_DETECTORS run over the AST
     │   - Uniqueness-aware detectors run with the precomputed keys (plus a
     │     per-tree scope index for the model's CTEs and subqueries)
-    │   - parse_directives() reads -- noqa-fixture: comments from raw_code
+    │   - parse_directives() reads -- noqa comments from raw_code
     │   - apply() partitions into active / suppressed
     │
     ▼
@@ -191,7 +191,7 @@ Line numbers come from `sg.line_range(node)`, which walks the node's `Identifier
 
 The detectors also expose **list queries** (`list_joins`, `list_windows`, `list_group_bys`, `list_aggregations`) that return dblect-shaped summary value types. Consumers don't need to import sqlglot to read structural facts about a statement.
 
-`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression names. A few of its members are emitted from outside `patterns.py`: `MALFORMED_SUPPRESSION` is raised by the suppression layer when a `-- noqa-fixture:` comment lacks a reason, and `NON_UNIQUE_WINDOW_ORDER_KEYS` + `JOIN_FANOUT` come from the fact-grounded detectors described below. The enum itself stays here so suppression syntax and JSON consumers have one canonical list of kind strings.
+`FindingKind` is a `StrEnum` so its values double as the JSON kind strings and the per-kind suppression codes. Each kind's suppression code is `DBLECT_` plus the value uppercased (`suppression_code()`), e.g. `DBLECT_JOIN_FANOUT`. A couple of its members are emitted from outside `patterns.py`: `NON_UNIQUE_WINDOW_ORDER_KEYS` + `JOIN_FANOUT` come from the fact-grounded detectors described below. The enum itself stays here so suppression codes and JSON consumers have one canonical list of kind strings.
 
 ## The uniqueness layer (`src/dblect/uniqueness/`)
 
@@ -217,7 +217,7 @@ The facts themselves come from declarations (`unique`, dbt-utils `unique_combina
 - `CROSS JOIN` is skipped (it's an explicit cartesian, not a fanout-by-accident).
 - A JOIN target whose name is shadowed by a local CTE resolves to the CTE's keys, matching SQL's resolution rules.
 
-Both detectors are enabled by default. Because they're opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from them. Findings of kinds `NON_UNIQUE_WINDOW_ORDER_KEYS` and `JOIN_FANOUT` are suppressible via the standard `-- noqa-fixture:` syntax.
+Both detectors are enabled by default. Because they're opportunistic, no opt-in flag is needed; projects without declared uniqueness simply see no findings from them. Findings of kinds `NON_UNIQUE_WINDOW_ORDER_KEYS` and `JOIN_FANOUT` are suppressible via the standard `-- noqa` syntax (a bare `-- noqa`, or `-- noqa: DBLECT_JOIN_FANOUT` for the one detector).
 
 ## The nullability layer (`src/dblect/nullability/`)
 
@@ -280,7 +280,7 @@ The where-provenance scenario tests in `tests/lineage/test_where_provenance.py` 
 Two modules:
 
 - [**`walker.py`**](../../src/dblect/audit/walker.py): `run_audit(manifest)` iterates models, runs detectors, applies suppression.
-- [**`suppress.py`**](../../src/dblect/audit/suppress.py): parses `-- noqa-fixture:` directives, matches them to findings.
+- [**`suppress.py`**](../../src/dblect/audit/suppress.py): parses SQLFluff-compatible `-- noqa` directives, matches them to findings.
 
 Rendering is no longer audit-specific: the unified reporter ([`src/dblect/report.py`](../../src/dblect/report.py)) renders an `AnalysisReport` carrying both families. See **The unified report** below.
 
@@ -294,20 +294,20 @@ Rendering is no longer audit-specific: the unified reporter ([`src/dblect/report
    - Reads `Node.analysis_sql` (the model's `compiled_code`). Models with no compiled SQL are recorded as `SkippedModel(reason="no compiled SQL (run \`dbt compile\`)")`.
    - Calls `parse_sql(sql, dialect)`. On `SQLParseError`, records `SkippedModel(reason="parse error: <details>")` and moves on. The walker **never raises on per-model failure**: one bad model shouldn't blind the audit to the rest.
    - Runs each detector, collecting `Finding`s.
-   - Calls `parse_directives(node.raw_code)` to extract `-- noqa-fixture:` comments — directives live in the source the developer wrote, not in the compiled output, so they always come from `raw_code`. Malformed comments (bare `-- noqa-fixture` with no reason) come back as their own findings of kind `MALFORMED_SUPPRESSION`.
+   - Calls `parse_directives(node.raw_code)` to extract `-- noqa` comments — directives live in the source the developer wrote, not in the compiled output, so they always come from `raw_code`.
    - Calls `apply(findings, directives)` to partition into active vs. suppressed.
 4. Returns an `AuditReport` carrying `findings`, `suppressed`, `skipped`, and `models_scanned`. Convenience properties `counts_by_kind` (a `Counter`-backed `Mapping[FindingKind, int]`) and `has_findings` are available for consumers that want the rolled-up view without re-iterating.
 
-Each active finding is wrapped in a `LocatedFinding(model_unique_id, file_path, finding)` so reporters can show file:line locations. Suppressed findings are wrapped in `SuppressedFinding(located, reason, directive_line)` which preserves both the original finding context and the directive that silenced it.
+Each active finding is wrapped in a `LocatedFinding(model_unique_id, file_path, finding)` so reporters can show file:line locations. Suppressed findings are wrapped in `SuppressedFinding(located, directive_line, bare)` which preserves both the original finding context and the directive that silenced it (`bare` records whether it was a kind-less `-- noqa`).
 
 ### Suppression
 
-Syntax in SQL files:
+dblect reads the SQLFluff `-- noqa` syntax, the same one dbt Fusion's `dbt lint` honors, so one comment can address both a lint rule and a dblect finding. Syntax in SQL files:
 
-- `-- noqa-fixture: <reason>` silences all kinds on the comment's line.
-- `-- noqa-fixture: <FindingKind>: <reason>` silences only that kind. The leading token must be a known `FindingKind` value or it falls back to all-kinds (so typos and free-text reasons like `TODO: revisit Q3` don't silently fail to suppress).
+- `-- noqa` (bare, no codes) silences every dblect finding on the comment's line.
+- `-- noqa: DBLECT_<KIND>` silences only that detector. The code is `DBLECT_` plus the `FindingKind` (or `CheckFindingKind`) value uppercased, e.g. `DBLECT_JOIN_FANOUT`. Codes that do not start with `DBLECT_` are real lint rule codes that `dbt lint` owns, so dblect ignores them; `-- noqa: RF01, DBLECT_JOIN_FANOUT` quiets the lint rule and our finding in one directive.
 - A directive applies on the line immediately above the finding's span, or anywhere within the span itself (`finding.line_start - 1 <= directive.line <= finding.line_end`). For single-line findings that collapses to "same line or one line above"; for multi-line findings (windows or joins that span several lines) the directive can sit on any line of the span.
-- A reason is required. A bare `-- noqa-fixture` produces a `MALFORMED_SUPPRESSION` finding so dangling directives are visible in PR review.
+- Every suppression is recorded in the report's `suppressed:` section (with the directive line and whether it was bare), so a silenced finding stays visible in review. dblect no longer owns the noqa syntax, so a malformed directive is `dbt lint`'s to police rather than something dblect flags.
 - Findings without line provenance (`line_start == 0`) are never suppressed.
 
 `SuppressionDirective(line, kind, reason)` and `directive_matches(directive, finding)` and `apply(findings, directives)` are the building blocks; the walker glues them together.
@@ -347,7 +347,7 @@ Two detector families surface findings: `run_check` (declaration-level, located 
 
 This is the one door for any consumer that needs every family's findings (the CLI, the incremental-worlds cross-world diff, the world axes to come), so a consumer never enumerates the families itself and cannot silently drop one. `AnalysisFinding` is a sealed union (`CheckFinding | LocatedFinding`); per-family handling uses `match` with `assert_never`, so adding a third family is a type error at every site rather than a quiet coverage gap. `cross_world_identity` lives here too: a finding's identity across two compilations of the same project, ignoring the message and line span that drift between compiled SQLs.
 
-`analyze` is the only production caller of `run_check` and `run_audit`; the CLI and the incremental check both go through the door. The two remain the entry points to two distinct subsystems, each with its own contract beyond "produce findings": `run_audit` carries a configurable detector set and `-- noqa-fixture:` suppression, `run_check` carries the resolution floor and coverage. Those contracts are what `tests/audit/` and `tests/check/` pin, and they hold whether or not `analyze` exists, so the two are real boundaries rather than alternative doors. `analyze` is the single door for any consumer that needs every family; the two subsystem entries are not re-exported as top-level `dblect` API, and their docstrings point a both-families consumer back to `analyze`.
+`analyze` is the only production caller of `run_check` and `run_audit`; the CLI and the incremental check both go through the door. The two remain the entry points to two distinct subsystems, each with its own contract beyond "produce findings": `run_audit` carries a configurable detector set and `-- noqa` suppression, `run_check` carries the resolution floor and coverage. Those contracts are what `tests/audit/` and `tests/check/` pin, and they hold whether or not `analyze` exists, so the two are real boundaries rather than alternative doors. `analyze` is the single door for any consumer that needs every family; the two subsystem entries are not re-exported as top-level `dblect` API, and their docstrings point a both-families consumer back to `analyze`.
 
 ## The CLI (`src/dblect/cli/`)
 

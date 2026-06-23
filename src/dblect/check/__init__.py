@@ -8,7 +8,12 @@ and ``docs/design/declaration-dsl.md`` for the findings it surfaces.
 from __future__ import annotations
 
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
-from dblect.check.flags import DomainFlag, check_worlds, flag_worlds, lower_flag
+from dblect.check.flags import (
+    DomainFlag,
+    check_worlds,
+    flag_worlds,
+    lower_flag,
+)
 from dblect.check.run import (
     CheckGraphs,
     WorldAnnotations,

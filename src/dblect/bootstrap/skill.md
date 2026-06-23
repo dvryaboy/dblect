@@ -267,6 +267,20 @@ Then read the findings. Three kinds matter:
 Iterate until contract issues are gone. A remaining `domain_type_contradiction` may
 be a true finding worth surfacing to the user; explain it and let them decide.
 
+**Suppressing a finding you and the user agree is intentional.** dblect reads
+SQLFluff-compatible `-- noqa` comments, the same syntax dbt Fusion's `dbt lint`
+honors, so one comment can speak to both tools. A bare `-- noqa` on the finding's line
+(or the line just above it) silences every dblect finding there. To silence one
+detector, name its code: `-- noqa: DBLECT_<KIND>`, where `<KIND>` is the finding kind
+uppercased (so `aggregation_not_well_typed` becomes `DBLECT_AGGREGATION_NOT_WELL_TYPED`,
+`join_fanout` becomes `DBLECT_JOIN_FANOUT`). Codes that do not start with `DBLECT_` are
+lint rule codes that belong to `dbt lint`, so a directive like
+`-- noqa: RF01, DBLECT_JOIN_FANOUT` quiets the lint rule and our finding at once.
+Every suppression is still listed in the report's `suppressed:` section, so a silenced
+finding stays visible in review rather than vanishing. Suppress only what the user has
+confirmed is intended; never reach for `-- noqa` to make a contradiction you have not
+explained go away.
+
 ## What good looks like
 
 A small, honest declaration layer: domain types on the magnitudes that carry a unit,

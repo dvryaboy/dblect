@@ -130,7 +130,7 @@ Each of the deferred items below is a real category of bug. The reason for defer
 - **Mutation operators.** v1 generates from scratch via synthesis; v2-full adds mutation-from-seed so each intent can be reached either way. Realism inherited from seeds is the v2 win.
 - **Skew intents.** Power-law cardinality on join keys, hot-key concentration. Profile overlay covers some of this passively; deliberate skew injection is its own intent class.
 - **Subpopulation intents.** Premium customers behave differently. Requires the user to declare a subpopulation predicate; not in v1.
-- **Cycle-aware FK construction.** FK graphs with cycles, recursive references. Most dbt projects don't have these, and the engineering cost is substantial. The v1 escape hatch is a `# noqa-fixture` annotation that lets the user write the custom generator.
+- **Cycle-aware FK construction.** FK graphs with cycles, recursive references. Most dbt projects don't have these, and the engineering cost is substantial. The v1 escape hatch is a `-- noqa` annotation that lets the user write the custom generator.
 - **Late-data and out-of-order arrival as first-class concerns** beyond the single-row LateRow intent. v1 ships LateRow; comprehensive late-data testing (multi-row backfills, watermark advancement) is a v2 concern.
 - **Multi-step replay.** Incremental materialization as a state machine across N runs. The architecture supports this; the v1 build runs single-shot.
 

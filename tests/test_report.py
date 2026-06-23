@@ -121,15 +121,20 @@ def test_text_singular_plural_and_clean_report() -> None:
 
 
 def test_text_carries_suppressed_and_skipped() -> None:
-    suppressed = (
-        SuppressedFinding(located=_structural(), reason="handled downstream", directive_line=8),
-    )
+    suppressed = (SuppressedFinding(located=_structural(), directive_line=8, bare=False),)
     skipped = (SkippedModel(unique_id="model.p.x", reason="no compiled SQL"),)
     text = render_text(_report(suppressed=suppressed, skipped=skipped))
     assert "suppressed:" in text
-    assert "-- handled downstream" in text
+    # A code-specific suppression names how it was silenced and the directive's line.
+    assert "suppressed by noqa: DBLECT_JOIN_FANOUT @ L8" in text
     assert "skipped:" in text
     assert "model.p.x  (no compiled SQL)" in text
+
+
+def test_text_suppressed_block_shows_bare_noqa() -> None:
+    suppressed = (SuppressedFinding(located=_structural(), directive_line=4, bare=True),)
+    text = render_text(_report(suppressed=suppressed))
+    assert "suppressed by noqa @ L4" in text
 
 
 def test_json_tags_each_finding_with_its_family() -> None:
@@ -163,27 +168,21 @@ def test_json_tags_each_finding_with_its_family() -> None:
     assert payload["coverage"]["worlds"] == {"worlds_enumerated": 1, "axes_enumerated": []}
 
 
-# --- the noqa-fixture suppression hint ---------------------------------------
+# --- the noqa suppression hint -----------------------------------------------
 
 
 def test_text_appends_suppression_hint_for_structural_findings() -> None:
     kind = FindingKind.JOIN_FANOUT
     text = render_text(_report(structural=(_structural(kind=kind),)))
     assert suppression_hint(kind) in text
+    assert "-- noqa: DBLECT_JOIN_FANOUT" in text
 
 
-def test_text_omits_hint_for_malformed_suppression() -> None:
-    # Pointing a malformed suppression directive at the suppression syntax would be
-    # circular, so this lone kind carries no hint.
-    text = render_text(_report(structural=(_structural(kind=FindingKind.MALFORMED_SUPPRESSION),)))
-    assert "noqa-fixture" not in text
-
-
-def test_text_omits_hint_for_declaration_findings() -> None:
-    # Declaration findings are not structural hazards; the suppression mechanism
-    # does not apply, so the hint must not leak into their block.
+def test_text_omits_hint_for_unlocated_declaration_findings() -> None:
+    # A declaration finding with no line (the default `_declaration`) cannot carry a
+    # directive, so the hint must not leak into its block.
     text = render_text(_report(declaration=(_declaration(),)))
-    assert "noqa-fixture" not in text
+    assert "noqa" not in text
 
 
 def test_json_message_stays_the_pure_observation() -> None:
@@ -194,4 +193,4 @@ def test_json_message_stays_the_pure_observation() -> None:
     payload = json.loads(render_json(_report(structural=structural)))
     [finding] = [f for f in payload["findings"] if f["family"] == "structural"]
     assert finding["message"] == observation
-    assert "noqa-fixture" not in finding["message"]
+    assert "noqa" not in finding["message"]

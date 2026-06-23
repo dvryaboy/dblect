@@ -54,7 +54,7 @@ Internally, dblect does the following:
 
 **Airflow task analysis (when Airflow is detected).** Run each task twice with identical inputs, compare outputs and downstream state, flag non-idempotence empirically. This is the seed of the Airflow-side capability; the audit keeps it empirical.
 
-**Report generation.** HTML or markdown report with findings grouped by class and severity. Every finding includes location, description, a reproducer (the generated input that triggered it), and a suggested fix. Mute mechanism: `# noqa-fixture: <reason>` comment that suppresses with required justification, visible in PR review.
+**Report generation.** HTML or markdown report with findings grouped by class and severity. Every finding includes location, description, a reproducer (the generated input that triggered it), and a suggested fix. Mute mechanism: SQLFluff-compatible `-- noqa` comments (bare to silence everything on a line, or `-- noqa: DBLECT_<KIND>` for one detector) that suppress, visible in PR review.
 
 **What the audit catches:**
 - Subtle SQL logic errors (wrong join conditions, NULL handling failures, ambiguous COALESCE)
@@ -251,7 +251,7 @@ A few capabilities apply across all layers rather than belonging to one:
 
 **CLI.** Standalone CLI for headless and CI use. v1 verbs: `init` (bootstrap-to-first-findings, one shot), `check` (run the structural audit immediately and the contract checks once contracts are declared, with `--flag-world` for selecting subsets), `show-case` (materialize a stored counterexample locally). `focus` (interactive contract drafting) and `impact --flag X` (flag-flip preflight) are slotted but deferred. Required for CI integration; sufficient for users who prefer not to drive via an LLM environment.
 
-**Ignore mechanism.** Findings can be muted via `# noqa-fixture: <reason>` comments (the canonical syntax, same flavor as `# noqa: ...` in linters) or YAML config entries. Requires a reason; muted findings are reviewable in PR; mutes don't silently propagate.
+**Ignore mechanism.** Findings can be muted via SQLFluff-compatible `-- noqa` comments (bare for all kinds on a line, or `-- noqa: DBLECT_<KIND>` for one detector, the same syntax dbt Fusion's `dbt lint` honors) or YAML config entries. Muted findings are reviewable in PR; mutes don't silently propagate.
 
 **Persistence.** The framework maintains state across runs: catalog of declared types and contracts, counterexample library (reproducers from past failures, kept as regression tests), scenario template library (curated and customer-extensible).
 
@@ -275,7 +275,7 @@ Order respects dependencies. Each milestone ends in a state where dblect does so
 7. **Equivalence-aware diffing.** Multiset, order-up-to-ties, set equivalence. Becomes load-bearing in later phases.
 8. **Replay determinism via differential execution.**
 9. **Static ambiguous-ordering detection.** Pattern matching on the SQL AST.
-10. **Report generation, ignore mechanism (`# noqa-fixture`), CLI basics (`init`, `check`).**
+10. **Report generation, ignore mechanism (`-- noqa`), CLI basics (`init`, `check`).**
 
 **Milestone:** `dblect init` ships against real dbt projects, finds real bugs end-to-end.
 

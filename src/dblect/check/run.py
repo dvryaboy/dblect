@@ -27,8 +27,15 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
+from dblect.audit.suppress import SuppressionDirective, apply, parse_directives
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
-from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
+from dblect.check.findings import (
+    CheckFinding,
+    CheckFindingKind,
+    CheckReport,
+    SuppressedCheckFinding,
+    UnbuiltModel,
+)
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -63,6 +70,7 @@ from dblect.lineage.properties.functional_dependency import (
 from dblect.lineage.property import COLUMNREF_META_KEY, propagate
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
+from dblect.sql import _sqlglot as sg
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -189,10 +197,13 @@ def run_check(
     findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
+    active, suppressed = _suppress(findings, manifest)
+
     return CheckReport(
-        findings=tuple(findings),
+        findings=active,
         load_issues=(),
         unbuilt=_unbuilt(graphs.relation_build.issues, graphs.column_build.issues),
+        suppressed=suppressed,
         contracts_resolved=graphs.contracts_resolved,
         models_propagated=len(manifest.models),
         predicates_collected=len(graphs.resolved.predicates),
@@ -201,13 +212,46 @@ def run_check(
     )
 
 
+def _suppress(
+    findings: Iterable[CheckFinding], manifest: Manifest
+) -> tuple[tuple[CheckFinding, ...], tuple[SuppressedCheckFinding, ...]]:
+    """Apply ``-- noqa`` directives to declaration-level findings.
+
+    Directives are read per model from the source the developer wrote (``raw_code``,
+    falling back to the compiled SQL), the same place the structural audit reads them,
+    and matched against the finding's line provenance. A finding with no model or no
+    located line (a contract-resolution issue, a project-wide coverage finding) carries
+    no line, so the matcher leaves it active; only the line-located domain-type and
+    aggregation findings are silenceable this way."""
+    directives_by_model: dict[str, tuple[SuppressionDirective, ...]] = {}
+    active: list[CheckFinding] = []
+    suppressed: list[SuppressedCheckFinding] = []
+    for finding in findings:
+        uid = finding.model_unique_id
+        node = manifest.models.get(uid) if uid is not None else None
+        if uid is None or node is None:
+            active.append(finding)
+            continue
+        if uid not in directives_by_model:
+            directives_by_model[uid] = parse_directives(node.raw_code or node.analysis_sql or "")
+        kept, hidden = apply((finding,), directives_by_model[uid])
+        active.extend(kept)
+        suppressed.extend(
+            SuppressedCheckFinding(finding=f, directive_line=d.line, bare=d.kinds is None)
+            for f, d in hidden
+        )
+    return tuple(active), tuple(suppressed)
+
+
 def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
     """The findings that vary by world: the domain-type contradictions and the
     not-well-typed aggregations, read off one world's annotations. The
     contract-resolution and resolution-floor findings are world-invariant and stay
     ``run_check``'s to report once."""
     findings: list[CheckFinding] = []
-    findings.extend(_contradiction_findings(graphs.manifest, world.domain_type))
+    findings.extend(
+        _contradiction_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+    )
     findings.extend(
         _aggregation_findings(
             graphs.manifest,
@@ -346,7 +390,9 @@ def _issue_findings(resolved: ResolvedContracts) -> list[CheckFinding]:
 
 
 def _contradiction_findings(
-    manifest: Manifest, annotations: Mapping[ColumnRef, Annotation[DomainTag]]
+    manifest: Manifest,
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    column_graph: ColumnLineageGraph,
 ) -> list[CheckFinding]:
     """One finding per column whose flow value is provisional: a declared type the
     inferred one contradicts, reported wherever the taint reached."""
@@ -354,6 +400,7 @@ def _contradiction_findings(
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:
             continue
+        line_start, line_end = _span_of(column_graph.derivation(ref))
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
@@ -364,6 +411,8 @@ def _contradiction_findings(
                 model_unique_id=ref.source.unique_id,
                 file_path=_file_of(manifest, ref.source),
                 column=ref.column,
+                line_start=line_start,
+                line_end=line_end,
             )
         )
     return out
@@ -388,6 +437,10 @@ def _aggregation_findings(
         agg = _culprit_aggregate(derivation, tagged) if tagged else None
         if agg is None:
             continue
+        # The aggregate node pins the line; the projection derivation is the fallback
+        # so the finding still lands near the right place when the aggregate carries no
+        # stamped identifier (a literal-only shape).
+        line_start, line_end = _span_of(agg, derivation)
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
@@ -395,6 +448,8 @@ def _aggregation_findings(
                 model_unique_id=ref.source.unique_id,
                 file_path=_file_of(manifest, ref.source),
                 column=ref.column,
+                line_start=line_start,
+                line_end=line_end,
             )
         )
     return out
@@ -495,3 +550,18 @@ def _sorted(
 def _file_of(manifest: Manifest, source: SourceRef) -> str | None:
     node = manifest.nodes.get(source.unique_id)
     return node.original_file_path if node is not None else None
+
+
+def _span_of(*nodes: Expr | None) -> tuple[int, int]:
+    """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
+    a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
+    convention a finding with no locatable line uses (never line-suppressible). The
+    line space is the parsed SQL's, matching where the ``-- noqa`` scanner
+    reads directives."""
+    for node in nodes:
+        if node is None:
+            continue
+        span = sg.line_range(node)
+        if span is not None:
+            return span
+    return (0, 0)

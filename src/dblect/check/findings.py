@@ -53,6 +53,25 @@ class CheckFinding:
     code: IssueCode | None = None
     """The specific resolution cause behind a ``CONTRACT_ISSUE``; ``None`` for the
     other kinds, which carry no such code."""
+    line_start: int = 0
+    line_end: int = 0
+    """1-indexed source-line span of the offending projection or aggregate in the
+    model's SQL, so a ``-- noqa`` comment on that line can acknowledge the
+    finding. ``0`` means we could not pin it to a line (a contract-resolution issue
+    or a project-wide coverage finding has no single SQL site), and a finding with no
+    line is never line-suppressible. The same convention the structural ``Finding``
+    uses, so one suppression scanner serves both families."""
+
+
+@dataclass(frozen=True, slots=True)
+class SuppressedCheckFinding:
+    """A declaration-level finding a ``-- noqa`` directive silenced. ``directive_line``
+    is where the directive sat; ``bare`` records whether it was a bare ``-- noqa`` (all
+    kinds) rather than a code-specific one."""
+
+    finding: CheckFinding
+    directive_line: int
+    bare: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +95,7 @@ class CheckReport:
     contracts_resolved: int
     models_propagated: int
     predicates_collected: int
+    suppressed: tuple[SuppressedCheckFinding, ...] = ()
     resolution: ResolutionCoverage = field(default_factory=lambda: ResolutionCoverage(0, 0, 0, ()))
     grounding: GroundingCoverage = field(default_factory=lambda: GroundingCoverage((), 0, 0))
     worlds: WorldCoverage = SINGLE_WORLD

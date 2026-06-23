@@ -54,11 +54,11 @@ structural findings:
 
 ### You can suppress these warnings
 
-Sometimes the catch-all bucket is on purpose: orphaned payments get pooled deliberately and handled downstream. When a finding is a known, intended choice, you tell dblect so with an inline comment, and it moves from a finding to a recorded, reasoned suppression rather than noise you learn to scroll past:
+Sometimes the catch-all bucket is on purpose: orphaned payments get pooled deliberately and handled downstream. When a finding is a known, intended choice, you tell dblect so with a SQLFluff-style `-- noqa` comment, the same syntax dbt Fusion's `dbt lint` honors, and it moves from a finding to a recorded suppression rather than noise you learn to scroll past:
 
 ```sql
     left join orders on payments.order_id = orders.order_id
-    group by orders.customer_id  -- noqa-fixture: null_group_after_outer_join: unmatched payments are intentionally pooled; handled downstream
+    group by orders.customer_id  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN
 ```
 
 ```
@@ -66,10 +66,10 @@ $ dblect check .
 dblect: 0 findings over 5 models (0 contracts resolved, 5 scanned, 0 predicate(s) collected)
 
 suppressed:
-  models/customers.sql:L44  null_group_after_outer_join  -- unmatched payments are intentionally pooled; handled downstream
+  models/customers.sql:L44  null_group_after_outer_join  suppressed by noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN @ L44
 ```
 
-The reason is required (a bare `-- noqa-fixture` becomes its own finding, so dangling silencers stay visible in review), and a directive can name one finding kind or, without a kind, silence every kind on its line.
+A bare `-- noqa` silences every dblect finding on its line; `-- noqa: DBLECT_<KIND>` silences one detector (the code is `DBLECT_` plus the finding kind uppercased). Codes that do not start with `DBLECT_` are real lint rule codes that belong to `dbt lint`, so `-- noqa: RF01, DBLECT_JOIN_FANOUT` speaks to both tools at once. Every suppression is logged in the `suppressed:` section, so a silenced finding stays visible in review.
 
 ### Catch meaning shifts, by adding a small amount of higher types
 
