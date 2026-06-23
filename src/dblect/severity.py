@@ -75,20 +75,8 @@ _RANK: dict[Severity, int] = {Severity.INFO: 0, Severity.WARN: 1, Severity.ERROR
 
 
 def _structural_severity(kind: FindingKind) -> Severity:
-    """A structural finding's default severity, by kind. The ``match`` is closed by
-    ``assert_never`` so a new ``FindingKind`` without a level is a type error here.
-
-    error: the analysis is saying the query can return wrong rows. A join can fan out and
-    multiply measures; an outer join's NULLs leak into a grouping, a coalesce, a join key,
-    a NOT IN, or a comparison that silently turns the outer join inner; a window's order
-    keys are not unique so the pick is arbitrary; a snapshot read has no temporal filter
-    so it sees every version. Each changes the result set, not just its order.
-
-    warn: the result is correct but its order or value is not pinned, so it can drift
-    between runs. An unordered ranking window or aggregate, and a non-deterministic
-    builtin in a load-bearing position, are determinism smells. A malformed suppression
-    directive is an operator mistake worth surfacing, not a query defect, so it warns.
-    """
+    """A structural finding's default severity. error: the query can return wrong rows.
+    warn: the rows are right but their order or value is not pinned, so they can drift."""
     match kind:
         case (
             FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
@@ -106,6 +94,7 @@ def _structural_severity(kind: FindingKind) -> Severity:
             FindingKind.UNORDERED_RANKING_WINDOW
             | FindingKind.UNORDERED_AGGREGATE
             | FindingKind.NON_DETERMINISTIC_FUNCTION
+            # An operator mistake worth surfacing, not a query defect, so it warns.
             | FindingKind.MALFORMED_SUPPRESSION
         ):
             return Severity.WARN
@@ -113,16 +102,8 @@ def _structural_severity(kind: FindingKind) -> Severity:
 
 
 def _check_severity(kind: CheckFindingKind) -> Severity:
-    """A declaration finding's default severity, by kind. Closed by ``assert_never`` so a
-    new ``CheckFindingKind`` without a level is a type error here.
-
-    A contract that does not line up with the manifest, a declared domain type the
-    substrate contradicts, and a sum the algebra cannot call well typed are each a
-    statement that the declared meaning and the computed one disagree, an error. A
-    resolution that sits below the configured floor is a coverage gap (the analysis could
-    not see enough to judge), surfaced as a warn so thin coverage is visible without
-    failing a run that declared a floor to learn its coverage.
-    """
+    """A declaration finding's default severity. error: the declared meaning and the
+    computed one disagree. warn: the analysis could not see enough to judge."""
     match kind:
         case (
             CheckFindingKind.CONTRACT_ISSUE
@@ -130,6 +111,8 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             | CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
         ):
             return Severity.ERROR
+        # A coverage gap, warned so thin coverage is visible without failing a run that
+        # declared a floor to learn its coverage.
         case CheckFindingKind.RESOLUTION_BELOW_FLOOR:
             return Severity.WARN
     assert_never(kind)
