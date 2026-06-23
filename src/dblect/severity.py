@@ -10,9 +10,12 @@ its own should not fail anyone's build.
 ``Severity`` is a ``StrEnum`` so the level values read as the plain words (the CLI flag
 and the JSON field both want ``info``/``warn``/``error``). Comparison is overridden to
 follow an explicit rank rather than the inherited string order, so ``>=`` is a real
-ordering and not a lexicographic accident. The per-kind tables are the single place a
-kind's default level is decided; ``severity_of`` reads a finding's level without the
-caller knowing which detector family produced it.
+ordering and not a lexicographic accident; comparing a ``Severity`` to anything else
+raises rather than silently falling back to ``str`` order. The per-kind mapping is the
+single place a kind's default level is decided, written as a ``match`` closed by
+``assert_never`` so a new kind without a level is a type error rather than a silent
+default; ``severity_of`` reads a finding's level without the caller knowing which
+detector family produced it.
 """
 
 from __future__ import annotations
@@ -43,84 +46,106 @@ class Severity(StrEnum):
     def rank(self) -> int:
         return _RANK[self]
 
+    # Comparison is by rank, and only against another Severity. Returning
+    # NotImplemented here would let Python fall back to ``str``'s lexicographic order
+    # (since a StrEnum *is* a str), which would compare ``"error" < "info"`` as True
+    # and quietly reintroduce the accident this ordering exists to avoid. We raise.
     def __lt__(self, other: object) -> bool:
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self.rank < other.rank
+        return self.rank < _require_severity(other).rank
 
     def __le__(self, other: object) -> bool:
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self.rank <= other.rank
+        return self.rank <= _require_severity(other).rank
 
     def __gt__(self, other: object) -> bool:
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self.rank > other.rank
+        return self.rank > _require_severity(other).rank
 
     def __ge__(self, other: object) -> bool:
-        if not isinstance(other, Severity):
-            return NotImplemented
-        return self.rank >= other.rank
+        return self.rank >= _require_severity(other).rank
+
+
+def _require_severity(value: object) -> Severity:
+    if not isinstance(value, Severity):
+        raise TypeError(
+            f"Severity is only comparable to another Severity, not {type(value).__name__}"
+        )
+    return value
 
 
 _RANK: dict[Severity, int] = {Severity.INFO: 0, Severity.WARN: 1, Severity.ERROR: 2}
 
 
-# A structural finding's default severity, by kind, in one place so the level is a
-# property of the detector's intent rather than scattered across call sites.
-#
-# error: the analysis is saying the query can return wrong rows. A join can fan out and
-# multiply measures; an outer join's NULLs leak into a grouping, a coalesce, a join key,
-# a NOT IN, or a comparison that silently turns the outer join inner; a window's order
-# keys are not unique so the pick is arbitrary; a snapshot read has no temporal filter so
-# it sees every version. Each changes the result set, not just its order.
-#
-# warn: the result is correct but its order or value is not pinned, so it can drift
-# between runs. An unordered ranking window or aggregate, and a non-deterministic builtin
-# in a load-bearing position, are determinism smells. A malformed suppression directive is
-# an operator mistake worth surfacing, not a query defect, so it warns rather than errors.
-STRUCTURAL_FINDING_SEVERITY: dict[FindingKind, Severity] = {
-    FindingKind.NULL_GROUP_AFTER_OUTER_JOIN: Severity.ERROR,
-    FindingKind.COALESCE_ON_JOIN_KEY: Severity.ERROR,
-    FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE: Severity.ERROR,
-    FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS: Severity.ERROR,
-    FindingKind.JOIN_FANOUT: Severity.ERROR,
-    FindingKind.NULL_GROUP_ON_NULLABLE_KEY: Severity.ERROR,
-    FindingKind.JOIN_ON_NULLABLE_KEY: Severity.ERROR,
-    FindingKind.NOT_IN_NULLABLE_SUBQUERY: Severity.ERROR,
-    FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING: Severity.ERROR,
-    FindingKind.UNORDERED_RANKING_WINDOW: Severity.WARN,
-    FindingKind.UNORDERED_AGGREGATE: Severity.WARN,
-    FindingKind.NON_DETERMINISTIC_FUNCTION: Severity.WARN,
-    FindingKind.MALFORMED_SUPPRESSION: Severity.WARN,
-}
+def _structural_severity(kind: FindingKind) -> Severity:
+    """A structural finding's default severity, by kind. The ``match`` is closed by
+    ``assert_never`` so a new ``FindingKind`` without a level is a type error here.
 
-# A declaration finding's default severity, by kind. A contract that does not line up
-# with the manifest, a declared domain type the substrate contradicts, and a sum the
-# algebra cannot call well typed are each a statement that the declared meaning and the
-# computed one disagree, an error. A resolution that sits below the configured floor is a
-# coverage gap (the analysis could not see enough to judge), surfaced as a warn so thin
-# coverage is visible without failing a run that declared a floor to learn its coverage.
-CHECK_FINDING_SEVERITY: dict[CheckFindingKind, Severity] = {
-    CheckFindingKind.CONTRACT_ISSUE: Severity.ERROR,
-    CheckFindingKind.DOMAIN_TYPE_CONTRADICTION: Severity.ERROR,
-    CheckFindingKind.AGGREGATION_NOT_WELL_TYPED: Severity.ERROR,
-    CheckFindingKind.RESOLUTION_BELOW_FLOOR: Severity.WARN,
-}
+    error: the analysis is saying the query can return wrong rows. A join can fan out and
+    multiply measures; an outer join's NULLs leak into a grouping, a coalesce, a join key,
+    a NOT IN, or a comparison that silently turns the outer join inner; a window's order
+    keys are not unique so the pick is arbitrary; a snapshot read has no temporal filter
+    so it sees every version. Each changes the result set, not just its order.
+
+    warn: the result is correct but its order or value is not pinned, so it can drift
+    between runs. An unordered ranking window or aggregate, and a non-deterministic
+    builtin in a load-bearing position, are determinism smells. A malformed suppression
+    directive is an operator mistake worth surfacing, not a query defect, so it warns.
+    """
+    match kind:
+        case (
+            FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+            | FindingKind.COALESCE_ON_JOIN_KEY
+            | FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
+            | FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS
+            | FindingKind.JOIN_FANOUT
+            | FindingKind.NULL_GROUP_ON_NULLABLE_KEY
+            | FindingKind.JOIN_ON_NULLABLE_KEY
+            | FindingKind.NOT_IN_NULLABLE_SUBQUERY
+            | FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING
+        ):
+            return Severity.ERROR
+        case (
+            FindingKind.UNORDERED_RANKING_WINDOW
+            | FindingKind.UNORDERED_AGGREGATE
+            | FindingKind.NON_DETERMINISTIC_FUNCTION
+            | FindingKind.MALFORMED_SUPPRESSION
+        ):
+            return Severity.WARN
+    assert_never(kind)
+
+
+def _check_severity(kind: CheckFindingKind) -> Severity:
+    """A declaration finding's default severity, by kind. Closed by ``assert_never`` so a
+    new ``CheckFindingKind`` without a level is a type error here.
+
+    A contract that does not line up with the manifest, a declared domain type the
+    substrate contradicts, and a sum the algebra cannot call well typed are each a
+    statement that the declared meaning and the computed one disagree, an error. A
+    resolution that sits below the configured floor is a coverage gap (the analysis could
+    not see enough to judge), surfaced as a warn so thin coverage is visible without
+    failing a run that declared a floor to learn its coverage.
+    """
+    match kind:
+        case (
+            CheckFindingKind.CONTRACT_ISSUE
+            | CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
+            | CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+        ):
+            return Severity.ERROR
+        case CheckFindingKind.RESOLUTION_BELOW_FLOOR:
+            return Severity.WARN
+    assert_never(kind)
 
 
 def severity_of(finding: AnalysisFinding) -> Severity:
-    """The severity of ``finding``, read from its kind's table, across both families.
+    """The severity of ``finding``, by its kind, across both detector families.
 
     Closed by ``assert_never`` so a new finding family is a type error here rather than
     a finding that silently lands at some default level.
     """
     match finding:
         case CheckFinding():
-            return CHECK_FINDING_SEVERITY[finding.kind]
+            return _check_severity(finding.kind)
         case LocatedFinding():
-            return STRUCTURAL_FINDING_SEVERITY[finding.finding.kind]
+            return _structural_severity(finding.finding.kind)
     assert_never(finding)
 
 

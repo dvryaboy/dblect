@@ -13,9 +13,9 @@ from dblect.audit.walker import LocatedFinding
 from dblect.severity import Severity, exceeds_threshold
 from dblect.sql import Finding, FindingKind
 
-# A kind at each level, read from the table indirectly so the test names levels, not
-# kinds: JOIN_FANOUT is error, UNORDERED_AGGREGATE is warn. There is no native info-level
-# structural kind, so the info boundary is exercised by the empty/at-threshold cases.
+# A kind at each level so the test names levels, not kinds: JOIN_FANOUT is error,
+# UNORDERED_AGGREGATE is warn. There is no native info-level structural kind, so the
+# info boundary is exercised by the empty/at-threshold cases.
 _ERROR_KIND = FindingKind.JOIN_FANOUT
 _WARN_KIND = FindingKind.UNORDERED_AGGREGATE
 
@@ -26,6 +26,21 @@ def _finding(kind: FindingKind) -> LocatedFinding:
         file_path="models/m.sql",
         finding=Finding(kind=kind, message="", sql_snippet="", line_start=1, line_end=1),
     )
+
+
+def test_severity_orders_info_below_warn_below_error() -> None:
+    # The threshold rests on this ordering; the comparison follows rank, not the
+    # inherited string order, so the boundary tests above are numeric over the levels.
+    assert Severity.INFO < Severity.WARN < Severity.ERROR
+    assert Severity.ERROR >= Severity.WARN >= Severity.INFO
+    assert sorted(Severity) == [Severity.INFO, Severity.WARN, Severity.ERROR]
+
+
+def test_severity_does_not_compare_against_a_bare_string() -> None:
+    # A StrEnum is a str, so a NotImplemented fallback would compare lexicographically
+    # ("error" < "info") and quietly invert the ordering. We raise instead.
+    with pytest.raises(TypeError):
+        _ = Severity.ERROR < "info"
 
 
 def test_no_findings_never_exceeds_any_threshold() -> None:
