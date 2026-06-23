@@ -243,6 +243,18 @@ def init(
             help="Path to a manifest.json the generated `models` stubs are built from.",
         ),
     ] = None,
+    catalog: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--catalog",
+            help=(
+                "Path to a catalog.json (`dbt docs generate`). Defaults to "
+                "catalog.json alongside the manifest. When present, the stubs carry "
+                "the warehouse-introspected columns, so they match what `check` "
+                "resolves against instead of being blind to undocumented columns."
+            ),
+        ),
+    ] = None,
     dbt_executable: Annotated[
         str,
         typer.Option("--dbt-executable", help="dbt CLI for the fallback `dbt compile`."),  # pyright: ignore[reportUnknownMemberType]
@@ -250,12 +262,13 @@ def init(
 ) -> None:
     """Scaffold a project's dblect/ declaration tree and generate the models stubs."""
     from dblect.contracts.stubs import generate_stub_module
-    from dblect.manifest import Manifest
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="init"
     )
-    loaded = Manifest.from_file(manifest_path)
+    loaded, catalog_path = _load_manifest_with_catalog(
+        manifest_path=manifest_path, explicit_catalog=catalog, command="init"
+    )
 
     decl = project_dir / "dblect"
     created = _scaffold_declarations(decl)
@@ -267,6 +280,13 @@ def init(
 
     for path in (*created, stubs_path):
         typer.echo(f"init: wrote {path}")
+    if catalog_path is None:
+        typer.echo(
+            "init: no catalog.json alongside the manifest, so the stub carries only "
+            "the columns schema.yml documents and may be blind to columns the models "
+            "actually emit. Run `dbt docs generate` (then re-run `dblect init`) or pass "
+            "--catalog to base the stub on the warehouse columns."
+        )
     typer.echo("init: scaffolding complete; add contracts and run `dblect check`.")
 
 
@@ -486,21 +506,37 @@ def _load_manifest(*, manifest_path: Path, explicit_catalog: Path | None, comman
     warehouse-introspected columns so seeds and sources resolve without manual
     documentation. A missing catalog is noted, not an error: it is the difference
     between full leaf coverage and resolving only what ``schema.yml`` documents."""
+    loaded, catalog_path = _load_manifest_with_catalog(
+        manifest_path=manifest_path, explicit_catalog=explicit_catalog, command=command
+    )
+    if catalog_path is None:
+        typer.echo(
+            f"{command}: no catalog.json alongside the manifest; seed/source columns come "
+            "only from schema.yml, so undocumented leaves may not resolve. Run "
+            "`dbt docs generate` or pass --catalog to cover them.",
+            err=True,
+        )
+    return loaded
+
+
+def _load_manifest_with_catalog(
+    *, manifest_path: Path, explicit_catalog: Path | None, command: str
+) -> tuple[Manifest, Path | None]:
+    """Load the manifest and merge a catalog's columns when one is available.
+
+    Returns the (possibly merged) manifest and the catalog path that was read, or
+    ``None`` when no catalog was found. Callers phrase their own note for the
+    no-catalog case, since the consequence differs by command (``check`` resolves
+    fewer leaves; ``init`` writes a stub blind to undocumented columns)."""
     from dblect.manifest import Catalog, Manifest
 
     typer.echo(f"{command}: reading manifest at {manifest_path}", err=True)
     loaded = Manifest.from_file(manifest_path)
     catalog_path = _resolve_catalog_path(explicit=explicit_catalog, manifest_path=manifest_path)
-    if catalog_path is not None:
-        typer.echo(f"{command}: reading catalog at {catalog_path}", err=True)
-        return loaded.merge_catalog(Catalog.from_file(catalog_path))
-    typer.echo(
-        f"{command}: no catalog.json alongside the manifest; seed/source columns come "
-        "only from schema.yml, so undocumented leaves may not resolve. Run "
-        "`dbt docs generate` or pass --catalog to cover them.",
-        err=True,
-    )
-    return loaded
+    if catalog_path is None:
+        return loaded, None
+    typer.echo(f"{command}: reading catalog at {catalog_path}", err=True)
+    return loaded.merge_catalog(Catalog.from_file(catalog_path)), catalog_path
 
 
 if __name__ == "__main__":
