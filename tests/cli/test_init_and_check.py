@@ -26,6 +26,56 @@ def _write(path: Path, body: str) -> None:
     path.write_text(body)
 
 
+def _stg_payments_stub(project: Path) -> str:
+    """The generated _StgPayments class body, so an `amount` assertion targets that
+    node rather than matching the column name in another model's stub."""
+    stubs = (project / "dblect" / "_stubs" / "models.py").read_text()
+    marker = "class _StgPayments(ModelProxy):"
+    block = next((b for b in stubs.split("\n\n") if b.lstrip().startswith(marker)), None)
+    assert block is not None, f"_StgPayments not found in:\n{stubs}"
+    return block
+
+
+def _catalog_json(columns_by_uid: dict[str, dict[str, str]]) -> str:
+    """A minimal catalog.json reporting `columns_by_uid` (uid -> column -> type), the
+    warehouse-introspected shape `dbt docs generate` writes. The merge precedence it
+    feeds is pinned in tests/manifest/test_catalog.py (#77)."""
+    import json
+
+    def entry(uid: str, cols: dict[str, str]) -> dict[str, object]:
+        return {
+            "metadata": {
+                "type": "BASE TABLE",
+                "schema": "main",
+                "name": uid.split(".")[-1],
+                "database": "db",
+                "comment": None,
+                "owner": None,
+            },
+            "columns": {
+                c: {"type": t, "index": i + 1, "name": c, "comment": None}
+                for i, (c, t) in enumerate(cols.items())
+            },
+            "stats": {},
+            "unique_id": uid,
+        }
+
+    return json.dumps(
+        {
+            "metadata": {
+                "dbt_schema_version": "https://schemas.getdbt.com/dbt/catalog/v1.json",
+                "dbt_version": "1.8.0",
+                "generated_at": "2024-01-01T00:00:00Z",
+                "invocation_id": "x",
+                "env": {},
+            },
+            "nodes": {uid: entry(uid, cols) for uid, cols in columns_by_uid.items()},
+            "sources": {},
+            "errors": None,
+        }
+    )
+
+
 # --- init -----------------------------------------------------------------------
 
 
@@ -50,6 +100,31 @@ def test_init_does_not_clobber_user_files(
     result = runner.invoke(app, ["init", str(tmp_path), "--manifest", str(jaffle_manifest_path)])
     assert result.exit_code == 0, result.output
     assert (tmp_path / "dblect" / "types.py").read_text() == "# my types\n"
+
+
+def test_init_stub_surfaces_catalog_columns_otherwise_blind(
+    jaffle_manifest_path: Path, runner: CliRunner, tmp_path: Path
+) -> None:
+    # The contract #134 adds: init feeds catalog.json through to the stub, so a column
+    # the warehouse emits but schema.yml leaves undocumented (stg_payments.amount) lands
+    # in the stub instead of being blind to it. Gating absent-without on present-with
+    # pins that the catalog is the cause; the merge precedence itself is pinned in
+    # tests/manifest/test_catalog.py (#77) and catalog auto-discovery in the check tests.
+    blind = tmp_path / "blind"
+    res = runner.invoke(app, ["init", str(blind), "--manifest", str(jaffle_manifest_path)])
+    assert res.exit_code == 0, res.output
+    assert "dbt docs generate" in res.output  # warns the stub may be blind
+    assert "amount: ColumnProxy" not in _stg_payments_stub(blind)
+
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(_catalog_json({"model.jaffle_shop.stg_payments": {"amount": "DOUBLE"}}))
+    seen = tmp_path / "seen"
+    res = runner.invoke(
+        app,
+        ["init", str(seen), "--manifest", str(jaffle_manifest_path), "--catalog", str(catalog)],
+    )
+    assert res.exit_code == 0, res.output
+    assert "amount: ColumnProxy" in _stg_payments_stub(seen)
 
 
 # --- check ----------------------------------------------------------------------
