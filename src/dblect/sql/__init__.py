@@ -5,7 +5,15 @@ from dblect.sql.aggregates import (
     AggregateBehavior,
     aggregate_behavior,
 )
-from dblect.sql.parse import SQLParseError, parse_sql
+from dblect.sql.parse import (
+    MultiResultScript,
+    NoResultScript,
+    ResultStatement,
+    SingleResult,
+    SQLParseError,
+    parse_result_statement,
+    parse_sql,
+)
 from dblect.sql.patterns import (
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
     SURROGATE_HASH_FUNCTIONS,
@@ -47,7 +55,11 @@ __all__ = [
     "GroupBySummary",
     "JoinSide",
     "JoinSummary",
+    "MultiResultScript",
+    "NoResultScript",
+    "ResultStatement",
     "SQLParseError",
+    "SingleResult",
     "WindowSummary",
     "aggregate_behavior",
     "all_findings",
@@ -62,6 +74,7 @@ __all__ = [
     "list_joins",
     "list_windows",
     "make_non_determinism_detector",
+    "parse_result_statement",
     "parse_sql",
     "scan_all",
     "suppression_hint",

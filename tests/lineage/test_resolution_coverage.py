@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dblect.lineage.builder import build_manifest_graph
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
 
@@ -104,6 +105,96 @@ def test_a_column_built_from_many_references_counts_once() -> None:
         columns=_cols(total="DECIMAL"),
     )
     assert _resolution(_manifest(src, model), "model.shop.totalled") == (1, 0, 0)
+
+
+def _upstream_by_column(manifest: Manifest, uid: str) -> dict[str, set[tuple[str, str]]]:
+    build = build_manifest_graph(manifest)
+    assert build.issues == (), build.issues
+    self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=uid)
+    out: dict[str, set[tuple[str, str]]] = {}
+    for ref, edges in build.graph.edges.items():
+        if ref.source == self_ref:
+            out[ref.column] = {(r.source.unique_id, r.column) for r in edges}
+    return out
+
+
+def test_ddl_prelude_yields_the_same_lineage_as_the_bare_select() -> None:
+    # Acceptance for the multi-statement split: a model compiled as
+    # `<DDL prelude>; <SELECT>` resolves to exactly the lineage of the bare SELECT.
+    src = _node(
+        "source.shop.raw.payments",
+        kind=ResourceType.SOURCE,
+        sql=None,
+        columns=_cols(amount="DECIMAL", currency="VARCHAR"),
+    )
+    bare = _node(
+        "model.shop.bare",
+        kind=ResourceType.MODEL,
+        sql="SELECT amount, currency FROM payments",
+        columns=_cols(amount="DECIMAL", currency="VARCHAR"),
+    )
+    prelude = _node(
+        "model.shop.prelude",
+        kind=ResourceType.MODEL,
+        sql=(
+            "CREATE TEMPORARY FUNCTION add_one(x INT) AS (x + 1);\n"
+            "SELECT amount, currency FROM payments"
+        ),
+        columns=_cols(amount="DECIMAL", currency="VARCHAR"),
+    )
+    manifest = _manifest(src, bare, prelude)
+    bare_lineage = _upstream_by_column(manifest, "model.shop.bare")
+    prelude_lineage = _upstream_by_column(manifest, "model.shop.prelude")
+    assert prelude_lineage == bare_lineage
+    assert _resolution(manifest, "model.shop.prelude") == _resolution(manifest, "model.shop.bare")
+
+
+def test_inline_defined_function_call_resolves_to_its_argument_lineage() -> None:
+    # A call to the inline-defined function is an opaque transform: it does not
+    # crash, and the output column still carries the lineage of the column it reads.
+    src = _node(
+        "source.shop.raw.payments",
+        kind=ResourceType.SOURCE,
+        sql=None,
+        columns=_cols(amount="DECIMAL"),
+    )
+    model = _node(
+        "model.shop.doubled",
+        kind=ResourceType.MODEL,
+        sql=(
+            "CREATE TEMPORARY FUNCTION secret(x INT) AS (x * 2);\n"
+            "SELECT secret(amount) AS doubled FROM payments"
+        ),
+        columns=_cols(doubled="DECIMAL"),
+    )
+    lineage = _upstream_by_column(_manifest(src, model), "model.shop.doubled")
+    assert lineage["doubled"] == {("source.shop.raw.payments", "amount")}
+
+
+def test_multi_result_script_is_an_unbuilt_coverage_miss() -> None:
+    # A genuine multi-statement script cannot be reduced to one model statement, so
+    # it is surfaced as a build issue rather than silently emptied or guessed at.
+    src = _node(
+        "source.shop.raw.payments",
+        kind=ResourceType.SOURCE,
+        sql=None,
+        columns=_cols(amount="DECIMAL"),
+    )
+    model = _node(
+        "model.shop.script",
+        kind=ResourceType.MODEL,
+        sql="SELECT amount FROM payments;\nSELECT amount FROM payments",
+        columns=_cols(amount="DECIMAL"),
+    )
+    build = build_manifest_graph(_manifest(src, model))
+    miss = [i for i in build.issues if i.model_unique_id == "model.shop.script"]
+    assert miss, "a multi-result script should be reported as a build issue"
+    assert "result-producing" in miss[0].message
+    # Nothing was emitted for the script: it is a miss, never analysed as if empty.
+    self_ref = ColumnRef(
+        source=SourceRef(kind=SourceKind.MODEL, unique_id="model.shop.script"), column="amount"
+    )
+    assert self_ref not in build.graph.edges
 
 
 def test_cte_depth_does_not_inflate_the_denominator() -> None:

@@ -23,12 +23,19 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
+
+if TYPE_CHECKING:
+    # Referenced only in ``suppression_hint``'s signature; imported under
+    # ``TYPE_CHECKING`` so this SQL-layer module stays free of a declaration-check
+    # import at load time.
+    from dblect.check.findings import CheckFindingKind
 
 
 class FindingKind(StrEnum):
@@ -47,8 +54,10 @@ class FindingKind(StrEnum):
     MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
-def suppression_hint(kind: FindingKind) -> str:
+def suppression_hint(kind: FindingKind | CheckFindingKind) -> str:
     # The suggested directive must stay valid suppression syntax (round-trip tested).
+    # Both finding families share the directive, so the hint takes either kind and
+    # renders the kind value the scanner reads back.
     return f"If this is intentional, record it with `-- noqa-fixture: {kind.value}: <reason>`."
 
 

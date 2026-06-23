@@ -1,17 +1,25 @@
-"""Parse SQL into a sqlglot AST.
+"""Parse dbt-compiled SQL into a sqlglot AST, reducing a compiled script to its result.
 
-The input to the analysis layer is dbt-compiled SQL (rendered by ``dbt
-compile``): plain SQL that sqlglot can parse directly. `parse_sql` is a thin
-wrapper around `sqlglot.parse_one` that translates parser errors into our
-own `SQLParseError` so callers can distinguish "this model's SQL is broken"
-from arbitrary sqlglot exceptions, and so the walker can record the
-offending SQL on its skipped-model report.
+A model usually compiles to a single ``SELECT``, but a macro that emits a helper UDF
+inline produces a script: leading ``CREATE [TEMPORARY] FUNCTION`` / ``DECLARE`` /
+``SET`` statements before the terminal query. `parse_result_statement` keeps the final
+top-level query and drops the prelude. A call to an inline-defined function stays an
+ordinary call, which the propagator reads as a value-erasing transform, so an inline
+UDF degrades to the opaque posture rather than failing the parse.
+
+A script with more than one query, or none, cannot be reduced to a single model, so
+the caller records a resolution-coverage miss instead of guessing. `parse_sql` is the
+single-statement door the detectors call; it sees through a prelude and raises
+`SQLParseError` when the SQL is unparseable or has no single result statement.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import sqlglot
 from sqlglot import Expr
+from sqlglot import expressions as exp
 from sqlglot.errors import ParseError
 
 
@@ -23,14 +31,78 @@ class SQLParseError(ValueError):
         self.sql = sql
 
 
-def parse_sql(sql: str, dialect: str | None = None) -> Expr:
-    """Parse `sql` with sqlglot under `dialect`, raising `SQLParseError` on failure.
+@dataclass(frozen=True, slots=True)
+class SingleResult:
+    """The script reduced to one result statement: the query the analysis walks."""
 
-    `dialect` is passed through to sqlglot. ``None`` selects sqlglot's
-    permissive default; pass ``"duckdb"``, ``"snowflake"``, etc. when the
-    SQL is dialect-specific.
+    statement: Expr
+
+
+@dataclass(frozen=True, slots=True)
+class MultiResultScript:
+    """More than one result-producing statement (genuine scripting): a coverage miss,
+    since picking the model statement would be a guess."""
+
+    result_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NoResultScript:
+    """No query to follow lineage on (an ``INSERT``- or DDL-only body): a coverage miss."""
+
+
+# The outcome of reducing a compiled script to its result statement.
+ResultStatement = SingleResult | MultiResultScript | NoResultScript
+
+
+def _is_result_producing(statement: Expr) -> bool:
+    """Whether ``statement`` is a result-producing query (sqlglot's ``exp.Query``:
+    ``SELECT``, set operation, or CTE chain). DDL, ``DECLARE``, ``SET``, ``INSERT``,
+    and ``CREATE TABLE AS`` are not, so they fall out as prelude or leave no result."""
+    return isinstance(statement, exp.Query)
+
+
+def parse_result_statement(sql: str, dialect: str | None = None) -> ResultStatement:
+    """Parse ``sql`` as a (possibly multi-statement) compiled script and reduce it to
+    its result statement.
+
+    Returns :class:`SingleResult` when exactly one statement is result-producing,
+    :class:`MultiResultScript` when more than one is (genuine scripting), and
+    :class:`NoResultScript` when none is. Raises :class:`SQLParseError` when sqlglot
+    cannot parse the input at all.
     """
     try:
-        return sqlglot.parse_one(sql, dialect=dialect)
+        statements = sqlglot.parse(sql, dialect=dialect)
     except ParseError as e:
         raise SQLParseError(str(e), sql=sql) from e
+    results = [s for s in statements if s is not None and _is_result_producing(s)]
+    if len(results) == 1:
+        return SingleResult(statement=results[0])
+    if len(results) > 1:
+        return MultiResultScript(result_count=len(results))
+    return NoResultScript()
+
+
+def parse_sql(sql: str, dialect: str | None = None) -> Expr:
+    """Parse ``sql`` and return its single result statement, seeing through a DDL
+    prelude. Raises `SQLParseError` when the SQL is unparseable or cannot be reduced to
+    one result statement; callers that want the structured outcome (to record a
+    coverage miss rather than a skip) use :func:`parse_result_statement` directly.
+
+    `dialect` is passed through to sqlglot; ``None`` selects its permissive default.
+    """
+    outcome = parse_result_statement(sql, dialect=dialect)
+    match outcome:
+        case SingleResult(statement=statement):
+            return statement
+        case MultiResultScript(result_count=count):
+            raise SQLParseError(
+                f"compiled SQL has {count} result-producing statements; "
+                "cannot reduce to a single model statement",
+                sql=sql,
+            )
+        case NoResultScript():
+            raise SQLParseError(
+                "compiled SQL has no result-producing statement to analyse",
+                sql=sql,
+            )

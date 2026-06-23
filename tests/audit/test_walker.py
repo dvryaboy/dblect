@@ -234,21 +234,22 @@ def test_run_audit_parses_each_model_once(
     # The facts pre-pass and the per-model detector loop used to each parse
     # every model's compiled SQL, which was twice the work. The walker now
     # parses once and shares the trees. Lock that in by counting calls to
-    # sqlglot.parse_one against each model's compiled SQL.
+    # sqlglot.parse (the multi-statement door the parser uses to split a
+    # compiled script into its result statement) against each model's compiled SQL.
     from typing import Any
 
     import sqlglot
 
     model_sqls = {m.compiled_code for m in jaffle.models.values() if m.compiled_code is not None}
     counts: dict[str, int] = {}
-    real_parse_one = sqlglot.parse_one
+    real_parse = sqlglot.parse
 
-    def counting_parse_one(sql: str, *args: Any, **kwargs: Any) -> Any:
+    def counting_parse(sql: str, *args: Any, **kwargs: Any) -> Any:
         if sql in model_sqls:
             counts[sql] = counts.get(sql, 0) + 1
-        return real_parse_one(sql, *args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
+        return real_parse(sql, *args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
 
-    monkeypatch.setattr(sqlglot, "parse_one", counting_parse_one)
+    monkeypatch.setattr(sqlglot, "parse", counting_parse)
     run_audit(jaffle, _DUCKDB)
     assert set(counts) == model_sqls, "every model's compiled SQL should be parsed"
     repeated = {n for n in counts.values() if n > 1}
