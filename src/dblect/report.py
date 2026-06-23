@@ -20,6 +20,7 @@ from dblect.analysis import AnalysisFinding, AnalysisReport
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding
 from dblect.severity import severity_of
+from dblect.sql import FindingKind, suppression_hint
 
 # Both families and the coverage block live under one document; consumers branch on
 # ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field.
@@ -139,6 +140,13 @@ def _render_structural(lf: LocatedFinding) -> str:
     head = f"{loc}  {severity_of(lf).value}  {lf.finding.kind.value}"
     body_lines: list[str] = [head]
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
+    # The suppression nudge is presentation, not observation, so it lives here rather
+    # than in `Finding.message` (the JSON `message` stays the pure observation). Every
+    # structural finding is line-suppressible, so the hint rides all of them. The lone
+    # exception is a malformed suppression directive: telling the reader to suppress it
+    # with another directive would be circular.
+    if lf.finding.kind is not FindingKind.MALFORMED_SUPPRESSION:
+        body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
     snippet = lf.finding.sql_snippet.strip()
     if snippet:
         body_lines.append(indent(f"snippet: {snippet}", "    "))
@@ -147,7 +155,12 @@ def _render_structural(lf: LocatedFinding) -> str:
 
 def _declaration_block(finding: CheckFinding) -> str:
     where = finding.model_unique_id or finding.contract or "<project>"
-    head = f"  {severity_of(finding).value}  {finding.kind.value}  {where}"
+    kind = finding.kind.value
+    # A contract issue names its specific cause inline, so the reader distinguishes an
+    # unsourced field from any other contract issue without reading the body.
+    if finding.code is not None:
+        kind += f" ({finding.code.value})"
+    head = f"  {severity_of(finding).value}  {kind}  {where}"
     if finding.column:
         head += f".{finding.column}"
     lines = [head, f"      {finding.message}"]

@@ -157,6 +157,14 @@ dblect check .       # now also reports meaning-level findings from the types yo
 
 `dblect check` produces structural findings in under a minute on typical projects, with no declarations required. From there, declare semantic types on the columns that matter and run `dblect check` in CI.
 
+Authoring those declarations is where an AI coding agent helps. Install the bootstrap skill into your agent and let it walk the project, propose types on the columns whose meaning matters, and run the check loop with you:
+
+```bash
+dblect setup claude .   # or: cursor, codex
+```
+
+This writes a harness-specific skill (`.claude/skills/`, `.cursor/rules/`, or an `AGENTS.md` block); run `dblect setup <target> --print` to review it first.
+
 See the [demo walkthrough](docs/design/demo_walkthrough.md) for an end-to-end tour against `jaffle_shop_duckdb`, and [docs/current_state/architecture.md](docs/current_state/architecture.md) for what is built today.
 
 ## Status

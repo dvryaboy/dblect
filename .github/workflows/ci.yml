@@ -15,7 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # Single version to conserve Actions minutes; widen the matrix back to the
+        # full supported range (3.11-3.13) when budget allows.
+        python-version: ["3.13"]
 
     steps:
       - uses: actions/checkout@v4

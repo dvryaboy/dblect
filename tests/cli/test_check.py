@@ -174,6 +174,52 @@ def test_finds_manifest_in_target_dir(
     assert "null_group_after_outer_join" in result.output
 
 
+def test_finds_manifest_under_flags_target_path(
+    tmp_path: Path, jaffle_manifest_path: Path, runner: CliRunner
+) -> None:
+    # Recent dbt moves the setting under ``flags:``; honor that location too.
+    project = tmp_path / "p"
+    (project / "build").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: x\nprofile: x\nflags:\n  target_path: build\n")
+    shutil.copy(jaffle_manifest_path, project / "build" / "manifest.json")
+    result = runner.invoke(app, ["check", "--no-fail", str(project)])
+    assert result.exit_code == 0, result.output
+    assert "null_group_after_outer_join" in result.output
+
+
+def test_relative_target_path_outside_project_resolves(
+    tmp_path: Path, jaffle_manifest_path: Path, runner: CliRunner
+) -> None:
+    # ``target-path: ../docs`` (the case from the field report) lands artifacts in a
+    # sibling directory; resolution must walk out of the project dir to find them.
+    project = tmp_path / "p"
+    project.mkdir(parents=True)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (project / "dbt_project.yml").write_text("name: x\nprofile: x\ntarget-path: ../docs\n")
+    shutil.copy(jaffle_manifest_path, docs / "manifest.json")
+    result = runner.invoke(app, ["check", "--no-fail", str(project)])
+    assert result.exit_code == 0, result.output
+    assert "null_group_after_outer_join" in result.output
+
+
+def test_env_var_overrides_project_target_path(
+    tmp_path: Path, jaffle_manifest_path: Path, runner: CliRunner
+) -> None:
+    # dbt's precedence puts DBT_TARGET_PATH above dbt_project.yml; the manifest sits
+    # where the env var points, not where the config says, so the env var must win.
+    project = tmp_path / "p"
+    (project / "from_env").mkdir(parents=True)
+    (project / "config_dir").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: x\nprofile: x\ntarget-path: config_dir\n")
+    shutil.copy(jaffle_manifest_path, project / "from_env" / "manifest.json")
+    result = runner.invoke(
+        app, ["check", "--no-fail", str(project)], env={"DBT_TARGET_PATH": "from_env"}
+    )
+    assert result.exit_code == 0, result.output
+    assert "null_group_after_outer_join" in result.output
+
+
 def test_missing_manifest_and_no_dbt_project_fails(tmp_path: Path, runner: CliRunner) -> None:
     result = runner.invoke(app, ["check", str(tmp_path)])
     assert result.exit_code != 0

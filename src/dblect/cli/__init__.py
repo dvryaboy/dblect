@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, cast
 
 import typer
+import yaml  # type: ignore[import-untyped]
 
+from dblect.bootstrap import SetupTarget
 from dblect.severity import Severity
 
 if TYPE_CHECKING:
     from dblect.adapters import AdapterProfile
+    from dblect.analysis import AnalysisReport
     from dblect.manifest import Manifest
+    from dblect.types import ContractRegistry
 
 app = typer.Typer(
     name="dblect",
@@ -50,8 +56,9 @@ def check(
         typer.Option(  # pyright: ignore[reportUnknownMemberType]
             "--manifest",
             help=(
-                "Path to a manifest.json. If omitted, dblect looks for "
-                "<project_dir>/target/manifest.json and falls back to running "
+                "Path to a manifest.json. If omitted, dblect looks under the "
+                "project's dbt target-path (honoring DBT_TARGET_PATH and "
+                "dbt_project.yml, defaulting to target/) and falls back to running "
                 "`dbt compile` to produce one."
             ),
         ),
@@ -132,6 +139,32 @@ def check(
             ),
         ),
     ] = None,
+    base_manifest: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--base-manifest",
+            help=(
+                "Path to the base revision's manifest.json (for example the stored "
+                "production manifest dbt Slim CI keeps). dblect analyses it the same "
+                "way as HEAD and reports only the findings the change introduces: a "
+                "finding whose kind, model, and subject already exist in the base is "
+                "preexisting and filtered out. Because it diffs analysis results "
+                "rather than edited source lines, it catches a hazard a change "
+                "introduces through a macro or an upstream model without touching the "
+                "model's own file. Omitted, the full report is rendered."
+            ),
+        ),
+    ] = None,
+    base_catalog: Annotated[
+        Path | None,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--base-catalog",
+            help=(
+                "Path to the base revision's catalog.json. Defaults to a catalog.json "
+                "beside --base-manifest. Only meaningful together with --base-manifest."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Check a dbt project: structural hazards and declaration-level contracts.
 
@@ -144,10 +177,14 @@ def check(
 
     from dblect import __version__
     from dblect.analysis import analyze
+    from dblect.baseline import introduced_findings
     from dblect.loader import load_declarations
     from dblect.report import render_json, render_text
     from dblect.sarif import render_sarif
     from dblect.severity import exceeds_threshold
+
+    if base_catalog is not None and base_manifest is None:
+        raise typer.BadParameter("--base-catalog has no effect without --base-manifest")
 
     manifest_path = _resolve_manifest_path(
         project_dir=project_dir, explicit=manifest, dbt_executable=dbt_executable, command="check"
@@ -160,6 +197,19 @@ def check(
         loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
     )
     report = replace(report, check=replace(report.check, load_issues=load_result.issues))
+    if base_manifest is not None:
+        base = _analyze_base(
+            base_manifest=base_manifest,
+            base_catalog=base_catalog,
+            dialect_override=dialect_override,
+            registry=load_result.registry,
+            resolution_floor=resolution_floor,
+        )
+        # Narrow only the merged ``findings`` view: that is what every renderer and the
+        # exit code read. The family sub-reports keep their project-wide coverage
+        # metadata (models scanned, contracts resolved), which describes the whole run,
+        # not the introduced subset.
+        report = replace(report, findings=introduced_findings(report.findings, base.findings))
     match output_format:
         case OutputFormat.JSON:
             rendered = render_json(report)
@@ -220,6 +270,39 @@ def init(
     typer.echo("init: scaffolding complete; add contracts and run `dblect check`.")
 
 
+@app.command()
+def setup(
+    target: Annotated[
+        SetupTarget,
+        typer.Argument(  # pyright: ignore[reportUnknownMemberType]
+            help="The AI coding agent to install the bootstrap skill into.",
+        ),
+    ],
+    project_dir: Annotated[
+        Path,
+        typer.Argument(  # pyright: ignore[reportUnknownMemberType]
+            help="Project to install into (where .claude/, .cursor/, or AGENTS.md lives).",
+        ),
+    ] = Path("."),
+    print_only: Annotated[
+        bool,
+        typer.Option(  # pyright: ignore[reportUnknownMemberType]
+            "--print",
+            help="Write the adapted skill to stdout instead of installing it.",
+        ),
+    ] = False,
+) -> None:
+    """Install the dblect bootstrap skill into an AI coding agent's project surface."""
+    from dblect.bootstrap import install, render
+
+    if print_only:
+        typer.echo(render(target))
+        return
+    path = install(target, project_dir)
+    typer.echo(f"setup: wrote {path}")
+    typer.echo(f"setup: open your {target.value} agent and run the dblect-bootstrap skill.")
+
+
 _STARTER_TYPES = '"""Project domain types: DomainType subclasses and named refinements."""\n'
 _STARTER_CONTRACTS_INIT = '"""Model contracts: one ModelContract per dbt model you type."""\n'
 _GITIGNORE = "# Generated by dblect; not checked in.\n_stubs/\n"
@@ -243,6 +326,32 @@ def _scaffold_declarations(decl: Path) -> list[Path]:
         path.write_text(body)
         created.append(path)
     return created
+
+
+def _analyze_base(
+    *,
+    base_manifest: Path,
+    base_catalog: Path | None,
+    dialect_override: str | None,
+    registry: ContractRegistry,
+    resolution_floor: float | None,
+) -> AnalysisReport:
+    """Analyse the base revision's manifest the same way HEAD was analysed.
+
+    Same dialect resolution, same declarations (``registry``), and the same
+    resolution floor, so a finding's cross-world identity is comparable across the two
+    worlds. The base catalog defaults to a ``catalog.json`` beside ``base_manifest``,
+    matching the Slim CI layout where the stored manifest and catalog sit together.
+    """
+    from dblect.analysis import analyze
+
+    if not base_manifest.exists():
+        raise typer.BadParameter(f"--base-manifest path does not exist: {base_manifest}")
+    loaded = _load_manifest(
+        manifest_path=base_manifest, explicit_catalog=base_catalog, command="check (base)"
+    )
+    profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check (base)")
+    return analyze(loaded, profile, registry=registry, resolution_floor=resolution_floor)
 
 
 def _resolve_profile(
@@ -274,6 +383,48 @@ def _resolve_profile(
     return profile
 
 
+def _target_path_from_project(project_dir: Path) -> str | None:
+    """The ``target-path`` a ``dbt_project.yml`` configures, or ``None``.
+
+    dbt accepts it top-level (``target-path:``) and, on recent versions, under
+    ``flags: {target_path: ...}``; the ``flags`` form is canonical now, so it
+    wins when both are present. A missing file, missing key, or unparseable YAML
+    yields ``None``: the caller falls back to ``target/`` and leaves any genuine
+    config error for dbt itself to report."""
+    project_yml = project_dir / "dbt_project.yml"
+    if not project_yml.exists():
+        return None
+    try:
+        parsed: object = yaml.safe_load(project_yml.read_text())
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    cfg = cast("Mapping[str, object]", parsed)
+    flags = cfg.get("flags")
+    if isinstance(flags, Mapping):
+        nested = cast("Mapping[str, object]", flags).get("target_path")
+        if isinstance(nested, str) and nested:
+            return nested
+    value = cfg.get("target-path")
+    return value if isinstance(value, str) and value else None
+
+
+def _resolve_target_dir(project_dir: Path) -> Path:
+    """The directory dbt writes compiled artifacts to, honoring a customized
+    ``target-path`` so a project that builds elsewhere works with no flags.
+
+    dbt's precedence is the ``--target-path`` CLI flag, then ``DBT_TARGET_PATH``,
+    then ``dbt_project.yml``, then the ``target/`` default. dblect has no
+    target-path flag of its own (``--manifest`` and ``--catalog`` override the
+    resolved files directly and short-circuit before this runs), so this covers
+    the env var, the project config, and the default. A relative value resolves
+    against the project directory, matching dbt."""
+    raw = os.environ.get("DBT_TARGET_PATH") or _target_path_from_project(project_dir)
+    target = Path(raw) if raw else Path("target")
+    return target if target.is_absolute() else project_dir / target
+
+
 def _resolve_manifest_path(
     *,
     project_dir: Path,
@@ -285,7 +436,7 @@ def _resolve_manifest_path(
         if not explicit.exists():
             raise typer.BadParameter(f"manifest path does not exist: {explicit}")
         return explicit
-    default = project_dir / "target" / "manifest.json"
+    default = _resolve_target_dir(project_dir) / "manifest.json"
     if default.exists():
         return default
     if not (project_dir / "dbt_project.yml").exists():

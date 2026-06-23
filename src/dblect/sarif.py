@@ -111,6 +111,7 @@ class _Result(TypedDict, total=False):
     locations: list[_Location]
     suppressions: list[_Suppression]
     partialFingerprints: dict[str, str]
+    properties: dict[str, str]
 
 
 class _DescriptorReference(TypedDict):
@@ -197,11 +198,13 @@ def _build_rules(
 
 
 def _descriptor(rule_id: str, level: _Level) -> _ReportingDescriptor:
-    _, _, kind = rule_id.partition("/")
+    # The leaf segment names the rule: for a sub-namespaced contract-issue id
+    # (``declaration/contract_issue/<code>``) that is the code, otherwise the kind.
+    leaf = rule_id.rsplit("/", 1)[-1]
     return {
         "id": rule_id,
-        "name": _pascal_case(kind),
-        "shortDescription": {"text": kind.replace("_", " ")},
+        "name": _pascal_case(leaf),
+        "shortDescription": {"text": leaf.replace("_", " ")},
         "defaultConfiguration": {"level": level},
     }
 
@@ -218,6 +221,11 @@ def _result_for(finding: AnalysisFinding, rule_index: dict[str, int]) -> _Result
     locations = _locations(finding)
     if locations:
         result["locations"] = locations
+    code = _issue_code(finding)
+    if code is not None:
+        # The code rides as a machine-readable property alongside the sub-namespaced
+        # ruleId, so a consumer can read the cause without parsing the id.
+        result["properties"] = {"code": code}
     return result
 
 
@@ -239,9 +247,23 @@ def _rule_id(finding: AnalysisFinding) -> str:
 def _family_and_kind(finding: AnalysisFinding) -> tuple[_Family, str]:
     match finding:
         case CheckFinding():
-            return "declaration", finding.kind.value
+            # A contract issue sub-namespaces its kind by the specific cause, so each
+            # cause is a distinct, stable rule a surface can group and triage by.
+            kind = finding.kind.value
+            if finding.code is not None:
+                kind = f"{kind}/{finding.code.value}"
+            return "declaration", kind
         case LocatedFinding():
             return "structural", finding.finding.kind.value
+    assert_never(finding)
+
+
+def _issue_code(finding: AnalysisFinding) -> str | None:
+    match finding:
+        case CheckFinding():
+            return finding.code.value if finding.code is not None else None
+        case LocatedFinding():
+            return None
     assert_never(finding)
 
 

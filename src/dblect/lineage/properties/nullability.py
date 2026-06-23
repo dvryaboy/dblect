@@ -514,6 +514,100 @@ def taint_outer_joins(
     return ColumnLineageGraph(edges=graph.edges, expressions=new_expressions)
 
 
+def _optional_alias_sides(select: exp.Select) -> dict[str, JoinSide]:
+    """Each optional-side alias mapped to the join kind that makes it optional.
+
+    The same reading as :func:`_optional_join_aliases`, retaining the side so a consumer can
+    name *which* outer join padded the column. A LEFT join's joined-in side reports LEFT, a
+    RIGHT join's accumulated left side reports RIGHT, a FULL join reports FULL for both. When
+    an alias becomes optional through more than one join, the last to taint it wins; the side
+    is descriptive, the optionality itself is what the taint relies on."""
+    from_ = sg.from_of(select)
+    left: set[str] = set()
+    if from_ is not None:
+        base = _relation_alias(from_.this)
+        if base is not None:
+            left.add(base)
+    optional: dict[str, JoinSide] = {}
+    for join in sg.joins_of(select):
+        side = sg.join_side_of(join)
+        alias = _relation_alias(join.this)
+        if side is JoinSide.LEFT and alias is not None:
+            optional[alias] = JoinSide.LEFT
+        elif side is JoinSide.RIGHT:
+            for a in left:
+                optional[a] = JoinSide.RIGHT
+        elif side is JoinSide.FULL:
+            if alias is not None:
+                optional[alias] = JoinSide.FULL
+            for a in left:
+                optional[a] = JoinSide.FULL
+        if alias is not None:
+            left.add(alias)
+    return optional
+
+
+def _outer_join_output_columns(
+    select: exp.Select, optional: Mapping[str, JoinSide]
+) -> dict[str, JoinSide]:
+    """The model's *output* columns produced from an outer-join optional side, each mapped
+    to the join kind that made it nullable.
+
+    A top-level projection contributes its output name when its expression is a bare column
+    qualified by an optional-side alias. ``COALESCE`` and other guards clear the optionality,
+    so a projection that wraps the column reports no outer-join cause. A projection whose
+    source we cannot read as a bare optional-side column reports nothing (the
+    silent-when-unsure posture), so the cause is a sufficient, never speculative, condition.
+    Output names are case-folded to match the detectors' lowercased keys."""
+    out: dict[str, JoinSide] = {}
+    for proj in select.selects:
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if not isinstance(inner, exp.Column):
+            continue
+        side = optional.get(inner.table.lower()) if inner.table else None
+        if side is not None:
+            out[sg.name_of(proj).lower()] = side
+    return out
+
+
+def outer_join_nullable_columns(
+    manifest: Manifest, *, parsed: Mapping[str, Expr] | None = None
+) -> Mapping[str, Mapping[str, JoinSide]]:
+    """Per model name, the output columns whose nullability the substrate attributes to an
+    outer join at that model's own top-level FROM/JOIN structure, each mapped to the join
+    kind (LEFT/RIGHT/FULL) that padded it.
+
+    This is the same structural reading :func:`taint_outer_joins` uses, surfaced so a
+    consumer (the join-on-nullable-key finding) can name *why* a key is nullable upstream
+    without rediscovering it. It is a sufficient condition: a model the analysis cannot
+    read (CTE-collapsed, unparseable, a projection that is not a bare optional-side column)
+    contributes nothing rather than a guess. Keyed by ``identifier or name`` to match how
+    the detectors resolve a relation in compiled SQL."""
+    out: dict[str, Mapping[str, JoinSide]] = {}
+    for node in manifest.nodes.values():
+        if node.resource_type is not ResourceType.MODEL:
+            continue
+        sql = node.compiled_code
+        if not sql:
+            continue
+        tree = parsed.get(node.unique_id) if parsed is not None else None
+        if tree is None:
+            try:
+                tree = parse_sql(sql, dialect="duckdb")
+            except SQLParseError:
+                continue
+        select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
+        if not isinstance(select, exp.Select):
+            continue
+        optional = _optional_alias_sides(select)
+        if not optional:
+            continue
+        columns = _outer_join_output_columns(select, optional)
+        if columns:
+            out[node.identifier or node.name] = columns
+    return out
+
+
 def activated_nullability(
     manifest: Manifest, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
 ) -> Mapping[ColumnRef, Annotation[Nullability]]:
