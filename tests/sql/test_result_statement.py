@@ -52,8 +52,10 @@ def test_parse_sql_tolerates_a_ddl_prelude() -> None:
     assert prefixed.sql(dialect="duckdb") == bare.sql(dialect="duckdb")
 
 
-_RESERVED = frozenset({"select", "from", "where", "as", "create", "function", "set", "table"})
-_IDENT = st.from_regex(r"[a-z][a-z0-9_]{0,6}", fullmatch=True).filter(lambda s: s not in _RESERVED)
+# Prefix every generated name with ``id_`` so it can never collide with a SQL keyword
+# (``in``, ``on``, ``select``, ...); a keyword used as a function or table name is a
+# parse error in its own right and is not what this property is exercising.
+_IDENT = st.from_regex(r"[a-z][a-z0-9_]{0,6}", fullmatch=True).map(lambda s: f"id_{s}")
 
 
 @given(
