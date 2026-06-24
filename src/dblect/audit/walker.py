@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
+from dblect.audit.sourcemap import LineMap, SourceSpan, SpanBasis, build_line_map
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
@@ -57,11 +58,27 @@ DEFAULT_DETECTORS: tuple[Detector, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class LocatedFinding:
-    """A `Finding` plus the model and file it came from."""
+    """A `Finding` plus the model and file it came from.
+
+    ``finding`` carries the compiled-SQL span the parser produced (the raw
+    observation). ``source_span`` is that span back-mapped onto the on-disk
+    template for reporting; it is ``None`` only when no back-map was performed (a
+    finding constructed outside the walker), in which case :attr:`located_span`
+    falls back to the compiled span, flagged compiled-relative.
+    """
 
     model_unique_id: str
     file_path: str | None
     finding: Finding
+    source_span: SourceSpan | None = None
+
+    @property
+    def located_span(self) -> SourceSpan:
+        """The span to report: the back-mapped source span, or the compiled span as a
+        compiled-relative fallback when no mapping is attached."""
+        if self.source_span is not None:
+            return self.source_span
+        return SourceSpan(self.finding.line_start, self.finding.line_end, SpanBasis.COMPILED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,10 +233,13 @@ def _scan_one(
     # output. Fall back to the compiled SQL only if `raw_code` is missing.
     directives = parse_directives(node.raw_code or node.analysis_sql or "")
     active_raw, suppressed_raw = apply(raw_findings, directives)
-    located_active = [_locate(node, f) for f in active_raw]
+    # Findings carry compiled-SQL spans; back-map them onto the source template once
+    # per model so the report points at the `.sql` the developer wrote.
+    line_map = build_line_map(node.analysis_sql, node.raw_code)
+    located_active = [_locate(node, f, line_map) for f in active_raw]
     located_suppressed = [
         SuppressedFinding(
-            located=_locate(node, f),
+            located=_locate(node, f, line_map),
             directive_line=d.line,
             bare=d.kinds is None,
         )
@@ -231,9 +251,10 @@ def _scan_one(
     )
 
 
-def _locate(node: Node, finding: Finding) -> LocatedFinding:
+def _locate(node: Node, finding: Finding, line_map: LineMap) -> LocatedFinding:
     return LocatedFinding(
         model_unique_id=node.unique_id,
         file_path=node.original_file_path,
         finding=finding,
+        source_span=line_map.map_span(finding.line_start, finding.line_end),
     )

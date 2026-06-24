@@ -11,6 +11,7 @@ from dblect.adapters import AdapterProfile, profile_for_adapter
 from dblect.audit import (
     DEFAULT_DETECTORS,
     AuditReport,
+    SpanBasis,
     run_audit,
 )
 from dblect.manifest import Manifest, Node, ResourceType
@@ -300,6 +301,49 @@ def test_macro_emitted_join_visible_in_compiled_code() -> None:
     assert any(
         lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
     ), "compiled path should see the macro-emitted LEFT JOIN and flag the GROUP BY"
+
+
+def test_finding_back_maps_compiled_span_to_the_source_line() -> None:
+    # A macro expands to two compiled lines, pushing the GROUP BY from source line 4
+    # to compiled line 5. The finding's compiled span is what the parser saw; its
+    # reported span is back-mapped onto the on-disk template, so the user is pointed
+    # at the line they wrote.
+    raw = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "{{ join_country(u) }}\n"
+        "group by u.user_id, d.country"
+    )
+    compiled = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "left join dim_country d\n"
+        "  on u.country_code = d.code\n"
+        "group by u.user_id, d.country"
+    )
+    node = Node(
+        unique_id="model.pkg.user_country",
+        name="user_country",
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", "user_country"),
+        package_name="pkg",
+        schema=None,
+        raw_code=raw,
+        compiled_code=compiled,
+        original_file_path="models/user_country.sql",
+        columns={},
+    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    [hit] = [
+        lf
+        for lf in run_audit(manifest, _DUCKDB).findings
+        if lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    # Compiled span is preserved on the raw finding; the located span is back-mapped.
+    assert hit.finding.line_start == 5
+    span = hit.located_span
+    assert span.basis is SpanBasis.SOURCE
+    assert (span.line_start, span.line_end) == (4, 4)
 
 
 def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> None:

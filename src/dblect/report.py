@@ -17,6 +17,7 @@ from textwrap import indent
 from typing import TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport
+from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, SuppressedCheckFinding
 from dblect.severity import severity_of
@@ -25,8 +26,10 @@ from dblect.sql import suppression_code, suppression_hint
 # Both families and the coverage block live under one document; consumers branch on
 # ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field;
 # to "3" when a suppression's ``reason`` slot gave way to a ``bare`` flag (SQLFluff
-# ``-- noqa`` directives carry no reason).
-JSON_SCHEMA_VERSION = "3"
+# ``-- noqa`` directives carry no reason); to "4" when a structural finding gained the
+# back-mapped ``source_line_start``/``source_line_end``/``line_basis`` fields alongside
+# its compiled ``line_start``/``line_end``.
+JSON_SCHEMA_VERSION = "4"
 
 
 def _partition_by_family(
@@ -129,7 +132,10 @@ def _structural_block(findings: Sequence[LocatedFinding]) -> str:
         by_model[lf.model_unique_id].append(lf)
     chunks: list[str] = []
     for uid in sorted(by_model):
-        group = sorted(by_model[uid], key=lambda lf: (lf.finding.line_start, lf.finding.line_end))
+        group = sorted(
+            by_model[uid],
+            key=lambda lf: (lf.located_span.line_start, lf.located_span.line_end),
+        )
         # Every finding in a model shares the model's file path; take it from the first.
         path = group[0].file_path or uid
         chunks.append(f"  {path}  ({uid})")
@@ -138,7 +144,7 @@ def _structural_block(findings: Sequence[LocatedFinding]) -> str:
 
 
 def _render_structural(lf: LocatedFinding) -> str:
-    loc = _format_line_range(lf.finding.line_start, lf.finding.line_end)
+    loc = _format_span(lf.located_span)
     head = f"{loc}  {severity_of(lf).value}  {lf.finding.kind.value}"
     body_lines: list[str] = [head]
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
@@ -178,6 +184,15 @@ def _declaration_block(finding: CheckFinding) -> str:
     return "\n".join(lines)
 
 
+def _format_span(span: SourceSpan) -> str:
+    """A line range, marked ``(compiled)`` when it could not be back-mapped to source
+    so a reader knows the number indexes the compiled SQL, not the on-disk file."""
+    rng = _format_line_range(span.line_start, span.line_end)
+    if span.basis is SpanBasis.COMPILED and span.line_start > 0:
+        return f"{rng} (compiled)"
+    return rng
+
+
 def _format_line_range(start: int, end: int) -> str:
     if start == 0:
         return "L?"
@@ -195,19 +210,26 @@ def _suppressed_block(
     kind, how it was silenced (bare ``noqa`` or the specific ``noqa: DBLECT_<KIND>``),
     and the line the directive sat on."""
     lines = ["suppressed:"]
-    rows: list[tuple[str, int, int, str, str, int]] = []
+    # (path, sort_start, sort_end, loc, kind, via, directive_line). ``loc`` is
+    # pre-formatted so the structural family can carry its back-mapped span (and the
+    # compiled-relative marker) while the declaration family keeps its compiled span.
+    rows: list[tuple[str, int, int, str, str, str, int]] = []
     for s in structural:
         f = s.located.finding
         path = s.located.file_path or s.located.model_unique_id
         via = "noqa" if s.bare else f"noqa: {suppression_code(f.kind)}"
-        rows.append((path, f.line_start, f.line_end, f.kind.value, via, s.directive_line))
+        span = s.located.located_span
+        loc = _format_span(span)
+        rows.append(
+            (path, span.line_start, span.line_end, loc, f.kind.value, via, s.directive_line)
+        )
     for c in declaration:
         cf = c.finding
         path = cf.file_path or cf.model_unique_id or "<project>"
         via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
-        rows.append((path, cf.line_start, cf.line_end, cf.kind.value, via, c.directive_line))
-    for path, line_start, line_end, kind, via, directive_line in sorted(rows):
-        loc = _format_line_range(line_start, line_end)
+        loc = _format_line_range(cf.line_start, cf.line_end)
+        rows.append((path, cf.line_start, cf.line_end, loc, cf.kind.value, via, c.directive_line))
+    for path, _start, _end, loc, kind, via, directive_line in sorted(rows):
         lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ L{directive_line}")
     return "\n".join(lines)
 
@@ -279,6 +301,14 @@ class JsonFinding(TypedDict):
     contract: str | None
     line_start: int | None
     line_end: int | None
+    # The structural family back-maps its compiled span onto the source template.
+    # ``line_start``/``line_end`` stay the compiled span the parser saw (unchanged);
+    # ``source_line_*`` carry the back-mapped span and ``line_basis`` records whether
+    # the back-map succeeded (``"source"``) or fell back to the compiled line
+    # (``"compiled"``). The declaration family is not back-mapped and reports nulls.
+    source_line_start: int | None
+    source_line_end: int | None
+    line_basis: str | None
     sql_snippet: str | None
 
 
@@ -397,10 +427,15 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
                 "contract": finding.contract,
                 "line_start": finding.line_start if located else None,
                 "line_end": finding.line_end if located else None,
+                "source_line_start": None,
+                "source_line_end": None,
+                "line_basis": None,
                 "sql_snippet": None,
             }
         case LocatedFinding():
             inner = finding.finding
+            span = finding.located_span
+            mapped = span.line_start > 0
             return {
                 "family": "structural",
                 "kind": inner.kind.value,
@@ -412,6 +447,9 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
                 "contract": None,
                 "line_start": inner.line_start,
                 "line_end": inner.line_end,
+                "source_line_start": span.line_start if mapped else None,
+                "source_line_end": span.line_end if mapped else None,
+                "line_basis": span.basis.value,
                 "sql_snippet": inner.sql_snippet,
             }
     assert_never(finding)

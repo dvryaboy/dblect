@@ -16,6 +16,7 @@ import json
 from typing import Literal, TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport, cross_world_identity
+from dblect.audit.sourcemap import SpanBasis
 from dblect.audit.walker import LocatedFinding, SkippedModel
 from dblect.check.findings import CheckFinding, CheckFindingKind, UnbuiltModel
 from dblect.loader import LoadIssue
@@ -308,9 +309,14 @@ def _structural_locations(finding: LocatedFinding) -> list[_Location]:
     location: _Location = {"logicalLocations": [{"fullyQualifiedName": finding.model_unique_id}]}
     if finding.file_path is not None:
         physical: _PhysicalLocation = {"artifactLocation": {"uri": finding.file_path}}
-        region = _region(finding.finding.line_start, finding.finding.line_end)
-        if region is not None:
-            physical["region"] = region
+        # The region indexes the source file, so it must use the back-mapped source
+        # span. A compiled-relative span would point a code-scanning UI at the wrong
+        # source line, so we emit no region and let the location resolve to the file.
+        span = finding.located_span
+        if span.basis is SpanBasis.SOURCE:
+            region = _region(span.line_start, span.line_end)
+            if region is not None:
+                physical["region"] = region
         location["physicalLocation"] = physical
     return [location]
 
