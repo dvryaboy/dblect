@@ -509,7 +509,8 @@ def make_non_determinism_detector(
                     f"{_non_deterministic_name(call)} appears in {label}; this position is "
                     "load-bearing because the value affects which rows go where (filtering, "
                     "grouping, ranking). Output buckets drift with wall-clock time. If "
-                    "intentional, suppress with `-- noqa: DBLECT_NON_DETERMINISTIC_FUNCTION`; "
+                    "intentional, suppress with "
+                    f"`-- noqa: {suppression_code(FindingKind.NON_DETERMINISTIC_FUNCTION)}`; "
                     "if not, bucket by the absolute timestamp and derive the relative measure "
                     "at query time."
                 ),
