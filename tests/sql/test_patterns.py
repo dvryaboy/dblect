@@ -189,6 +189,30 @@ def test_within_group_array_agg_not_flagged() -> None:
     assert detect_unordered_aggregate(p) == ()
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # sqlglot wraps the ORDER BY under a Limit for the top-n idiom, and can
+        # stack a Distinct underneath. The detector must see through both.
+        "select array_agg(x order by y limit 1) as arr from t",
+        "select array_agg(distinct x order by y limit 1) as arr from t",
+        "select string_agg(name, ',' order by ts limit 3) as names from t",
+    ],
+)
+def test_ordered_aggregate_with_inner_limit_not_flagged(sql: str) -> None:
+    assert detect_unordered_aggregate(_parse(sql)) == ()
+
+
+def test_unordered_aggregate_over_ordered_subquery_arg_is_flagged() -> None:
+    # The ORDER BY here belongs to the subquery argument, not the aggregate's
+    # own ordering, so the aggregate IS unordered. Pins the contract that the
+    # detector unwraps the aggregate's clause rather than scanning the subtree.
+    p = _parse("select array_agg((select v from u order by w limit 1)) as arr from t")
+    findings = detect_unordered_aggregate(p)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
+
+
 def test_unordered_string_agg_detected() -> None:
     # sqlglot parses both STRING_AGG and GROUP_CONCAT into exp.GroupConcat,
     # so the existing aggregate detector covers them.

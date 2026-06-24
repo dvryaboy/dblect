@@ -57,6 +57,28 @@ def order_of(w: exp.Window) -> exp.Order | None:
     return cast("exp.Order | None", w.args.get("order"))
 
 
+# Modifiers that sqlglot stacks above an aggregate's ORDER BY clause. The order
+# can sit directly at the aggregate's `this`, or under a top-n LIMIT, or below a
+# DISTINCT (sqlglot has produced both `Limit -> Order` and `Order -> Distinct`),
+# so we walk transparently through these to reach the ordering itself.
+_AGGREGATE_CLAUSE_MODIFIERS: tuple[type[Expr], ...] = (exp.Limit, exp.Distinct)
+
+
+def aggregate_order_of(agg: Expr) -> exp.Order | None:
+    """The ORDER BY governing an aggregate's element order, if any.
+
+    Returns the aggregate's own ``Order`` clause, seeing through the LIMIT and
+    DISTINCT modifiers sqlglot wraps around it (``ARRAY_AGG(x ORDER BY y LIMIT n)``
+    parses as ``Limit -> Order``). Returns ``None`` when the aggregate has no
+    ordering of its own. An ``Order`` nested inside a subquery or other argument
+    expression is not the aggregate's ordering and is deliberately not returned.
+    """
+    inner = agg.this
+    while isinstance(inner, _AGGREGATE_CLAUSE_MODIFIERS):
+        inner = inner.this
+    return inner if isinstance(inner, exp.Order) else None
+
+
 def partition_of(w: exp.Window) -> list[Expr]:
     return cast("list[Expr]", w.args.get("partition_by") or [])
 
