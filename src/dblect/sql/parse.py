@@ -48,18 +48,33 @@ class MultiResultScript:
 
 @dataclass(frozen=True, slots=True)
 class NoResultScript:
-    """No query to follow lineage on (an ``INSERT``- or DDL-only body): a coverage miss."""
+    """No query to follow lineage on (an ``INSERT ... VALUES`` or DDL-only body): a
+    coverage miss."""
 
 
 # The outcome of reducing a compiled script to its result statement.
 ResultStatement = SingleResult | MultiResultScript | NoResultScript
 
 
-def _is_result_producing(statement: Expr) -> bool:
-    """Whether ``statement`` is a result-producing query (sqlglot's ``exp.Query``:
-    ``SELECT``, set operation, or CTE chain). DDL, ``DECLARE``, ``SET``, ``INSERT``,
-    and ``CREATE TABLE AS`` are not, so they fall out as prelude or leave no result."""
-    return isinstance(statement, exp.Query)
+def _result_query(statement: Expr) -> Expr | None:
+    """The result-producing query ``statement`` carries, or ``None``.
+
+    A bare query (sqlglot's ``exp.Query``: ``SELECT``, set operation, or CTE chain)
+    is its own result. A materialization wrapper holds its query in ``expression``:
+    ``CREATE TABLE ... AS SELECT``, ``CREATE VIEW ... AS SELECT``, and
+    ``INSERT ... SELECT`` all carry the model's logic in that inner ``SELECT``, so the
+    detectors analyse it rather than dropping the model. ``DECLARE``, ``SET``, an inline
+    ``CREATE FUNCTION``, ``INSERT ... VALUES``, and column-list DDL hold no query and
+    fall out as prelude or leave no result. ``MERGE`` has no single result query (its
+    source sits in a ``using`` clause) and is left as a non-result.
+    """
+    if isinstance(statement, exp.Query):
+        return statement
+    if isinstance(statement, exp.Create | exp.Insert):
+        inner = statement.expression
+        if isinstance(inner, exp.Query):
+            return inner
+    return None
 
 
 def parse_result_statement(sql: str, dialect: str | None = None) -> ResultStatement:
@@ -75,7 +90,7 @@ def parse_result_statement(sql: str, dialect: str | None = None) -> ResultStatem
         statements = sqlglot.parse(sql, dialect=dialect)
     except ParseError as e:
         raise SQLParseError(str(e), sql=sql) from e
-    results = [s for s in statements if s is not None and _is_result_producing(s)]
+    results = [q for s in statements if s is not None if (q := _result_query(s)) is not None]
     if len(results) == 1:
         return SingleResult(statement=results[0])
     if len(results) > 1:
