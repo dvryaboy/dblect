@@ -236,6 +236,10 @@ class Node:
     schema does not carry one. ``False`` is dbt saying the node was not compiled;
     it feeds :attr:`compilation_status` directly rather than being inferred from the
     code fields."""
+    language: str | None = None
+    """dbt's node ``language`` (``"sql"`` or ``"python"``), or ``None`` on schemas that
+    don't carry it. Only SQL nodes are assessed for the stale/absent-compile signal; a
+    Python model's empty SQL ``compiled_code`` is not a compile gap."""
 
     @property
     def compilation_status(self) -> CompilationStatus:
@@ -245,7 +249,13 @@ class Node:
         when there is a non-trivial source template but no compiled code (the
         non-hermetic-compile gap), and ``COMPILED`` when there is compiled code or
         nothing non-trivial to compile.
+
+        Only SQL nodes carry this signal: a Python (or other non-SQL) model is not
+        SQL-analysable, so an empty SQL ``compiled_code`` is not the compile gap and the
+        node reads as ``COMPILED`` here rather than as a coverage miss.
         """
+        if (self.language or "sql").lower() != "sql":
+            return CompilationStatus.COMPILED
         if self.compiled_flag is False:
             return CompilationStatus.NOT_COMPILED
         compiled = (self.compiled_code or "").strip()
@@ -432,6 +442,8 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         depends_on_nodes = tuple(getattr(depends_on, "nodes", ()) or ())
     raw_compiled_flag = getattr(n, "compiled", None)
     compiled_flag = raw_compiled_flag if isinstance(raw_compiled_flag, bool) else None
+    raw_language = getattr(n, "language", None)
+    language = raw_language if isinstance(raw_language, str) else None
     return Node(
         unique_id=uid,
         name=n.name,
@@ -449,6 +461,7 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
         compiled_flag=compiled_flag,
+        language=language,
     )
 
 

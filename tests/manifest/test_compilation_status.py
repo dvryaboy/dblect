@@ -67,6 +67,15 @@ def test_whitespace_only_raw_with_empty_compiled_is_compiled(
     assert manifest.nodes[uid].compilation_status is CompilationStatus.COMPILED
 
 
+def test_python_model_is_not_a_stale_compile_miss(jaffle_raw: Mapping[str, Any]) -> None:
+    # A Python model is not SQL-analysable; an empty SQL ``compiled_code`` is not the
+    # non-hermetic-compile gap, so it must not be surfaced as a stale/absent coverage
+    # miss that tells the user to run `dbt compile` against a warehouse.
+    uid = _a_model_uid(jaffle_raw)
+    manifest = _with_node(jaffle_raw, uid, language="python", compiled_code="", compiled=True)
+    assert manifest.nodes[uid].compilation_status is CompilationStatus.COMPILED
+
+
 def test_status_present_for_a_node_with_no_compiled_flag() -> None:
     # A manifest shape with no `compiled` flag and present compiled_code reads as
     # compiled (the flag defaults absent on older schemas).
