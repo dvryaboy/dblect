@@ -23,8 +23,10 @@ from dblect.severity import severity_of
 from dblect.sql import suppression_code, suppression_hint
 
 # Both families and the coverage block live under one document; consumers branch on
-# ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field.
-JSON_SCHEMA_VERSION = "2"
+# ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field;
+# to "3" when a suppression's ``reason`` slot gave way to a ``bare`` flag (SQLFluff
+# ``-- noqa`` directives carry no reason).
+JSON_SCHEMA_VERSION = "3"
 
 
 def _partition_by_family(
