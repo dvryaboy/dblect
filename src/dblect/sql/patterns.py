@@ -392,8 +392,7 @@ def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
     for node in tree.find_all(*_ORDERED_AGGREGATE_FUNCTIONS):
         if isinstance(node.parent, exp.WithinGroup):
             continue
-        inner = node.this
-        if isinstance(inner, exp.Order):
+        if sg.aggregate_order_of(node) is not None:
             continue
         out.append(
             finding_at(
