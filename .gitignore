@@ -220,3 +220,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 HANDOFF.md
+
+# Claude Code local worktrees
+.claude/worktrees/
