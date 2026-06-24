@@ -94,9 +94,7 @@ def _every_branch_report() -> AnalysisReport:
     )
     audit = AuditReport(
         findings=structural,
-        suppressed=(
-            SuppressedFinding(located=_located(line=9), reason="handled", directive_line=8),
-        ),
+        suppressed=(SuppressedFinding(located=_located(line=9), directive_line=8, bare=False),),
         skipped=(SkippedModel(unique_id="model.p.x", reason="no compiled SQL"),),
         models_scanned=2,
     )
@@ -169,7 +167,7 @@ def test_no_finding_is_dropped() -> None:
 
 
 def test_suppressed_finding_is_marked_suppressed_not_dropped() -> None:
-    suppressed = (SuppressedFinding(located=_located(line=9), reason="handled", directive_line=8),)
+    suppressed = (SuppressedFinding(located=_located(line=9), directive_line=8, bare=False),)
     audit = AuditReport(findings=(), suppressed=suppressed, skipped=(), models_scanned=1)
     check = CheckReport(
         findings=(),
@@ -183,7 +181,32 @@ def test_suppressed_finding_is_marked_suppressed_not_dropped() -> None:
 
     (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
     # A suppressed finding still reaches code scanning, marked so it is not re-alarmed.
-    assert result["suppressions"][0]["justification"] == "handled"
+    # The justification records how it was silenced and where the directive sat.
+    assert result["suppressions"][0]["justification"] == "noqa: DBLECT_JOIN_FANOUT @ L8"
+
+
+def test_suppressed_declaration_finding_reaches_sarif() -> None:
+    from dblect.check.findings import SuppressedCheckFinding
+
+    suppressed = (
+        SuppressedCheckFinding(finding=_declaration(column="amount"), directive_line=4, bare=True),
+    )
+    check = CheckReport(
+        findings=(),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=0,
+        models_propagated=1,
+        predicates_collected=0,
+        suppressed=suppressed,
+    )
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    report = AnalysisReport(findings=(), check=check, audit=audit)
+
+    # A suppressed declaration finding reaches SARIF marked suppressed, not dropped.
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    assert result["suppressions"][0]["kind"] == "inSource"
+    assert result["suppressions"][0]["justification"].endswith("@ L4")
 
 
 @pytest.mark.parametrize("fmt", ["text", "json", "sarif"])

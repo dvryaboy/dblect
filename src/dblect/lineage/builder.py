@@ -29,7 +29,6 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
-import sqlglot
 from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
@@ -47,7 +46,7 @@ from dblect.lineage.graph import (
     attach_source_ref,
 )
 from dblect.lineage.property import UnionConfluence, attach_column_ref
-from dblect.manifest import Manifest, ResourceType
+from dblect.manifest import Manifest, ResourceType, compilation_miss_reason
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
@@ -63,6 +62,14 @@ class BuildIssue:
 
     model_unique_id: str
     message: str
+
+
+def _compilation_miss(node: ManifestNode) -> str | None:
+    """The coverage-miss reason for ``node`` when its ``compiled_code`` is not a
+    faithful rendering of the model, or ``None`` when it is. Consulted before parsing
+    so a stale or never-compiled node is a coverage miss, never analysed as if its
+    body were empty."""
+    return compilation_miss_reason(node.compilation_status)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +128,10 @@ def build_relation_graph(
     derivations: dict[SourceRef, Expr] = {}
     issues: list[BuildIssue] = []
     for uid, model in manifest.models.items():
+        miss = _compilation_miss(model)
+        if miss is not None:
+            issues.append(BuildIssue(model_unique_id=uid, message=miss))
+            continue
         if parsed is not None:
             tree = parsed.get(uid)
             if tree is None:
@@ -180,6 +191,10 @@ def build_manifest_graph(
         if uid not in manifest.models:
             continue
         model = manifest.models[uid]
+        miss = _compilation_miss(model)
+        if miss is not None:
+            issues.append(BuildIssue(model_unique_id=uid, message=miss))
+            continue
         sql = model.analysis_sql
         if sql is None:
             issues.append(BuildIssue(model_unique_id=uid, message="model has no compiled SQL"))
@@ -277,7 +292,7 @@ def _walk_model(
     build also reads the counts. Splitting it here is what lets coverage ride
     alongside the graph without changing ``build_model_graph``'s return type."""
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
-    expression: Expr = tree.copy() if tree is not None else sqlglot.parse_one(sql, dialect=dialect)
+    expression: Expr = tree.copy() if tree is not None else parse_sql(sql, dialect=dialect)
     expression = qualify(
         expression,
         dialect=dialect,

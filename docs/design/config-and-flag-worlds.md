@@ -16,7 +16,7 @@ These look like two small discoverers. They are the surface of a deeper question
 
 ## The parsing reality: configuration is invisible in what we parse
 
-dblect analyzes **compiled SQL**. `Manifest.Node.analysis_sql` returns `compiled_code`, and every analysis path reads it: the lineage builder, the nullability property, the SQL detectors, the relation walk. The one place the on-disk template (`raw_code`) is touched is the suppression scanner, which text-matches `-- noqa-fixture:` comments and never parses. So the pipeline is `compiled SQL -> sqlglot AST -> detectors and lineage`, and by the time sqlglot sees the SQL, dbt's Jinja runtime has already run.
+dblect analyzes **compiled SQL**. `Manifest.Node.analysis_sql` returns `compiled_code`, and every analysis path reads it: the lineage builder, the nullability property, the SQL detectors, the relation walk. The one place the on-disk template (`raw_code`) is touched is the suppression scanner, which text-matches `-- noqa` comments and never parses. So the pipeline is `compiled SQL -> sqlglot AST -> detectors and lineage`, and by the time sqlglot sees the SQL, dbt's Jinja runtime has already run.
 
 That timing is the whole problem. After Jinja runs:
 

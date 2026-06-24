@@ -6,6 +6,7 @@ from dblect.manifest.parse import (
     DATA_FLOW_UID_PREFIXES,
     DEFAULT_SNAPSHOT_VALIDITY_COLUMNS,
     Column,
+    CompilationStatus,
     ConstraintSpec,
     ConstraintType,
     DbtTestMetadata,
@@ -14,6 +15,7 @@ from dblect.manifest.parse import (
     ModelConfig,
     Node,
     ResourceType,
+    compilation_miss_reason,
     generic_test_target_uid,
 )
 
@@ -22,6 +24,7 @@ __all__ = [
     "DEFAULT_SNAPSHOT_VALIDITY_COLUMNS",
     "Catalog",
     "Column",
+    "CompilationStatus",
     "ConstraintSpec",
     "ConstraintType",
     "CycleError",
@@ -32,5 +35,6 @@ __all__ = [
     "ModelConfig",
     "Node",
     "ResourceType",
+    "compilation_miss_reason",
     "generic_test_target_uid",
 ]

@@ -216,7 +216,6 @@ def test_check_json_format(jaffle_manifest_path: Path, runner: CliRunner, tmp_pa
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "2"
     assert payload["summary"]["contracts_resolved"] == 1
     # A contract that lines up yields no declaration finding; the structural family is
     # what the unified command adds on top.

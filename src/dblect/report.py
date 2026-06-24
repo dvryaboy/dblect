@@ -18,13 +18,15 @@ from typing import TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
-from dblect.check.findings import CheckFinding
+from dblect.check.findings import CheckFinding, SuppressedCheckFinding
 from dblect.severity import severity_of
-from dblect.sql import FindingKind, suppression_hint
+from dblect.sql import suppression_code, suppression_hint
 
 # Both families and the coverage block live under one document; consumers branch on
-# ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field.
-JSON_SCHEMA_VERSION = "2"
+# ``family`` per finding. Bumped to "2" when each finding gained a ``severity`` field;
+# to "3" when a suppression's ``reason`` slot gave way to a ``bare`` flag (SQLFluff
+# ``-- noqa`` directives carry no reason).
+JSON_SCHEMA_VERSION = "3"
 
 
 def _partition_by_family(
@@ -63,8 +65,8 @@ def render_text(report: AnalysisReport) -> str:
         sections.append(
             "declaration findings:\n" + "\n\n".join(_declaration_block(f) for f in declaration)
         )
-    if report.audit.suppressed:
-        sections.append(_suppressed_block(report.audit.suppressed))
+    if report.audit.suppressed or report.check.suppressed:
+        sections.append(_suppressed_block(report.audit.suppressed, report.check.suppressed))
     if report.audit.skipped:
         sections.append(_skipped_block(report.audit.skipped))
     if report.check.unbuilt:
@@ -142,11 +144,8 @@ def _render_structural(lf: LocatedFinding) -> str:
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
     # The suppression nudge is presentation, not observation, so it lives here rather
     # than in `Finding.message` (the JSON `message` stays the pure observation). Every
-    # structural finding is line-suppressible, so the hint rides all of them. The lone
-    # exception is a malformed suppression directive: telling the reader to suppress it
-    # with another directive would be circular.
-    if lf.finding.kind is not FindingKind.MALFORMED_SUPPRESSION:
-        body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
+    # structural finding is line-suppressible, so the hint rides all of them.
+    body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
     snippet = lf.finding.sql_snippet.strip()
     if snippet:
         body_lines.append(indent(f"snippet: {snippet}", "    "))
@@ -165,7 +164,17 @@ def _declaration_block(finding: CheckFinding) -> str:
         head += f".{finding.column}"
     lines = [head, f"      {finding.message}"]
     if finding.file_path:
-        lines.append(f"      {finding.file_path}")
+        loc = (
+            f":{_format_line_range(finding.line_start, finding.line_end)}"
+            if finding.line_start
+            else ""
+        )
+        lines.append(f"      {finding.file_path}{loc}")
+    # A finding pinned to a line is line-suppressible, so it carries the same nudge the
+    # structural family does. One that could not be located (line 0: a contract or
+    # coverage finding) has no line to put a directive on, so the hint is omitted.
+    if finding.line_start:
+        lines.append(f"      {suppression_hint(finding.kind)}")
     return "\n".join(lines)
 
 
@@ -177,16 +186,29 @@ def _format_line_range(start: int, end: int) -> str:
     return f"L{start}-{end}"
 
 
-def _suppressed_block(suppressed: Sequence[SuppressedFinding]) -> str:
+def _suppressed_block(
+    structural: Sequence[SuppressedFinding],
+    declaration: Sequence[SuppressedCheckFinding],
+) -> str:
+    """Both families' silenced findings under one heading, so a reviewer reads every
+    recorded acknowledgement in one place. Each line names where the finding sat, its
+    kind, how it was silenced (bare ``noqa`` or the specific ``noqa: DBLECT_<KIND>``),
+    and the line the directive sat on."""
     lines = ["suppressed:"]
-    by_model: dict[str, list[SuppressedFinding]] = defaultdict(list)
-    for s in suppressed:
-        by_model[s.located.model_unique_id].append(s)
-    for uid in sorted(by_model):
-        for s in sorted(by_model[uid], key=lambda x: x.located.finding.line_start):
-            path = s.located.file_path or uid
-            loc = _format_line_range(s.located.finding.line_start, s.located.finding.line_end)
-            lines.append(f"  {path}:{loc}  {s.located.finding.kind.value}  -- {s.reason}")
+    rows: list[tuple[str, int, int, str, str, int]] = []
+    for s in structural:
+        f = s.located.finding
+        path = s.located.file_path or s.located.model_unique_id
+        via = "noqa" if s.bare else f"noqa: {suppression_code(f.kind)}"
+        rows.append((path, f.line_start, f.line_end, f.kind.value, via, s.directive_line))
+    for c in declaration:
+        cf = c.finding
+        path = cf.file_path or cf.model_unique_id or "<project>"
+        via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
+        rows.append((path, cf.line_start, cf.line_end, cf.kind.value, via, c.directive_line))
+    for path, line_start, line_end, kind, via, directive_line in sorted(rows):
+        loc = _format_line_range(line_start, line_end)
+        lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ L{directive_line}")
     return "\n".join(lines)
 
 
@@ -261,8 +283,8 @@ class JsonFinding(TypedDict):
 
 
 class JsonSuppression(TypedDict):
-    reason: str
     directive_line: int
+    bare: bool
 
 
 class JsonSuppressedFinding(JsonFinding):
@@ -311,7 +333,7 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
             "models_scanned": report.audit.models_scanned,
             "contracts_resolved": report.check.contracts_resolved,
             "predicates_collected": report.check.predicates_collected,
-            "suppressed": len(report.audit.suppressed),
+            "suppressed": len(report.audit.suppressed) + len(report.check.suppressed),
             "skipped": len(report.audit.skipped),
             "load_issues": len(report.check.load_issues),
             "unbuilt": len(report.check.unbuilt),
@@ -338,7 +360,16 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
             },
         },
         "findings": [_finding_payload(f) for f in report.findings],
-        "suppressed": [_suppressed_payload(s) for s in report.audit.suppressed],
+        "suppressed": [
+            *(
+                _suppressed_payload(s.located, directive_line=s.directive_line, bare=s.bare)
+                for s in report.audit.suppressed
+            ),
+            *(
+                _suppressed_payload(c.finding, directive_line=c.directive_line, bare=c.bare)
+                for c in report.check.suppressed
+            ),
+        ],
         "skipped": [{"unique_id": s.unique_id, "reason": s.reason} for s in report.audit.skipped],
         "load_issues": [
             {"module": i.module, "message": i.message} for i in report.check.load_issues
@@ -351,6 +382,10 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
 def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
     match finding:
         case CheckFinding():
+            # A located finding (a domain-type or aggregation finding pinned to its
+            # projection) carries its line span so a consumer can point at it and
+            # acknowledge it; an unlocated one (line 0) reports null, as before.
+            located = finding.line_start > 0
             return {
                 "family": "declaration",
                 "kind": finding.kind.value,
@@ -360,8 +395,8 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
                 "file_path": finding.file_path,
                 "column": finding.column,
                 "contract": finding.contract,
-                "line_start": None,
-                "line_end": None,
+                "line_start": finding.line_start if located else None,
+                "line_end": finding.line_end if located else None,
                 "sql_snippet": None,
             }
         case LocatedFinding():
@@ -382,6 +417,9 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
     assert_never(finding)
 
 
-def _suppressed_payload(s: SuppressedFinding) -> JsonSuppressedFinding:
-    base = _finding_payload(s.located)
-    return {**base, "suppression": {"reason": s.reason, "directive_line": s.directive_line}}
+def _suppressed_payload(
+    finding: AnalysisFinding, *, directive_line: int, bare: bool
+) -> JsonSuppressedFinding:
+    # Both families' suppressions share this shape; the caller unwraps its own dataclass.
+    base = _finding_payload(finding)
+    return {**base, "suppression": {"directive_line": directive_line, "bare": bare}}

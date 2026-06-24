@@ -68,8 +68,14 @@ tagged yet; this section accumulates the work that a first release will carry.
 - Structural detectors over every model: outer-join `WHERE` inversion,
   non-determinism, the NULL-group-after-outer-join family (`GROUP BY`, join
   key, `NOT IN`), and snapshot reads missing a temporal filter.
-- Source-line provenance on every finding, and `-- noqa-fixture:` suppression
-  with a required reason.
+- Source-line provenance on every finding, and SQLFluff-compatible `-- noqa`
+  suppression. A bare `-- noqa` silences every dblect finding on its line; a
+  `-- noqa: DBLECT_<KIND>` directive silences one detector, and codes without the
+  `DBLECT_` prefix are left for `dbt lint` so one comment can address both tools.
+  This replaces the earlier bespoke `-- noqa-fixture:` syntax: dblect no longer owns
+  the suppression grammar, so it coexists with dbt Fusion's `dbt lint` rather than
+  competing with it. Every suppression is still logged in the report's `suppressed:`
+  section.
 
 **Cross-world analysis**
 

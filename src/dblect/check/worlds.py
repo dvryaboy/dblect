@@ -27,7 +27,13 @@ from dataclasses import dataclass
 
 from dblect.check.coverage import WorldCoverage
 from dblect.check.findings import CheckFinding
-from dblect.check.run import CheckGraphs, WorldFacts, propagate_world, world_findings
+from dblect.check.run import (
+    CheckGraphs,
+    WorldFacts,
+    propagate_world,
+    suppress_check_findings,
+    world_findings,
+)
 from dblect.lineage.facts.model import Fact, WorldRef
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.domain_type import DomainTag
@@ -113,7 +119,8 @@ def enumerate_worlds(
     results: list[WorldResult] = []
     for world, compile_facts in world_facts.items():
         annotations = propagate_world(graphs, _world_facts(graphs, world, compile_facts))
-        results.append(
-            WorldResult(world=world, findings=tuple(world_findings(graphs, annotations)))
-        )
+        # Apply -- noqa the same way single-world run_check does, so a triaged finding
+        # stays silenced here rather than reappearing as active in every world.
+        active, _ = suppress_check_findings(world_findings(graphs, annotations), graphs.manifest)
+        results.append(WorldResult(world=world, findings=active))
     return EnumeratedFindings(per_world=tuple(results))

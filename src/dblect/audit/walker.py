@@ -10,9 +10,8 @@ recorded on the report as skipped, with a reason. The walker never raises on
 per-model failure: one bad model shouldn't blind the audit to the rest of the
 project.
 
-Suppression directives (``-- noqa-fixture:`` comments) are always read from
-``raw_code``: they live in the source the developer wrote, not in the
-compiled output.
+Suppression directives (``-- noqa`` comments) are always read from ``raw_code``:
+they live in the source the developer wrote, not in the compiled output.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.audit.suppress import apply, parse_directives
-from dblect.manifest import Manifest, Node
+from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
 from dblect.sql import (
@@ -67,11 +66,13 @@ class LocatedFinding:
 
 @dataclass(frozen=True, slots=True)
 class SuppressedFinding:
-    """A finding that a ``-- noqa-fixture:`` directive silenced, with its reason."""
+    """A finding that a ``-- noqa`` directive silenced. ``directive_line`` is where the
+    directive sat; ``bare`` records whether it was a bare ``-- noqa`` (all kinds) rather
+    than a code-specific one, so the report can show how the finding was silenced."""
 
     located: LocatedFinding
-    reason: str
     directive_line: int
+    bare: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +197,9 @@ def _scan_one(
     *,
     detectors: Sequence[Detector],
 ) -> _Scanned | SkippedModel:
+    compilation_reason = compilation_miss_reason(node.compilation_status)
+    if compilation_reason is not None:
+        return SkippedModel(unique_id=node.unique_id, reason=compilation_reason)
     if parse_outcome is None:
         return SkippedModel(
             unique_id=node.unique_id,
@@ -210,17 +214,14 @@ def _scan_one(
         raw_findings.extend(detector(tree))
     # Directives live in the source the developer wrote, not the compiled
     # output. Fall back to the compiled SQL only if `raw_code` is missing.
-    directives, malformed = parse_directives(node.raw_code or node.analysis_sql or "")
-    # Malformed-suppression findings ride the regular pipeline; we never
-    # suppress them with another directive (it would be silly), so apply()
-    # only runs over the detector findings.
+    directives = parse_directives(node.raw_code or node.analysis_sql or "")
     active_raw, suppressed_raw = apply(raw_findings, directives)
-    located_active = [_locate(node, f) for f in (*active_raw, *malformed)]
+    located_active = [_locate(node, f) for f in active_raw]
     located_suppressed = [
         SuppressedFinding(
             located=_locate(node, f),
-            reason=d.reason,
             directive_line=d.line,
+            bare=d.kinds is None,
         )
         for f, d in suppressed_raw
     ]

@@ -23,12 +23,19 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
+
+if TYPE_CHECKING:
+    # Referenced only in ``suppression_hint``'s signature; imported under
+    # ``TYPE_CHECKING`` so this SQL-layer module stays free of a declaration-check
+    # import at load time.
+    from dblect.check.findings import CheckFindingKind
 
 
 class FindingKind(StrEnum):
@@ -44,12 +51,21 @@ class FindingKind(StrEnum):
     JOIN_ON_NULLABLE_KEY = "join_on_nullable_key"
     NOT_IN_NULLABLE_SUBQUERY = "not_in_nullable_subquery"
     SNAPSHOT_TEMPORAL_FILTER_MISSING = "snapshot_temporal_filter_missing"
-    MALFORMED_SUPPRESSION = "malformed_suppression"
 
 
-def suppression_hint(kind: FindingKind) -> str:
+def suppression_code(kind: FindingKind | CheckFindingKind) -> str:
+    """The SQLFluff-style noqa code for a finding kind: ``DBLECT_`` plus the kind's
+    value uppercased (e.g. ``DBLECT_JOIN_FANOUT``). The ``DBLECT_`` prefix is what
+    distinguishes our codes from real lint rule codes (``RF01`` and friends), so dbt
+    lint's noqa directives and ours coexist in one comment without colliding."""
+    return f"DBLECT_{kind.value.upper()}"
+
+
+def suppression_hint(kind: FindingKind | CheckFindingKind) -> str:
     # The suggested directive must stay valid suppression syntax (round-trip tested).
-    return f"If this is intentional, record it with `-- noqa-fixture: {kind.value}: <reason>`."
+    # Both finding families share the directive, so the hint takes either kind and
+    # renders the noqa code the scanner reads back.
+    return f"If this is intentional, suppress it with `-- noqa: {suppression_code(kind)}`."
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,8 +508,10 @@ def make_non_determinism_detector(
                     f"{_non_deterministic_name(call)} appears in {label}; this position is "
                     "load-bearing because the value affects which rows go where (filtering, "
                     "grouping, ranking). Output buckets drift with wall-clock time. If "
-                    "intentional, suppress with `-- noqa-fixture:`; if not, bucket by the "
-                    "absolute timestamp and derive the relative measure at query time."
+                    "intentional, suppress with "
+                    f"`-- noqa: {suppression_code(FindingKind.NON_DETERMINISTIC_FUNCTION)}`; "
+                    "if not, bucket by the absolute timestamp and derive the relative measure "
+                    "at query time."
                 ),
                 node=scope,
             )

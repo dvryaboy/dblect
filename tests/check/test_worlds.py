@@ -49,7 +49,14 @@ def _cols(**types: str) -> Mapping[str, Column]:
     return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
 
 
-def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str, Column]) -> Node:
+def _node(
+    uid: str,
+    *,
+    kind: ResourceType,
+    sql: str | None,
+    columns: Mapping[str, Column],
+    raw: str | None = None,
+) -> Node:
     return Node(
         unique_id=uid,
         name=uid.split(".")[-1],
@@ -57,7 +64,7 @@ def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str
         fqn=tuple(uid.split(".")[1:]),
         package_name="shop",
         schema="analytics",
-        raw_code=None,
+        raw_code=raw,
         compiled_code=sql,
         original_file_path=f"models/{uid.split('.')[-1]}.sql",
         columns=columns,
@@ -208,3 +215,38 @@ def test_cross_world_disagreement_is_data_not_error() -> None:
         f for f in by_finding if f.kind is CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
     )
     assert by_finding[contradiction] == frozenset({world_eur})
+
+
+def test_world_findings_honor_noqa_suppression() -> None:
+    # The enumerator applies -- noqa like run_check, so a triaged finding is not active
+    # in any world.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR"),
+        ),
+        _node(
+            "model.shop.stg_payments",
+            kind=ResourceType.MODEL,
+            sql="SELECT amount FROM payments",
+            raw="SELECT amount FROM payments  -- noqa: DBLECT_DOMAIN_TYPE_CONTRADICTION",
+            columns=_cols(amount="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+    eur = _eur_source_fact(manifest)
+
+    class StgPayments(ModelContract):
+        dbt_model = "stg_payments"
+        amount: MoneyUSD
+
+    graphs = build_check_graphs(manifest, _DUCKDB)
+    world_eur = WorldRef(frozenset({("currency", "EUR")}))
+    result = enumerate_worlds(graphs, {world_eur: (_compile_tag(eur, world_eur),)})
+
+    kinds = [f.kind for r in result.per_world for f in r.findings]
+    assert CheckFindingKind.DOMAIN_TYPE_CONTRADICTION not in kinds

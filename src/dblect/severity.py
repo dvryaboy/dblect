@@ -94,8 +94,6 @@ def _structural_severity(kind: FindingKind) -> Severity:
             FindingKind.UNORDERED_RANKING_WINDOW
             | FindingKind.UNORDERED_AGGREGATE
             | FindingKind.NON_DETERMINISTIC_FUNCTION
-            # An operator mistake worth surfacing, not a query defect, so it warns.
-            | FindingKind.MALFORMED_SUPPRESSION
         ):
             return Severity.WARN
     assert_never(kind)
