@@ -203,9 +203,8 @@ def test_suppressed_declaration_finding_reaches_sarif() -> None:
     audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
     report = AnalysisReport(findings=(), check=check, audit=audit)
 
+    # A suppressed declaration finding reaches SARIF marked suppressed, not dropped.
     (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
-    # A -- noqa'd declaration finding is triaged, not dropped: it still reaches the
-    # SARIF surface marked suppressed, so the audit trail matches the JSON report.
     assert result["suppressions"][0]["kind"] == "inSource"
     assert result["suppressions"][0]["justification"].endswith("@ L4")
 

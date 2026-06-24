@@ -59,14 +59,11 @@ ResultStatement = SingleResult | MultiResultScript | NoResultScript
 def _result_query(statement: Expr) -> Expr | None:
     """The result-producing query ``statement`` carries, or ``None``.
 
-    A bare query (sqlglot's ``exp.Query``: ``SELECT``, set operation, or CTE chain)
-    is its own result. A materialization wrapper holds its query in ``expression``:
-    ``CREATE TABLE ... AS SELECT``, ``CREATE VIEW ... AS SELECT``, and
-    ``INSERT ... SELECT`` all carry the model's logic in that inner ``SELECT``, so the
-    detectors analyse it rather than dropping the model. ``DECLARE``, ``SET``, an inline
-    ``CREATE FUNCTION``, ``INSERT ... VALUES``, and column-list DDL hold no query and
-    fall out as prelude or leave no result. ``MERGE`` has no single result query (its
-    source sits in a ``using`` clause) and is left as a non-result.
+    A bare ``exp.Query`` (``SELECT``, set operation, CTE chain) is its own result. A
+    materialization wrapper (``CREATE TABLE/VIEW ... AS SELECT``, ``INSERT ... SELECT``)
+    holds the model's logic in ``expression``, so the detectors analyse that inner query
+    rather than dropping the model. ``MERGE`` keeps its source in a ``using`` clause with
+    no single result query, so it is deliberately left as a non-result.
     """
     if isinstance(statement, exp.Query):
         return statement

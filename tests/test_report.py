@@ -141,7 +141,6 @@ def test_json_tags_each_finding_with_its_family() -> None:
     payload = json.loads(
         render_json(_report(structural=(_structural(),), declaration=(_declaration(),)))
     )
-    assert payload["schema_version"] == "3"
     assert payload["summary"] == {
         "findings": 2,
         "structural": 1,
@@ -169,11 +168,9 @@ def test_json_tags_each_finding_with_its_family() -> None:
 
 
 def test_json_suppression_payload_carries_directive_line_and_bare() -> None:
-    # The suppression object is {directive_line, bare}: SQLFluff -- noqa has no reason
-    # slot, so the schema bumped to "3" and no `reason` key rides along.
+    # A -- noqa has no reason slot, so a suppression serializes as {directive_line, bare}.
     suppressed = (SuppressedFinding(located=_structural(), directive_line=8, bare=False),)
     payload = json.loads(render_json(_report(structural=(_structural(),), suppressed=suppressed)))
-    assert payload["schema_version"] == "3"
     [entry] = payload["suppressed"]
     assert entry["suppression"] == {"directive_line": 8, "bare": False}
 

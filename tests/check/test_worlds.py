@@ -218,9 +218,8 @@ def test_cross_world_disagreement_is_data_not_error() -> None:
 
 
 def test_world_findings_honor_noqa_suppression() -> None:
-    # A -- noqa on the contradicting model silences the finding on the single-world
-    # path; the enumerator must apply the same suppression so a triaged finding does
-    # not reappear as active in every world.
+    # The enumerator applies -- noqa like run_check, so a triaged finding is not active
+    # in any world.
     nodes = (
         _node(
             "source.shop.raw.payments",

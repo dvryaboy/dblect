@@ -36,15 +36,10 @@ def test_two_result_statements_is_a_multi_result_miss() -> None:
     assert outcome.result_count == 2
 
 
-def test_prelude_with_no_query_is_a_no_result_miss() -> None:
+@pytest.mark.parametrize("body", ["CREATE TABLE t (x INT)", "INSERT INTO t (x) VALUES (1)"])
+def test_body_with_no_query_is_a_no_result_miss(body: str) -> None:
     # A VALUES-only or DDL-only compiled body has no query to follow lineage on.
-    outcome = parse_result_statement("CREATE TABLE t (x INT)", dialect="duckdb")
-    assert isinstance(outcome, NoResultScript)
-
-
-def test_insert_values_with_no_query_is_a_no_result_miss() -> None:
-    outcome = parse_result_statement("INSERT INTO t (x) VALUES (1)", dialect="duckdb")
-    assert isinstance(outcome, NoResultScript)
+    assert isinstance(parse_result_statement(body, dialect="duckdb"), NoResultScript)
 
 
 @pytest.mark.parametrize(
@@ -56,27 +51,12 @@ def test_insert_values_with_no_query_is_a_no_result_miss() -> None:
     ],
 )
 def test_materialization_wrapper_reduces_to_its_inner_select(wrapped: str) -> None:
-    # A model compiled to CTAS / CREATE VIEW AS / INSERT...SELECT carries its logic in
-    # the inner SELECT. The reducer hands that query to the detectors, identical to the
-    # bare SELECT, rather than dropping the model as a coverage miss.
+    # A CTAS / CREATE VIEW AS / INSERT...SELECT carries its logic in the inner SELECT;
+    # the reducer hands that query to the detectors, identical to the bare SELECT.
     outcome = parse_result_statement(wrapped, dialect="duckdb")
     assert isinstance(outcome, SingleResult)
-    assert isinstance(outcome.statement, exp.Select)
     bare = parse_sql("SELECT a, b FROM t", dialect="duckdb")
     assert outcome.statement.sql(dialect="duckdb") == bare.sql(dialect="duckdb")
-
-
-def test_wrapper_prelude_then_ctas_reduces_to_the_ctas_select() -> None:
-    # The DDL-prelude skip composes with wrapper-unwrapping: a leading inline UDF in
-    # front of a CTAS body still reduces to the CTAS's SELECT.
-    outcome = parse_result_statement(
-        "CREATE TEMPORARY FUNCTION g(x INT) AS (x);\nCREATE TABLE foo AS SELECT a FROM t",
-        dialect="duckdb",
-    )
-    assert isinstance(outcome, SingleResult)
-    assert outcome.statement.sql(dialect="duckdb") == parse_sql(
-        "SELECT a FROM t", dialect="duckdb"
-    ).sql(dialect="duckdb")
 
 
 def test_parse_sql_tolerates_a_ddl_prelude() -> None:

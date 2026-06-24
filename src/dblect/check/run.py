@@ -557,12 +557,9 @@ def _span_of(*nodes: Expr | None) -> tuple[int, int]:
     a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
     convention a finding with no locatable line uses (never line-suppressible).
 
-    The span is in the compiled SQL's line space. The ``-- noqa`` scanner reads
-    directives from the developer's ``raw_code`` template, so the two coincide for a
-    model with no macro expansion and can diverge for one where macros shift line
-    numbers. Aligning the two faithfully needs a compiled-to-raw line back-map, which
-    is its own work stream; until then a directive on a macro-shifted line may land off
-    by the expansion's offset."""
+    The span is in the compiled SQL's line space, while the ``-- noqa`` scanner reads
+    directives from ``raw_code``. The two coincide without macro expansion and can
+    diverge with it; aligning them faithfully needs a compiled-to-raw line back-map."""
     for node in nodes:
         if node is None:
             continue

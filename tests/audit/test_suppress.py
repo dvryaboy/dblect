@@ -40,22 +40,21 @@ def test_bare_noqa_is_an_all_kinds_directive() -> None:
 
 
 def test_noqa_inside_a_string_literal_is_not_a_directive() -> None:
-    # A `-- noqa` that lives inside a SQL string literal is data, not a comment, and
-    # must not silence findings on that line.
+    # `-- noqa` inside a string literal is data, not a comment.
     assert parse_directives("select '-- noqa' as label from t") == ()
     assert parse_directives('select "-- noqa: DBLECT_JOIN_FANOUT" as c from t') == ()
 
 
-def test_real_comment_after_a_string_literal_is_still_a_directive() -> None:
-    # The string-literal guard must not swallow a genuine trailing comment.
-    [d] = parse_directives("select '-- not a comment' as label from t  -- noqa: DBLECT_JOIN_FANOUT")
-    assert d.kinds == frozenset({FindingKind.JOIN_FANOUT})
-
-
-def test_doubled_quote_escape_does_not_hide_a_trailing_comment() -> None:
-    # `''` is an escaped quote inside the literal; the string closes at the final quote,
-    # so the trailing `-- noqa` is a real comment.
-    [d] = parse_directives("select 'it''s fine' as c from t  -- noqa")
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select '-- not a comment' as label from t  -- noqa",
+        # `''` escapes a quote inside the literal, so the string closes and the comment is real.
+        "select 'it''s fine' as c from t  -- noqa",
+    ],
+)
+def test_quote_tracking_keeps_a_real_trailing_comment(sql: str) -> None:
+    [d] = parse_directives(sql)
     assert d.kinds is None
 
 
