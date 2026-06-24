@@ -61,10 +61,8 @@ class LocatedFinding:
     """A `Finding` plus the model and file it came from.
 
     ``finding`` carries the compiled-SQL span the parser produced (the raw
-    observation). ``source_span`` is that span back-mapped onto the on-disk
-    template for reporting; it is ``None`` only when no back-map was performed (a
-    finding constructed outside the walker), in which case :attr:`located_span`
-    falls back to the compiled span, flagged compiled-relative.
+    observation); ``source_span`` is that span back-mapped onto the on-disk template,
+    set by the walker and ``None`` when no back-map was performed.
     """
 
     model_unique_id: str
@@ -74,8 +72,8 @@ class LocatedFinding:
 
     @property
     def located_span(self) -> SourceSpan:
-        """The span to report: the back-mapped source span, or the compiled span as a
-        compiled-relative fallback when no mapping is attached."""
+        """The span to report: the back-mapped ``source_span``, or the compiled span as a
+        compiled-relative fallback when none is attached."""
         if self.source_span is not None:
             return self.source_span
         return SourceSpan(self.finding.line_start, self.finding.line_end, SpanBasis.COMPILED)

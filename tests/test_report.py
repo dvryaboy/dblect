@@ -220,6 +220,47 @@ def test_compiled_relative_finding_is_marked_and_keeps_compiled_line() -> None:
     assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (12, 12, "compiled")
 
 
+def _located_declaration(*, source_span: SourceSpan) -> CheckFinding:
+    return CheckFinding(
+        kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+        message="reducing 'total' mixes a per-row companion held constant by nothing",
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        column="total",
+        line_start=7,
+        line_end=7,
+        source_span=source_span,
+    )
+
+
+def test_declaration_finding_back_maps_its_span_for_both_bases() -> None:
+    # A located declaration finding back-maps its compiled span: the report points at the
+    # source line and the JSON keeps the compiled span beside the back-mapped one. Both
+    # bases ride the same declaration payload branch, so both are pinned here. (The
+    # ``(compiled)`` text marker is the shared `_format_span` helper, pinned once on the
+    # structural family.)
+    mapped = _located_declaration(source_span=SourceSpan(3, 3, SpanBasis.SOURCE))
+    assert "models/m.sql:L3" in render_text(_report(declaration=(mapped,)))
+    payload = json.loads(render_json(_report(declaration=(mapped,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (7, 3, "source")
+
+    fallback = _located_declaration(source_span=SourceSpan(7, 7, SpanBasis.COMPILED))
+    payload = json.loads(render_json(_report(declaration=(fallback,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (7, 7, "compiled")
+
+
+def test_unlocated_declaration_finding_reports_null_source_span() -> None:
+    # A finding with no SQL site (a contract or coverage finding) stays unlocated: no
+    # source span, no basis, the same nulls the compiled line fields already report.
+    payload = json.loads(render_json(_report(declaration=(_declaration(),))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert f["line_start"] is None
+    assert f["source_line_start"] is None
+    assert f["line_basis"] is None
+
+
 def test_json_suppression_payload_carries_directive_line_and_bare() -> None:
     # A -- noqa has no reason slot, so a suppression serializes as {directive_line, bare}.
     suppressed = (SuppressedFinding(located=_structural(), directive_line=8, bare=False),)

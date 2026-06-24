@@ -146,6 +146,40 @@ def test_compiled_relative_finding_emits_no_region() -> None:
     assert physical["artifactLocation"]["uri"] == "models/m.sql"
 
 
+def _declaration_only_report(finding: CheckFinding) -> AnalysisReport:
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(finding,),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=1,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    return AnalysisReport(findings=(finding,), check=check, audit=audit)
+
+
+def test_located_declaration_finding_carries_a_source_region() -> None:
+    # The new behavior for the declaration family: a located finding now emits a region
+    # on its back-mapped source line. (The compiled-relative gate that drops the region
+    # is the same conditional the structural family pins, and the unlocated no-region
+    # path rides the schema-validated every-branch report.)
+    located = CheckFinding(
+        kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+        message="reducing 'total' mixes a per-row companion held constant by nothing",
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        column="total",
+        line_start=7,
+        line_end=7,
+        source_span=SourceSpan(3, 3, SpanBasis.SOURCE),
+    )
+    report = _declaration_only_report(located)
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    region = result["locations"][0]["physicalLocation"]["region"]
+    assert region["startLine"] == 3
+
+
 def test_contract_issue_rule_id_subnamespaces_by_code_and_carries_it() -> None:
     # Each contract-issue cause gets a stable, distinct ruleId so code scanning can
     # group and triage by cause; the code also rides as a machine-readable property.

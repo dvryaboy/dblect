@@ -170,11 +170,7 @@ def _declaration_block(finding: CheckFinding) -> str:
         head += f".{finding.column}"
     lines = [head, f"      {finding.message}"]
     if finding.file_path:
-        loc = (
-            f":{_format_line_range(finding.line_start, finding.line_end)}"
-            if finding.line_start
-            else ""
-        )
+        loc = f":{_format_span(finding.located_span)}" if finding.line_start else ""
         lines.append(f"      {finding.file_path}{loc}")
     # A finding pinned to a line is line-suppressible, so it carries the same nudge the
     # structural family does. One that could not be located (line 0: a contract or
@@ -227,8 +223,11 @@ def _suppressed_block(
         cf = c.finding
         path = cf.file_path or cf.model_unique_id or "<project>"
         via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
-        loc = _format_line_range(cf.line_start, cf.line_end)
-        rows.append((path, cf.line_start, cf.line_end, loc, cf.kind.value, via, c.directive_line))
+        span = cf.located_span
+        loc = _format_span(span)
+        rows.append(
+            (path, span.line_start, span.line_end, loc, cf.kind.value, via, c.directive_line)
+        )
     for path, _start, _end, loc, kind, via, directive_line in sorted(rows):
         lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ L{directive_line}")
     return "\n".join(lines)
@@ -416,6 +415,7 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
             # projection) carries its line span so a consumer can point at it and
             # acknowledge it; an unlocated one (line 0) reports null, as before.
             located = finding.line_start > 0
+            span = finding.located_span
             return {
                 "family": "declaration",
                 "kind": finding.kind.value,
@@ -427,9 +427,9 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
                 "contract": finding.contract,
                 "line_start": finding.line_start if located else None,
                 "line_end": finding.line_end if located else None,
-                "source_line_start": None,
-                "source_line_end": None,
-                "line_basis": None,
+                "source_line_start": span.line_start if located else None,
+                "source_line_end": span.line_end if located else None,
+                "line_basis": span.basis.value if located else None,
                 "sql_snippet": None,
             }
         case LocatedFinding():

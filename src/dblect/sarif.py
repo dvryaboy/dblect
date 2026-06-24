@@ -322,15 +322,25 @@ def _structural_locations(finding: LocatedFinding) -> list[_Location]:
 
 
 def _declaration_locations(finding: CheckFinding) -> list[_Location]:
-    # No line span: a declaration finding locates by logical name, with a physical
-    # location only when the source file is known. A project-wide finding anchors to
-    # neither and yields no location, which SARIF permits.
+    # A declaration finding locates by logical name, with a physical location (and a
+    # region for the line-located kinds) only when the source file is known. A
+    # project-wide finding anchors to neither and yields no location, which SARIF permits.
     name = _declaration_name(finding)
     location: _Location = {}
     if name is not None:
         location["logicalLocations"] = [{"fullyQualifiedName": name}]
     if finding.file_path is not None:
-        location["physicalLocation"] = {"artifactLocation": {"uri": finding.file_path}}
+        physical: _PhysicalLocation = {"artifactLocation": {"uri": finding.file_path}}
+        # A located declaration finding (a domain-type or aggregation finding pinned to
+        # its projection) carries a back-mapped source span. As with the structural
+        # family, the region rides the source span and is dropped when it could not be
+        # back-mapped, so a code-scanning UI never highlights a guessed line.
+        span = finding.located_span
+        if span.basis is SpanBasis.SOURCE:
+            region = _region(span.line_start, span.line_end)
+            if region is not None:
+                physical["region"] = region
+        location["physicalLocation"] = physical
     return [location] if location else []
 
 
