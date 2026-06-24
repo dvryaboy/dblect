@@ -197,7 +197,7 @@ def run_check(
     findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
-    active, suppressed = _suppress(findings, manifest)
+    active, suppressed = suppress_check_findings(findings, manifest)
 
     return CheckReport(
         findings=active,
@@ -212,7 +212,7 @@ def run_check(
     )
 
 
-def _suppress(
+def suppress_check_findings(
     findings: Iterable[CheckFinding], manifest: Manifest
 ) -> tuple[tuple[CheckFinding, ...], tuple[SuppressedCheckFinding, ...]]:
     """Apply ``-- noqa`` directives to declaration-level findings.
