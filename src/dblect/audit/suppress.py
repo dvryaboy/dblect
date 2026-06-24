@@ -73,6 +73,27 @@ _F = TypeVar("_F", bound=Suppressible)
 _NOQA = re.compile(r"--\s*noqa(?![\w-])\s*(?::\s*(?P<codes>[^\n]*))?", re.IGNORECASE)
 
 
+def _comment_of(line: str) -> str | None:
+    """The text from `line`'s first ``--`` comment marker, or ``None`` when the line
+    has no comment outside a string literal.
+
+    A ``--`` inside a ``'...'`` or ``"..."`` literal is data, not a comment, so it must
+    not start the directive scan (a projection like ``select '-- noqa' as label`` would
+    otherwise read as a bare suppression). Doubled quotes (SQL's in-literal escape)
+    toggle the state twice, leaving it correct.
+    """
+    quote: str | None = None
+    for i, ch in enumerate(line):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "-" and line[i + 1 : i + 2] == "-":
+            return line[i:]
+    return None
+
+
 @cache
 def _kind_by_code() -> dict[str, SuppressibleKind]:
     """The kind a ``DBLECT_`` code names, across both families. Built on first use
@@ -109,7 +130,10 @@ def parse_directives(sql: str) -> tuple[SuppressionDirective, ...]:
     """
     directives: list[SuppressionDirective] = []
     for line_idx, line_text in enumerate(sql.splitlines(), start=1):
-        m = _NOQA.search(line_text)
+        comment = _comment_of(line_text)
+        if comment is None:
+            continue
+        m = _NOQA.search(comment)
         if m is None:
             continue
         raw_codes = (m.group("codes") or "").strip()
