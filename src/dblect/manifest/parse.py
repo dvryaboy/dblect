@@ -46,6 +46,25 @@ class CompilationStatus(StrEnum):
     NOT_COMPILED = "not_compiled"
 
 
+# The coverage-miss reason for a node whose compiled SQL does not faithfully represent
+# the model, by status. Both the audit walk and the lineage build consult this and skip
+# such a node rather than analysing it as if its body were empty, so the two report the
+# same wording for the same condition.
+_COMPILATION_MISS_REASON: dict[CompilationStatus, str] = {
+    CompilationStatus.STALE_OR_ABSENT: (
+        "compiled_code is empty or stale while the source template is non-trivial; "
+        "compilation likely did not reach the warehouse (run `dbt compile` with a connection)"
+    ),
+    CompilationStatus.NOT_COMPILED: "manifest marks this node as not compiled (run `dbt compile`)",
+}
+
+
+def compilation_miss_reason(status: CompilationStatus) -> str | None:
+    """The coverage-miss reason for ``status``, or ``None`` when the node is
+    ``COMPILED`` (a faithful rendering, nothing to surface)."""
+    return _COMPILATION_MISS_REASON.get(status)
+
+
 class ResourceType(StrEnum):
     """dbt node kinds dblect cares about for data-flow analysis.
 

@@ -46,7 +46,7 @@ from dblect.lineage.graph import (
     attach_source_ref,
 )
 from dblect.lineage.property import UnionConfluence, attach_column_ref
-from dblect.manifest import CompilationStatus, Manifest, ResourceType
+from dblect.manifest import Manifest, ResourceType, compilation_miss_reason
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
@@ -64,26 +64,12 @@ class BuildIssue:
     message: str
 
 
-# The coverage-miss reason for a node whose compiled SQL does not faithfully
-# represent the model, by compilation status. A node in one of these states is
-# never analysed as if it were empty: the builder skips it and records the reason
-# so the report surfaces a measurable gap rather than a clean bill.
-_COMPILATION_MISS_REASON: dict[CompilationStatus, str] = {
-    CompilationStatus.STALE_OR_ABSENT: (
-        "compiled_code is empty or stale while the source template is non-trivial; "
-        "compilation likely did not reach the warehouse (run `dbt compile` with a "
-        "connection)"
-    ),
-    CompilationStatus.NOT_COMPILED: "manifest marks this node as not compiled (run `dbt compile`)",
-}
-
-
 def _compilation_miss(node: ManifestNode) -> str | None:
     """The coverage-miss reason for ``node`` when its ``compiled_code`` is not a
     faithful rendering of the model, or ``None`` when it is. Consulted before parsing
     so a stale or never-compiled node is a coverage miss, never analysed as if its
     body were empty."""
-    return _COMPILATION_MISS_REASON.get(node.compilation_status)
+    return compilation_miss_reason(node.compilation_status)
 
 
 @dataclass(frozen=True, slots=True)

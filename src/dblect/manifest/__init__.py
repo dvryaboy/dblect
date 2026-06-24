@@ -15,6 +15,7 @@ from dblect.manifest.parse import (
     ModelConfig,
     Node,
     ResourceType,
+    compilation_miss_reason,
     generic_test_target_uid,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "ModelConfig",
     "Node",
     "ResourceType",
+    "compilation_miss_reason",
     "generic_test_target_uid",
 ]
