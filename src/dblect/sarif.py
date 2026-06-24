@@ -16,11 +16,11 @@ import json
 from typing import Literal, TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport, cross_world_identity
-from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
-from dblect.check.findings import CheckFinding, UnbuiltModel
+from dblect.audit.walker import LocatedFinding, SkippedModel
+from dblect.check.findings import CheckFinding, CheckFindingKind, UnbuiltModel
 from dblect.loader import LoadIssue
 from dblect.severity import Severity, severity_of
-from dblect.sql import suppression_code
+from dblect.sql import FindingKind, suppression_code
 
 SARIF_VERSION = "2.1.0"
 SARIF_SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -147,11 +147,19 @@ _SarifLog = TypedDict("_SarifLog", {"$schema": str, "version": str, "runs": list
 def render_sarif(report: AnalysisReport, *, version: str, indent_spaces: int = 2) -> str:
     """Render ``report`` as a SARIF 2.1.0 log. ``version`` stamps the tool driver."""
     active = list(report.findings)
-    suppressed = list(report.audit.suppressed)
+    # Both families' suppressions ride along: a -- noqa'd structural or declaration
+    # finding stays visible as a triaged result, normalized to (finding, bare, line).
+    suppressed: list[tuple[AnalysisFinding, bool, int]] = [
+        (s.located, s.bare, s.directive_line) for s in report.audit.suppressed
+    ]
+    suppressed.extend((s.finding, s.bare, s.directive_line) for s in report.check.suppressed)
 
-    rules, rule_index = _build_rules(active, suppressed)
+    rules, rule_index = _build_rules(active, [f for f, _, _ in suppressed])
     results: list[_Result] = [_result_for(f, rule_index) for f in active]
-    results.extend(_suppressed_result(s, rule_index) for s in suppressed)
+    results.extend(
+        _suppressed_result(f, bare=bare, directive_line=line, rule_index=rule_index)
+        for f, bare, line in suppressed
+    )
 
     driver: _ToolComponent = {
         "name": "dblect",
@@ -184,16 +192,14 @@ def render_sarif(report: AnalysisReport, *, version: str, indent_spaces: int = 2
 
 
 def _build_rules(
-    active: list[AnalysisFinding], suppressed: list[SuppressedFinding]
+    active: list[AnalysisFinding], suppressed: list[AnalysisFinding]
 ) -> tuple[list[_ReportingDescriptor], dict[str, int]]:
     """The rules every result references, sorted by id, with an id->index map built
     from that order so each result's ``ruleIndex`` is correct. A rule id identifies one
     kind, so the kind's severity sets the rule's default level."""
     levels: dict[str, _Level] = {}
-    for f in active:
+    for f in (*active, *suppressed):
         levels[_rule_id(f)] = _sarif_level(f)
-    for s in suppressed:
-        levels[_rule_id(s.located)] = _sarif_level(s.located)
     rules = [_descriptor(rule_id, levels[rule_id]) for rule_id in sorted(levels)]
     return rules, {rule["id"]: i for i, rule in enumerate(rules)}
 
@@ -230,13 +236,24 @@ def _result_for(finding: AnalysisFinding, rule_index: dict[str, int]) -> _Result
     return result
 
 
-def _suppressed_result(s: SuppressedFinding, rule_index: dict[str, int]) -> _Result:
+def _suppressed_result(
+    finding: AnalysisFinding, *, bare: bool, directive_line: int, rule_index: dict[str, int]
+) -> _Result:
     # A suppressed finding is still a result, so a surface can show what was triaged
-    # away rather than silently dropping it.
-    result = _result_for(s.located, rule_index)
-    via = "noqa" if s.bare else f"noqa: {suppression_code(s.located.finding.kind)}"
-    result["suppressions"] = [{"kind": "inSource", "justification": f"{via} @ L{s.directive_line}"}]
+    # away rather than silently dropping it. Works for either family's finding.
+    result = _result_for(finding, rule_index)
+    via = "noqa" if bare else f"noqa: {suppression_code(_suppression_kind(finding))}"
+    result["suppressions"] = [{"kind": "inSource", "justification": f"{via} @ L{directive_line}"}]
     return result
+
+
+def _suppression_kind(finding: AnalysisFinding) -> FindingKind | CheckFindingKind:
+    match finding:
+        case CheckFinding():
+            return finding.kind
+        case LocatedFinding():
+            return finding.finding.kind
+    assert_never(finding)
 
 
 def _rule_id(finding: AnalysisFinding) -> str:

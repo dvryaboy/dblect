@@ -185,6 +185,31 @@ def test_suppressed_finding_is_marked_suppressed_not_dropped() -> None:
     assert result["suppressions"][0]["justification"] == "noqa: DBLECT_JOIN_FANOUT @ L8"
 
 
+def test_suppressed_declaration_finding_reaches_sarif() -> None:
+    from dblect.check.findings import SuppressedCheckFinding
+
+    suppressed = (
+        SuppressedCheckFinding(finding=_declaration(column="amount"), directive_line=4, bare=True),
+    )
+    check = CheckReport(
+        findings=(),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=0,
+        models_propagated=1,
+        predicates_collected=0,
+        suppressed=suppressed,
+    )
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    report = AnalysisReport(findings=(), check=check, audit=audit)
+
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    # A -- noqa'd declaration finding is triaged, not dropped: it still reaches the
+    # SARIF surface marked suppressed, so the audit trail matches the JSON report.
+    assert result["suppressions"][0]["kind"] == "inSource"
+    assert result["suppressions"][0]["justification"].endswith("@ L4")
+
+
 @pytest.mark.parametrize("fmt", ["text", "json", "sarif"])
 def test_cli_check_emits_requested_format(jaffle_manifest_path: Path, fmt: str) -> None:
     from typer.testing import CliRunner
