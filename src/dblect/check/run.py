@@ -555,9 +555,14 @@ def _file_of(manifest: Manifest, source: SourceRef) -> str | None:
 def _span_of(*nodes: Expr | None) -> tuple[int, int]:
     """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
     a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
-    convention a finding with no locatable line uses (never line-suppressible). The
-    line space is the parsed SQL's, matching where the ``-- noqa`` scanner
-    reads directives."""
+    convention a finding with no locatable line uses (never line-suppressible).
+
+    The span is in the compiled SQL's line space. The ``-- noqa`` scanner reads
+    directives from the developer's ``raw_code`` template, so the two coincide for a
+    model with no macro expansion and can diverge for one where macros shift line
+    numbers. Aligning the two faithfully needs a compiled-to-raw line back-map, which
+    is its own work stream; until then a directive on a macro-shifted line may land off
+    by the expansion's offset."""
     for node in nodes:
         if node is None:
             continue
