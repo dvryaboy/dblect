@@ -361,8 +361,14 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
         },
         "findings": [_finding_payload(f) for f in report.findings],
         "suppressed": [
-            *(_suppressed_payload(s) for s in report.audit.suppressed),
-            *(_suppressed_check_payload(c) for c in report.check.suppressed),
+            *(
+                _suppressed_payload(s.located, directive_line=s.directive_line, bare=s.bare)
+                for s in report.audit.suppressed
+            ),
+            *(
+                _suppressed_payload(c.finding, directive_line=c.directive_line, bare=c.bare)
+                for c in report.check.suppressed
+            ),
         ],
         "skipped": [{"unique_id": s.unique_id, "reason": s.reason} for s in report.audit.skipped],
         "load_issues": [
@@ -411,11 +417,9 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
     assert_never(finding)
 
 
-def _suppressed_payload(s: SuppressedFinding) -> JsonSuppressedFinding:
-    base = _finding_payload(s.located)
-    return {**base, "suppression": {"directive_line": s.directive_line, "bare": s.bare}}
-
-
-def _suppressed_check_payload(c: SuppressedCheckFinding) -> JsonSuppressedFinding:
-    base = _finding_payload(c.finding)
-    return {**base, "suppression": {"directive_line": c.directive_line, "bare": c.bare}}
+def _suppressed_payload(
+    finding: AnalysisFinding, *, directive_line: int, bare: bool
+) -> JsonSuppressedFinding:
+    # Both families' suppressions share this shape; the caller unwraps its own dataclass.
+    base = _finding_payload(finding)
+    return {**base, "suppression": {"directive_line": directive_line, "bare": bare}}
