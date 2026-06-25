@@ -150,15 +150,18 @@ def detect_join_on_nullable_key(
                 # as a spurious non-match rather than dropped. That is the opposite framing
                 # from every other join here, so leave it to a dedicated future case.
                 continue
+            cols_by_alias = sg.equality_cols_by_alias(on)
+            if cols_by_alias is None:  # not a clean conjunction of column equalities
+                continue
             keys: list[_NullableKey] = []
-            for alias, relation in sorted(alias_to_rel.items()):
+            for alias, cols in sorted(cols_by_alias.items()):
                 if alias in dropped:  # this outer join drops the no-match here: its intent
+                    continue
+                relation = alias_to_rel.get(alias)
+                if relation is None:  # a subquery or CTE source, not a bare table
                     continue
                 nullable = nullable_by_name.get(relation)
                 if not nullable:
-                    continue
-                cols = sg.equality_cols_on_alias(on, alias)
-                if not cols:
                     continue
                 causes = causes_by_relation.get(relation, {})
                 keys.extend(
@@ -267,14 +270,28 @@ _JOIN_KIND_WORD: Mapping[JoinSide, str] = {
 _OUTER_SIDES = frozenset({JoinSide.LEFT, JoinSide.RIGHT, JoinSide.FULL})
 
 
-def _shared_cause_clause(keys: Sequence[_NullableKey]) -> str:
-    """The ``why nullable`` clause when every attributed key shares one cause; else empty.
+def _columns_and_cause(keys: Sequence[_NullableKey]) -> tuple[str, str]:
+    """The spanned key columns as a listing, and the trailing ``why nullable`` clause.
 
-    A single cause across the spanned columns names it (the common composite-key shape, all
-    columns drawn from one upstream outer join). Mixed or absent causes degrade to no clause
-    rather than picking one arbitrarily."""
-    causes = {k.cause for k in keys if k.cause is not NullableCause.UNKNOWN}
-    return _cause_clause(next(iter(causes))) if len(causes) == 1 else ""
+    Returns ``(listing, trailing_clause)``. When every column shares one cause the listing
+    stays a clean ``k1, k2`` and the clause trails once (the common composite-key shape, all
+    columns drawn from one upstream outer join). When the columns carry different causes the
+    clause moves inline onto each column that has one, so no column borrows another's
+    provenance, and the trailing clause is empty: ``k1 (produced via a left join, ...), k2``.
+
+    A column drawn from more than one source with disagreeing causes resolves to no cause for
+    that column, the same honest degradation applied per column."""
+    seen: dict[str, set[NullableCause]] = {}
+    for k in keys:
+        seen.setdefault(k.column, set()).add(k.cause)
+    resolved = {
+        col: next(iter(causes)) if len(causes) == 1 else NullableCause.UNKNOWN
+        for col, causes in seen.items()
+    }
+    columns = sorted(resolved)
+    if len(set(resolved.values())) == 1:
+        return ", ".join(columns), _cause_clause(next(iter(resolved.values())))
+    return ", ".join(f"{col}{_cause_clause(resolved[col])}" for col in columns), ""
 
 
 def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSide) -> Finding:
@@ -285,28 +302,33 @@ def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSid
     on either side silently drops the left row just as an inner join would). An outer join's
     surviving rows reach here (the preserved side of a LEFT or RIGHT join, both sides of a
     FULL join), where the row is kept NULL-padded and the hazard is the silent non-match, so
-    the message says the row is kept rather than implying any preserved-row loss."""
-    columns = ", ".join(sorted({k.column for k in keys}))
+    the message says the row is kept rather than implying any preserved-row loss.
+
+    The ``why nullable`` cause is attributed per column: columns that agree share one trailing
+    clause, columns that differ each carry their own inline, so a mixed-cause composite key
+    stays one finding without one column's provenance bleeding onto another."""
+    distinct_columns = sorted({k.column for k in keys})
+    plain_columns = ", ".join(distinct_columns)
+    listing, cause = _columns_and_cause(keys)
     sources = ", ".join(repr(r) for r in sorted({k.relation for k in keys}))
-    is_are = "are" if len({k.column for k in keys}) > 1 else "is"
-    cause = _shared_cause_clause(keys)
+    is_are = "are" if len(distinct_columns) > 1 else "is"
     kind_word = _JOIN_KIND_WORD.get(side)
     prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
     guard = (
-        f"The durable guard is a not_null test on {columns} in {sources}, which turns this "
-        f"silent {{loss}} into a loud test failure on the producing model; or, locally, "
+        f"The durable guard is a not_null test on {plain_columns} in {sources}, which turns "
+        f"this silent {{loss}} into a loud test failure on the producing model; or, locally, "
         f"filter the nulls or COALESCE to a sentinel if the match was intended."
     )
     if side in _OUTER_SIDES:
         message = (
-            f"{prefix} keys on {columns}, which {is_are} nullable upstream in "
+            f"{prefix} keys on {listing}, which {is_are} nullable upstream in "
             f"{sources}{cause}; the outer join keeps these rows, but NULL never equals NULL, "
             f"so a NULL key silently never matches and the row survives with the join target "
             f"NULL-padded. {guard.format(loss='non-match')}"
         )
     else:
         message = (
-            f"{prefix} keys on {columns}, which {is_are} nullable upstream in {sources}{cause}; "
+            f"{prefix} keys on {listing}, which {is_are} nullable upstream in {sources}{cause}; "
             f"NULL never equals NULL, so rows with a NULL key never match and are silently "
             f"dropped. {guard.format(loss='row loss')}"
         )

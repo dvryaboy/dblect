@@ -250,6 +250,41 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
     return frozenset(cols)
 
 
+def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
+    """Per-alias join-key columns from a conjunction of column equalities, in one walk.
+
+    The multi-alias companion to :func:`equality_cols_on_alias`: it flattens the conjunction
+    once and returns every mentioned alias mapped to its key columns, so a caller reasoning
+    about all of a join's sides does not re-walk the predicate per alias. Returns ``None``
+    with the same meaning as the single-alias form, when ``predicate`` is anything other than
+    a conjunction of bare column-to-column equalities (the caller then skips the whole join).
+    An alias maps to its columns only when it appears exactly once in every conjunct, the rule
+    :func:`equality_cols_on_alias` enforces; aliases that fail it are simply absent.
+    """
+    leaves = _conjunctive_leaves(predicate)
+    sides: list[tuple[tuple[str | None, str], tuple[str | None, str]]] = []
+    for leaf in leaves:
+        if not isinstance(leaf, exp.EQ):
+            return None
+        left, right = leaf.this, leaf.expression
+        if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
+            return None
+        sides.append(
+            ((column_table(left), column_name(left)), (column_table(right), column_name(right)))
+        )
+    out: dict[str, frozenset[str]] = {}
+    for alias in {a for pair in sides for a, _ in pair if a is not None}:
+        cols: set[str] = set()
+        for left_side, right_side in sides:
+            on_alias = [c for a, c in (left_side, right_side) if a == alias]
+            if len(on_alias) != 1:
+                break
+            cols.add(on_alias[0])
+        else:
+            out[alias] = frozenset(cols)
+    return out
+
+
 def equality_literal_columns(predicate: Expr) -> tuple[exp.Column, ...]:
     """Columns a conjunct of `predicate` pins to a literal (``col = 'usd'``).
 

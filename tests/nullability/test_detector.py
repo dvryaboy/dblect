@@ -24,6 +24,7 @@ import pytest
 from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import (
+    NullableCause,
     detect_join_on_nullable_key,
     make_nullability_detectors,
 )
@@ -325,3 +326,50 @@ def test_full_join_flags_with_outer_framing_because_both_sides_survive() -> None
     lowered = findings[0].message.lower()
     assert "full outer join" in lowered
     assert "drop" not in lowered  # both sides are kept, padded
+
+
+# A mixed-cause composite key stays one finding, but each column carries its own cause: the
+# attributed column names its provenance inline, the unattributed one names none, so neither
+# borrows the other's. This is the per-column precision the single-clause shape could not give.
+def test_composite_key_attributes_each_column_cause_independently() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN}}  # k2 has no attributed cause
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1 (produced via a left join" in msg  # k1 names its own cause inline
+    assert "k2 (produced" not in msg  # k2 does not borrow it
+    assert msg.lower().count("produced via") == 1  # named once, for k1 only
+
+
+# When every spanned column shares one cause, the listing stays clean and the clause trails
+# once for the whole key rather than repeating inline on each column.
+def test_composite_key_names_the_shared_cause_once() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN, "k2": NullableCause.LEFT_JOIN}}
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1, k2, which are nullable upstream" in msg  # clean listing, no inline clause
+    assert msg.lower().count("produced via a left join") == 1  # trailing clause, once
+
+
+# Two columns with genuinely different upstream causes each name their own inline, in one
+# finding, so a left-join-padded key and a right-join-padded key are not conflated.
+def test_composite_key_with_distinct_causes_names_each_inline() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN, "k2": NullableCause.RIGHT_JOIN}}
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1 (produced via a left join" in msg
+    assert "k2 (produced via a right join" in msg
