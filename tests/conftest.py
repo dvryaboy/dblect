@@ -63,6 +63,22 @@ def snapshot_audit_manifest_path() -> Path:
 
 
 @pytest.fixture(scope="session")
+def jaffle_bigquery_manifest_path() -> Path:
+    """Jaffle compiled against BigQuery: real bigquery-dialect compiled SQL
+    (backtick identifiers, ``adapter_type == "bigquery"``), with the project and
+    dataset rewritten to neutral placeholders. Backs the end-to-end check that the
+    detectors run against real BigQuery output, the basis for treating bigquery as
+    a validated adapter. Regenerate with scripts/refresh_bigquery_fixtures.sh.
+    """
+    path = FIXTURES / "jaffle_bigquery" / "manifest.json"
+    if not path.exists():
+        pytest.skip(
+            "bigquery jaffle fixture not present; run scripts/refresh_bigquery_fixtures.sh",
+        )
+    return path
+
+
+@pytest.fixture(scope="session")
 def jaffle_snowflake_meta_manifest_path() -> Path:
     """Jaffle manifest with ``metadata.adapter_type`` relabeled to ``snowflake``.
 

@@ -324,6 +324,16 @@ def test_now_in_explicit_group_by_expression_detected() -> None:
     assert len(findings) == 1
 
 
+@pytest.mark.parametrize("func", ["current_datetime()", "session_user()"])
+def test_bigquery_typed_nondeterministic_in_join_detected(func: str) -> None:
+    # CURRENT_DATETIME() and SESSION_USER() parse to their own typed nodes under
+    # the bigquery dialect (not Anonymous), so the typed set alone must list them.
+    detector = make_non_determinism_detector()
+    findings = detector(parse_sql(f"select * from a join b on a.k = {func}", dialect="bigquery"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
+
+
 def test_current_timestamp_in_window_order_by_detected() -> None:
     sql = "select row_number() over (order by ts - current_timestamp) as rn from t"
     findings = _non_determinism(sql)

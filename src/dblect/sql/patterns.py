@@ -167,7 +167,12 @@ _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
         exp.CurrentTimestamp,
         exp.CurrentDate,
         exp.CurrentTime,
+        # BigQuery's CURRENT_DATETIME() and SESSION_USER() parse to their own typed
+        # nodes (siblings of CurrentTimestamp / CurrentUser), so both are listed to
+        # catch them dialect-neutrally.
+        exp.CurrentDatetime,
         exp.CurrentUser,
+        exp.SessionUser,
         exp.Rand,
         exp.Uuid,
     }
