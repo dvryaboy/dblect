@@ -440,28 +440,11 @@ def _relation_alias(e: Expr) -> str | None:
 def _optional_join_aliases(select: exp.Select) -> set[str]:
     """The FROM-clause aliases whose columns an outer join can pad with NULL: the
     joined-in side of a LEFT join, the accumulated left side of a RIGHT join, both for a
-    FULL join. INNER and CROSS pad nothing. Aliases are case-folded to match the graph."""
-    from_ = sg.from_of(select)
-    left: set[str] = set()
-    if from_ is not None:
-        base = _relation_alias(from_.this)
-        if base is not None:
-            left.add(base)
-    optional: set[str] = set()
-    for join in sg.joins_of(select):
-        side = sg.join_side_of(join)
-        alias = _relation_alias(join.this)
-        if side is JoinSide.LEFT and alias is not None:
-            optional.add(alias)
-        elif side is JoinSide.RIGHT:
-            optional |= left
-        elif side is JoinSide.FULL:
-            if alias is not None:
-                optional.add(alias)
-            optional |= left
-        if alias is not None:
-            left.add(alias)
-    return optional
+    FULL join. INNER and CROSS pad nothing. Aliases are case-folded to match the graph.
+
+    This is the side-blind reading of :func:`_optional_alias_sides`: an alias is optional
+    exactly when that function attributes it a padding join, so the set is its keyset."""
+    return set(_optional_alias_sides(select))
 
 
 def _wrap_optional_columns(expr: Expr, optional: set[str]) -> Expr:

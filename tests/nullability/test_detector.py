@@ -23,7 +23,11 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
-from dblect.nullability.detector import make_nullability_detectors
+from dblect.nullability.detector import (
+    NullableCause,
+    detect_join_on_nullable_key,
+    make_nullability_detectors,
+)
 from dblect.sql import Finding, FindingKind, parse_sql
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -222,3 +226,150 @@ def test_join_finding_does_not_fabricate_a_cause_when_not_derivable() -> None:
     assert "not_null" in msg  # the durable guard is still recommended
     assert "left join" not in msg.lower()
     assert "produced via" not in msg.lower()
+
+
+# The detector reasons about join-side preservation and per-join collapse purely from the
+# AST plus the per-relation nullable index, so these contracts are pinned at that boundary
+# rather than through the manifest machinery the integration cases above exercise.
+def _join_keys(sql: str, nullable: dict[str, frozenset[str]]) -> tuple[Finding, ...]:
+    return detect_join_on_nullable_key(parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable)
+
+
+_STG_NULLABLE = {"stg": frozenset({"tag"})}
+
+
+# A nullable key on the non-preserved side of an outer join is benign: those rows not
+# joining is the outer join's defining semantics, not a silent hazard. Here ``other`` is
+# the preserved left side and ``stg`` the optional right side, so the detector stays quiet.
+def test_join_does_not_flag_non_preserved_side_of_outer_join() -> None:
+    sql = "SELECT o.k FROM other o LEFT JOIN stg s ON o.k = s.tag"
+    assert _join_keys(sql, _STG_NULLABLE) == ()
+
+
+# The preserved side of an outer join is the case worth flagging: those rows survive, but a
+# NULL key silently never matches. Here ``stg`` is the preserved left side. The message
+# frames a silent non-match, not row loss, because no preserved row is dropped.
+def test_join_flags_preserved_side_of_outer_join_without_row_loss_framing() -> None:
+    sql = "SELECT s.id FROM stg s LEFT JOIN other o ON s.tag = o.k"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    lowered = findings[0].message.lower()
+    assert "drop" not in lowered  # the preserved row is kept, not dropped
+    assert "match" in lowered  # the hazard is the silent non-match
+
+
+# On an inner join a NULL key really is dropped from the result, so that finding keeps the
+# row-loss framing. Pinning both framings guards the inner/outer distinction.
+def test_inner_join_keeps_row_loss_framing() -> None:
+    sql = "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    assert "drop" in findings[0].message.lower()
+
+
+# A composite-key join is one decision to look at. The detector emits one finding listing
+# the spanned key columns rather than one finding per column.
+def test_composite_key_join_yields_one_finding_listing_all_columns() -> None:
+    nullable = {"dim": frozenset({"k1", "k2", "k3", "k4"})}
+    sql = (
+        "SELECT f.v FROM fact f JOIN dim d "
+        "ON f.k1 = d.k1 AND f.k2 = d.k2 AND f.k3 = d.k3 AND f.k4 = d.k4"
+    )
+    findings = _join_keys(sql, nullable)
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert all(col in msg for col in ("k1", "k2", "k3", "k4"))
+
+
+# Preservation is gated per join, not per SELECT. An outer join earlier in the same scope
+# leaves ``stg`` optional, but the later inner join on ``s.tag`` still silently drops the
+# NULL-key rows, so that genuine row loss must still be flagged with row-loss framing.
+def test_inner_join_still_flagged_when_an_unrelated_outer_join_made_the_side_optional() -> None:
+    sql = "SELECT o.k FROM other o LEFT JOIN stg s ON o.k = s.id JOIN third t ON s.tag = t.k"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    assert "drop" in findings[0].message.lower()
+
+
+# A semi join filters its left rows down to those with a match, so a NULL key silently drops
+# the left row just as an inner join would, on either side: the left key never matches, or the
+# right key that would have matched is invisible. The detector flags it with the SEMI label
+# and row-loss framing.
+def test_semi_join_flags_either_side_with_row_loss_framing() -> None:
+    right_nullable = "SELECT a.x FROM other a LEFT SEMI JOIN stg s ON a.k = s.tag"
+    left_nullable = "SELECT a.x FROM stg a LEFT SEMI JOIN other o ON a.tag = o.k"
+    for sql in (right_nullable, left_nullable):
+        findings = _join_keys(sql, _STG_NULLABLE)
+        assert len(findings) == 1
+        lowered = findings[0].message.lower()
+        assert "semi join" in lowered
+        assert "drop" in lowered  # the left row is silently dropped on a NULL key
+
+
+# An anti join inverts the hazard: a NULL key matches nothing, so the row is kept as a
+# spurious non-match rather than dropped. That framing is the opposite of every other join
+# here, so the detector leaves it alone rather than emit a mislabelled finding.
+def test_anti_join_is_left_alone() -> None:
+    right_nullable = "SELECT a.x FROM other a LEFT ANTI JOIN stg s ON a.k = s.tag"
+    left_nullable = "SELECT a.x FROM stg a LEFT ANTI JOIN other o ON a.tag = o.k"
+    assert _join_keys(right_nullable, _STG_NULLABLE) == ()
+    assert _join_keys(left_nullable, _STG_NULLABLE) == ()
+
+
+# A FULL join drops no rows: both sides survive NULL-padded, so a NULL key is the silent
+# non-match hazard on either side. The detector flags it with the kept-row outer framing,
+# not row loss.
+def test_full_join_flags_with_outer_framing_because_both_sides_survive() -> None:
+    sql = "SELECT s.id FROM stg s FULL JOIN other o ON s.tag = o.k"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    lowered = findings[0].message.lower()
+    assert "full outer join" in lowered
+    assert "drop" not in lowered  # both sides are kept, padded
+
+
+# A mixed-cause composite key stays one finding, but each column carries its own cause: the
+# attributed column names its provenance inline, the unattributed one names none, so neither
+# borrows the other's. This is the per-column precision the single-clause shape could not give.
+def test_composite_key_attributes_each_column_cause_independently() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN}}  # k2 has no attributed cause
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1 (produced via a left join" in msg  # k1 names its own cause inline
+    assert "k2 (produced" not in msg  # k2 does not borrow it
+    assert msg.lower().count("produced via") == 1  # named once, for k1 only
+
+
+# When every spanned column shares one cause, the listing stays clean and the clause trails
+# once for the whole key rather than repeating inline on each column.
+def test_composite_key_names_the_shared_cause_once() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN, "k2": NullableCause.LEFT_JOIN}}
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1, k2, which are nullable upstream" in msg  # clean listing, no inline clause
+    assert msg.lower().count("produced via a left join") == 1  # trailing clause, once
+
+
+# Two columns with genuinely different upstream causes each name their own inline, in one
+# finding, so a left-join-padded key and a right-join-padded key are not conflated.
+def test_composite_key_with_distinct_causes_names_each_inline() -> None:
+    nullable = {"dim": frozenset({"k1", "k2"})}
+    cause = {"dim": {"k1": NullableCause.LEFT_JOIN, "k2": NullableCause.RIGHT_JOIN}}
+    sql = "SELECT f.v FROM fact f JOIN dim d ON f.k1 = d.k1 AND f.k2 = d.k2"
+    findings = detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, cause_by_name=cause
+    )
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "k1 (produced via a left join" in msg
+    assert "k2 (produced via a right join" in msg

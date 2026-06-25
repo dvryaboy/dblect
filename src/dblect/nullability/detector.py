@@ -18,7 +18,8 @@ undeclared project sees no noise).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 
 import sqlglot.expressions as exp
@@ -63,6 +64,18 @@ class NullableCause(StrEnum):
 CauseByName = Mapping[str, Mapping[str, NullableCause]]
 
 
+@dataclass(frozen=True)
+class _NullableKey:
+    """One join-key column proven nullable upstream, with its source relation and cause.
+
+    A composite-key join collects several of these for one finding, so the message can list
+    every spanned column instead of fanning out one finding per column."""
+
+    relation: str
+    column: str
+    cause: NullableCause
+
+
 def detect_null_group_on_nullable_key(
     tree: Expr, *, nullable_by_name: NullableByName
 ) -> tuple[Finding, ...]:
@@ -105,38 +118,58 @@ def detect_join_on_nullable_key(
 ) -> tuple[Finding, ...]:
     """Flag a JOIN whose equality key is a column nullable in its upstream relation.
 
-    NULL never equals NULL, so rows with a NULL join key never match: an inner join
-    silently drops them and an outer join leaves them unmatched. As with the group-by
-    detector, the nullability is read from the upstream relation, so this fires on an
-    inherited-nullable key the local SQL gives no hint about, complementing the
-    structural ``coalesce_on_join_key`` and ``where_on_outer_joined_nullable``. Only
-    bare-column equality keys are reasoned about.
+    NULL never equals NULL, so a NULL join key never matches, but the consequence depends
+    on the join. An inner join drops the row from either side, silent row loss. An outer
+    join keeps its preserved rows and pads the target with NULLs, a silent non-match; its
+    dropped side simply not joining is the join's defining semantics rather than a hazard,
+    and ``where_on_outer_joined_nullable`` and ``null_group_on_nullable_key`` already cover
+    that side's downstream effects with more precision. So this gates per join on
+    ``joins_with_outer_dropped_aliases``: it flags every nullable key except the one on the
+    join's own dropped side. A FULL join drops nothing (both sides survive NULL-padded), so
+    it flags both. A semi join filters its left rows, so a NULL key on either side silently
+    drops the row exactly as an inner join does, and it is flagged with the same row-loss
+    framing. An anti join inverts the hazard (a NULL key is kept as a spurious non-match), so
+    it is left alone. Gating per join keeps an outer join elsewhere in the same SELECT from
+    silencing an inner join's genuine row loss.
+
+    Nullability is read from the upstream relation, so this fires on an inherited-nullable
+    key the local SQL gives no hint about. One join is one decision to look at, so a
+    composite-key join yields one finding listing the spanned key columns rather than one
+    per column. Only bare-column equality keys are reasoned about.
     """
     causes_by_relation = cause_by_name or {}
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         alias_to_rel = _alias_to_relation(sel)
-        for join in sg.joins_of(sel):
+        for join, side, dropped in sg.joins_with_outer_dropped_aliases(sel):
             on = sg.on_of(join)
             if on is None:
                 continue
-            for alias, relation in alias_to_rel.items():
+            if side is JoinSide.ANTI:
+                # Anti join inverts the hazard: a NULL key matches nothing, so the row is kept
+                # as a spurious non-match rather than dropped. That is the opposite framing
+                # from every other join here, so leave it to a dedicated future case.
+                continue
+            cols_by_alias = sg.equality_cols_by_alias(on)
+            if cols_by_alias is None:  # not a clean conjunction of column equalities
+                continue
+            keys: list[_NullableKey] = []
+            for alias, cols in sorted(cols_by_alias.items()):
+                if alias in dropped:  # this outer join drops the no-match here: its intent
+                    continue
+                relation = alias_to_rel.get(alias)
+                if relation is None:  # a subquery or CTE source, not a bare table
+                    continue
                 nullable = nullable_by_name.get(relation)
                 if not nullable:
                     continue
-                cols = sg.equality_cols_on_alias(on, alias)
-                if not cols:
-                    continue
                 causes = causes_by_relation.get(relation, {})
-                out.extend(
-                    _join_finding(
-                        join,
-                        source=relation,
-                        column=column,
-                        cause=causes.get(column, NullableCause.UNKNOWN),
-                    )
+                keys.extend(
+                    _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
                     for column in sorted(cols & nullable)
                 )
+            if keys:
+                out.append(_join_finding(join, keys, side=side))
     return tuple(out)
 
 
@@ -225,22 +258,81 @@ def _cause_clause(cause: NullableCause) -> str:
             return ""
 
 
-def _join_finding(
-    join: exp.Join, *, source: str, column: str, cause: NullableCause = NullableCause.UNKNOWN
-) -> Finding:
-    return finding_at(
-        FindingKind.JOIN_ON_NULLABLE_KEY,
-        message=(
-            f"JOIN keys on {column}, which is nullable upstream in {source!r}"
-            f"{_cause_clause(cause)}; NULL never equals NULL, so rows with a NULL {column} "
-            f"never match and are silently dropped (inner join) or left unmatched (outer "
-            f"join). The durable guard is a not_null test on {column} in {source!r}, which "
-            f"turns this silent row loss into a loud test failure on the producing model; "
-            f"or, locally, filter the nulls or COALESCE to a sentinel if the match was "
-            f"intended."
-        ),
-        node=join,
+# The kind word prefixed onto "JOIN" in a finding. An inner join is absent and reads as the
+# bare "JOIN". LEFT/RIGHT/FULL take the kept-row outer framing; SEMI takes the row-loss
+# framing (it filters the left rows, so a NULL key drops the row exactly as an inner join).
+_JOIN_KIND_WORD: Mapping[JoinSide, str] = {
+    JoinSide.LEFT: "LEFT",
+    JoinSide.RIGHT: "RIGHT",
+    JoinSide.FULL: "FULL OUTER",
+    JoinSide.SEMI: "SEMI",
+}
+_OUTER_SIDES = frozenset({JoinSide.LEFT, JoinSide.RIGHT, JoinSide.FULL})
+
+
+def _columns_and_cause(keys: Sequence[_NullableKey]) -> tuple[str, str]:
+    """The spanned key columns as a listing, and the trailing ``why nullable`` clause.
+
+    Returns ``(listing, trailing_clause)``. When every column shares one cause the listing
+    stays a clean ``k1, k2`` and the clause trails once (the common composite-key shape, all
+    columns drawn from one upstream outer join). When the columns carry different causes the
+    clause moves inline onto each column that has one, so no column borrows another's
+    provenance, and the trailing clause is empty: ``k1 (produced via a left join, ...), k2``.
+
+    A column drawn from more than one source with disagreeing causes resolves to no cause for
+    that column, the same honest degradation applied per column."""
+    seen: dict[str, set[NullableCause]] = {}
+    for k in keys:
+        seen.setdefault(k.column, set()).add(k.cause)
+    resolved = {
+        col: next(iter(causes)) if len(causes) == 1 else NullableCause.UNKNOWN
+        for col, causes in seen.items()
+    }
+    columns = sorted(resolved)
+    if len(set(resolved.values())) == 1:
+        return ", ".join(columns), _cause_clause(next(iter(resolved.values())))
+    return ", ".join(f"{col}{_cause_clause(resolved[col])}" for col in columns), ""
+
+
+def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSide) -> Finding:
+    """One finding per join, listing every nullable key column it spans.
+
+    The framing follows the join side. An inner or semi join drops the row on a NULL key, so
+    the message keeps the row-loss framing (a semi join filters its left rows, so a NULL key
+    on either side silently drops the left row just as an inner join would). An outer join's
+    surviving rows reach here (the preserved side of a LEFT or RIGHT join, both sides of a
+    FULL join), where the row is kept NULL-padded and the hazard is the silent non-match, so
+    the message says the row is kept rather than implying any preserved-row loss.
+
+    The ``why nullable`` cause is attributed per column: columns that agree share one trailing
+    clause, columns that differ each carry their own inline, so a mixed-cause composite key
+    stays one finding without one column's provenance bleeding onto another."""
+    distinct_columns = sorted({k.column for k in keys})
+    plain_columns = ", ".join(distinct_columns)
+    listing, cause = _columns_and_cause(keys)
+    sources = ", ".join(repr(r) for r in sorted({k.relation for k in keys}))
+    is_are = "are" if len(distinct_columns) > 1 else "is"
+    kind_word = _JOIN_KIND_WORD.get(side)
+    prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
+    guard = (
+        f"The durable guard is a not_null test on {plain_columns} in {sources}, which turns "
+        f"this silent {{loss}} into a loud test failure on the producing model; or, locally, "
+        f"filter the nulls or COALESCE to a sentinel if the match was intended."
     )
+    if side in _OUTER_SIDES:
+        message = (
+            f"{prefix} keys on {listing}, which {is_are} nullable upstream in "
+            f"{sources}{cause}; the outer join keeps these rows, but NULL never equals NULL, "
+            f"so a NULL key silently never matches and the row survives with the join target "
+            f"NULL-padded. {guard.format(loss='non-match')}"
+        )
+    else:
+        message = (
+            f"{prefix} keys on {listing}, which {is_are} nullable upstream in {sources}{cause}; "
+            f"NULL never equals NULL, so rows with a NULL key never match and are silently "
+            f"dropped. {guard.format(loss='row loss')}"
+        )
+    return finding_at(FindingKind.JOIN_ON_NULLABLE_KEY, message=message, node=join)
 
 
 def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
