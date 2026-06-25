@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import (
     SuppressionDirective,
     apply,
     directive_matches,
     parse_directives,
 )
+from dblect.audit.walker import LocatedFinding
 from dblect.check.findings import CheckFinding, CheckFindingKind
 from dblect.sql import Finding, FindingKind, suppression_code
 
@@ -19,13 +21,22 @@ def _finding(
     line_start: int,
     line_end: int | None = None,
     kind: FindingKind = FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
-) -> Finding:
-    return Finding(
-        kind=kind,
-        message="x",
-        sql_snippet="snippet",
-        line_start=line_start,
-        line_end=line_end if line_end is not None else line_start,
+) -> LocatedFinding:
+    # Suppression matches a finding's source-space ``located_span``, so the unit under
+    # test is the located finding. The line is given in source space here (a SOURCE-basis
+    # span), which is what a `-- noqa` the developer wrote is matched against.
+    end = line_end if line_end is not None else line_start
+    return LocatedFinding(
+        model_unique_id="model.shop.m",
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=kind,
+            message="x",
+            sql_snippet="snippet",
+            line_start=line_start,
+            line_end=end,
+        ),
+        source_span=SourceSpan(line_start, end, SpanBasis.SOURCE) if line_start > 0 else None,
     )
 
 
@@ -158,6 +169,45 @@ def test_finding_without_line_is_never_suppressed() -> None:
     assert not directive_matches(d, f)
 
 
+def test_directive_matches_the_source_span_not_the_compiled_span() -> None:
+    # Macro expansion shifts the finding's compiled line (7) away from the source line
+    # the developer wrote (3). A directive on the source line matches; the compiled line
+    # does not. This is the contract that makes the line the report shows suppressible.
+    f = LocatedFinding(
+        model_unique_id="model.shop.m",
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+            message="x",
+            sql_snippet="snippet",
+            line_start=7,
+            line_end=7,
+        ),
+        source_span=SourceSpan(3, 3, SpanBasis.SOURCE),
+    )
+    assert directive_matches(SuppressionDirective(line=3, kinds=None), f)
+    assert not directive_matches(SuppressionDirective(line=7, kinds=None), f)
+
+
+def test_compiled_basis_finding_falls_back_to_the_compiled_line() -> None:
+    # A construct emitted inside a macro has no source line; its located_span stays
+    # compiled-relative, so matching falls back to the compiled line (the honest, if
+    # imperfect, behavior until macro-emitted findings get their own suppression path).
+    f = LocatedFinding(
+        model_unique_id="model.shop.m",
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+            message="x",
+            sql_snippet="snippet",
+            line_start=5,
+            line_end=5,
+        ),
+        source_span=SourceSpan(5, 5, SpanBasis.COMPILED),
+    )
+    assert directive_matches(SuppressionDirective(line=5, kinds=None), f)
+
+
 # --- apply ---
 
 
@@ -169,7 +219,7 @@ def test_apply_partitions_findings() -> None:
     )
     active, suppressed = apply(findings, directives)
     assert len(active) == 1
-    assert active[0].line_start == 10
+    assert active[0].finding.line_start == 10
     assert len(suppressed) == 1
     assert suppressed[0][1].kinds is None
 

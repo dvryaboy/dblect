@@ -27,6 +27,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
+from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import SuppressionDirective, apply, parse_directives
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.check.findings import (
@@ -249,14 +250,20 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     contract-resolution and resolution-floor findings are world-invariant and stay
     ``run_check``'s to report once."""
     findings: list[CheckFinding] = []
+    # One source-map per model, shared across both finding kinds: a model that produces
+    # both a contradiction and an aggregation finding builds its line map once.
+    line_maps: dict[str, LineMap] = {}
     findings.extend(
-        _contradiction_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+        _contradiction_findings(
+            graphs.manifest, world.domain_type, graphs.column_build.graph, line_maps
+        )
     )
     findings.extend(
         _aggregation_findings(
             graphs.manifest,
             world.domain_type,
             graphs.column_build.graph,
+            line_maps,
         )
     )
     return findings
@@ -393,6 +400,7 @@ def _contradiction_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     column_graph: ColumnLineageGraph,
+    line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     """One finding per column whose flow value is provisional: a declared type the
     inferred one contradicts, reported wherever the taint reached."""
@@ -401,6 +409,7 @@ def _contradiction_findings(
         if not ann.provisional or ann.value == NAKED:
             continue
         line_start, line_end = _span_of(column_graph.derivation(ref))
+        uid = ref.source.unique_id
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
@@ -408,11 +417,12 @@ def _contradiction_findings(
                     f"declared domain type for {ref.column!r} is contradicted by the type "
                     "that flows in from upstream"
                 ),
-                model_unique_id=ref.source.unique_id,
+                model_unique_id=uid,
                 file_path=_file_of(manifest, ref.source),
                 column=ref.column,
                 line_start=line_start,
                 line_end=line_end,
+                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
             )
         )
     return out
@@ -422,6 +432,7 @@ def _aggregation_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     column_graph: ColumnLineageGraph,
+    line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     """One finding per aggregate output whose tag cleared to naked while an operand
     it summed still carried one: a reduction the algebra cannot call well typed."""
@@ -441,15 +452,17 @@ def _aggregation_findings(
         # so the finding still lands near the right place when the aggregate carries no
         # stamped identifier (a literal-only shape).
         line_start, line_end = _span_of(agg, derivation)
+        uid = ref.source.unique_id
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
                 message=_aggregation_message(ref, agg, annotations),
-                model_unique_id=ref.source.unique_id,
+                model_unique_id=uid,
                 file_path=_file_of(manifest, ref.source),
                 column=ref.column,
                 line_start=line_start,
                 line_end=line_end,
+                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
             )
         )
     return out
@@ -552,14 +565,39 @@ def _file_of(manifest: Manifest, source: SourceRef) -> str | None:
     return node.original_file_path if node is not None else None
 
 
+def _source_span(
+    manifest: Manifest,
+    uid: str,
+    line_start: int,
+    line_end: int,
+    cache: dict[str, LineMap],
+) -> SourceSpan:
+    """Back-map a compiled span onto the model's source template (see
+    :mod:`dblect.audit.sourcemap`), reusing one line map per model across the world's
+    findings."""
+    # The "no line" sentinel has no source position; skip building the map for a model
+    # whose findings are all unlocated.
+    if line_start == 0:
+        return SourceSpan.compiled(line_start, line_end)
+    line_map = cache.get(uid)
+    if line_map is None:
+        node = manifest.nodes.get(uid)
+        compiled = node.analysis_sql if node is not None else None
+        raw = node.raw_code if node is not None else None
+        line_map = build_line_map(compiled, raw)
+        cache[uid] = line_map
+    return line_map.map_span(line_start, line_end)
+
+
 def _span_of(*nodes: Expr | None) -> tuple[int, int]:
     """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
     a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
     convention a finding with no locatable line uses (never line-suppressible).
 
-    The span is in the compiled SQL's line space, while the ``-- noqa`` scanner reads
-    directives from ``raw_code``. The two coincide without macro expansion and can
-    diverge with it; aligning them faithfully needs a compiled-to-raw line back-map."""
+    The span is in the compiled SQL's line space. The located finding kinds carry it
+    on ``line_start``/``line_end`` and additionally back-map it onto ``raw_code`` via
+    :func:`_source_span`, so the report can point at the source line the developer
+    wrote when the construct passes through verbatim."""
     for node in nodes:
         if node is None:
             continue

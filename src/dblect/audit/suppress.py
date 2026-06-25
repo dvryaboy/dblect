@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar
 
+from dblect.audit.sourcemap import SourceSpan
 from dblect.sql import FindingKind, suppression_code
 
 if TYPE_CHECKING:
@@ -52,15 +53,20 @@ if TYPE_CHECKING:
 
 class Suppressible(Protocol):
     """What a directive needs to decide whether it silences a finding: the kind it
-    carries and the line span it occupies. Both families satisfy this, so matching is
-    written once over the protocol rather than per family."""
+    carries and the source-space span it occupies. Both families satisfy this, so
+    matching is written once over the protocol rather than per family.
+
+    The span is the back-mapped ``located_span``, not the raw compiled span. Directives
+    live in ``raw_code`` and are read in source-line space (:func:`parse_directives`), so
+    matching them against the source span is what lets a ``-- noqa`` on the line the
+    report shows actually silence a finding whose compiled line a macro expansion shifted.
+    A construct emitted inside a macro has no source line, so its ``located_span`` stays
+    compiled-relative and matching falls back to the compiled line, as before."""
 
     @property
     def kind(self) -> SuppressibleKind: ...
     @property
-    def line_start(self) -> int: ...
-    @property
-    def line_end(self) -> int: ...
+    def located_span(self) -> SourceSpan: ...
 
 
 _F = TypeVar("_F", bound=Suppressible)
@@ -151,15 +157,18 @@ def directive_matches(directive: SuppressionDirective, finding: Suppressible) ->
     """True if `directive` silences `finding`.
 
     A directive applies when it sits on the line immediately above the finding's span
-    or anywhere within the span itself. A bare directive (``kinds is None``) silences
-    every kind; a coded directive silences only the kinds it names (and a kind from one
-    family never matches a finding from the other, since the codes are distinct).
-    Findings without a line range (``line_start == 0``) are never suppressed: a
-    directive can't responsibly silence what it can't locate.
+    or anywhere within the span itself. The span is the finding's source-space
+    ``located_span``, so a directive the developer placed on the line they wrote matches
+    even when macro expansion shifted the compiled line. A bare directive
+    (``kinds is None``) silences every kind; a coded directive silences only the kinds it
+    names (and a kind from one family never matches a finding from the other, since the
+    codes are distinct). Findings without a line range (``line_start == 0``) are never
+    suppressed: a directive can't responsibly silence what it can't locate.
     """
-    if finding.line_start == 0:
+    span = finding.located_span
+    if span.line_start == 0:
         return False
-    if not (finding.line_start - 1 <= directive.line <= finding.line_end):
+    if not (span.line_start - 1 <= directive.line <= span.line_end):
         return False
     if directive.kinds is None:
         return True

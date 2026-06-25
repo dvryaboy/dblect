@@ -18,7 +18,14 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.analysis import AnalysisReport, analyze
-from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
+from dblect.audit import (
+    AuditReport,
+    LocatedFinding,
+    SkippedModel,
+    SourceSpan,
+    SpanBasis,
+    SuppressedFinding,
+)
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport, UnbuiltModel
 from dblect.loader import LoadIssue
 from dblect.manifest import Manifest
@@ -42,8 +49,9 @@ def _validate(sarif_text: str) -> dict[str, Any]:
     return document
 
 
-def _located(*, line: int) -> LocatedFinding:
-    # line 0 is the detector's "could not pin a line" sentinel.
+def _located(*, line: int, basis: SpanBasis = SpanBasis.SOURCE) -> LocatedFinding:
+    # line 0 is the detector's "could not pin a line" sentinel; a SOURCE basis carries
+    # the back-mapped source span (the common case), COMPILED the un-mappable fallback.
     return LocatedFinding(
         model_unique_id=_MODEL,
         file_path="models/m.sql",
@@ -54,6 +62,7 @@ def _located(*, line: int) -> LocatedFinding:
             line_start=line,
             line_end=line,
         ),
+        source_span=SourceSpan(line, line, basis) if line > 0 else None,
     )
 
 
@@ -103,6 +112,72 @@ def _every_branch_report() -> AnalysisReport:
 
 def test_every_emitted_shape_validates_against_the_sarif_schema() -> None:
     _validate(render_sarif(_every_branch_report(), version=_VERSION))
+
+
+def _structural_only_report(finding: LocatedFinding) -> AnalysisReport:
+    audit = AuditReport(findings=(finding,), suppressed=(), skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=0,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    return AnalysisReport(findings=(finding,), check=check, audit=audit)
+
+
+def test_region_uses_the_back_mapped_source_line() -> None:
+    # The region indexes the source file, so a back-mapped finding annotates the
+    # source line, not the compiled one.
+    report = _structural_only_report(_located(line=9, basis=SpanBasis.SOURCE))
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    region = result["locations"][0]["physicalLocation"]["region"]
+    assert region["startLine"] == 9
+
+
+def test_compiled_relative_finding_emits_no_region() -> None:
+    # A span that could not be back-mapped would point a viewer at a guessed source
+    # line, so the location resolves to the file with no region rather than mislead.
+    report = _structural_only_report(_located(line=9, basis=SpanBasis.COMPILED))
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    physical = result["locations"][0]["physicalLocation"]
+    assert "region" not in physical
+    assert physical["artifactLocation"]["uri"] == "models/m.sql"
+
+
+def _declaration_only_report(finding: CheckFinding) -> AnalysisReport:
+    audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(finding,),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=1,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    return AnalysisReport(findings=(finding,), check=check, audit=audit)
+
+
+def test_located_declaration_finding_carries_a_source_region() -> None:
+    # The new behavior for the declaration family: a located finding now emits a region
+    # on its back-mapped source line. (The compiled-relative gate that drops the region
+    # is the same conditional the structural family pins, and the unlocated no-region
+    # path rides the schema-validated every-branch report.)
+    located = CheckFinding(
+        kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+        message="reducing 'total' mixes a per-row companion held constant by nothing",
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        column="total",
+        line_start=7,
+        line_end=7,
+        source_span=SourceSpan(3, 3, SpanBasis.SOURCE),
+    )
+    report = _declaration_only_report(located)
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    region = result["locations"][0]["physicalLocation"]["region"]
+    assert region["startLine"] == 3
 
 
 def test_contract_issue_rule_id_subnamespaces_by_code_and_carries_it() -> None:

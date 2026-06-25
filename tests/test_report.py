@@ -11,7 +11,14 @@ from __future__ import annotations
 import json
 
 from dblect.analysis import AnalysisReport
-from dblect.audit import AuditReport, LocatedFinding, SkippedModel, SuppressedFinding
+from dblect.audit import (
+    AuditReport,
+    LocatedFinding,
+    SkippedModel,
+    SourceSpan,
+    SpanBasis,
+    SuppressedFinding,
+)
 from dblect.check.findings import CheckFinding, CheckFindingKind, CheckReport
 from dblect.report import render_json, render_text
 from dblect.sql import Finding, FindingKind, suppression_hint
@@ -24,7 +31,12 @@ def _structural(
     message: str = "join can multiply rows",
     *,
     kind: FindingKind = FindingKind.JOIN_FANOUT,
+    source_span: SourceSpan | None = None,
 ) -> LocatedFinding:
+    # Default to a successful back-map (source line == compiled line), the common
+    # ref-only case; tests that need the compiled-relative path pass it explicitly.
+    if source_span is None:
+        source_span = SourceSpan(9, 9, SpanBasis.SOURCE)
     return LocatedFinding(
         model_unique_id=_MODEL,
         file_path="models/m.sql",
@@ -35,6 +47,7 @@ def _structural(
             line_start=9,
             line_end=9,
         ),
+        source_span=source_span,
     )
 
 
@@ -165,6 +178,110 @@ def test_json_tags_each_finding_with_its_family() -> None:
     # the check-family coverage block rides along
     assert "resolution" in payload["coverage"]
     assert payload["coverage"]["worlds"] == {"worlds_enumerated": 1, "axes_enumerated": []}
+
+
+def test_structural_finding_carries_back_mapped_source_span() -> None:
+    # A back-mapped finding reports its compiled span unchanged and a source span the
+    # text renderer shows without a marker; the JSON records the basis as source.
+    text = render_text(_report(structural=(_structural(),)))
+    assert "L9  error  join_fanout" in text
+    assert "(compiled)" not in text
+    payload = json.loads(render_json(_report(structural=(_structural(),))))
+    [f] = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (9, 9, "source")
+
+
+def test_compiled_relative_finding_is_marked_and_keeps_compiled_line() -> None:
+    # A finding whose compiled span could not be back-mapped reports the compiled
+    # line, marked so a reader knows it indexes the compiled SQL, not the source file.
+    compiled_only = _structural(source_span=SourceSpan(12, 12, SpanBasis.COMPILED))
+
+    # rebind the compiled span to match the fallback the walker would produce
+    def _at(line: int) -> LocatedFinding:
+        f = compiled_only.finding
+        return LocatedFinding(
+            model_unique_id=compiled_only.model_unique_id,
+            file_path=compiled_only.file_path,
+            finding=Finding(
+                kind=f.kind,
+                message=f.message,
+                sql_snippet=f.sql_snippet,
+                line_start=line,
+                line_end=line,
+            ),
+            source_span=SourceSpan(line, line, SpanBasis.COMPILED),
+        )
+
+    text = render_text(_report(structural=(_at(12),)))
+    assert "L12 (compiled)  error  join_fanout" in text
+    payload = json.loads(render_json(_report(structural=(_at(12),))))
+    [f] = [f for f in payload["findings"] if f["family"] == "structural"]
+    # compiled line preserved; source span mirrors it; basis flags the fallback.
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (12, 12, "compiled")
+
+
+def test_unlocated_structural_finding_reports_null_source_span_and_basis() -> None:
+    # A literal-only structural finding sqlglot stamped no line on (line 0) reports null
+    # for the source span and basis, the same null contract the declaration family uses
+    # for its unlocated findings. Both families agree on the no-line case.
+    unlocated = LocatedFinding(
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=FindingKind.JOIN_FANOUT,
+            message="join can multiply rows",
+            sql_snippet="",
+            line_start=0,
+            line_end=0,
+        ),
+        source_span=None,
+    )
+    payload = json.loads(render_json(_report(structural=(unlocated,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert f["source_line_start"] is None
+    assert f["source_line_end"] is None
+    assert f["line_basis"] is None
+
+
+def _located_declaration(*, source_span: SourceSpan) -> CheckFinding:
+    return CheckFinding(
+        kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+        message="reducing 'total' mixes a per-row companion held constant by nothing",
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        column="total",
+        line_start=7,
+        line_end=7,
+        source_span=source_span,
+    )
+
+
+def test_declaration_finding_back_maps_its_span_for_both_bases() -> None:
+    # A located declaration finding back-maps its compiled span: the report points at the
+    # source line and the JSON keeps the compiled span beside the back-mapped one. Both
+    # bases ride the same declaration payload branch, so both are pinned here. (The
+    # ``(compiled)`` text marker is the shared `_format_span` helper, pinned once on the
+    # structural family.)
+    mapped = _located_declaration(source_span=SourceSpan(3, 3, SpanBasis.SOURCE))
+    assert "models/m.sql:L3" in render_text(_report(declaration=(mapped,)))
+    payload = json.loads(render_json(_report(declaration=(mapped,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (7, 3, "source")
+
+    fallback = _located_declaration(source_span=SourceSpan(7, 7, SpanBasis.COMPILED))
+    payload = json.loads(render_json(_report(declaration=(fallback,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (7, 7, "compiled")
+
+
+def test_unlocated_declaration_finding_reports_null_source_span() -> None:
+    # A finding with no SQL site (a contract or coverage finding) stays unlocated: no
+    # source span, no basis, the same nulls the compiled line fields already report.
+    payload = json.loads(render_json(_report(declaration=(_declaration(),))))
+    [f] = [f for f in payload["findings"] if f["family"] == "declaration"]
+    assert f["line_start"] is None
+    assert f["source_line_start"] is None
+    assert f["line_basis"] is None
 
 
 def test_json_suppression_payload_carries_directive_line_and_bare() -> None:

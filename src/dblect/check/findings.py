@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
+from dblect.audit.sourcemap import SourceSpan
 from dblect.check.coverage import SINGLE_WORLD, GroundingCoverage, ResolutionCoverage, WorldCoverage
 from dblect.loader import LoadIssue
 from dblect.types.bridge import IssueCode
@@ -55,12 +56,24 @@ class CheckFinding:
     other kinds, which carry no such code."""
     line_start: int = 0
     line_end: int = 0
-    """1-indexed source-line span of the offending projection or aggregate in the
-    model's SQL, so a ``-- noqa`` comment on that line can acknowledge the
-    finding. ``0`` means we could not pin it to a line (a contract-resolution issue
-    or a project-wide coverage finding has no single SQL site), and a finding with no
-    line is never line-suppressible. The same convention the structural ``Finding``
-    uses, so one suppression scanner serves both families."""
+    """1-indexed span of the offending projection or aggregate in the model's
+    **compiled** SQL (the line space the derivation node was stamped in). ``0`` means
+    we could not pin it to a line (a contract-resolution issue or a project-wide
+    coverage finding has no single SQL site), and a finding with no line is never
+    line-suppressible. The same convention the structural ``Finding`` uses, so one
+    suppression scanner serves both families."""
+    source_span: SourceSpan | None = None
+    """The compiled span back-mapped onto the on-disk template, set by the check run for
+    the line-located kinds and ``None`` for an unlocated finding or one built outside
+    the run."""
+
+    @property
+    def located_span(self) -> SourceSpan:
+        """The span to report: the back-mapped ``source_span``, or the compiled span as a
+        compiled-relative fallback when none is attached."""
+        if self.source_span is not None:
+            return self.source_span
+        return SourceSpan.compiled(self.line_start, self.line_end)
 
 
 @dataclass(frozen=True, slots=True)

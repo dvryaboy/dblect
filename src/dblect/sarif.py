@@ -16,6 +16,7 @@ import json
 from typing import Literal, TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport, cross_world_identity
+from dblect.audit.sourcemap import SpanBasis
 from dblect.audit.walker import LocatedFinding, SkippedModel
 from dblect.check.findings import CheckFinding, CheckFindingKind, UnbuiltModel
 from dblect.loader import LoadIssue
@@ -308,23 +309,38 @@ def _structural_locations(finding: LocatedFinding) -> list[_Location]:
     location: _Location = {"logicalLocations": [{"fullyQualifiedName": finding.model_unique_id}]}
     if finding.file_path is not None:
         physical: _PhysicalLocation = {"artifactLocation": {"uri": finding.file_path}}
-        region = _region(finding.finding.line_start, finding.finding.line_end)
-        if region is not None:
-            physical["region"] = region
+        # The region indexes the source file, so it must use the back-mapped source
+        # span. A compiled-relative span would point a code-scanning UI at the wrong
+        # source line, so we emit no region and let the location resolve to the file.
+        span = finding.located_span
+        if span.basis is SpanBasis.SOURCE:
+            region = _region(span.line_start, span.line_end)
+            if region is not None:
+                physical["region"] = region
         location["physicalLocation"] = physical
     return [location]
 
 
 def _declaration_locations(finding: CheckFinding) -> list[_Location]:
-    # No line span: a declaration finding locates by logical name, with a physical
-    # location only when the source file is known. A project-wide finding anchors to
-    # neither and yields no location, which SARIF permits.
+    # A declaration finding locates by logical name, with a physical location (and a
+    # region for the line-located kinds) only when the source file is known. A
+    # project-wide finding anchors to neither and yields no location, which SARIF permits.
     name = _declaration_name(finding)
     location: _Location = {}
     if name is not None:
         location["logicalLocations"] = [{"fullyQualifiedName": name}]
     if finding.file_path is not None:
-        location["physicalLocation"] = {"artifactLocation": {"uri": finding.file_path}}
+        physical: _PhysicalLocation = {"artifactLocation": {"uri": finding.file_path}}
+        # A located declaration finding (a domain-type or aggregation finding pinned to
+        # its projection) carries a back-mapped source span. As with the structural
+        # family, the region rides the source span and is dropped when it could not be
+        # back-mapped, so a code-scanning UI never highlights a guessed line.
+        span = finding.located_span
+        if span.basis is SpanBasis.SOURCE:
+            region = _region(span.line_start, span.line_end)
+            if region is not None:
+                physical["region"] = region
+        location["physicalLocation"] = physical
     return [location] if location else []
 
 
