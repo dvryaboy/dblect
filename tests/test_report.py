@@ -220,6 +220,18 @@ def test_compiled_relative_finding_is_marked_and_keeps_compiled_line() -> None:
     assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (12, 12, "compiled")
 
 
+def test_macro_call_finding_renders_via_macro_and_keeps_compiled_line() -> None:
+    # A finding emitted inside a macro reports the `{{ ... }}` call line, marked
+    # `(via macro)` so a reader knows it names the call site rather than the construct.
+    # The compiled line the parser saw stays on `line_start` for anyone who needs it.
+    finding = _structural(source_span=SourceSpan(3, 3, SpanBasis.MACRO_CALL))
+    text = render_text(_report(structural=(finding,)))
+    assert "L3 (via macro)  error  join_fanout" in text
+    payload = json.loads(render_json(_report(structural=(finding,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (9, 3, "macro_call")
+
+
 def test_unlocated_structural_finding_reports_null_source_span_and_basis() -> None:
     # A literal-only structural finding sqlglot stamped no line on (line 0) reports null
     # for the source span and basis, the same null contract the declaration family uses

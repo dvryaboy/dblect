@@ -10,7 +10,7 @@ relative span rather than guessing.
 
 from __future__ import annotations
 
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from dblect.audit.sourcemap import SpanBasis, build_line_map
@@ -24,10 +24,11 @@ def test_identity_when_source_and_compiled_match() -> None:
     assert (span.line_start, span.line_end) == (2, 2)
 
 
-def test_macro_insertion_maps_passthrough_and_leaves_expansion_compiled() -> None:
+def test_macro_insertion_maps_passthrough_and_anchors_expansion_to_its_call() -> None:
     # `{{ totals() }}` expands to two lines, pushing `group by 1` from source line 4 to
     # compiled line 5. The passthrough line back-maps to source; a line that came out of
-    # the macro has no source origin and stays compiled-relative.
+    # the macro has no source line of its own, so it anchors to the `{{ totals() }}` call
+    # site (source line 3) that the developer can place a `-- noqa` on.
     raw = "select\n  customer_id,\n  {{ totals() }}\ngroup by 1"
     compiled = "select\n  customer_id,\n  sum(amount) as total,\n  count(*) as n\ngroup by 1"
     m = build_line_map(compiled, raw)
@@ -37,8 +38,8 @@ def test_macro_insertion_maps_passthrough_and_leaves_expansion_compiled() -> Non
     assert (group_by.line_start, group_by.line_end) == (4, 4)
 
     from_macro = m.map_span(4, 4)  # `count(*) as n`, emitted by the macro
-    assert from_macro.basis is SpanBasis.COMPILED
-    assert (from_macro.line_start, from_macro.line_end) == (4, 4)
+    assert from_macro.basis is SpanBasis.MACRO_CALL
+    assert (from_macro.line_start, from_macro.line_end) == (3, 3)
 
 
 def test_indentation_change_still_maps() -> None:
@@ -101,6 +102,70 @@ def test_non_monotonic_span_degrades_to_compiled() -> None:
     assert span.basis is SpanBasis.COMPILED
 
 
+# --- macro-call anchoring: a macro-emitted span points at its call site -------
+
+
+def test_macro_emitted_span_anchors_to_its_only_call_site() -> None:
+    # The macro emits two compiled lines (3-4) between the `customer_id` and `group by`
+    # anchors; the only `{{ ... }}` in that source gap is `{{ totals() }}` at line 3, so
+    # both emitted lines anchor there.
+    raw = "select\n  customer_id,\n  {{ totals() }}\ngroup by 1"
+    compiled = "select\n  customer_id,\n  sum(amount) as total,\n  count(*) as n\ngroup by 1"
+    m = build_line_map(compiled, raw)
+    for compiled_line in (3, 4):
+        span = m.map_span(compiled_line, compiled_line)
+        assert span.basis is SpanBasis.MACRO_CALL
+        assert (span.line_start, span.line_end) == (3, 3)
+
+
+def test_two_call_sites_in_one_gap_degrade_to_compiled() -> None:
+    # Two `{{ ... }}` calls sit in the same source gap, so a macro-emitted compiled line
+    # between the anchors cannot be blamed on one call over the other. The mapper declines
+    # rather than guess, keeping the honest compiled line.
+    raw = "select\n  {{ dims() }},\n  {{ metrics() }}\nfrom t"
+    compiled = "select\n  a, b,\n  c, d\nfrom t"
+    m = build_line_map(compiled, raw)
+    span = m.map_span(2, 2)
+    assert span.basis is SpanBasis.COMPILED
+    assert (span.line_start, span.line_end) == (2, 2)
+
+
+def test_macro_call_inside_for_loop_is_reachable() -> None:
+    # A `{{ ... }}` bracketed by a `{% for %}` still carries its source line in the parsed
+    # tree, so loop-emitted SQL anchors to the loop body the developer wrote (source 3).
+    raw = "select\n{% for c in cols %}\n  {{ metric(c) }},\n{% endfor %}\n  1 as x\nfrom t"
+    compiled = "select\n  sum(a) as a_m,\n  sum(b) as b_m,\n  1 as x\nfrom t"
+    m = build_line_map(compiled, raw)
+    for compiled_line in (2, 3):  # both loop iterations' output
+        span = m.map_span(compiled_line, compiled_line)
+        assert span.basis is SpanBasis.MACRO_CALL
+        assert (span.line_start, span.line_end) == (3, 3)
+
+
+def test_macro_call_inside_if_block_is_reachable() -> None:
+    # A `{{ ... }}` bracketed by a `{% if %}` (taken branch) anchors to the call line
+    # inside the conditional (source 4), not to the `{% if %}` header.
+    raw = "select\n  id,\n{% if include_totals %}\n  {{ totals() }}\n{% endif %}\nfrom t"
+    compiled = "select\n  id,\n  sum(amount) as total\nfrom t"
+    m = build_line_map(compiled, raw)
+    span = m.map_span(3, 3)
+    assert span.basis is SpanBasis.MACRO_CALL
+    assert (span.line_start, span.line_end) == (4, 4)
+
+
+def test_fully_generated_model_anchors_to_its_only_call() -> None:
+    # A model that is nothing but one macro call has no verbatim anchors at all. The gap
+    # is the whole file, and with a single call site the emitted SQL still anchors to it,
+    # so even a fully generated model stays suppressible at its call line.
+    raw = "{{ dbt_utils.union_relations(relations) }}"
+    compiled = "select a from x\nunion all\nselect a from y"
+    m = build_line_map(compiled, raw)
+    for compiled_line in (1, 2, 3):
+        span = m.map_span(compiled_line, compiled_line)
+        assert span.basis is SpanBasis.MACRO_CALL
+        assert (span.line_start, span.line_end) == (1, 1)
+
+
 # --- property: soundness under arbitrary macro insertion ----------------------
 
 # Tokens carry no whitespace, so a normalized match is an exact match and the
@@ -133,3 +198,27 @@ def test_a_mapped_line_carries_the_content_of_the_source_line_it_names(
         span = m.map_span(compiled_idx, compiled_idx)
         if span.basis is SpanBasis.SOURCE:
             assert source_lines[span.line_start - 1] == line
+
+
+@given(
+    prefix=st.lists(_SQL_LINE, min_size=1, max_size=4, unique=True),
+    suffix=st.lists(_SQL_LINE, min_size=1, max_size=4, unique=True),
+    emitted=st.lists(_SQL_LINE, min_size=1, max_size=4, unique=True),
+)
+def test_macro_emitted_lines_anchor_to_the_single_call_site(
+    prefix: list[str], suffix: list[str], emitted: list[str]
+) -> None:
+    """Soundness of the call-site anchor: one `{{ ... }}` call between verbatim anchors,
+    and every line it emits anchors to that one call's source line. The literal tokens
+    carry no Jinja braces, so the call line never collides with an emitted or anchor line.
+    Mutually distinct lines keep difflib from anchoring an emitted line to a coincidental
+    literal twin, which would (correctly) take it out of the macro-emitted population."""
+    assume(len(set(prefix + suffix + emitted)) == len(prefix) + len(suffix) + len(emitted))
+    call_line = len(prefix) + 1
+    raw = "\n".join([*prefix, "{{ m() }}", *suffix])
+    compiled = "\n".join([*prefix, *emitted, *suffix])
+    m = build_line_map(compiled, raw)
+    for offset in range(len(emitted)):
+        span = m.map_span(len(prefix) + offset + 1, len(prefix) + offset + 1)
+        assert span.basis is SpanBasis.MACRO_CALL
+        assert (span.line_start, span.line_end) == (call_line, call_line)

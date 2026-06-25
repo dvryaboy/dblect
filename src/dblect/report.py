@@ -181,11 +181,15 @@ def _declaration_block(finding: CheckFinding) -> str:
 
 
 def _format_span(span: SourceSpan) -> str:
-    """A line range, marked ``(compiled)`` when it could not be back-mapped to source
-    so a reader knows the number indexes the compiled SQL, not the on-disk file."""
+    """A line range, marked so a reader knows which text the number indexes: ``(via macro)``
+    for a ``{{ ... }}`` call site, ``(compiled)`` when no source line was found, bare for a
+    plain source line."""
     rng = _format_line_range(span.line_start, span.line_end)
-    if span.basis is SpanBasis.COMPILED and span.line_start > 0:
-        return f"{rng} (compiled)"
+    if span.line_start > 0:
+        if span.basis is SpanBasis.MACRO_CALL:
+            return f"{rng} (via macro)"
+        if span.basis is SpanBasis.COMPILED:
+            return f"{rng} (compiled)"
     return rng
 
 

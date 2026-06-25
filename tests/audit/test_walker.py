@@ -267,6 +267,24 @@ def test_run_audit_parses_each_model_once(
     assert not repeated, f"each model's SQL should parse exactly once; counts: {counts.values()}"
 
 
+def _user_country(raw: str, compiled: str) -> Manifest:
+    """A one-model manifest for `model.pkg.user_country`, varying only the raw template
+    and its compiled SQL: the two inputs the back-map tests turn."""
+    node = Node(
+        unique_id="model.pkg.user_country",
+        name="user_country",
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", "user_country"),
+        package_name="pkg",
+        schema=None,
+        raw_code=raw,
+        compiled_code=compiled,
+        original_file_path="models/user_country.sql",
+        columns={},
+    )
+    return Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+
+
 def test_macro_emitted_join_visible_in_compiled_code() -> None:
     # Regression guard for "we analyze compiled_code". A model whose LEFT
     # JOIN comes from a macro call: in the on-disk template the join is
@@ -279,24 +297,15 @@ def test_macro_emitted_join_visible_in_compiled_code() -> None:
         "left join dim_country d on u.country_code = d.code\n"
         "group by u.user_id, d.country"
     )
-    node = Node(
-        unique_id="model.pkg.user_country",
-        name="user_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "user_country"),
-        package_name="pkg",
-        schema=None,
-        raw_code=(
+    manifest = _user_country(
+        raw=(
             "select u.user_id, d.country, count(*) as n\n"
             "from users u\n"
             "{{ join_country(u) }}\n"
             "group by u.user_id, d.country"
         ),
-        compiled_code=compiled_sql,
-        original_file_path="models/user_country.sql",
-        columns={},
+        compiled=compiled_sql,
     )
-    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
     report = run_audit(manifest, _DUCKDB)
     assert any(
         lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
@@ -321,19 +330,7 @@ def test_finding_back_maps_compiled_span_to_the_source_line() -> None:
         "  on u.country_code = d.code\n"
         "group by u.user_id, d.country"
     )
-    node = Node(
-        unique_id="model.pkg.user_country",
-        name="user_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "user_country"),
-        package_name="pkg",
-        schema=None,
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path="models/user_country.sql",
-        columns={},
-    )
-    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    manifest = _user_country(raw, compiled)
     [hit] = [
         lf
         for lf in run_audit(manifest, _DUCKDB).findings
@@ -367,19 +364,7 @@ def test_noqa_on_the_source_line_suppresses_a_macro_shifted_finding() -> None:
         "  on u.country_code = d.code\n"
         "group by u.user_id, d.country  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
     )
-    node = Node(
-        unique_id="model.pkg.user_country",
-        name="user_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "user_country"),
-        package_name="pkg",
-        schema=None,
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path="models/user_country.sql",
-        columns={},
-    )
-    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    manifest = _user_country(raw, compiled)
     report = run_audit(manifest, _DUCKDB)
 
     active = [
@@ -396,6 +381,43 @@ def test_noqa_on_the_source_line_suppresses_a_macro_shifted_finding() -> None:
     span = hidden.located.located_span
     assert span.basis is SpanBasis.SOURCE
     assert (span.line_start, span.line_end) == (4, 4)
+
+
+def test_noqa_on_the_macro_call_line_suppresses_a_macro_emitted_finding() -> None:
+    # The GROUP BY that trips the detector is itself emitted by `{{ country_rollup(u) }}`,
+    # so it has no source line of its own: its compiled line (5) back-maps to the macro
+    # call site (source line 3), not to a verbatim source line. A `-- noqa` the developer
+    # placed on that call line silences it. This is the case the prior cut left
+    # unsuppressable: a finding living entirely in macro-generated SQL.
+    raw = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "{{ country_rollup(u) }}  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
+    )
+    compiled = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "left join dim_country d\n"
+        "  on u.country_code = d.code\n"
+        "group by u.user_id, d.country"
+    )
+    manifest = _user_country(raw, compiled)
+    report = run_audit(manifest, _DUCKDB)
+
+    active = [
+        f for f in report.findings if f.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    assert active == [], "the noqa on the macro call line should silence the emitted finding"
+    [hidden] = [
+        s for s in report.suppressed if s.located.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    # The construct lives at compiled line 5; it anchors to the `{{ country_rollup(u) }}`
+    # call at source line 3, where the directive sits.
+    assert hidden.directive_line == 3
+    assert hidden.located.finding.line_start == 5
+    span = hidden.located.located_span
+    assert span.basis is SpanBasis.MACRO_CALL
+    assert (span.line_start, span.line_end) == (3, 3)
 
 
 def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> None:

@@ -23,7 +23,8 @@ import hypothesis.strategies as st
 from hypothesis import given, settings
 from jinja2 import nodes
 
-from dblect.varinf import VarKind, WalkResult, make_environment, walk_source
+from dblect.templating import make_environment
+from dblect.varinf import VarKind, WalkResult, walk_source
 
 # Leaf expressions. Var/env_var calls always carry a constant name, the only
 # shape the walker keys a usage on (and the only shape the oracle counts).
