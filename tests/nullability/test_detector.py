@@ -23,7 +23,10 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
-from dblect.nullability.detector import make_nullability_detectors
+from dblect.nullability.detector import (
+    detect_join_on_nullable_key,
+    make_nullability_detectors,
+)
 from dblect.sql import Finding, FindingKind, parse_sql
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -222,3 +225,56 @@ def test_join_finding_does_not_fabricate_a_cause_when_not_derivable() -> None:
     assert "not_null" in msg  # the durable guard is still recommended
     assert "left join" not in msg.lower()
     assert "produced via" not in msg.lower()
+
+
+# The detector reasons about join-side preservation and per-join collapse purely from the
+# AST plus the per-relation nullable index, so these contracts are pinned at that boundary
+# rather than through the manifest machinery the integration cases above exercise.
+def _join_keys(sql: str, nullable: dict[str, frozenset[str]]) -> tuple[Finding, ...]:
+    return detect_join_on_nullable_key(parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable)
+
+
+_STG_NULLABLE = {"stg": frozenset({"tag"})}
+
+
+# A nullable key on the non-preserved side of an outer join is benign: those rows not
+# joining is the outer join's defining semantics, not a silent hazard. Here ``other`` is
+# the preserved left side and ``stg`` the optional right side, so the detector stays quiet.
+def test_join_does_not_flag_non_preserved_side_of_outer_join() -> None:
+    sql = "SELECT o.k FROM other o LEFT JOIN stg s ON o.k = s.tag"
+    assert _join_keys(sql, _STG_NULLABLE) == ()
+
+
+# The preserved side of an outer join is the case worth flagging: those rows survive, but a
+# NULL key silently never matches. Here ``stg`` is the preserved left side. The message
+# frames a silent non-match, not row loss, because no preserved row is dropped.
+def test_join_flags_preserved_side_of_outer_join_without_row_loss_framing() -> None:
+    sql = "SELECT s.id FROM stg s LEFT JOIN other o ON s.tag = o.k"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    lowered = findings[0].message.lower()
+    assert "drop" not in lowered  # the preserved row is kept, not dropped
+    assert "match" in lowered  # the hazard is the silent non-match
+
+
+# On an inner join a NULL key really is dropped from the result, so that finding keeps the
+# row-loss framing. Pinning both framings guards the inner/outer distinction.
+def test_inner_join_keeps_row_loss_framing() -> None:
+    sql = "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag"
+    findings = _join_keys(sql, _STG_NULLABLE)
+    assert len(findings) == 1
+    assert "drop" in findings[0].message.lower()
+
+
+# A composite-key join is one decision to look at. The detector emits one finding listing
+# the spanned key columns rather than one finding per column.
+def test_composite_key_join_yields_one_finding_listing_all_columns() -> None:
+    nullable = {"dim": frozenset({"k1", "k2", "k3", "k4"})}
+    sql = (
+        "SELECT f.v FROM fact f JOIN dim d "
+        "ON f.k1 = d.k1 AND f.k2 = d.k2 AND f.k3 = d.k3 AND f.k4 = d.k4"
+    )
+    findings = _join_keys(sql, nullable)
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert all(col in msg for col in ("k1", "k2", "k3", "k4"))

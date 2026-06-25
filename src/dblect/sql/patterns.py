@@ -568,23 +568,7 @@ def _order_targets(order: exp.Order | None) -> tuple[str, ...]:
 
 
 def _nullable_tables(sel: exp.Select) -> set[str]:
-    from_ = sg.from_of(sel)
-    if from_ is None:
-        return set()
-    nullable: set[str] = set()
-    accumulated_left: set[str] = {sg.name_of(from_.this)} if from_.this is not None else set()
-    for j in sg.joins_of(sel):
-        right_name = sg.name_of(j.this)
-        side = sg.join_side_of(j)
-        if side is JoinSide.LEFT:
-            nullable.add(right_name)
-        elif side is JoinSide.RIGHT:
-            nullable.update(accumulated_left)
-        elif side is JoinSide.FULL:
-            nullable.add(right_name)
-            nullable.update(accumulated_left)
-        accumulated_left.add(right_name)
-    return nullable
+    return sg.outer_join_optional_aliases(sel)
 
 
 def _is_null_protected(col: exp.Column, *, until: Expr) -> bool:

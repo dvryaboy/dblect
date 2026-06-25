@@ -114,6 +114,34 @@ def name_of(e: Expr) -> str:
     return e.alias_or_name
 
 
+def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
+    """The aliases an outer join in ``sel`` leaves NULL-padded: its non-preserved sides.
+
+    A LEFT join makes its right side optional, a RIGHT join its accumulated left, a FULL
+    join both. Inner and cross joins preserve every row, so they contribute nothing. The
+    aliases are returned by ``alias_or_name`` to line up with the join-key callers, which
+    qualify columns by the same alias. An alias absent from this set is on a preserved
+    side: its rows survive the join.
+    """
+    from_ = from_of(sel)
+    if from_ is None:
+        return set()
+    optional: set[str] = set()
+    accumulated_left: set[str] = {name_of(from_.this)} if from_.this is not None else set()
+    for j in joins_of(sel):
+        right_name = name_of(j.this)
+        side = join_side_of(j)
+        if side is JoinSide.LEFT:
+            optional.add(right_name)
+        elif side is JoinSide.RIGHT:
+            optional.update(accumulated_left)
+        elif side is JoinSide.FULL:
+            optional.add(right_name)
+            optional.update(accumulated_left)
+        accumulated_left.add(right_name)
+    return optional
+
+
 def column_table(c: exp.Column) -> str | None:
     """The qualifier on a column reference (``a`` in ``a.id``), or ``None``."""
     return c.table or None
