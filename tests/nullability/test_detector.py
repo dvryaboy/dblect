@@ -23,10 +23,7 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
-from dblect.nullability.detector import (
-    detect_join_on_nullable_key,
-    make_nullability_detectors,
-)
+from dblect.nullability.detector import make_nullability_detectors
 from dblect.sql import Finding, FindingKind, parse_sql
 
 _DUCKDB = profile_for_adapter("duckdb")
