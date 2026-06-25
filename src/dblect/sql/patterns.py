@@ -325,8 +325,16 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
             risky: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
-                if table is not None and table in nullable:
-                    risky.add(table)
+                if table is None or table not in nullable:
+                    continue
+                # A nullable-side column wrapped in a COALESCE that has a
+                # guaranteed-present fallback (a literal, or a column from a
+                # non-nullable relation) cannot make the group key NULL, so it
+                # forms no phantom bucket. coalesce(b.k, a.k) over a left join,
+                # or coalesce(b.status, 'NONE'), is the canonical safe idiom.
+                if _coalesce_supplies_nonnull(c, nullable=nullable, until=grp_expr):
+                    continue
+                risky.add(table)
             if risky:
                 tables = ", ".join(sorted(risky))
                 out.append(
@@ -585,6 +593,37 @@ def _is_null_protected(col: exp.Column, *, until: Expr) -> bool:
     while node is not None and node is not until:
         if isinstance(node, exp.Coalesce | exp.Is):
             return True
+        node = node.parent
+    return False
+
+
+def _coalesce_has_nonnullable_fallback(co: exp.Coalesce, nullable: set[str]) -> bool:
+    """True if `co` has an argument the outer join cannot make NULL: a literal
+    (no column references at all) or an expression whose every column comes from
+    a relation not in `nullable`. Such a COALESCE is non-NULL regardless of which
+    side matched, so ``coalesce(b.k, a.k)`` or ``coalesce(b.status, 'NONE')``
+    qualifies, while ``coalesce(b.k, c.k)`` across a full outer join does not.
+    """
+    args = [a for a in (co.this, *co.expressions) if isinstance(a, Expr)]
+    for arg in args:
+        cols = sg.find_columns(arg)
+        if not cols:
+            return True
+        if all(sg.column_table(c) not in nullable for c in cols):
+            return True
+    return False
+
+
+def _coalesce_supplies_nonnull(col: exp.Column, *, nullable: set[str], until: Expr) -> bool:
+    """True if `col` sits inside a COALESCE (reached before `until`) that has a
+    guaranteed-present fallback, so the enclosing expression is never NULL from
+    an unmatched outer-join row."""
+    node: Expr | None = col
+    while node is not None:
+        if isinstance(node, exp.Coalesce) and _coalesce_has_nonnullable_fallback(node, nullable):
+            return True
+        if node is until:
+            break
         node = node.parent
     return False
 

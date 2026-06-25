@@ -121,6 +121,44 @@ def test_null_group_after_right_join_flips_nullability() -> None:
     assert len(findings) == 1
 
 
+def test_null_group_coalesce_with_preserved_side_fallback_not_detected() -> None:
+    # coalesce(b.k, a.k) over a left join: a.k is the preserved (non-nullable)
+    # side, so the group key is never NULL from an unmatched row. No phantom bucket.
+    sql = """
+    select coalesce(b.k, a.k) as k, count(*) as n
+    from a left join b on a.k = b.k
+    group by coalesce(b.k, a.k)
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert findings == ()
+
+
+def test_null_group_coalesce_with_literal_fallback_not_detected() -> None:
+    # A literal fallback also guarantees the group key is non-NULL.
+    sql = """
+    select coalesce(b.status, 'NONE') as status, count(*) as n
+    from a left join b on a.k = b.k
+    group by coalesce(b.status, 'NONE')
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert findings == ()
+
+
+def test_null_group_coalesce_all_nullable_args_still_detected() -> None:
+    # Across a full outer join both sides are nullable, so coalesce(b.k, c.k)
+    # can still be NULL when neither side matched. The phantom bucket is real.
+    sql = """
+    select coalesce(b.k, c.k) as k, count(*) as n
+    from a
+    full outer join b on a.k = b.k
+    full outer join c on a.k = c.k
+    group by coalesce(b.k, c.k)
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
 def test_coalesce_on_join_key_detected() -> None:
     sql = """
     select coalesce(a.k, 0) as k_safe
