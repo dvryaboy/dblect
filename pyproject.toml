@@ -62,6 +62,14 @@ dev = [
     "dbt-duckdb>=1.8",
     "pytest-xdist>=3.6",
 ]
+# Maintainer-only: regenerates the committed warehouse fixtures (e.g.
+# scripts/refresh_bigquery_fixtures.sh). Deliberately NOT a runtime or user
+# dependency and NOT in `dev`. dblect analyses a committed manifest and never
+# talks to a warehouse, so a warehouse adapter is needed only to refresh fixtures.
+# Sync it on its own (`uv sync --group warehouse-fixtures`), not alongside `dev`.
+warehouse-fixtures = [
+    "dbt-bigquery>=1.9,<2.0",
+]
 
 [tool.hatch.version]
 path = "src/dblect/_version.py"

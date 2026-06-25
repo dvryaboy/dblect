@@ -7,7 +7,9 @@ register(
     AdapterProfile(
         adapter_type="bigquery",
         sqlglot_dialect="bigquery",
-        validated=False,
+        validated=True,
+        # NOT NULL is enforced (REQUIRED mode). PRIMARY KEY / FOREIGN KEY constraints
+        # exist but are advisory (unenforced), so keys are not enforced.
         not_null_enforced=True,
         key_enforced=False,
         default_incremental_strategy=IncrementalStrategy.MERGE,

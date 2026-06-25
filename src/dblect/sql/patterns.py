@@ -167,7 +167,9 @@ _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
         exp.CurrentTimestamp,
         exp.CurrentDate,
         exp.CurrentTime,
+        exp.CurrentDatetime,
         exp.CurrentUser,
+        exp.SessionUser,
         exp.Rand,
         exp.Uuid,
     }

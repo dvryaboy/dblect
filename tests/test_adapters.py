@@ -20,6 +20,7 @@ from dblect.adapters import (
     profile_for_adapter,
     register,
     resolve_profile,
+    validated_adapters,
 )
 from dblect.sql import PORTABLE_NON_DETERMINISTIC_BUILTINS
 
@@ -90,6 +91,16 @@ def test_validated_adapter_resolves_to_its_profile() -> None:
     assert resolve_profile(adapter_type="duckdb", explicit_dialect=None) == profile_for_adapter(
         "duckdb"
     )
+
+
+def test_bigquery_is_validated_and_resolves_without_override() -> None:
+    # bigquery is a validated adapter: it resolves without a --dialect override and
+    # carries the bigquery sqlglot dialect and the (advisory) unenforced-key facet.
+    profile = resolve_profile(adapter_type="bigquery", explicit_dialect=None)
+    assert profile.validated is True
+    assert "bigquery" in validated_adapters()
+    assert profile.sqlglot_dialect == "bigquery"
+    assert profile.key_enforced is False
 
 
 def test_unvalidated_adapter_without_override_raises() -> None:

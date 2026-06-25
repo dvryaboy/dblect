@@ -328,6 +328,21 @@ def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> 
     assert nondet_hits(profile_for_adapter("snowflake")) == 0
 
 
+def test_bigquery_jaffle_audits_end_to_end(jaffle_bigquery_manifest_path: Path) -> None:
+    # Real bigquery-compiled SQL (backtick identifiers, adapter_type "bigquery") flows
+    # through the audit under the bigquery profile: every model parses and is scanned,
+    # and the LEFT JOIN + GROUP BY in `customers` is flagged. This is the end-to-end
+    # basis for treating bigquery as a validated adapter.
+    manifest = Manifest.from_file(jaffle_bigquery_manifest_path)
+    assert manifest.adapter_type == "bigquery"
+    report = run_audit(manifest, profile_for_adapter("bigquery"))
+    assert report.models_scanned == len(manifest.models)
+    assert report.skipped == ()
+    assert any(
+        lf.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for lf in report.findings
+    ), "the bigquery-compiled LEFT JOIN + GROUP BY should be flagged"
+
+
 def _without_sql(node: Node) -> Node:
     return replace(node, raw_code=None, compiled_code=None)
 
