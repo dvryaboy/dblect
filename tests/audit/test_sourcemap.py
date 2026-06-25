@@ -65,6 +65,30 @@ def test_zero_line_sentinel_is_preserved_as_compiled() -> None:
     assert (span.line_start, span.line_end) == (0, 0)
 
 
+def test_contiguous_multiline_span_maps_to_source() -> None:
+    # A multi-line span whose every line passes through verbatim maps as a whole: a
+    # leading compiled prelude shifts source lines 2-3 down to compiled lines 3-4.
+    raw = "select\n  a,\n  b\nfrom t"
+    compiled = "-- prelude\nselect\n  a,\n  b\nfrom t"
+    m = build_line_map(compiled, raw)
+    span = m.map_span(3, 4)
+    assert span.basis is SpanBasis.SOURCE
+    assert (span.line_start, span.line_end) == (2, 3)
+
+
+def test_multiline_span_with_macro_emitted_interior_degrades_to_compiled() -> None:
+    # A span (compiled 2-4) whose endpoints anchor but whose interior line came out of a
+    # macro is not a clean source region. Anchoring only the endpoints would report a
+    # SOURCE span covering a source line the construct never occupied, so the mapper
+    # declines to compiled-relative rather than over-claim.
+    raw = "select a,\n  b,\n  c\nfrom t"
+    compiled = "select a,\n  b,\n  macro_emitted,\n  c\nfrom t"
+    m = build_line_map(compiled, raw)
+    span = m.map_span(2, 4)
+    assert span.basis is SpanBasis.COMPILED
+    assert (span.line_start, span.line_end) == (2, 4)
+
+
 def test_non_monotonic_span_degrades_to_compiled() -> None:
     # A span whose endpoints map to source lines out of order (start after end) is
     # not a coherent source region; the mapper declines rather than emit a reversed

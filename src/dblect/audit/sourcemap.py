@@ -47,6 +47,12 @@ class SourceSpan:
     line_end: int
     basis: SpanBasis
 
+    @classmethod
+    def compiled(cls, line_start: int, line_end: int) -> SourceSpan:
+        """A compiled-relative span: its line numbers index the compiled SQL. This is the
+        honest fallback a finding reports when no back-map onto the source was attached."""
+        return cls(line_start, line_end, SpanBasis.COMPILED)
+
 
 def _normalize(line: str) -> str:
     """Collapse runs of whitespace and trim, so a re-indented passthrough line still
@@ -65,16 +71,26 @@ class LineMap:
     _to_source: tuple[int, ...]
 
     def map_span(self, line_start: int, line_end: int) -> SourceSpan:
-        """Map a 1-indexed compiled span to a source span when both endpoints anchor
-        to source lines in order, else return the compiled span as the fallback.
+        """Map a 1-indexed compiled span to a source span when the whole span passes
+        through verbatim, else return the compiled span as the fallback.
+
+        Every compiled line in ``[line_start, line_end]`` must anchor, and to a
+        contiguous run of source lines: anchoring only the endpoints would let a span
+        whose interior was emitted by a macro report a SOURCE region covering source
+        lines the construct never occupied. A gap (a macro-emitted interior line) or a
+        non-consecutive jump degrades to compiled-relative rather than over-claiming.
 
         ``line_start == 0`` is the detector's "no line" sentinel; it has no source
         position by construction and stays compiled-relative."""
         start = self._lookup(line_start)
-        end = self._lookup(line_end)
-        if start is not None and end is not None and end >= start:
-            return SourceSpan(start, end, SpanBasis.SOURCE)
-        return SourceSpan(line_start, line_end, SpanBasis.COMPILED)
+        if start is None or line_end < line_start:
+            return SourceSpan.compiled(line_start, line_end)
+        expected = start
+        for compiled_line in range(line_start, line_end + 1):
+            if self._lookup(compiled_line) != expected:
+                return SourceSpan.compiled(line_start, line_end)
+            expected += 1
+        return SourceSpan(start, start + (line_end - line_start), SpanBasis.SOURCE)
 
     def _lookup(self, one_indexed: int) -> int | None:
         """The 1-indexed source line a 1-indexed compiled line maps to, or None."""

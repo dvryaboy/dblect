@@ -220,6 +220,29 @@ def test_compiled_relative_finding_is_marked_and_keeps_compiled_line() -> None:
     assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (12, 12, "compiled")
 
 
+def test_unlocated_structural_finding_reports_null_source_span_and_basis() -> None:
+    # A literal-only structural finding sqlglot stamped no line on (line 0) reports null
+    # for the source span and basis, the same null contract the declaration family uses
+    # for its unlocated findings. Both families agree on the no-line case.
+    unlocated = LocatedFinding(
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=FindingKind.JOIN_FANOUT,
+            message="join can multiply rows",
+            sql_snippet="",
+            line_start=0,
+            line_end=0,
+        ),
+        source_span=None,
+    )
+    payload = json.loads(render_json(_report(structural=(unlocated,))))
+    [f] = [f for f in payload["findings"] if f["family"] == "structural"]
+    assert f["source_line_start"] is None
+    assert f["source_line_end"] is None
+    assert f["line_basis"] is None
+
+
 def _located_declaration(*, source_span: SourceSpan) -> CheckFinding:
     return CheckFinding(
         kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,

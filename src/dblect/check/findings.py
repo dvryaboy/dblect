@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 
-from dblect.audit.sourcemap import SourceSpan, SpanBasis
+from dblect.audit.sourcemap import SourceSpan
 from dblect.check.coverage import SINGLE_WORLD, GroundingCoverage, ResolutionCoverage, WorldCoverage
 from dblect.loader import LoadIssue
 from dblect.types.bridge import IssueCode
@@ -73,7 +73,7 @@ class CheckFinding:
         compiled-relative fallback when none is attached."""
         if self.source_span is not None:
             return self.source_span
-        return SourceSpan(self.line_start, self.line_end, SpanBasis.COMPILED)
+        return SourceSpan.compiled(self.line_start, self.line_end)
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.audit.sourcemap import LineMap, SourceSpan, SpanBasis, build_line_map
+from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import apply, parse_directives
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
@@ -71,12 +71,18 @@ class LocatedFinding:
     source_span: SourceSpan | None = None
 
     @property
+    def kind(self) -> FindingKind:
+        """The finding's kind, surfaced so a ``-- noqa`` directive can match it through the
+        ``Suppressible`` protocol the same way a declaration finding's does."""
+        return self.finding.kind
+
+    @property
     def located_span(self) -> SourceSpan:
         """The span to report: the back-mapped ``source_span``, or the compiled span as a
         compiled-relative fallback when none is attached."""
         if self.source_span is not None:
             return self.source_span
-        return SourceSpan(self.finding.line_start, self.finding.line_end, SpanBasis.COMPILED)
+        return SourceSpan.compiled(self.finding.line_start, self.finding.line_end)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,21 +236,19 @@ def _scan_one(
     # Directives live in the source the developer wrote, not the compiled
     # output. Fall back to the compiled SQL only if `raw_code` is missing.
     directives = parse_directives(node.raw_code or node.analysis_sql or "")
-    active_raw, suppressed_raw = apply(raw_findings, directives)
-    # Findings carry compiled-SQL spans; back-map them onto the source template once
-    # per model so the report points at the `.sql` the developer wrote.
+    # Findings carry compiled-SQL spans; back-map them onto the source template once per
+    # model, then match directives against that source span. Locating before suppressing
+    # is what lets a `-- noqa` on the line the report shows silence a finding whose
+    # compiled line a macro expansion pushed away from its source line.
     line_map = build_line_map(node.analysis_sql, node.raw_code)
-    located_active = [_locate(node, f, line_map) for f in active_raw]
+    located = [_locate(node, f, line_map) for f in raw_findings]
+    active, suppressed = apply(located, directives)
     located_suppressed = [
-        SuppressedFinding(
-            located=_locate(node, f, line_map),
-            directive_line=d.line,
-            bare=d.kinds is None,
-        )
-        for f, d in suppressed_raw
+        SuppressedFinding(located=lf, directive_line=d.line, bare=d.kinds is None)
+        for lf, d in suppressed
     ]
     return _Scanned(
-        findings=tuple(located_active),
+        findings=tuple(active),
         suppressed=tuple(located_suppressed),
     )
 

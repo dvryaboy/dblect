@@ -207,8 +207,8 @@ def _suppressed_block(
     and the line the directive sat on."""
     lines = ["suppressed:"]
     # (path, sort_start, sort_end, loc, kind, via, directive_line). ``loc`` is
-    # pre-formatted so the structural family can carry its back-mapped span (and the
-    # compiled-relative marker) while the declaration family keeps its compiled span.
+    # pre-formatted so each family carries its back-mapped span (and the compiled-relative
+    # marker when the back-map declined), computed from its own ``located_span``.
     rows: list[tuple[str, int, int, str, str, str, int]] = []
     for s in structural:
         f = s.located.finding
@@ -300,11 +300,11 @@ class JsonFinding(TypedDict):
     contract: str | None
     line_start: int | None
     line_end: int | None
-    # The structural family back-maps its compiled span onto the source template.
+    # Both families back-map their compiled span onto the source template.
     # ``line_start``/``line_end`` stay the compiled span the parser saw (unchanged);
     # ``source_line_*`` carry the back-mapped span and ``line_basis`` records whether
     # the back-map succeeded (``"source"``) or fell back to the compiled line
-    # (``"compiled"``). The declaration family is not back-mapped and reports nulls.
+    # (``"compiled"``). An unlocated finding (line 0) reports null for all three.
     source_line_start: int | None
     source_line_end: int | None
     line_basis: str | None
@@ -435,7 +435,10 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
         case LocatedFinding():
             inner = finding.finding
             span = finding.located_span
-            mapped = span.line_start > 0
+            # An unlocated structural finding (line 0: a literal-only expression sqlglot
+            # stamped no identifier on) reports null source span and basis, the same
+            # null contract the declaration family uses for its unlocated findings.
+            located = inner.line_start > 0
             return {
                 "family": "structural",
                 "kind": inner.kind.value,
@@ -447,9 +450,9 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
                 "contract": None,
                 "line_start": inner.line_start,
                 "line_end": inner.line_end,
-                "source_line_start": span.line_start if mapped else None,
-                "source_line_end": span.line_end if mapped else None,
-                "line_basis": span.basis.value,
+                "source_line_start": span.line_start if located else None,
+                "source_line_end": span.line_end if located else None,
+                "line_basis": span.basis.value if located else None,
                 "sql_snippet": inner.sql_snippet,
             }
     assert_never(finding)

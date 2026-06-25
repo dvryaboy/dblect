@@ -346,6 +346,58 @@ def test_finding_back_maps_compiled_span_to_the_source_line() -> None:
     assert (span.line_start, span.line_end) == (4, 4)
 
 
+def test_noqa_on_the_source_line_suppresses_a_macro_shifted_finding() -> None:
+    # A compiled prelude plus a macro-expanded join push the GROUP BY from source line 4
+    # to compiled line 6 (a two-line offset, past the one-line "directive above" slack).
+    # A `-- noqa` on the source line the developer wrote (and that the report shows)
+    # silences the finding, because suppression matches the back-mapped source span. The
+    # directive rides through compilation verbatim, so it sits on the same construct line
+    # in both texts.
+    raw = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "{{ join_country(u) }}\n"
+        "group by u.user_id, d.country  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
+    )
+    compiled = (
+        "-- compiled by dbt\n"
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "left join dim_country d\n"
+        "  on u.country_code = d.code\n"
+        "group by u.user_id, d.country  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
+    )
+    node = Node(
+        unique_id="model.pkg.user_country",
+        name="user_country",
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", "user_country"),
+        package_name="pkg",
+        schema=None,
+        raw_code=raw,
+        compiled_code=compiled,
+        original_file_path="models/user_country.sql",
+        columns={},
+    )
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    report = run_audit(manifest, _DUCKDB)
+
+    active = [
+        f for f in report.findings if f.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    assert active == [], "the noqa on the source GROUP BY line should silence the finding"
+    [hidden] = [
+        s for s in report.suppressed if s.located.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    # The directive sits on the source line (4); the finding's compiled line (6) is two
+    # past it, so only matching the back-mapped source span suppresses it.
+    assert hidden.directive_line == 4
+    assert hidden.located.finding.line_start == 6
+    span = hidden.located.located_span
+    assert span.basis is SpanBasis.SOURCE
+    assert (span.line_start, span.line_end) == (4, 4)
+
+
 def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> None:
     # A DuckDB-only nondeterministic builtin in a load-bearing position fires under the
     # duckdb profile and stays silent under another, proving the audit's resolved

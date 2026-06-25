@@ -250,14 +250,20 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     contract-resolution and resolution-floor findings are world-invariant and stay
     ``run_check``'s to report once."""
     findings: list[CheckFinding] = []
+    # One source-map per model, shared across both finding kinds: a model that produces
+    # both a contradiction and an aggregation finding builds its line map once.
+    line_maps: dict[str, LineMap] = {}
     findings.extend(
-        _contradiction_findings(graphs.manifest, world.domain_type, graphs.column_build.graph)
+        _contradiction_findings(
+            graphs.manifest, world.domain_type, graphs.column_build.graph, line_maps
+        )
     )
     findings.extend(
         _aggregation_findings(
             graphs.manifest,
             world.domain_type,
             graphs.column_build.graph,
+            line_maps,
         )
     )
     return findings
@@ -394,11 +400,11 @@ def _contradiction_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     column_graph: ColumnLineageGraph,
+    line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     """One finding per column whose flow value is provisional: a declared type the
     inferred one contradicts, reported wherever the taint reached."""
     out: list[CheckFinding] = []
-    line_maps: dict[str, LineMap] = {}
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:
             continue
@@ -426,11 +432,11 @@ def _aggregation_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     column_graph: ColumnLineageGraph,
+    line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     """One finding per aggregate output whose tag cleared to naked while an operand
     it summed still carried one: a reduction the algebra cannot call well typed."""
     out: list[CheckFinding] = []
-    line_maps: dict[str, LineMap] = {}
     for ref, ann in _sorted(annotations):
         if ann.value != NAKED:
             continue
@@ -569,6 +575,10 @@ def _source_span(
     """Back-map a compiled span onto the model's source template (see
     :mod:`dblect.audit.sourcemap`), reusing one line map per model across the world's
     findings."""
+    # The "no line" sentinel has no source position; skip building the map for a model
+    # whose findings are all unlocated.
+    if line_start == 0:
+        return SourceSpan.compiled(line_start, line_end)
     line_map = cache.get(uid)
     if line_map is None:
         node = manifest.nodes.get(uid)
