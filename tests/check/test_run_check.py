@@ -36,7 +36,14 @@ def _cols(**types: str) -> Mapping[str, Column]:
     return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
 
 
-def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str, Column]) -> Node:
+def _node(
+    uid: str,
+    *,
+    kind: ResourceType,
+    sql: str | None,
+    columns: Mapping[str, Column],
+    raw: str | None = None,
+) -> Node:
     return Node(
         unique_id=uid,
         name=uid.split(".")[-1],
@@ -44,7 +51,7 @@ def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str
         fqn=tuple(uid.split(".")[1:]),
         package_name="shop",
         schema="analytics",
-        raw_code=None,
+        raw_code=raw,
         compiled_code=sql,
         original_file_path=f"models/{uid.split('.')[-1]}.sql",
         columns=columns,
@@ -218,16 +225,11 @@ def test_aggregation_finding_back_maps_to_the_source_line() -> None:
         "-- compiled at build\n"
         "select\n  country,\n  sum(amount) as total\nfrom payments\ngroup by country"
     )
-    mart = Node(
-        unique_id="model.shop.revenue_by_country",
-        name="revenue_by_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", "revenue_by_country"),
-        package_name="shop",
-        schema="analytics",
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path="models/revenue_by_country.sql",
+    mart = _node(
+        "model.shop.revenue_by_country",
+        kind=ResourceType.MODEL,
+        sql=compiled,
+        raw=raw,
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
     manifest = Manifest(
@@ -262,16 +264,11 @@ def test_noqa_on_the_source_line_suppresses_a_macro_shifted_aggregation() -> Non
         "-- compiled at build\n"
         f"select\n  country,\n  sum(amount) as total{noqa}\nfrom payments\ngroup by country"
     )
-    mart = Node(
-        unique_id="model.shop.revenue_by_country",
-        name="revenue_by_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", "revenue_by_country"),
-        package_name="shop",
-        schema="analytics",
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path="models/revenue_by_country.sql",
+    mart = _node(
+        "model.shop.revenue_by_country",
+        kind=ResourceType.MODEL,
+        sql=compiled,
+        raw=raw,
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
     manifest = Manifest(
@@ -298,6 +295,48 @@ def test_noqa_on_the_source_line_suppresses_a_macro_shifted_aggregation() -> Non
     assert hidden.directive_line == 3
     assert hidden.finding.line_start == 5
     assert hidden.finding.located_span.basis is SpanBasis.SOURCE
+
+
+def test_noqa_on_the_macro_call_line_suppresses_a_macro_emitted_aggregation() -> None:
+    # The SUM that the algebra cannot call well typed is emitted by `{{ revenue() }}`, so
+    # it has no source line of its own: its compiled line back-maps to the macro call site
+    # (source line 3). A `-- noqa` the developer placed on that call line silences it, the
+    # declaration-family counterpart of the macro-emitted structural case.
+    noqa = "  -- noqa: DBLECT_AGGREGATION_NOT_WELL_TYPED"
+    raw = f"select\n  country,\n  {{{{ revenue() }}}}{noqa}\nfrom payments\ngroup by country"
+    compiled = "select\n  country,\n  sum(amount) as total\nfrom payments\ngroup by country"
+    mart = _node(
+        "model.shop.revenue_by_country",
+        kind=ResourceType.MODEL,
+        sql=compiled,
+        raw=raw,
+        columns=_cols(country="VARCHAR", total="DECIMAL"),
+    )
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={_AGG_NODES[0].unique_id: _AGG_NODES[0], mart.unique_id: mart},
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    assert not [
+        f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ], "the noqa on the macro call line should silence the emitted aggregation finding"
+    [hidden] = [
+        s
+        for s in report.suppressed
+        if s.finding.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ]
+    # The SUM is at compiled line 3; it anchors to the `{{ revenue() }}` call at source
+    # line 3, where the directive sits.
+    assert hidden.directive_line == 3
+    assert hidden.finding.line_start == 3
+    assert hidden.finding.located_span.basis is SpanBasis.MACRO_CALL
+    assert (hidden.finding.located_span.line_start, hidden.finding.located_span.line_end) == (3, 3)
 
 
 def test_mixed_currency_sum_is_flagged() -> None:

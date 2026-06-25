@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from jinja2 import nodes
 
-from dblect.varinf.environment import make_environment
+from dblect.templating import make_environment
 
 
 @pytest.fixture(scope="module")

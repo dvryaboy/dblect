@@ -4,14 +4,17 @@ A bare ``jinja2.Environment`` rejects the tags dbt relies on. A probe of the
 fixture's macro bodies found the failures fall into a small, closed set: two are
 standard Jinja extensions dbt enables (``do`` and the loop controls), and the
 rest are dbt block tags that share one shape. We enable the two extensions and
-add one generic block-tag extension, so the var walker parses the same source
-dbt does.
+add one generic block-tag extension, so callers parse the same source dbt does.
 
 The block-tag extension parses the body *into* statements rather than skipping
 to the end tag, so a ``var()`` inside a snapshot (including one nested in an
 ``{% if %}``) keeps its syntactic context and is classified correctly. Only the
 header tokens (``snapshot name``, ``materialization ..., adapter='x'``) are
 skipped, where vars do not live.
+
+The environment is reused across the codebase wherever raw dbt template structure
+is needed without a render: the var walker reads ``var()`` usage from the parsed
+tree, and the source-line back-map reads ``{{ ... }}`` call-site positions from it.
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ class DbtBlockTags(Extension):
 
 
 def make_environment() -> Environment:
-    """Build the environment the var walker parses source Jinja with.
+    """Build the environment used to parse dbt source Jinja.
 
     Enables the two stdlib extensions dbt uses and the dbt block-tag extension.
     The environment never renders; it is used only for ``parse``.
@@ -70,9 +73,9 @@ def make_environment() -> Environment:
 
 @cache
 def shared_environment() -> Environment:
-    """The environment the walker parses with, materialized once on first use.
+    """The dbt-template parsing environment, materialized once on first use.
 
-    Building an environment wires three extensions, and the walker parses one
+    Building an environment wires three extensions, and a caller parsing one
     environment per node otherwise. The environment only ever ``parse``s (it never
     renders and holds no per-source state), so a single instance serves every walk.
     Callers that want an isolated environment build one with :func:`make_environment`.

@@ -146,6 +146,16 @@ def test_compiled_relative_finding_emits_no_region() -> None:
     assert physical["artifactLocation"]["uri"] == "models/m.sql"
 
 
+def test_macro_call_finding_emits_a_region_at_the_call_line() -> None:
+    # A macro-emitted finding anchors to the `{{ ... }}` call site, a real source line the
+    # developer wrote. Unlike a purely compiled span, that is a legitimate place to point a
+    # code-scanning UI, so the region rides it (here the call line is 9).
+    report = _structural_only_report(_located(line=9, basis=SpanBasis.MACRO_CALL))
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    region = result["locations"][0]["physicalLocation"]["region"]
+    assert region["startLine"] == 9
+
+
 def _declaration_only_report(finding: CheckFinding) -> AnalysisReport:
     audit = AuditReport(findings=(), suppressed=(), skipped=(), models_scanned=1)
     check = CheckReport(

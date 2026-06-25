@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from jinja2 import TemplateError, nodes
 
-from dblect.varinf.environment import shared_environment
+from dblect.templating import shared_environment
 from dblect.varinf.usage import (
     Arithmetic,
     ArithOp,
