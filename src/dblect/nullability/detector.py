@@ -119,14 +119,18 @@ def detect_join_on_nullable_key(
     """Flag a JOIN whose equality key is a column nullable in its upstream relation.
 
     NULL never equals NULL, so a NULL join key never matches, but the consequence depends
-    on the side. On an inner (or semi) join the row is dropped from either side, silent row
-    loss. On an outer join the preserved side keeps the row and pads the target with NULLs,
-    a silent non-match, while the non-preserved side simply not joining is the outer join's
-    defining semantics rather than a hazard. So this gates by preservation, reading the same
-    ``outer_join_optional_aliases`` machinery the structural ``null_group_after_outer_join``
-    and ``where_on_outer_joined_nullable`` detectors share: it flags any nullable key on a
-    preserved side and stays silent on the non-preserved side, where those siblings already
-    cover the downstream effects with more precision.
+    on the join. An inner join drops the row from either side, silent row loss. An outer
+    join keeps its preserved rows and pads the target with NULLs, a silent non-match; its
+    dropped side simply not joining is the join's defining semantics rather than a hazard,
+    and ``where_on_outer_joined_nullable`` and ``null_group_on_nullable_key`` already cover
+    that side's downstream effects with more precision. So this gates per join on
+    ``joins_with_outer_dropped_aliases``: it flags every nullable key except the one on the
+    join's own dropped side. A FULL join drops nothing (both sides survive NULL-padded), so
+    it flags both. A semi join filters its left rows, so a NULL key on either side silently
+    drops the row exactly as an inner join does, and it is flagged with the same row-loss
+    framing. An anti join inverts the hazard (a NULL key is kept as a spurious non-match), so
+    it is left alone. Gating per join keeps an outer join elsewhere in the same SELECT from
+    silencing an inner join's genuine row loss.
 
     Nullability is read from the upstream relation, so this fires on an inherited-nullable
     key the local SQL gives no hint about. One join is one decision to look at, so a
@@ -137,14 +141,18 @@ def detect_join_on_nullable_key(
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         alias_to_rel = _alias_to_relation(sel)
-        optional = sg.outer_join_optional_aliases(sel)
-        for join in sg.joins_of(sel):
+        for join, side, dropped in sg.joins_with_outer_dropped_aliases(sel):
             on = sg.on_of(join)
             if on is None:
                 continue
+            if side is JoinSide.ANTI:
+                # Anti join inverts the hazard: a NULL key matches nothing, so the row is kept
+                # as a spurious non-match rather than dropped. That is the opposite framing
+                # from every other join here, so leave it to a dedicated future case.
+                continue
             keys: list[_NullableKey] = []
             for alias, relation in sorted(alias_to_rel.items()):
-                if alias in optional:  # non-preserved side: the no-match is the join's intent
+                if alias in dropped:  # this outer join drops the no-match here: its intent
                     continue
                 nullable = nullable_by_name.get(relation)
                 if not nullable:
@@ -158,7 +166,7 @@ def detect_join_on_nullable_key(
                     for column in sorted(cols & nullable)
                 )
             if keys:
-                out.append(_join_finding(join, keys, side=sg.join_side_of(join)))
+                out.append(_join_finding(join, keys, side=side))
     return tuple(out)
 
 
@@ -247,11 +255,16 @@ def _cause_clause(cause: NullableCause) -> str:
             return ""
 
 
-_OUTER_KIND_WORD: Mapping[JoinSide, str] = {
+# The kind word prefixed onto "JOIN" in a finding. An inner join is absent and reads as the
+# bare "JOIN". LEFT/RIGHT/FULL take the kept-row outer framing; SEMI takes the row-loss
+# framing (it filters the left rows, so a NULL key drops the row exactly as an inner join).
+_JOIN_KIND_WORD: Mapping[JoinSide, str] = {
     JoinSide.LEFT: "LEFT",
     JoinSide.RIGHT: "RIGHT",
     JoinSide.FULL: "FULL OUTER",
+    JoinSide.SEMI: "SEMI",
 }
+_OUTER_SIDES = frozenset({JoinSide.LEFT, JoinSide.RIGHT, JoinSide.FULL})
 
 
 def _shared_cause_clause(keys: Sequence[_NullableKey]) -> str:
@@ -267,30 +280,33 @@ def _shared_cause_clause(keys: Sequence[_NullableKey]) -> str:
 def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSide) -> Finding:
     """One finding per join, listing every nullable key column it spans.
 
-    The framing follows the join side. On an inner join a NULL key drops the row, so the
-    message keeps the row-loss framing. On an outer join only the preserved side reaches
-    here, where the row survives NULL-padded and the hazard is the silent non-match, so the
-    message says the row is kept rather than implying any preserved-row loss."""
+    The framing follows the join side. An inner or semi join drops the row on a NULL key, so
+    the message keeps the row-loss framing (a semi join filters its left rows, so a NULL key
+    on either side silently drops the left row just as an inner join would). An outer join's
+    surviving rows reach here (the preserved side of a LEFT or RIGHT join, both sides of a
+    FULL join), where the row is kept NULL-padded and the hazard is the silent non-match, so
+    the message says the row is kept rather than implying any preserved-row loss."""
     columns = ", ".join(sorted({k.column for k in keys}))
     sources = ", ".join(repr(r) for r in sorted({k.relation for k in keys}))
     is_are = "are" if len({k.column for k in keys}) > 1 else "is"
     cause = _shared_cause_clause(keys)
+    kind_word = _JOIN_KIND_WORD.get(side)
+    prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
     guard = (
         f"The durable guard is a not_null test on {columns} in {sources}, which turns this "
         f"silent {{loss}} into a loud test failure on the producing model; or, locally, "
         f"filter the nulls or COALESCE to a sentinel if the match was intended."
     )
-    outer_kind = _OUTER_KIND_WORD.get(side)
-    if outer_kind is not None:
+    if side in _OUTER_SIDES:
         message = (
-            f"{outer_kind} JOIN keys on {columns}, which {is_are} nullable upstream in "
-            f"{sources}{cause}; this is the preserved side, so the rows are kept, but NULL "
-            f"never equals NULL, so a NULL key silently never matches and the row survives "
-            f"with the join target NULL-padded. {guard.format(loss='non-match')}"
+            f"{prefix} keys on {columns}, which {is_are} nullable upstream in "
+            f"{sources}{cause}; the outer join keeps these rows, but NULL never equals NULL, "
+            f"so a NULL key silently never matches and the row survives with the join target "
+            f"NULL-padded. {guard.format(loss='non-match')}"
         )
     else:
         message = (
-            f"JOIN keys on {columns}, which {is_are} nullable upstream in {sources}{cause}; "
+            f"{prefix} keys on {columns}, which {is_are} nullable upstream in {sources}{cause}; "
             f"NULL never equals NULL, so rows with a NULL key never match and are silently "
             f"dropped. {guard.format(loss='row loss')}"
         )

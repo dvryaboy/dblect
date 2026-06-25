@@ -26,6 +26,8 @@ class JoinSide(StrEnum):
     RIGHT = "right"
     FULL = "full"
     CROSS = "cross"
+    SEMI = "semi"
+    ANTI = "anti"
 
 
 def from_of(sel: exp.Select) -> exp.From | None:
@@ -90,14 +92,20 @@ def fn_of(w: exp.Window) -> Expr | None:
 def join_side_of(j: exp.Join) -> JoinSide:
     """The side of `j` as a `JoinSide`.
 
-    Reads sqlglot's ``side`` and ``kind`` token strings. ``CROSS`` overrides
-    side (sqlglot keeps it on ``kind``); a missing/empty side defaults to
-    ``INNER``, which is the SQL default for ``a JOIN b`` without a qualifier.
+    Reads sqlglot's ``side`` and ``kind`` token strings. ``CROSS``/``SEMI``/``ANTI``
+    live on ``kind`` and override side (sqlglot still records ``LEFT`` as the side of a
+    ``LEFT SEMI JOIN``, but a semi join filters rather than pads, so it is not an outer
+    join). A missing/empty side defaults to ``INNER``, the SQL default for ``a JOIN b``
+    without a qualifier.
     """
     side = (j.side or "").upper()
     kind = (j.kind or "").upper()
     if "CROSS" in kind:
         return JoinSide.CROSS
+    if "SEMI" in kind:
+        return JoinSide.SEMI
+    if "ANTI" in kind:
+        return JoinSide.ANTI
     match side:
         case "LEFT":
             return JoinSide.LEFT
@@ -118,10 +126,10 @@ def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
     """The aliases an outer join in ``sel`` leaves NULL-padded: its non-preserved sides.
 
     A LEFT join makes its right side optional, a RIGHT join its accumulated left, a FULL
-    join both. Inner and cross joins preserve every row, so they contribute nothing. The
-    aliases are returned by ``alias_or_name`` to line up with the join-key callers, which
+    join both. Inner, cross, semi, and anti joins do not NULL-pad, so they contribute
+    nothing. The aliases are returned by ``alias_or_name`` to line up with callers that
     qualify columns by the same alias. An alias absent from this set is on a preserved
-    side: its rows survive the join.
+    side: its rows survive the join un-padded.
     """
     from_ = from_of(sel)
     if from_ is None:
@@ -140,6 +148,43 @@ def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
             optional.update(accumulated_left)
         accumulated_left.add(right_name)
     return optional
+
+
+def joins_with_outer_dropped_aliases(
+    sel: exp.Select,
+) -> list[tuple[exp.Join, JoinSide, frozenset[str]]]:
+    """Each join in ``sel`` with its side and the aliases whose unmatched rows it drops.
+
+    A LEFT join drops its unmatched right rows; a RIGHT join its unmatched left rows (every
+    alias accumulated to its left). A FULL join drops nothing, since both sides survive
+    NULL-padded, and inner, cross, semi, and anti joins report an empty set (an inner join's
+    unmatched rows belong to no single side, and semi/anti filter rather than pad). The
+    accumulated-left context grows left to right, so a later RIGHT join sees the earlier
+    tables.
+
+    This is the per-join view a caller gates on when it cares about one join's own dropped
+    side. It differs from :func:`outer_join_optional_aliases`, the output-nullable union that
+    counts both sides of a FULL join (both can be NULL in the result) and is not scoped to a
+    single join.
+    """
+    from_ = from_of(sel)
+    out: list[tuple[exp.Join, JoinSide, frozenset[str]]] = []
+    if from_ is None:
+        return out
+    accumulated_left: set[str] = {name_of(from_.this)} if from_.this is not None else set()
+    for j in joins_of(sel):
+        right_name = name_of(j.this)
+        side = join_side_of(j)
+        dropped: frozenset[str]
+        if side is JoinSide.LEFT:
+            dropped = frozenset({right_name})
+        elif side is JoinSide.RIGHT:
+            dropped = frozenset(accumulated_left)
+        else:
+            dropped = frozenset()
+        out.append((j, side, dropped))
+        accumulated_left.add(right_name)
+    return out
 
 
 def column_table(c: exp.Column) -> str | None:
