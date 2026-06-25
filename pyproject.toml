@@ -64,7 +64,7 @@ dev = [
 ]
 # Maintainer-only: regenerates the committed warehouse fixtures (e.g.
 # scripts/refresh_bigquery_fixtures.sh). Deliberately NOT a runtime or user
-# dependency and NOT in `dev` — dblect analyses a committed manifest and never
+# dependency and NOT in `dev`. dblect analyses a committed manifest and never
 # talks to a warehouse, so a warehouse adapter is needed only to refresh fixtures.
 # Sync it on its own (`uv sync --group warehouse-fixtures`), not alongside `dev`.
 warehouse-fixtures = [
