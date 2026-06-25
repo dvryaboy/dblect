@@ -454,21 +454,29 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
                 table = sg.column_table(c)
                 if table is not None and table in nullable:
                     risky_tables.add(table)
-            if risky_tables:
-                tables = ", ".join(sorted(risky_tables))
-                out.append(
-                    finding_at(
-                        FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
-                        message=(
-                            f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
-                            f"nullable join side ({tables}); rows where the join didn't match "
-                            "are filtered out, silently inverting the OUTER JOIN to INNER. "
-                            "Move the predicate into the ON clause, or guard the column "
-                            "with COALESCE / IS [NOT] NULL."
-                        ),
-                        node=cmp,
-                    )
+            if not risky_tables:
+                continue
+            # A nullable-side predicate inside a top-level OR does not invert the
+            # join when a sibling disjunct keeps the rows where this side is NULL
+            # alive: `a.x > 0 OR b.y > 0` on a left join, or the full-outer
+            # `l.v > 0 OR r.v > 0` idiom. The disjunction is join-preserving, so
+            # the predicate is not the inverting culprit.
+            if _rescued_by_or_disjunction(cmp, risky_tables, where):
+                continue
+            tables = ", ".join(sorted(risky_tables))
+            out.append(
+                finding_at(
+                    FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
+                    message=(
+                        f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
+                        f"nullable join side ({tables}); rows where the join didn't match "
+                        "are filtered out, silently inverting the OUTER JOIN to INNER. "
+                        "Move the predicate into the ON clause, or guard the column "
+                        "with COALESCE / IS [NOT] NULL."
+                    ),
+                    node=cmp,
                 )
+            )
     return tuple(out)
 
 
@@ -586,6 +594,58 @@ def _is_null_protected(col: exp.Column, *, until: Expr) -> bool:
         if isinstance(node, exp.Coalesce | exp.Is):
             return True
         node = node.parent
+    return False
+
+
+def _top_level_disjuncts(predicate: Expr) -> list[Expr]:
+    """Flatten the top-level OR tree of `predicate` into its disjuncts. A WHERE
+    that is not an OR at its root yields a single disjunct (itself), so callers
+    see no disjunction to reason about."""
+    out: list[Expr] = []
+    stack: list[Expr] = [predicate]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Or):
+            stack.extend((node.this, node.expression))
+        else:
+            out.append(node)
+    return out
+
+
+def _is_descendant(node: Expr, ancestor: Expr) -> bool:
+    cur: Expr | None = node
+    while cur is not None:
+        if cur is ancestor:
+            return True
+        cur = cur.parent
+    return False
+
+
+def _rescued_by_or_disjunction(cmp: Expr, risky: set[str], where: exp.Where) -> bool:
+    """True if `cmp` is one term of a top-level OR whose other side keeps the
+    rows where `cmp`'s nullable tables are NULL alive, so `cmp` does not invert
+    the outer join.
+
+    A sibling disjunct rescues when it references at least one column and none of
+    its columns come from a table in `risky`: it can hold for rows where those
+    tables did not match (a predicate on the preserved side, or on the other side
+    of a full outer join). A disjunct that also constrains a risky table, or one
+    with no column at all (a bare literal), does not qualify, so the genuine
+    inversions (a lone predicate, an AND, or an OR over the same nullable side)
+    still fire.
+    """
+    disjuncts = _top_level_disjuncts(where.this)
+    if len(disjuncts) <= 1:
+        return False
+    own = next((d for d in disjuncts if _is_descendant(cmp, d)), None)
+    if own is None:
+        return False
+    for d in disjuncts:
+        if d is own:
+            continue
+        cols = sg.find_columns(d)
+        if cols and all(sg.column_table(c) not in risky for c in cols):
+            return True
     return False
 
 

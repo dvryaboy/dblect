@@ -296,6 +296,38 @@ def test_where_on_right_joined_left_side_detected() -> None:
     assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
 
 
+def test_where_or_with_preserved_side_disjunct_not_detected() -> None:
+    # `a.x > 0 OR b.y > 0`: an unmatched left row (b.* NULL) still survives via
+    # the preserved-side disjunct a.x > 0, so b.y > 0 does not invert the join.
+    sql = "select * from a left join b on a.k = b.k where a.x > 0 or b.y > 0"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_full_outer_or_over_both_sides_not_detected() -> None:
+    # The full-outer "keep rows where either side has signal" idiom. A row present
+    # only in l (r.* NULL) survives via l.v > 0; a row present only in r via r.v > 0.
+    # Neither disjunct inverts the join.
+    sql = "select * from l full outer join r on l.k = r.k where l.v > 0 or r.v > 0"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_and_with_nullable_predicate_still_detected() -> None:
+    # Conjunctive position: b.y > 0 is NULL for unmatched rows, so the AND drops
+    # every one of them. This is the genuine inversion and must still fire.
+    sql = "select * from a left join b on a.k = b.k where b.y > 0 and a.x > 0"
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
+
+
+def test_where_or_over_same_nullable_side_still_detected() -> None:
+    # Both disjuncts reference the same nullable side, so an unmatched b row has
+    # both NULL and is dropped: a real inversion. Both predicates fire.
+    sql = "select * from a left join b on a.k = b.k where b.y > 0 or b.z > 0"
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) == 2
+
+
 # --- Non-deterministic function in load-bearing positions ---
 
 
