@@ -200,40 +200,6 @@ PORTABLE_NON_DETERMINISTIC_BUILTINS: frozenset[str] = frozenset(
 )
 
 
-# --- surrogate-hash grammar --------------------------------------------------
-#
-# The typed-node vocabulary for recognizing a surrogate-hash key: a hash of a
-# structural combination of columns. These are SQL-grammar facts (the `exp.*`
-# classes are dialect-independent even though the per-dialect parser picks them),
-# so they live here rather than in the uniqueness property. An adapter that hashes
-# via a function sqlglot parses to `exp.Anonymous` would compose a name set on top,
-# as the non-determinism builtins do; nothing demands that yet.
-#
-# These are tuples, not frozensets like the sets above, because membership is
-# tested with `isinstance`, whose subclass-awareness is load-bearing: `TO_HEX(...)`
-# parses to `exp.LowerHex`, a subclass of `exp.Hex`, so listing `Hex` looks through
-# the hex wrapper. A hash's hex and raw-digest spellings, though, are siblings, not
-# in a subclass relation (`MD5`/`MD5Digest`, `SHA2`/`SHA2Digest`), so both are
-# listed explicitly. Resolved by name for tolerance across sqlglot versions.
-SURROGATE_HASH_FUNCTIONS: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n)
-    for n in ("MD5", "MD5Digest", "SHA", "SHA1Digest", "SHA2", "SHA2Digest", "FarmFingerprint")
-    if hasattr(exp, n)
-)
-# Single-argument wrappers that do not change which tuple is hashed, looked through
-# to reach the hash (e.g. `TO_HEX(MD5(...))`, `LOWER(...)`).
-SURROGATE_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
-)
-# Structural combinators that assemble columns into the hashed value without making
-# the input anything other than those columns.
-SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
-    getattr(exp, n)
-    for n in ("Concat", "DPipe", "Cast", "TryCast", "Coalesce", "Lower", "Upper", "Trim", "Paren")
-    if hasattr(exp, n)
-)
-
-
 def finding_at(kind: FindingKind, *, message: str, node: Expr) -> Finding:
     """Build a Finding whose snippet and source span both come from `node`."""
     span = sg.line_range(node)

@@ -18,9 +18,6 @@ from dblect.sql.parse import (
 )
 from dblect.sql.patterns import (
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
-    SURROGATE_HASH_FUNCTIONS,
-    SURROGATE_HASH_PASSTHROUGH,
-    SURROGATE_HASH_STRUCTURAL,
     AggregateSummary,
     Finding,
     FindingKind,
@@ -44,6 +41,11 @@ from dblect.sql.patterns import (
     scan_all,
     suppression_code,
     suppression_hint,
+)
+from dblect.sql.vocab import (
+    SURROGATE_HASH_FUNCTIONS,
+    SURROGATE_HASH_PASSTHROUGH,
+    SURROGATE_HASH_STRUCTURAL,
 )
 
 __all__ = [
