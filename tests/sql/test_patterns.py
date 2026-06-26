@@ -12,6 +12,7 @@ from dblect.sql import (
     FindingKind,
     JoinSide,
     detect_coalesce_on_join_key,
+    detect_inner_flatten_row_drop,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -121,23 +122,123 @@ def test_null_group_after_right_join_flips_nullability() -> None:
     assert len(findings) == 1
 
 
-def test_coalesce_on_join_key_detected() -> None:
+# --- GROUP BY on outer-joined nullable: COALESCE / IS NULL guards (#169) ---
+
+
+def test_null_group_coalesce_to_preserved_side_not_detected() -> None:
+    # base is the preserved (FROM) side, so coalesce(meta.key, base.key) is never NULL.
+    sql = """
+    select coalesce(meta.key, base.key) as key, sum(base.amount) as amount
+    from base
+    left join meta on base.key = meta.key
+    group by coalesce(meta.key, base.key)
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_coalesce_to_literal_not_detected() -> None:
+    sql = """
+    select coalesce(b.k, 'none') as k, count(*) as n
+    from a left join b on a.k = b.k
+    group by coalesce(b.k, 'none')
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_coalesce_all_nullable_sides_detected() -> None:
+    # Both b and c are nullable (full outer joins), so the merged key can be NULL.
+    sql = """
+    select coalesce(b.k, c.k) as k, count(*) as n
+    from a
+    full outer join b on a.k = b.k
+    full outer join c on a.k = c.k
+    group by coalesce(b.k, c.k)
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_is_not_null_key_not_detected() -> None:
+    # Grouping by a boolean IS NOT NULL test has two real buckets, no phantom NULL group.
+    sql = """
+    select b.k is not null as matched, count(*) as n
+    from a left join b on a.k = b.k
+    group by b.k is not null
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+# --- WHERE on outer-joined nullable: top-level OR-sibling rescue (#168) ---
+
+
+def test_where_left_join_or_sibling_on_preserved_side_not_detected() -> None:
+    # An unmatched left row (b.* NULL) still survives via a.x > 0, so the OR is
+    # join-preserving and neither term inverts the join.
+    sql = "select * from a left join b on a.k = b.k where a.x > 0 or b.y > 0"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_full_outer_both_sides_or_not_detected() -> None:
+    sql = "select * from l full outer join r on l.k = r.k where l.v > 0 or r.v > 0"
+    assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
+
+
+def test_where_conjunctive_predicate_still_detected() -> None:
+    # An AND at the root drops every unmatched row; the genuine inversion still fires.
+    sql = "select * from a left join b on a.k = b.k where b.y > 0 and a.x > 0"
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
+
+
+def test_where_same_side_or_still_detected() -> None:
+    # Both disjuncts constrain the same nullable side, so no sibling keeps unmatched rows.
+    sql = "select * from a left join b on a.k = b.k where b.y > 0 or b.z > 0"
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) >= 1
+    assert all(f.kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE for f in findings)
+
+
+def test_coalesce_on_join_key_in_on_clause_detected() -> None:
+    # COALESCE in the match condition itself turns non-matches into sentinel
+    # matches: the load-bearing position for this hazard.
+    sql = """
+    select a.id
+    from a left join b on coalesce(a.k, 0) = coalesce(b.k, 0)
+    """
+    findings = detect_coalesce_on_join_key(_parse(sql))
+    assert len(findings) >= 1
+    assert all(f.kind is FindingKind.COALESCE_ON_JOIN_KEY for f in findings)
+
+
+def test_coalesce_on_join_key_in_projection_not_detected() -> None:
+    # The projection-list coalesce of a join key is the FULL/RIGHT merge idiom
+    # (recover the key from whichever side matched), a guard, not a hazard (#139).
     sql = """
     select coalesce(a.k, 0) as k_safe
     from a left join b on a.k = b.k
     """
-    findings = detect_coalesce_on_join_key(_parse(sql))
-    assert len(findings) == 1
-    assert findings[0].kind is FindingKind.COALESCE_ON_JOIN_KEY
+    assert detect_coalesce_on_join_key(_parse(sql)) == ()
+
+
+def test_coalesce_full_outer_merge_in_projection_not_detected() -> None:
+    # The canonical FULL OUTER union idiom: prefer one feed, fall back to the other.
+    sql = """
+    select coalesce(a.k, b.k) as k, coalesce(a.v, b.v) as v
+    from a full outer join b on a.k = b.k
+    """
+    assert detect_coalesce_on_join_key(_parse(sql)) == ()
 
 
 def test_coalesce_on_non_join_column_not_detected() -> None:
+    # A COALESCE on a projected column that is not part of any ON clause is silent:
+    # the hazard is scoped to the match condition, not arbitrary projection cleanup.
     sql = """
     select coalesce(a.name, '') as name
     from a left join b on a.id = b.id
     """
-    findings = detect_coalesce_on_join_key(_parse(sql))
-    assert findings == ()
+    assert detect_coalesce_on_join_key(_parse(sql)) == ()
 
 
 def test_unordered_row_number_detected() -> None:
@@ -296,6 +397,68 @@ def test_where_on_right_joined_left_side_detected() -> None:
     assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
 
 
+# --- Inner array-flatten row drop (#63) ---
+
+
+def _parse_d(sql: str, dialect: str) -> Expr:
+    return parse_sql(sql, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select t.id, u.x from t, unnest(t.arr) as u(x)",
+        "select t.id, u.x from t cross join unnest(t.arr) as u(x)",
+    ],
+)
+def test_inner_unnest_duckdb_flagged(sql: str) -> None:
+    findings = detect_inner_flatten_row_drop(_parse_d(sql, "duckdb"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.INNER_FLATTEN_ROW_DROP
+
+
+def test_left_join_unnest_duckdb_not_flagged() -> None:
+    sql = "select t.id, u.x from t left join unnest(t.arr) as u(x) on true"
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "duckdb")) == ()
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("select t.id, x from t, unnest(t.arr) as x", 1),
+        ("select t.id, x from t cross join unnest(t.arr) as x", 1),
+        ("select t.id, x from t left join unnest(t.arr) as x", 0),
+    ],
+)
+def test_inner_unnest_bigquery(sql: str, expected: int) -> None:
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == expected
+
+
+def test_snowflake_lateral_flatten_inner_flagged() -> None:
+    sql = "select t.id, f.value from t, lateral flatten(input => t.arr) f"
+    findings = detect_inner_flatten_row_drop(_parse_d(sql, "snowflake"))
+    assert len(findings) == 1
+
+
+def test_spark_lateral_view_explode_inner_flagged_outer_silent() -> None:
+    inner = "select t.id, x from t lateral view explode(t.arr) tt as x"
+    outer = "select t.id, x from t lateral view outer explode(t.arr) tt as x"
+    assert len(detect_inner_flatten_row_drop(_parse_d(inner, "spark"))) == 1
+    assert detect_inner_flatten_row_drop(_parse_d(outer, "spark")) == ()
+
+
+def test_plain_cross_join_of_tables_not_flagged() -> None:
+    # A cartesian product of two relations is not an array flatten; not our hazard.
+    sql = "select * from a cross join b"
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "duckdb")) == ()
+
+
+def test_lateral_subquery_not_flatten_not_flagged() -> None:
+    # A LATERAL over a subquery (not an array flatten) does not drop rows on empty arrays.
+    sql = "select t.id, s.v from t, lateral (select max(x) as v from u where u.id = t.id) s"
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "postgres")) == ()
+
+
 # --- Non-deterministic function in load-bearing positions ---
 
 
@@ -381,10 +544,10 @@ def test_baseline_builtin_fires_under_the_default_set() -> None:
 
 def test_scan_all_runs_every_detector() -> None:
     sql = """
-    select coalesce(a.k, 0) as k_safe,
+    select b.k,
            row_number() over (partition by b.k) as rn,
            array_agg(amount) as amounts
-    from a left join b on a.k = b.k
+    from a left join b on coalesce(a.k, 0) = coalesce(b.k, 0)
     group by b.k
     """
     findings = scan_all(_parse(sql))

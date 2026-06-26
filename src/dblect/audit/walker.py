@@ -33,6 +33,7 @@ from dblect.sql import (
     FindingKind,
     SQLParseError,
     detect_coalesce_on_join_key,
+    detect_inner_flatten_row_drop,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -53,6 +54,7 @@ DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_unordered_window,
     detect_unordered_aggregate,
     detect_where_on_outer_joined_nullable,
+    detect_inner_flatten_row_drop,
 )
 
 

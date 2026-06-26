@@ -59,6 +59,11 @@ class AdapterProfile:
     ``non_deterministic_builtins`` is the complete name set (the portable baseline
     plus this adapter's own builtins) the non-determinism detector matches anonymous
     function calls against; a consumer reads it whole and unions nothing.
+    ``duplicate_safe_aggregate_builtins`` is the same shape for the duplicate-sensitivity
+    predicate: names of UDF aggregates this warehouse exposes (parsed as anonymous
+    calls) whose result a duplicated row does not change, so a fan-out into them is
+    harmless. It defaults to empty, since most duplicate-safe aggregates already carry a
+    dedicated sqlglot type; the few that arrive anonymous are declared here.
     """
 
     adapter_type: str
@@ -68,6 +73,7 @@ class AdapterProfile:
     key_enforced: bool
     default_incremental_strategy: IncrementalStrategy | None
     non_deterministic_builtins: frozenset[str]
+    duplicate_safe_aggregate_builtins: frozenset[str] = frozenset()
 
     def effective_strategy(self, declared: str | None) -> IncrementalStrategy | None:
         """The strategy in force for a model: the declared one when set (``None`` if

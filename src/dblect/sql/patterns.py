@@ -29,6 +29,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
+from dblect.sql import guards
 from dblect.sql._sqlglot import JoinSide
 
 if TYPE_CHECKING:
@@ -50,6 +51,7 @@ class FindingKind(StrEnum):
     NULL_GROUP_ON_NULLABLE_KEY = "null_group_on_nullable_key"
     JOIN_ON_NULLABLE_KEY = "join_on_nullable_key"
     NOT_IN_NULLABLE_SUBQUERY = "not_in_nullable_subquery"
+    INNER_FLATTEN_ROW_DROP = "inner_flatten_row_drop"
     SNAPSHOT_TEMPORAL_FILTER_MISSING = "snapshot_temporal_filter_missing"
 
 
@@ -160,6 +162,18 @@ _NULL_INTOLERANT_COMPARISONS: frozenset[type[Expr]] = frozenset(
         exp.ILike,
         exp.Between,
     }
+)
+
+# Array-flattening constructs whose inner (non-outer) form drops a parent row when the
+# array is empty or NULL. ``UNNEST`` and ``explode``/``flatten`` parse to dedicated types
+# across dialects (duckdb/bigquery ``UNNEST`` -> ``exp.Unnest``; snowflake ``flatten`` and
+# spark ``explode`` -> ``exp.Explode``); a dialect that leaves the flatten anonymous is
+# matched by name. Resolved by ``isinstance`` so subclasses look through.
+_ARRAY_FLATTEN_TYPED: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n) for n in ("Unnest", "Explode", "Posexplode", "Inline") if hasattr(exp, n)
+)
+_ARRAY_FLATTEN_NAMES: frozenset[str] = frozenset(
+    {"unnest", "explode", "explode_outer", "posexplode", "flatten", "json_array_elements"}
 )
 
 _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
@@ -312,6 +326,12 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
     grouping by such a column collapses every unmatched left row into a
     single NULL bucket, which is almost never intended. RIGHT and FULL OUTER
     are flagged symmetrically.
+
+    A nullable-side column is cleared when the value-effect catalog proves the
+    grouped value cannot be the padding NULL: an ``IS [NOT] NULL`` test (the
+    buckets are the two booleans), or a ``COALESCE`` whose fallback the join keeps
+    present (``coalesce(meta.key, base.key)`` recovers the preserved-side key). A
+    ``COALESCE`` of two nullable sides still fires: the merged key can be NULL.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -321,12 +341,18 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
         g = sg.group_of(sel)
         if g is None:
             continue
+        nullable_fs = frozenset(nullable)
         for grp_expr in g.expressions:
             risky: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
-                if table is not None and table in nullable:
-                    risky.add(table)
+                if table is None or table not in nullable:
+                    continue
+                if guards.is_null_checked(c, until=grp_expr) or guards.supplies_present_value(
+                    c, until=grp_expr, nullable=nullable_fs
+                ):
+                    continue
+                risky.add(table)
             if risky:
                 tables = ", ".join(sorted(risky))
                 out.append(
@@ -343,37 +369,42 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
 
 
 def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
-    """Flag COALESCE applied to a column that also appears in a JOIN ON clause.
+    """Flag COALESCE applied to a join-key column inside a JOIN ON clause.
 
-    Patching a join-key column with COALESCE typically defeats the NULL
-    semantics that distinguish "no match" from "match with NULL". Worth a look.
+    Patching a join-key column with COALESCE in the match condition itself
+    (``on coalesce(a.k, 0) = coalesce(b.k, 0)``) defeats the NULL semantics that
+    distinguish "no match" from "match with NULL", turning non-matches into
+    matches on the sentinel. That is the load-bearing position for this hazard.
+
+    The same ``coalesce(a.k, b.k)`` in the projection of a FULL/RIGHT outer join
+    is the opposite: the canonical merge idiom that recovers the key from whichever
+    side matched, a value-effect guard rather than a hazard. So the search is scoped
+    to the ON clause and the projection-list merge stays silent (issue #139).
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        keys: set[tuple[str | None, str]] = set()
-        for j in sg.joins_of(sel):
-            on = sg.on_of(j)
-            if on is None:
-                continue
-            for c in sg.find_columns(on):
-                keys.add((sg.column_table(c), sg.column_name(c)))
+        ons = [on for j in sg.joins_of(sel) if (on := sg.on_of(j)) is not None]
+        keys: set[tuple[str | None, str]] = {
+            (sg.column_table(c), sg.column_name(c)) for on in ons for c in sg.find_columns(on)
+        }
         if not keys:
             continue
-        for coalesce in sg.find_all_coalesce(sel):
-            first = coalesce.this
-            if not isinstance(first, exp.Column):
-                continue
-            if (sg.column_table(first), sg.column_name(first)) in keys:
-                out.append(
-                    finding_at(
-                        FindingKind.COALESCE_ON_JOIN_KEY,
-                        message=(
-                            f"COALESCE on join key {sg.render_sql(first)} masks NULLs that "
-                            "the JOIN's semantics distinguish"
-                        ),
-                        node=coalesce,
+        for on in ons:
+            for coalesce in on.find_all(exp.Coalesce):
+                first = coalesce.this
+                if not isinstance(first, exp.Column):
+                    continue
+                if (sg.column_table(first), sg.column_name(first)) in keys:
+                    out.append(
+                        finding_at(
+                            FindingKind.COALESCE_ON_JOIN_KEY,
+                            message=(
+                                f"COALESCE on join key {sg.render_sql(first)} in the ON clause "
+                                "masks NULLs that the JOIN's semantics distinguish"
+                            ),
+                            node=coalesce,
+                        )
                     )
-                )
     return tuple(out)
 
 
@@ -434,41 +465,82 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
     quietly takes them back. The fix is to move the predicate into the JOIN's
     ON clause or to wrap the column in ``coalesce``.
 
-    A predicate is "protected" if the column reference is wrapped in
-    ``COALESCE`` or sits inside an ``IS [NOT] NULL`` check between itself and
-    the comparison node. Protected predicates are silent.
+    A predicate is cleared when the value-effect catalog neutralises the padding
+    NULL: the column is wrapped in ``COALESCE`` or an ``IS [NOT] NULL`` check
+    before the comparison, or the comparison is one term of a top-level ``OR``
+    whose sibling disjunct keeps the unmatched rows alive (``where a.x > 0 or
+    b.y > 0`` does not invert the join). Cleared predicates are silent.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         nullable = _nullable_tables(sel)
         if not nullable:
             continue
-        where = sel.args.get("where")
+        where = sg.where_of(sel)
         if where is None:
             continue
+        nullable_fs = frozenset(nullable)
         for cmp in where.find_all(*_NULL_INTOLERANT_COMPARISONS):
             risky_tables: set[str] = set()
             for c in sg.find_columns(cmp):
-                if _is_null_protected(c, until=cmp):
+                if guards.is_coalesced(c, until=cmp) or guards.is_null_checked(c, until=cmp):
                     continue
                 table = sg.column_table(c)
                 if table is not None and table in nullable:
                     risky_tables.add(table)
-            if risky_tables:
-                tables = ", ".join(sorted(risky_tables))
-                out.append(
-                    finding_at(
-                        FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
-                        message=(
-                            f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
-                            f"nullable join side ({tables}); rows where the join didn't match "
-                            "are filtered out, silently inverting the OUTER JOIN to INNER. "
-                            "Move the predicate into the ON clause, or guard the column "
-                            "with COALESCE / IS [NOT] NULL."
-                        ),
-                        node=cmp,
-                    )
+            if not risky_tables:
+                continue
+            if guards.rescued_by_or_sibling(cmp, where=where, nullable=nullable_fs):
+                continue
+            tables = ", ".join(sorted(risky_tables))
+            out.append(
+                finding_at(
+                    FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE,
+                    message=(
+                        f"WHERE predicate {sg.render_sql(cmp)} compares a column from "
+                        f"nullable join side ({tables}); rows where the join didn't match "
+                        "are filtered out, silently inverting the OUTER JOIN to INNER. "
+                        "Move the predicate into the ON clause, or guard the column "
+                        "with COALESCE / IS [NOT] NULL."
+                    ),
+                    node=cmp,
                 )
+            )
+    return tuple(out)
+
+
+def detect_inner_flatten_row_drop(tree: Expr) -> tuple[Finding, ...]:
+    """Flag an inner array-flatten arm (``UNNEST``/``explode``/``flatten``) that drops the
+    parent row when the array is empty or NULL.
+
+    ``FROM t, UNNEST(t.arr)`` (equivalently ``CROSS JOIN UNNEST(...)`` or ``CROSS JOIN
+    LATERAL ...``) emits zero rows for any ``t`` whose ``arr`` is empty or null, so the
+    lateral behaves like an inner join against the unnested set and the parent row vanishes.
+    Analysts usually expect every parent row to survive. This is the deflation twin of
+    ``join_fanout``: fan-out multiplies rows, this annihilates them. The row-preserving form
+    is the ``LEFT``/``OUTER`` variant (``LEFT JOIN UNNEST(...) ON TRUE``, ``LATERAL
+    FLATTEN(... OUTER => TRUE)``, spark ``LATERAL VIEW OUTER explode(...)``), which is
+    silent. The construct parses dialect-specifically, so the detector reads the structural
+    shape sqlglot produces rather than the surface syntax.
+    """
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(tree):
+        for j in sg.joins_of(sel):
+            kernel = _flatten_arm(j.this)
+            if kernel is None:
+                continue
+            if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_is_outer(kernel):
+                continue
+            out.append(_inner_flatten_finding(j))
+        for lat in sel.find_all(exp.Lateral):
+            # Spark `LATERAL VIEW [OUTER] explode(...)` is a standalone lateral (view=True),
+            # not a join arm; the join-arm laterals (snowflake) carry view=False and are
+            # handled above. `OUTER` makes the parent row survive.
+            if not lat.args.get("view") or _enclosing_select(lat) is not sel:
+                continue
+            if not _is_flatten_like(lat.this) or lat.args.get("outer"):
+                continue
+            out.append(_inner_flatten_finding(lat))
     return tuple(out)
 
 
@@ -534,6 +606,7 @@ _STRUCTURAL_DETECTORS = (
     detect_unordered_window,
     detect_unordered_aggregate,
     detect_where_on_outer_joined_nullable,
+    detect_inner_flatten_row_drop,
 )
 
 
@@ -573,20 +646,63 @@ def _nullable_tables(sel: exp.Select) -> set[str]:
     return sg.outer_join_optional_aliases(sel)
 
 
-def _is_null_protected(col: exp.Column, *, until: Expr) -> bool:
-    """True if `col` is wrapped in a NULL-tolerant context before reaching `until`.
+_OUTER_JOIN_SIDES: frozenset[JoinSide] = frozenset({JoinSide.LEFT, JoinSide.RIGHT, JoinSide.FULL})
 
-    Walks from `col` up the AST. ``COALESCE(col, ...)`` returns the fallback
-    when ``col`` is NULL, so the comparison sees a non-NULL value. ``IS NULL``
-    and ``IS NOT NULL`` are themselves null checks, so the analyst is
-    explicitly handling the nullable case.
-    """
-    node: Expr | None = col
-    while node is not None and node is not until:
-        if isinstance(node, exp.Coalesce | exp.Is):
-            return True
-        node = node.parent
-    return False
+
+def _is_flatten_like(node: Expr | None) -> bool:
+    """True if ``node`` is an array-flattening expression (``UNNEST``, ``explode``,
+    ``flatten``), by dedicated type or, for a dialect that leaves it anonymous, by name."""
+    if node is None:
+        return False
+    if isinstance(node, _ARRAY_FLATTEN_TYPED):
+        return True
+    return (
+        isinstance(node, exp.Anonymous)
+        and isinstance(node.this, str)
+        and (node.this.lower() in _ARRAY_FLATTEN_NAMES)
+    )
+
+
+def _flatten_arm(node: Expr) -> Expr | None:
+    """The flatten kernel of a FROM/JOIN arm, or ``None`` if the arm is not an array
+    flatten. ``UNNEST`` sits directly in the arm; ``LATERAL``/``TABLE(...)`` wrap the
+    flatten function, and we return the wrapper so its ``OUTER`` marker can be read."""
+    if isinstance(node, exp.Unnest):
+        return node
+    if isinstance(node, exp.Lateral) and _is_flatten_like(node.this):
+        return node
+    table_from_rows = getattr(exp, "TableFromRows", None)
+    if table_from_rows is not None and isinstance(node, table_from_rows):
+        return node if _is_flatten_like(node.this) else None
+    return None
+
+
+def _flatten_is_outer(kernel: Expr) -> bool:
+    """True if the flatten kernel carries an ``OUTER`` marker that preserves the parent row
+    (``LATERAL FLATTEN(... OUTER => TRUE)``)."""
+    return bool(kernel.args.get("outer"))
+
+
+def _enclosing_select(node: Expr) -> exp.Select | None:
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Select):
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _inner_flatten_finding(node: Expr) -> Finding:
+    return finding_at(
+        FindingKind.INNER_FLATTEN_ROW_DROP,
+        message=(
+            f"inner array flatten {sg.render_sql(node)} drops the parent row when the array "
+            "is empty or NULL, behaving like an inner join against the unnested set. If every "
+            "parent row should survive, use the row-preserving outer form (LEFT JOIN "
+            "UNNEST(...) ON TRUE, FLATTEN(... OUTER => TRUE), LATERAL VIEW OUTER explode(...))."
+        ),
+        node=node,
+    )
 
 
 def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:

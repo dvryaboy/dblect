@@ -4,6 +4,8 @@ from dblect.sql.aggregates import (
     AGGREGATE_BEHAVIORS,
     AggregateBehavior,
     aggregate_behavior,
+    duplicate_sensitive,
+    strips_duplicates,
 )
 from dblect.sql.parse import (
     MultiResultScript,
@@ -28,6 +30,7 @@ from dblect.sql.patterns import (
     WindowSummary,
     all_findings,
     detect_coalesce_on_join_key,
+    detect_inner_flatten_row_drop,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -65,10 +68,12 @@ __all__ = [
     "aggregate_behavior",
     "all_findings",
     "detect_coalesce_on_join_key",
+    "detect_inner_flatten_row_drop",
     "detect_null_group_after_outer_join",
     "detect_unordered_aggregate",
     "detect_unordered_window",
     "detect_where_on_outer_joined_nullable",
+    "duplicate_sensitive",
     "finding_at",
     "list_aggregations",
     "list_group_bys",
@@ -78,6 +83,7 @@ __all__ = [
     "parse_result_statement",
     "parse_sql",
     "scan_all",
+    "strips_duplicates",
     "suppression_code",
     "suppression_hint",
 ]
