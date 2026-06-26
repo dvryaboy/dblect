@@ -380,12 +380,20 @@ def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
     is the opposite: the canonical merge idiom that recovers the key from whichever
     side matched, a value-effect guard rather than a hazard. So the search is scoped
     to the ON clause and the projection-list merge stays silent (issue #139).
+
+    The keys are the columns of the ON clause's equality predicates, the actual match
+    positions. A filter pushed into the ON clause (``on a.k = b.k and coalesce(b.flag,
+    true)``) contributes no key, so a COALESCE over its columns is not mistaken for a
+    masked join key.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         ons = [on for j in sg.joins_of(sel) if (on := sg.on_of(j)) is not None]
         keys: set[tuple[str | None, str]] = {
-            (sg.column_table(c), sg.column_name(c)) for on in ons for c in sg.find_columns(on)
+            (sg.column_table(c), sg.column_name(c))
+            for on in ons
+            for eq in on.find_all(exp.EQ)
+            for c in sg.find_columns(eq)
         }
         if not keys:
             continue
@@ -529,16 +537,16 @@ def detect_inner_flatten_row_drop(tree: Expr) -> tuple[Finding, ...]:
             kernel = _flatten_arm(j.this)
             if kernel is None:
                 continue
-            if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_is_outer(kernel):
+            if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_preserves_rows(kernel):
                 continue
             out.append(_inner_flatten_finding(j))
-        for lat in sel.find_all(exp.Lateral):
-            # Spark `LATERAL VIEW [OUTER] explode(...)` is a standalone lateral (view=True),
-            # not a join arm; the join-arm laterals (snowflake) carry view=False and are
-            # handled above. `OUTER` makes the parent row survive.
-            if not lat.args.get("view") or _enclosing_select(lat) is not sel:
+        for lat in sg.laterals_of(sel):
+            # Spark `LATERAL VIEW [OUTER] explode(...)` is a standalone lateral (view=True)
+            # stored on the select; the join-arm laterals (snowflake) carry view=False and
+            # are handled above as flatten arms.
+            if not _is_flatten_like(lat.this):
                 continue
-            if not _is_flatten_like(lat.this) or lat.args.get("outer"):
+            if _flatten_preserves_rows(lat):
                 continue
             out.append(_inner_flatten_finding(lat))
     return tuple(out)
@@ -654,13 +662,12 @@ def _is_flatten_like(node: Expr | None) -> bool:
     ``flatten``), by dedicated type or, for a dialect that leaves it anonymous, by name."""
     if node is None:
         return False
-    if isinstance(node, _ARRAY_FLATTEN_TYPED):
-        return True
-    return (
-        isinstance(node, exp.Anonymous)
-        and isinstance(node.this, str)
-        and (node.this.lower() in _ARRAY_FLATTEN_NAMES)
-    )
+    return sg.matches_typed_or_named(node, _ARRAY_FLATTEN_TYPED, _ARRAY_FLATTEN_NAMES)
+
+
+_FLATTEN_WRAPPER_TYPED: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n) for n in ("Lateral", "TableFromRows") if hasattr(exp, n)
+)
 
 
 def _flatten_arm(node: Expr) -> Expr | None:
@@ -669,27 +676,54 @@ def _flatten_arm(node: Expr) -> Expr | None:
     flatten function, and we return the wrapper so its ``OUTER`` marker can be read."""
     if isinstance(node, exp.Unnest):
         return node
-    if isinstance(node, exp.Lateral) and _is_flatten_like(node.this):
+    if isinstance(node, _FLATTEN_WRAPPER_TYPED) and _is_flatten_like(node.this):
         return node
-    table_from_rows = getattr(exp, "TableFromRows", None)
-    if table_from_rows is not None and isinstance(node, table_from_rows):
-        return node if _is_flatten_like(node.this) else None
     return None
 
 
-def _flatten_is_outer(kernel: Expr) -> bool:
-    """True if the flatten kernel carries an ``OUTER`` marker that preserves the parent row
-    (``LATERAL FLATTEN(... OUTER => TRUE)``)."""
-    return bool(kernel.args.get("outer"))
+def _flatten_preserves_rows(kernel: Expr) -> bool:
+    """True if a flatten arm is written in a row-preserving outer form. The dialects spell
+    this three ways, consolidated here so a new spelling is one clause rather than a fix
+    spread across the detector:
+
+    * the LATERAL / join wrapper carries an ``OUTER`` keyword (spark ``LATERAL VIEW OUTER
+      explode(...)``, read from ``kernel.args['outer']``);
+    * the flatten function is an outer variant whose row-preservation is in the node type or
+      name (spark ``explode_outer`` -> ``_ExplodeOuter``, ``posexplode_outer`` ->
+      ``PosexplodeOuter``);
+    * the flatten call carries an ``OUTER => TRUE`` keyword argument (snowflake
+      ``FLATTEN(... OUTER => TRUE)``).
+    """
+    if bool(kernel.args.get("outer")):
+        return True
+    fn = kernel.this if isinstance(kernel, _FLATTEN_WRAPPER_TYPED) else kernel
+    return _is_outer_flatten_form(fn) or _has_outer_kwarg(fn)
 
 
-def _enclosing_select(node: Expr) -> exp.Select | None:
-    parent = node.parent
-    while parent is not None:
-        if isinstance(parent, exp.Select):
-            return parent
-        parent = parent.parent
-    return None
+def _is_outer_flatten_form(fn: Expr | None) -> bool:
+    """True for the explode variants whose outer-ness is encoded in the function itself: a
+    dedicated type (``_ExplodeOuter``, ``PosexplodeOuter``) or an anonymous ``*_outer`` name.
+    Both spell the row-preserving form as a name ending in ``outer``."""
+    if fn is None:
+        return False
+    name = (
+        fn.this if isinstance(fn, exp.Anonymous) and isinstance(fn.this, str) else type(fn).__name__
+    )
+    return name.lower().endswith("outer")
+
+
+def _has_outer_kwarg(fn: Expr) -> bool:
+    """True if the flatten call carries ``OUTER => TRUE`` (snowflake ``FLATTEN``), parsed as
+    a ``Kwarg`` named ``outer`` among the call's direct arguments."""
+    for kw in (fn.this, *fn.args.get("expressions", [])):
+        if (
+            isinstance(kw, exp.Kwarg)
+            and isinstance(kw.this, exp.Var)
+            and kw.this.name.lower() == "outer"
+        ):
+            value = kw.expression
+            return value.this if isinstance(value, exp.Boolean) else value is not None
+    return False
 
 
 def _inner_flatten_finding(node: Expr) -> Finding:
@@ -741,13 +775,7 @@ def _find_non_deterministic(e: Expr, names: frozenset[str]) -> list[Expr]:
 
 
 def _is_non_deterministic(node: Expr, names: frozenset[str]) -> bool:
-    if type(node) in _NON_DETERMINISTIC_TYPED:
-        return True
-    return (
-        isinstance(node, exp.Anonymous)
-        and isinstance(node.this, str)
-        and node.this.lower() in names
-    )
+    return sg.matches_typed_or_named(node, tuple(_NON_DETERMINISTIC_TYPED), names)
 
 
 def _non_deterministic_name(call: Expr) -> str:

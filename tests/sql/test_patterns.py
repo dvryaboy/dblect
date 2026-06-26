@@ -200,6 +200,18 @@ def test_where_same_side_or_still_detected() -> None:
     assert all(f.kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE for f in findings)
 
 
+def test_where_or_sibling_on_other_optional_side_still_detected() -> None:
+    # Two independent LEFT joins: a row matching neither b nor c has both sides NULL, so
+    # `b.y > 0 or c.z > 0` is UNKNOWN and the row drops. A sibling on another optional side
+    # is not guaranteed present on the dropped rows, so it does not rescue: still a hazard.
+    sql = (
+        "select * from a left join b on a.k = b.k left join c on a.k = c.k where b.y > 0 or c.z > 0"
+    )
+    findings = detect_where_on_outer_joined_nullable(_parse(sql))
+    assert len(findings) >= 1
+    assert all(f.kind is FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE for f in findings)
+
+
 def test_coalesce_on_join_key_in_on_clause_detected() -> None:
     # COALESCE in the match condition itself turns non-matches into sentinel
     # matches: the load-bearing position for this hazard.
@@ -237,6 +249,16 @@ def test_coalesce_on_non_join_column_not_detected() -> None:
     sql = """
     select coalesce(a.name, '') as name
     from a left join b on a.id = b.id
+    """
+    assert detect_coalesce_on_join_key(_parse(sql)) == ()
+
+
+def test_coalesce_on_filter_pushed_into_on_clause_not_detected() -> None:
+    # `coalesce(b.flag, true)` is a filter in the ON clause, not a match key, so it must
+    # not be mistaken for a masked join key. Only the equality predicate's columns are keys.
+    sql = """
+    select a.id
+    from a left join b on a.id = b.id and coalesce(b.flag, true)
     """
     assert detect_coalesce_on_join_key(_parse(sql)) == ()
 
@@ -440,11 +462,32 @@ def test_snowflake_lateral_flatten_inner_flagged() -> None:
     assert len(findings) == 1
 
 
+def test_snowflake_lateral_flatten_outer_kwarg_silent() -> None:
+    # `FLATTEN(... OUTER => TRUE)` emits a NULL row for an empty/null array, preserving the
+    # parent row. The OUTER marker is a kwarg of the flatten call, not the lateral wrapper.
+    sql = "select t.id, f.value from t, lateral flatten(input => t.arr, outer => true) f"
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "snowflake")) == ()
+
+
 def test_spark_lateral_view_explode_inner_flagged_outer_silent() -> None:
     inner = "select t.id, x from t lateral view explode(t.arr) tt as x"
     outer = "select t.id, x from t lateral view outer explode(t.arr) tt as x"
     assert len(detect_inner_flatten_row_drop(_parse_d(inner, "spark"))) == 1
     assert detect_inner_flatten_row_drop(_parse_d(outer, "spark")) == ()
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        # The outer-ness of explode_outer / posexplode_outer lives in the function itself,
+        # not an OUTER keyword, yet they preserve the parent row and must stay silent.
+        ("select t.id, x from t lateral view explode_outer(t.arr) tt as x", 0),
+        ("select t.id, p, x from t lateral view posexplode_outer(t.arr) tt as p, x", 0),
+        ("select t.id, p, x from t lateral view posexplode(t.arr) tt as p, x", 1),
+    ],
+)
+def test_spark_explode_outer_variants(sql: str, expected: int) -> None:
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "spark"))) == expected
 
 
 def test_plain_cross_join_of_tables_not_flagged() -> None:

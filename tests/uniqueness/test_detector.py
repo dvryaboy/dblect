@@ -346,6 +346,31 @@ def test_fanout_unknown_udf_aggregate_keeps_firing_unless_declared_idempotent() 
     assert cleared == ()
 
 
+def test_fanout_silent_when_scalar_udf_reads_only_grouping_keys() -> None:
+    # `fmt_region(f.region)` is a scalar function over a grouping key, constant within a
+    # group, so it cannot fold the multiplied rows. The only real aggregate is `max`
+    # (duplicate-safe), so the grouping collapses the fan-out: no output hazard.
+    parsed = _parse(
+        "select f.id, fmt_region(f.region) as region, max(d.x) as mx "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id, f.region"
+    )
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
+def test_fanout_collapse_ignores_aggregate_in_nested_subquery() -> None:
+    # The `sum(o.amt)` aggregate folds rows of `other` in a correlated subquery, a separate
+    # scope; it is not a consumer of the multiplied join rows. The outer grouping with only
+    # `max` collapses the fan-out.
+    parsed = _parse(
+        "select f.id, max(d.x) as mx, "
+        "(select sum(o.amt) from other o where o.id = f.id) as s "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id"
+    )
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
 # --- end-to-end key resolution through make_fact_grounded_detectors ----------
 #
 # The direct-call tests above hand the detector a ``model_keys`` map keyed the way

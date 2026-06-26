@@ -47,6 +47,12 @@ def joins_of(sel: exp.Select) -> list[exp.Join]:
     return cast("list[exp.Join]", sel.args.get("joins") or [])
 
 
+def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
+    """The standalone laterals stored on ``sel`` (spark ``LATERAL VIEW``), distinct from the
+    join-arm laterals that live among :func:`joins_of`."""
+    return cast("list[exp.Lateral]", sel.args.get("laterals") or [])
+
+
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
 
@@ -218,6 +224,23 @@ def find_all_aggfunc(e: Expr) -> list[Expr]:
 
 def render_sql(e: Expr) -> str:
     return e.sql()
+
+
+def matches_typed_or_named(
+    node: Expr, typed: tuple[type[Expr], ...], names: frozenset[str]
+) -> bool:
+    """True if ``node`` is one of ``typed`` (``isinstance``, so subclasses look through), or
+    a function sqlglot left as ``exp.Anonymous`` whose name (case-insensitive) is in
+    ``names``. The dialect parsers pick a dedicated type for most constructs; the few a
+    dialect leaves anonymous are matched by name. Every entry in ``names`` must be lowercase.
+    """
+    if isinstance(node, typed):
+        return True
+    return (
+        isinstance(node, exp.Anonymous)
+        and isinstance(node.this, str)
+        and node.this.lower() in names
+    )
 
 
 def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None:

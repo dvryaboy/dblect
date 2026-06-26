@@ -356,20 +356,54 @@ def _collapsed_before_sensitive_consumer(sel: exp.Select, *, safe_builtins: froz
     GROUP BY (the fan-out flows straight to the rows) is never collapsed here. Only
     projections and HAVING are scanned; a function in a GROUP BY key or the join's own ON
     clause is not a consumer of the multiplied rows.
+
+    Two scoping rules keep the consumer set honest. A node is read only when it belongs to
+    ``sel`` itself, never a nested sub-SELECT, whose aggregate folds different rows. And an
+    ``exp.Anonymous`` call is weighed as a possible aggregate only when it reads a column
+    outside the grouping keys: a function over grouping keys alone is a grouped scalar
+    projection (valid SQL guarantees grouped non-aggregates), constant within a group, so a
+    fan-out that duplicates rows cannot move it. A typed aggregate is always weighed, since
+    even ``sum`` of a grouping key scales with the duplicated row count.
     """
     if sg.group_of(sel) is None:
         return False
+    group_keys = _group_key_columns(sel)
     consumers: list[Expr] = list(sel.expressions)
     having = sel.args.get("having")
     if isinstance(having, exp.Having) and isinstance(having.this, Expr):
         consumers.append(having.this)
     for root in consumers:
         for node in root.walk():
-            if isinstance(node, exp.AggFunc | exp.Anonymous) and duplicate_sensitive(
-                node, safe_builtins=safe_builtins
-            ):
+            if not isinstance(node, exp.AggFunc | exp.Anonymous):
+                continue
+            if node.find_ancestor(exp.Select) is not sel:
+                continue
+            if isinstance(node, exp.Anonymous) and not _reads_outside_grouping(node, group_keys):
+                continue
+            if duplicate_sensitive(node, safe_builtins=safe_builtins):
                 return False
     return True
+
+
+def _group_key_columns(sel: exp.Select) -> frozenset[tuple[str | None, str]]:
+    """The ``(qualifier, name)`` of every column in ``sel``'s GROUP BY keys."""
+    group = sg.group_of(sel)
+    if group is None:
+        return frozenset()
+    return frozenset(
+        (sg.column_table(c), sg.column_name(c))
+        for e in group.expressions
+        for c in sg.find_columns(e)
+    )
+
+
+def _reads_outside_grouping(node: Expr, group_keys: frozenset[tuple[str | None, str]]) -> bool:
+    """True if ``node`` references a column that is not a grouping key. A call reading only
+    grouping keys (or no column at all) cannot fold multiplied rows: its value is fixed
+    within a group."""
+    return any(
+        (sg.column_table(c), sg.column_name(c)) not in group_keys for c in sg.find_columns(node)
+    )
 
 
 def _window_is_in_scope(w: exp.Window, sel: exp.Select) -> bool:

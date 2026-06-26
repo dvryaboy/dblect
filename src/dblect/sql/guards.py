@@ -30,6 +30,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import JoinSide
 
 
 def is_coalesced(col: exp.Column, *, until: Expr) -> bool:
@@ -78,30 +79,83 @@ def rescued_by_or_sibling(predicate: Expr, *, where: exp.Where, nullable: frozen
 
     A nullable-side comparison drops an unmatched row only when it sits in a conjunctive
     position. Under a top-level ``OR``, a row survives whenever any single term holds, so a
-    sibling disjunct that references at least one column, none of them from the nullable
-    sides ``predicate`` constrains, can carry the rows where ``predicate``'s side did not
-    match. ``where a.x > 0 or b.y > 0`` over ``a LEFT JOIN b`` does not invert the join: an
-    unmatched-``b`` row survives via ``a.x > 0``. A same-side ``OR`` (``b.y > 0 or b.z >
-    0``) is not rescued, and an ``AND`` at the root has no top-level disjunction to rescue
-    anything, so both keep firing.
+    sibling disjunct rescues the rows ``predicate`` would drop only when it references a
+    relation guaranteed present on exactly those rows (:func:`_present_when_padded`). A
+    preserved side qualifies (``where a.x > 0 or b.y > 0`` over ``a LEFT JOIN b``: an
+    unmatched-``b`` row survives via ``a.x > 0``), and so does the partner of a single FULL
+    OUTER join (``where l.v > 0 or r.v > 0``, since a full join populates one side per
+    unmatched row). A sibling resting on another independent optional side does not
+    (``where b.y > 0 or c.z > 0`` over ``a LEFT JOIN b LEFT JOIN c`` keeps firing: a row
+    matching neither ``b`` nor ``c`` is dropped). A same-side ``OR`` and an ``AND`` at the
+    root keep firing for the same reason.
     """
-    root = _unparen(where.this)
-    disjuncts = _top_level_disjuncts(root)
+    sel = where.parent
+    if not isinstance(sel, exp.Select):
+        return False
+    disjuncts = _top_level_disjuncts(_unparen(where.this))
     if len(disjuncts) < 2:
         return False
     own = _enclosing_disjunct(predicate, disjuncts)
     if own is None:
         return False
-    constrained = {
+    constrained = frozenset(
         table for c in sg.find_columns(predicate) if (table := sg.column_table(c)) in nullable
-    }
+    )
+    present = _present_when_padded(sel, constrained=constrained, nullable=nullable)
     for sibling in disjuncts:
         if sibling is own:
             continue
-        sibling_cols = sg.find_columns(sibling)
-        if sibling_cols and not any(sg.column_table(c) in constrained for c in sibling_cols):
+        if any(sg.column_table(c) in present for c in sg.find_columns(sibling)):
             return True
     return False
+
+
+def _present_when_padded(
+    sel: exp.Select, *, constrained: frozenset[str], nullable: frozenset[str]
+) -> frozenset[str]:
+    """Aliases guaranteed present on the rows where every alias in ``constrained`` is
+    NULL-padded, so a disjunct referencing one of them genuinely keeps those rows alive.
+
+    A preserved-side alias (never NULL-padded, so absent from ``nullable``) is present on
+    every output row. The partner of a single FULL OUTER join is present exactly on the
+    rows where the other side is padded, since a full join populates one side per unmatched
+    row. An independent optional side carries no such guarantee, so a sibling resting on it
+    cannot rescue the drop.
+    """
+    present = set(_relation_aliases(sel) - nullable)
+    if constrained:
+        complements = _full_outer_complements(sel)
+        common = set(complements.get(next(iter(constrained)), frozenset()))
+        for table in constrained:
+            common &= complements.get(table, frozenset())
+        present |= common
+    return frozenset(present)
+
+
+def _relation_aliases(sel: exp.Select) -> frozenset[str]:
+    aliases: set[str] = set()
+    from_ = sg.from_of(sel)
+    if from_ is not None and from_.this is not None:
+        aliases.add(sg.name_of(from_.this))
+    for j in sg.joins_of(sel):
+        aliases.add(sg.name_of(j.this))
+    return frozenset(aliases)
+
+
+def _full_outer_complements(sel: exp.Select) -> dict[str, frozenset[str]]:
+    """The mutually-present partner of a single FULL OUTER join: when one side is padded
+    the other is populated. Scoped to a lone full join of two relations, the case where
+    the complement is sound; a chain of full joins can leave both sides padded on the same
+    row, so anything more complex yields no complement and the detector keeps firing.
+    """
+    joins = sg.joins_of(sel)
+    from_ = sg.from_of(sel)
+    if from_ is None or from_.this is None or len(joins) != 1:
+        return {}
+    if sg.join_side_of(joins[0]) is not JoinSide.FULL:
+        return {}
+    left, right = sg.name_of(from_.this), sg.name_of(joins[0].this)
+    return {left: frozenset({right}), right: frozenset({left})}
 
 
 def _path(col: exp.Column, until: Expr) -> Iterator[Expr]:
