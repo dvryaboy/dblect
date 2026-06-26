@@ -627,11 +627,13 @@ def surrogate_key_discoverer(
 #
 # The relation-algebra walk for candidate keys. It mirrors the column reducer's
 # job (turn a derivation into an inferred annotation, recursing into referenced
-# nodes) but over relation algebra: a FROM carries the source's keys, a JOIN keeps
-# the probe side's keys only when the joined-in side is unique on the join
-# columns, GROUP BY / DISTINCT introduce a key, UNION ALL keeps none, and the
-# projection remaps keys onto output names. Posture is silent-when-unproven: a
-# shape the walk does not model drops keys rather than over-claiming.
+# nodes) but over relation algebra: a FROM carries the source's keys; an INNER JOIN
+# keeps the probe side's keys when the joined-in side is unique on the join columns,
+# and carries the joined-in side's keys when the probe is (each side surviving when
+# the other cannot multiply it); GROUP BY / DISTINCT introduce a key, UNION ALL keeps
+# none, and the projection remaps keys onto output names. Posture is
+# silent-when-unproven: a shape the walk does not model drops keys rather than
+# over-claiming.
 
 # A column qualified by its FROM/JOIN source alias, tracked inside one scope so a
 # multi-source scope's join keys line up; the qualifier collapses to bare output
@@ -814,8 +816,12 @@ class _RelationWalk:
         joins = sg.joins_of(sel)
         joins_preserve = True
         for j in joins:
-            preserved = self._join_preserves(j, cte_scope=local)
-            combined = combined if preserved else frozenset[_QKey]()
+            resolved = (
+                self._resolve_source(j.this, cte_scope=local) if isinstance(j.this, Expr) else None
+            )
+            preserved = self._join_preserves(j, resolved=resolved)
+            survivors = self._joined_in_survivors(j, left_keys=combined, resolved=resolved)
+            combined = (combined if preserved else frozenset[_QKey]()) | survivors
             joins_preserve = joins_preserve and preserved
 
         group = sg.group_of(sel)
@@ -876,7 +882,7 @@ class _RelationWalk:
         # offset)`` when ``WITH OFFSET`` is present is a later precision refinement.
         return None
 
-    def _join_preserves(self, j: exp.Join, *, cte_scope: Mapping[str, _Carried]) -> bool:
+    def _join_preserves(self, j: exp.Join, *, resolved: tuple[str, _Carried] | None) -> bool:
         """Whether ``j`` cannot multiply the probe side's rows, so the probe side's
         keys (and any conditional keys riding with them) carry through unchanged.
 
@@ -887,10 +893,6 @@ class _RelationWalk:
         """
         if sg.join_side_of(j) is JoinSide.CROSS:
             return False  # explicit cartesian product: no key survives
-        target = j.this
-        if not isinstance(target, Expr):
-            return False
-        resolved = self._resolve_source(target, cte_scope=cte_scope)
         if resolved is None:
             return False
         r_alias, r_carried = resolved
@@ -903,6 +905,38 @@ class _RelationWalk:
         if right_join_cols is None:
             return False
         return any(k <= right_join_cols for k in r_carried.keys)
+
+    def _joined_in_survivors(
+        self, j: exp.Join, *, left_keys: frozenset[_QKey], resolved: tuple[str, _Carried] | None
+    ) -> frozenset[_QKey]:
+        """The keys the joined-in side contributes to an INNER join's result.
+
+        The mirror of :meth:`_join_preserves`: when the left side is unique on the join columns
+        (one of its surviving keys is covered by the left-side join columns), each joined-in row
+        matches at most one left row, so the joined-in side's keys hold on the result. Only an
+        INNER join qualifies, since an outer join NULL-pads the joined-in columns on unmatched
+        rows and the key no longer identifies them. ``left_keys`` are the keys of the result
+        built so far, so the rule composes across a chain of joins.
+        """
+        if sg.join_side_of(j) is not JoinSide.INNER:
+            return frozenset()
+        if resolved is None:
+            return frozenset()
+        t_alias, t_carried = resolved
+        if not t_carried.keys:
+            return frozenset()
+        on = sg.on_of(j)
+        if on is None:
+            return frozenset()
+        by_alias = sg.equality_cols_by_alias(on)
+        if by_alias is None:
+            return frozenset()
+        left_join_cols: set[_QCol] = {
+            (alias, col) for alias, cols in by_alias.items() if alias != t_alias for col in cols
+        }
+        if not any(k <= left_join_cols for k in left_keys):
+            return frozenset()
+        return _qualify(t_alias, t_carried.keys)
 
 
 def _qualify(alias: str, keys: frozenset[Key]) -> frozenset[_QKey]:

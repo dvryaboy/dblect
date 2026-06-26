@@ -41,7 +41,10 @@ from dblect.sql import (
     make_non_determinism_detector,
     parse_sql,
 )
-from dblect.uniqueness.detector import make_fact_grounded_detectors
+from dblect.uniqueness.detector import (
+    make_cross_model_fanout_detectors,
+    make_fact_grounded_detectors,
+)
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
@@ -162,6 +165,7 @@ def run_audit(
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(manifest, profile, parsed=trees),
+        *make_cross_model_fanout_detectors(manifest, profile, parsed=trees),
         *make_nullability_detectors(manifest, profile, parsed=trees),
         *make_snapshot_detectors(manifest),
     )
