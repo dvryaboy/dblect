@@ -208,6 +208,43 @@ def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> No
     assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
 
 
+def test_right_join_does_not_preserve_probe_keys() -> None:
+    """A RIGHT JOIN NULL-pads the probe (left) side on joined-in rows with no match, so the
+    probe key can repeat as NULL and does not survive, even when the joined-in side is unique
+    on the join column."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _model(
+            "model.shop.enriched",
+            "SELECT o.id, c.region FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
+        ),
+    )
+    assert keys["model.shop.enriched"] == CandidateKeySet.of()
+
+
+def test_full_join_does_not_preserve_probe_keys() -> None:
+    """A FULL JOIN NULL-pads both sides on unmatched rows, so neither side's key identifies
+    the result and no key survives."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _model(
+            "model.shop.enriched",
+            "SELECT o.id, c.region FROM orders o FULL JOIN customers c ON o.customer_id = c.id",
+        ),
+    )
+    assert keys["model.shop.enriched"] == CandidateKeySet.of()
+
+
 def test_join_drops_keys_when_joined_side_is_not_unique_on_the_key() -> None:
     """The joined-in side is not known unique on the join column, so the join can
     fan out and no key is proven."""
@@ -223,6 +260,64 @@ def test_join_drops_keys_when_joined_side_is_not_unique_on_the_key() -> None:
         ),
     )
     assert keys["model.shop.joined"] == CandidateKeySet.of()  # no key proven
+
+
+def test_inner_join_carries_joined_in_key_when_probe_is_unique_on_the_join_cols() -> None:
+    """The symmetric rule. ``orders`` is unique on the join column, so each ``order_items`` row
+    matches at most one order and the result is keyed at the line grain. The probe key
+    ``order_id`` does not survive (an order spans many items), so the joined-in ``item_id`` is
+    the proven key."""
+    orders = _source("source.shop.raw.orders")
+    items = _source("source.shop.raw.order_items")
+    keys = _keys(
+        orders,
+        items,
+        _unique("test.shop.o", column="order_id", target=orders.unique_id),
+        _unique("test.shop.i", column="item_id", target=items.unique_id),
+        _model(
+            "model.shop.lines",
+            "SELECT o.order_id, i.item_id FROM orders o "
+            "JOIN order_items i ON o.order_id = i.order_id",
+        ),
+    )
+    assert keys["model.shop.lines"] == CandidateKeySet.of(_key("item_id"))
+
+
+def test_left_join_does_not_carry_the_joined_in_key() -> None:
+    """An outer join NULL-pads the joined-in columns on unmatched probe rows, so ``item_id``
+    no longer identifies them and the rule must not fire."""
+    orders = _source("source.shop.raw.orders")
+    items = _source("source.shop.raw.order_items")
+    keys = _keys(
+        orders,
+        items,
+        _unique("test.shop.o", column="order_id", target=orders.unique_id),
+        _unique("test.shop.i", column="item_id", target=items.unique_id),
+        _model(
+            "model.shop.lines",
+            "SELECT o.order_id, i.item_id FROM orders o "
+            "LEFT JOIN order_items i ON o.order_id = i.order_id",
+        ),
+    )
+    assert keys["model.shop.lines"] == CandidateKeySet.of()
+
+
+def test_inner_join_drops_joined_in_key_when_probe_not_unique_on_the_join_cols() -> None:
+    """Without a known key on ``orders`` the probe is not proven unique on the join column, so
+    a single item could match several orders and ``item_id`` is not a proven key."""
+    orders = _source("source.shop.raw.orders")
+    items = _source("source.shop.raw.order_items")
+    keys = _keys(
+        orders,
+        items,
+        _unique("test.shop.i", column="item_id", target=items.unique_id),
+        _model(
+            "model.shop.lines",
+            "SELECT o.order_id, i.item_id FROM orders o "
+            "JOIN order_items i ON o.order_id = i.order_id",
+        ),
+    )
+    assert keys["model.shop.lines"] == CandidateKeySet.of()
 
 
 def test_union_all_proves_no_key() -> None:

@@ -84,6 +84,7 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
             | FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS
             | FindingKind.JOIN_FANOUT
+            | FindingKind.CROSS_MODEL_FANOUT
             | FindingKind.NULL_GROUP_ON_NULLABLE_KEY
             | FindingKind.JOIN_ON_NULLABLE_KEY
             | FindingKind.NOT_IN_NULLABLE_SUBQUERY
