@@ -188,3 +188,28 @@ def test_no_known_origin_grain_is_silent() -> None:
         schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
     )
     assert _findings(manifest, _MART) == ()
+
+
+def test_local_cte_shadowing_the_relation_is_silent() -> None:
+    """The consumer's own WITH defines a CTE named like the model, so the FROM reads that
+    per-query scope, which the propagator does not annotate, and the detector stays silent."""
+    mart_sql = (
+        "WITH stg_order_items AS (SELECT order_id, 1 AS amount FROM orders) "
+        "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
+    )
+    manifest = _shop(items_unique_on=None, mart_sql=mart_sql)
+    assert _findings(manifest, _MART) == ()
+
+
+def test_unrelated_nested_cte_does_not_shadow_a_real_read() -> None:
+    """A CTE named like the fanned-out relation but declared only inside an unrelated nested
+    scope does not silence the genuine read of that relation in the outer query: CTE shadowing
+    is lexical, not tree-wide."""
+    mart_sql = (
+        "WITH unrelated AS ("
+        "WITH stg_order_items AS (SELECT 1 AS x) SELECT x FROM stg_order_items"
+        ") "
+        "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
+    )
+    manifest = _shop(items_unique_on=None, mart_sql=mart_sql)
+    assert [f.kind for f in _findings(manifest, _MART)] == [FindingKind.CROSS_MODEL_FANOUT]

@@ -31,7 +31,7 @@ from sqlglot import Expr
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.model import Annotation
-from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceKind, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
@@ -187,11 +187,34 @@ def detect_join_fanout(
     return tuple(out)
 
 
+# The relation graph and the uniqueness annotations propagated over it. The fact-grounded
+# and cross-model fan-out factories both rest on this pair, so an audit computes it once and
+# threads it into both rather than re-running the fixpoint per factory.
+RelationUniqueness = tuple[RelationLineageGraph, Mapping[SourceRef, Annotation[CandidateKeySet]]]
+
+
+def relation_uniqueness(
+    manifest: Manifest, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
+) -> RelationUniqueness:
+    """Build the relation graph and propagate the uniqueness property over it.
+
+    ``propagate`` memoizes only within a single call, so the two detector factories that need
+    this pair would otherwise each rebuild the graph and re-run the whole-manifest uniqueness
+    fixpoint. :func:`dblect.audit.walker.run_audit` computes it once and passes it to both;
+    a standalone caller that omits it gets a fresh propagation. ``parsed`` shares the audit's
+    already-parsed trees so the graph build does not re-parse.
+    """
+    graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    keys = propagate(graph, uniqueness_property(manifest, profile, parsed=parsed))
+    return graph, keys
+
+
 def make_fact_grounded_detectors(
     manifest: Manifest,
     profile: AdapterProfile,
     *,
     parsed: Mapping[str, Expr] | None = None,
+    relation_keys: RelationUniqueness | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against substrate-derived keys.
 
@@ -203,9 +226,14 @@ def make_fact_grounded_detectors(
 
     ``profile`` is the run's resolved target: its dialect parses the graph and its
     semantics ground the uniqueness keys, so parsing and enforcement agree.
+    ``relation_keys`` lets the audit pass an already-propagated graph/keys pair (see
+    :func:`relation_uniqueness`) so the fixpoint is not re-run.
     """
-    graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    keys = propagate(graph, uniqueness_property(manifest, profile, parsed=parsed))
+    graph, keys = (
+        relation_keys
+        if relation_keys is not None
+        else relation_uniqueness(manifest, profile, parsed=parsed)
+    )
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every
@@ -216,9 +244,9 @@ def make_fact_grounded_detectors(
     conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
     flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
     activated = activate_conditional(keys, flow)
-    model_keys = _by_name(manifest, activated, lambda cks: cks.keys)
-    conditional_by_name = _by_name(manifest, keys, lambda ann: ann.value.conditional)
-    flow_by_name = _by_name(manifest, flow, lambda ann: ann.value)
+    model_keys = _by_name(manifest, activated, lambda _ref, cks: cks.keys)
+    conditional_by_name = _by_name(manifest, keys, lambda _ref, ann: ann.value.conditional)
+    flow_by_name = _by_name(manifest, flow, lambda _ref, ann: ann.value)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -275,12 +303,14 @@ def detect_cross_model_fanout(
     Silent when the FROM is not a single ref'd relation (a join or a CTE/subquery needs
     column-level reasoning kept for later), when the aggregate is duplicate-safe, and when the
     origin relation has no known key, the firewall posture: with no grain to name there is no
-    positive fact to fire on.
+    positive fact to fire on. Also silent on a star-argument fold (``COUNT(*)``): it names no
+    column, so there is no magnitude to trace to an origin grain. A star count over a
+    fanned-out relation does double count, so closing that gap (it needs the relation's own
+    row grain rather than a traced origin) is tracked as future work, not handled here.
     """
-    cte_names = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        ref = _single_from_ref(sel, name_to_ref, cte_names)
+        ref = _single_from_ref(sel, name_to_ref)
         if ref is None:
             continue
         rel_prov = provenance_by_source.get(ref, {})
@@ -313,22 +343,28 @@ def make_cross_model_fanout_detectors(
     profile: AdapterProfile,
     *,
     parsed: Mapping[str, Expr] | None = None,
+    relation_keys: RelationUniqueness | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the cross-model fan-out detector against two propagated properties.
 
     Uniqueness comes from the relation graph (which relation is keyed at which grain) and
     where-provenance from the column graph (which source a magnitude traces to). Both are
     propagated once over the whole manifest; ``parsed`` shares the audit's already-parsed
-    trees so neither graph re-parses.
+    trees so neither graph re-parses. ``relation_keys`` lets the audit pass the
+    already-propagated uniqueness (see :func:`relation_uniqueness`) so the fixpoint, also
+    needed by :func:`make_fact_grounded_detectors`, is not run twice.
     """
-    rel_graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    keys = propagate(rel_graph, uniqueness_property(manifest, profile, parsed=parsed))
+    _, keys = (
+        relation_keys
+        if relation_keys is not None
+        else relation_uniqueness(manifest, profile, parsed=parsed)
+    )
     keys_by_source: dict[SourceRef, CandidateKeySet] = {ref: ann.value for ref, ann in keys.items()}
 
     col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
     provenance = propagate(col_graph, where_provenance)
     provenance_by_source = _provenance_by_source(provenance)
-    name_to_ref = _name_to_ref(manifest, keys_by_source)
+    name_to_ref = _by_name(manifest, keys_by_source, lambda ref, _v: ref)
 
     def fanout(tree: Expr) -> tuple[Finding, ...]:
         return detect_cross_model_fanout(
@@ -342,14 +378,14 @@ def make_cross_model_fanout_detectors(
     return (fanout,)
 
 
-def _single_from_ref(
-    sel: exp.Select, name_to_ref: NameToRef, cte_names: frozenset[str] | set[str]
-) -> SourceRef | None:
+def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | None:
     """The ``SourceRef`` of ``sel``'s FROM when it is a single ref'd relation with no joins.
 
     A join or a non-table FROM (subquery) needs column-level reasoning we keep for later, and
-    a name shadowed by a local CTE is a per-query scope the propagator does not annotate, so
-    all three return ``None`` and the detector stays silent.
+    a name shadowed by a CTE in ``sel``'s lexical scope is a per-query scope the propagator
+    does not annotate, so all three return ``None`` and the detector stays silent. CTE
+    resolution uses :func:`_cte_body_for`, walking the enclosing WITH chain outward, so a name
+    defined only as a CTE in an unrelated sibling scope does not shadow a genuine relation read.
     """
     if sg.joins_of(sel):
         return None
@@ -357,7 +393,7 @@ def _single_from_ref(
     if from_ is None or not isinstance(from_.this, exp.Table):
         return None
     name = from_.this.name
-    if name in cte_names:
+    if _cte_body_for(name, sel) is not None:
         return None
     return name_to_ref.get(name)
 
@@ -439,28 +475,12 @@ def _provenance_by_source(
     return by_source
 
 
-def _name_to_ref(manifest: Manifest, refs: KeysBySource) -> dict[str, SourceRef]:
-    """Index every annotated relation's ``SourceRef`` by the name it carries in compiled SQL,
-    mirroring :func:`_by_name`: a source under ``identifier or name``, a model under ``name``,
-    models winning a collision (a ``ref`` resolves to the model)."""
-    by_name: dict[str, SourceRef] = {}
-    models: dict[str, SourceRef] = {}
-    for ref in refs:
-        node = manifest.nodes.get(ref.unique_id)
-        if node is None:
-            continue
-        target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = ref
-    by_name.update(models)
-    return by_name
-
-
 _V = TypeVar("_V")
 _R = TypeVar("_R")
 
 
 def _by_name(
-    manifest: Manifest, anns: Mapping[SourceRef, _V], extract: Callable[[_V], _R]
+    manifest: Manifest, anns: Mapping[SourceRef, _V], extract: Callable[[SourceRef, _V], _R]
 ) -> dict[str, _R]:
     """Index a per-relation value by the relation name as it appears in compiled SQL.
 
@@ -469,8 +489,9 @@ def _by_name(
     a model resolves under ``name``. This must match the relation-graph builder's
     ``_build_name_to_source`` so a name the detectors look up by lands on the same
     relation the propagation annotated. Models win over sources on a name collision
-    (applied last), matching how a ``ref`` resolves. ``extract`` pulls the field the
-    caller wants (keys, conditional keys, or flow) from each annotation.
+    (applied last), matching how a ``ref`` resolves. ``extract`` pulls the value the
+    caller wants (keys, conditional keys, flow, or the ``SourceRef`` itself) from each
+    relation's ``(ref, annotation)`` pair.
     """
     by_name: dict[str, _R] = {}
     models: dict[str, _R] = {}
@@ -479,7 +500,7 @@ def _by_name(
         if node is None:
             continue
         target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = extract(value)
+        target[node.identifier or node.name] = extract(ref, value)
     by_name.update(models)
     return by_name
 

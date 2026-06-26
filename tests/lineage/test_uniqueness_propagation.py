@@ -208,6 +208,43 @@ def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> No
     assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
 
 
+def test_right_join_does_not_preserve_probe_keys() -> None:
+    """A RIGHT JOIN NULL-pads the probe (left) side on joined-in rows with no match, so the
+    probe key can repeat as NULL and does not survive, even when the joined-in side is unique
+    on the join column."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _model(
+            "model.shop.enriched",
+            "SELECT o.id, c.region FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
+        ),
+    )
+    assert keys["model.shop.enriched"] == CandidateKeySet.of()
+
+
+def test_full_join_does_not_preserve_probe_keys() -> None:
+    """A FULL JOIN NULL-pads both sides on unmatched rows, so neither side's key identifies
+    the result and no key survives."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _model(
+            "model.shop.enriched",
+            "SELECT o.id, c.region FROM orders o FULL JOIN customers c ON o.customer_id = c.id",
+        ),
+    )
+    assert keys["model.shop.enriched"] == CandidateKeySet.of()
+
+
 def test_join_drops_keys_when_joined_side_is_not_unique_on_the_key() -> None:
     """The joined-in side is not known unique on the join column, so the join can
     fan out and no key is proven."""

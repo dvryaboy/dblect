@@ -44,6 +44,7 @@ from dblect.sql import (
 from dblect.uniqueness.detector import (
     make_cross_model_fanout_detectors,
     make_fact_grounded_detectors,
+    relation_uniqueness,
 )
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
@@ -162,10 +163,13 @@ def run_audit(
     """
     parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
+    # The fact-grounded and cross-model fan-out factories both rest on the relation graph's
+    # propagated uniqueness; propagate it once and share it so the fixpoint runs a single time.
+    rel_keys = relation_uniqueness(manifest, profile, parsed=trees)
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
-        *make_fact_grounded_detectors(manifest, profile, parsed=trees),
-        *make_cross_model_fanout_detectors(manifest, profile, parsed=trees),
+        *make_fact_grounded_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
+        *make_cross_model_fanout_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
         *make_nullability_detectors(manifest, profile, parsed=trees),
         *make_snapshot_detectors(manifest),
     )
