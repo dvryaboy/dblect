@@ -490,6 +490,54 @@ def test_spark_explode_outer_variants(sql: str, expected: int) -> None:
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "spark"))) == expected
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The wide-to-long pivot idiom: a constructed array of N literal structs is never
+        # empty, so the cross join drops no parent row.
+        "select t.id, m.metric_name, m.metric_value from t, "
+        "unnest(array[struct('clicks' as metric_name, t.clicks as metric_value), "
+        "struct('impressions' as metric_name, t.impressions as metric_value)]) as m",
+        "select t.id, x from t cross join unnest(array[1, 2, 3]) as x",
+    ],
+)
+def test_inner_unnest_of_nonempty_literal_array_not_flagged(sql: str) -> None:
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "bigquery")) == ()
+
+
+def test_inner_unnest_of_empty_literal_array_still_flagged() -> None:
+    # An empty constructor carries no non-emptiness guarantee (degenerate, but pinned).
+    sql = "select t.id, x from t cross join unnest(array[]) as x"
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
+
+
+def test_inner_unnest_of_array_subquery_still_flagged() -> None:
+    # ARRAY(SELECT ...) also parses to exp.Array, but the subquery may return zero rows, so
+    # the array can be empty and the parent row can still drop.
+    sql = "select t.id, x from t cross join unnest(array(select v from u where u.id = t.id)) as x"
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
+
+
+def test_inner_unnest_of_column_still_flagged_without_a_map() -> None:
+    # A column array's non-emptiness needs the propagated property; the bare structural
+    # detector cannot prove it and keeps firing.
+    sql = "select t.id, x from t cross join unnest(t.arr) as x"
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
+
+
+def test_inner_unnest_of_column_cleared_by_model_nonempty_map() -> None:
+    sql = "select s.id, x from stg s cross join unnest(s.tags) as x"
+    tree = _parse_d(sql, "bigquery")
+    assert len(detect_inner_flatten_row_drop(tree)) == 1
+    assert detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})}) == ()
+
+
+def test_model_nonempty_map_only_clears_the_named_column() -> None:
+    sql = "select s.id, x from stg s cross join unnest(s.other) as x"
+    tree = _parse_d(sql, "bigquery")
+    assert len(detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})})) == 1
+
+
 def test_plain_cross_join_of_tables_not_flagged() -> None:
     # A cartesian product of two relations is not an array flatten; not our hazard.
     sql = "select * from a cross join b"

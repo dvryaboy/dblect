@@ -25,6 +25,7 @@ from sqlglot import Expr
 from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import apply, parse_directives
+from dblect.flatten.detector import make_array_nonemptiness_detectors
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
@@ -33,7 +34,6 @@ from dblect.sql import (
     FindingKind,
     SQLParseError,
     detect_coalesce_on_join_key,
-    detect_inner_flatten_row_drop,
     detect_null_group_after_outer_join,
     detect_unordered_aggregate,
     detect_unordered_window,
@@ -51,14 +51,16 @@ Detector = Callable[[Expr], tuple[Finding, ...]]
 
 # The dialect-agnostic structural detectors. Context-bound detectors (non-determinism
 # from the resolved adapter, uniqueness and nullability grounded against declared
-# facts) are built per run in `run_audit` and appended there, so they are not listed.
+# facts, inner-flatten grounded against propagated array non-emptiness) are built per
+# run in `run_audit` and appended there, so they are not listed. The inner-flatten check
+# in particular is run only through its fact-grounded factory so it sees the cross-model
+# non-emptiness map; listing the structural form here too would double-report it.
 DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
     detect_unordered_window,
     detect_unordered_aggregate,
     detect_where_on_outer_joined_nullable,
-    detect_inner_flatten_row_drop,
 )
 
 
@@ -151,7 +153,9 @@ def run_audit(
     order-keys and join-fanout detectors (grounded against declared keys), the
     nullability hazard detectors (GROUP BY, join key, and NOT IN on an
     inherited-nullable column, grounded against the propagated nullability
-    property), and the snapshot temporal-filter detector (grounded against the
+    property), the inner-flatten row-drop detector (grounded against the
+    propagated array-non-emptiness property, so a rebuilt-then-unnested array is
+    not flagged), and the snapshot temporal-filter detector (grounded against the
     manifest's snapshots and their validity columns). The fact-grounded ones are
     opportunistic, silent on projects that declare nothing, so they need no opt-in
     flag. They share the audit's pre-parsed trees, so the SQL is parsed once.
@@ -171,6 +175,7 @@ def run_audit(
         *make_fact_grounded_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
         *make_cross_model_fanout_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
         *make_nullability_detectors(manifest, profile, parsed=trees),
+        *make_array_nonemptiness_detectors(manifest, profile, parsed=trees),
         *make_snapshot_detectors(manifest),
     )
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *contextual)

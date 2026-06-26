@@ -14,6 +14,10 @@ dispatches it with no global registration step.
 """
 
 from dblect.lineage.properties.aggregation_depth import aggregation_depth
+from dblect.lineage.properties.array_nonemptiness import (
+    ArrayNonEmpty,
+    array_nonemptiness,
+)
 from dblect.lineage.properties.domain_type import (
     CONFLICT,
     NAKED,
@@ -52,6 +56,7 @@ __all__ = [
     "CONFLICT",
     "FD",
     "NAKED",
+    "ArrayNonEmpty",
     "CandidateKeySet",
     "Concrete",
     "Dimension",
@@ -61,6 +66,7 @@ __all__ = [
     "PerRow",
     "Tagged",
     "aggregation_depth",
+    "array_nonemptiness",
     "determines",
     "domain_type_grounding",
     "domain_type_property",

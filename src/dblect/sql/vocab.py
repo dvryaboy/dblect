@@ -12,6 +12,22 @@ from __future__ import annotations
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+
+def array_literal_nonempty(expr: Expr) -> bool:
+    """True when ``expr`` is an array constructor with one or more constructed elements,
+    which cannot be empty.
+
+    ``ARRAY[e1, ..., en]`` and ``ARRAY(e1, ..., en)`` both parse to ``exp.Array`` with the
+    elements as ``expressions``, so a non-empty element list is a provably non-empty array.
+    The ``ARRAY(SELECT ...)`` array-subquery form parses to ``exp.Array`` too, but its single
+    element is a query that may return zero rows, so it carries no guarantee and disqualifies
+    the array. Used by both the ``array_nonemptiness`` property and the inner-flatten detector
+    so the two read the literal-array idiom the same way."""
+    if not isinstance(expr, exp.Array) or not expr.expressions:
+        return False
+    return not any(isinstance(e, exp.Query) for e in expr.expressions)
+
+
 # --- surrogate-hash grammar --------------------------------------------------
 #
 # The typed-node vocabulary for recognizing a surrogate-hash key: a hash of a

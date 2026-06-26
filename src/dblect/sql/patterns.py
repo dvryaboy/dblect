@@ -20,7 +20,7 @@ with the per-finding ignore syntax).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -31,6 +31,7 @@ from sqlglot import Expr
 from dblect.sql import _sqlglot as sg
 from dblect.sql import guards
 from dblect.sql._sqlglot import JoinSide
+from dblect.sql.vocab import array_literal_nonempty
 
 if TYPE_CHECKING:
     # Referenced only in ``suppression_hint``'s signature; imported under
@@ -484,7 +485,9 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
     return tuple(out)
 
 
-def detect_inner_flatten_row_drop(tree: Expr) -> tuple[Finding, ...]:
+def detect_inner_flatten_row_drop(
+    tree: Expr, *, model_nonempty: Mapping[str, frozenset[str]] | None = None
+) -> tuple[Finding, ...]:
     """Flag an inner array-flatten arm (``UNNEST``/``explode``/``flatten``) that drops the
     parent row when the array is empty or NULL.
 
@@ -497,7 +500,15 @@ def detect_inner_flatten_row_drop(tree: Expr) -> tuple[Finding, ...]:
     FLATTEN(... OUTER => TRUE)``, spark ``LATERAL VIEW OUTER explode(...)``), which is
     silent. The construct parses dialect-specifically, so the detector reads the structural
     shape sqlglot produces rather than the surface syntax.
+
+    An ``UNNEST`` whose argument is provably non-empty drops no row, so it is silent too.
+    A literal ``ARRAY[...]`` constructor with one or more elements is the local, always-on
+    case (the wide-to-long pivot idiom). When ``model_nonempty`` is supplied (per relation
+    name, the output columns the ``array_nonemptiness`` property proved non-empty), an
+    ``UNNEST`` of a column that resolves to one of those columns is cleared as well, so a
+    rebuilt-then-unnested array carried across a model boundary stays quiet.
     """
+    cte_names = {sg.name_of(cte).lower() for cte in tree.find_all(exp.CTE)}
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         for j in sg.joins_of(sel):
@@ -505,6 +516,8 @@ def detect_inner_flatten_row_drop(tree: Expr) -> tuple[Finding, ...]:
             if kernel is None:
                 continue
             if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_preserves_rows(kernel):
+                continue
+            if _unnest_arg_provably_nonempty(kernel, sel, model_nonempty, cte_names):
                 continue
             out.append(_inner_flatten_finding(j))
         for lat in sg.laterals_of(sel):
@@ -691,6 +704,73 @@ def _has_outer_kwarg(fn: Expr) -> bool:
             value = kw.expression
             return value.this if isinstance(value, exp.Boolean) else value is not None
     return False
+
+
+def _unnest_arg_provably_nonempty(
+    kernel: Expr,
+    sel: exp.Select,
+    model_nonempty: Mapping[str, frozenset[str]] | None,
+    cte_names: set[str],
+) -> bool:
+    """True when every array ``kernel`` unnests is provably non-empty, so no parent row drops.
+
+    Only the ``UNNEST`` spelling carries its array arguments where we can read them; the
+    ``explode``/``flatten`` function forms wrap the array in dialect-specific ways and are
+    left to the outer-form check. ``UNNEST(a, b)`` zips several arrays, every one of which
+    must be non-empty for the row to survive."""
+    if not isinstance(kernel, exp.Unnest):
+        return False
+    args = [a for a in kernel.expressions if isinstance(a, Expr)]
+    if not args:
+        return False
+    return all(_array_expr_nonempty(a, sel, model_nonempty, cte_names) for a in args)
+
+
+def _array_expr_nonempty(
+    arg: Expr,
+    sel: exp.Select,
+    model_nonempty: Mapping[str, frozenset[str]] | None,
+    cte_names: set[str],
+) -> bool:
+    """Whether one unnested expression is provably non-empty.
+
+    A literal ``ARRAY[...]`` with one or more constructed elements is non-empty by
+    construction (the always-on local case). A column is non-empty when it resolves to a
+    relation read in ``sel`` whose ``model_nonempty`` set lists it; a column qualified by a
+    CTE in scope is local scaffolding the propagated map does not address, so it is not
+    cleared here."""
+    if array_literal_nonempty(arg):
+        return True
+    if model_nonempty is None or not isinstance(arg, exp.Column):
+        return False
+    relation = _column_relation_name(arg, sel)
+    if relation is None or relation.lower() in cte_names:
+        return False
+    return sg.column_name(arg) in model_nonempty.get(relation, frozenset())
+
+
+def _column_relation_name(col: exp.Column, sel: exp.Select) -> str | None:
+    """The relation name a column reads from in ``sel``: its qualifier resolved through the
+    scope's FROM/JOIN tables, or the sole table when the column is unqualified. ``None`` when
+    the qualifier names no table arm or the unqualified scope reads more than one relation."""
+    relations = _relation_names(sel)
+    qualifier = sg.column_table(col)
+    if qualifier is not None:
+        return relations.get(qualifier.lower())
+    return next(iter(relations.values())) if len(relations) == 1 else None
+
+
+def _relation_names(sel: exp.Select) -> dict[str, str]:
+    """Map each table arm's alias-or-name (case-folded) to its relation name, skipping the
+    flatten arms themselves so an ``UNNEST`` does not shadow the relation it draws from."""
+    out: dict[str, str] = {}
+    from_ = sg.from_of(sel)
+    if from_ is not None and isinstance(from_.this, exp.Table):
+        out[from_.this.alias_or_name.lower()] = from_.this.name
+    for j in sg.joins_of(sel):
+        if isinstance(j.this, exp.Table):
+            out[j.this.alias_or_name.lower()] = j.this.name
+    return out
 
 
 def _inner_flatten_finding(node: Expr) -> Finding:
