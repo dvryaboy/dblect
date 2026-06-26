@@ -40,7 +40,7 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
-from dblect.sql import Finding, FindingKind
+from dblect.sql import Finding, FindingKind, duplicate_sensitive
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -111,12 +111,22 @@ def detect_join_fanout(
     *,
     model_keys: ModelKeys,
     scope_index: ScopeIndex | None = None,
+    duplicate_safe_builtins: frozenset[str] = frozenset(),
 ) -> tuple[Finding, ...]:
     """Flag JOINs whose joined-in side has keys that don't cover the join.
 
     For each JOIN whose joined-in side resolves to keys (an in-scope CTE or a
     ref'd model), we ask whether any known key fits within the right-side equality
     predicate columns. If yes, the join cannot multiply rows. If no, we flag.
+
+    The finding is suppressed when the fan-out is collapsed in the same query before
+    any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
+    scope whose every aggregate is duplicate-safe (``max``, ``min``, ``any_value``, the
+    boolean folds, a ``DISTINCT`` aggregate). The row multiplication cannot then change
+    any output value, so the structurally-real fan-out is not an output hazard (issue
+    #170). A ``sum``/``count``/``avg`` over the joined rows, or a raw passthrough with no
+    grouping, keeps it firing. ``duplicate_safe_builtins`` lets the adapter name UDF
+    aggregates the duplicate-sensitivity predicate would otherwise treat as sensitive.
 
     Silent when the joined-in side has no known keys, when the ON predicate is not
     a conjunction of equalities between bare columns with exactly one side on the
@@ -146,6 +156,8 @@ def detect_join_fanout(
             if not joined_cols:
                 continue
             if any(k <= joined_cols for k in target_keys):
+                continue
+            if _collapsed_before_sensitive_consumer(sel, safe_builtins=duplicate_safe_builtins):
                 continue
             sample_keys = ", ".join(sorted(joined_cols))
             known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in target_keys)
@@ -214,7 +226,12 @@ def make_fact_grounded_detectors(
         )
 
     def fanout(tree: Expr) -> tuple[Finding, ...]:
-        return detect_join_fanout(tree, model_keys=model_keys, scope_index=scope_index(tree))
+        return detect_join_fanout(
+            tree,
+            model_keys=model_keys,
+            scope_index=scope_index(tree),
+            duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
+        )
 
     return (window_keys, fanout)
 
@@ -323,6 +340,70 @@ def _cte_body_for(name: str, sel: exp.Select) -> Expr | None:
                         return body if isinstance(body, Expr) else None
         node = node.parent
     return None
+
+
+def _collapsed_before_sensitive_consumer(sel: exp.Select, *, safe_builtins: frozenset[str]) -> bool:
+    """True when ``sel``'s GROUP BY collapses any fan-out before a duplicate-sensitive
+    consumer reads the multiplied rows.
+
+    After a GROUP BY the output is one row per group, so a row multiplication changes an
+    output value only through a duplicate-sensitive aggregate (``sum``, ``count``,
+    ``array_agg``: it folds the duplicated rows). The collapse clears only when every
+    aggregate consumer of the grouped rows (a projection or a HAVING term) is positively
+    known to be duplicate-safe: an idempotent fold, a ``DISTINCT`` aggregate, or a UDF the
+    adapter named in ``safe_builtins``. An aggregate UDF sqlglot leaves as ``exp.Anonymous``
+    is sensitive by default, so an unknown fold keeps the finding firing. A scope with no
+    GROUP BY (the fan-out flows straight to the rows) is never collapsed here. Only
+    projections and HAVING are scanned; a function in a GROUP BY key or the join's own ON
+    clause is not a consumer of the multiplied rows.
+
+    Two scoping rules keep the consumer set honest. A node is read only when it belongs to
+    ``sel`` itself, never a nested sub-SELECT, whose aggregate folds different rows. And an
+    ``exp.Anonymous`` call is weighed as a possible aggregate only when it reads a column
+    outside the grouping keys: a function over grouping keys alone is a grouped scalar
+    projection (valid SQL guarantees grouped non-aggregates), constant within a group, so a
+    fan-out that duplicates rows cannot move it. A typed aggregate is always weighed, since
+    even ``sum`` of a grouping key scales with the duplicated row count.
+    """
+    if sg.group_of(sel) is None:
+        return False
+    group_keys = _group_key_columns(sel)
+    consumers: list[Expr] = list(sel.expressions)
+    having = sel.args.get("having")
+    if isinstance(having, exp.Having) and isinstance(having.this, Expr):
+        consumers.append(having.this)
+    for root in consumers:
+        for node in root.walk():
+            if not isinstance(node, exp.AggFunc | exp.Anonymous):
+                continue
+            if node.find_ancestor(exp.Select) is not sel:
+                continue
+            if isinstance(node, exp.Anonymous) and not _reads_outside_grouping(node, group_keys):
+                continue
+            if duplicate_sensitive(node, safe_builtins=safe_builtins):
+                return False
+    return True
+
+
+def _group_key_columns(sel: exp.Select) -> frozenset[tuple[str | None, str]]:
+    """The ``(qualifier, name)`` of every column in ``sel``'s GROUP BY keys."""
+    group = sg.group_of(sel)
+    if group is None:
+        return frozenset()
+    return frozenset(
+        (sg.column_table(c), sg.column_name(c))
+        for e in group.expressions
+        for c in sg.find_columns(e)
+    )
+
+
+def _reads_outside_grouping(node: Expr, group_keys: frozenset[tuple[str | None, str]]) -> bool:
+    """True if ``node`` references a column that is not a grouping key. A call reading only
+    grouping keys (or no column at all) cannot fold multiplied rows: its value is fixed
+    within a group."""
+    return any(
+        (sg.column_table(c), sg.column_name(c)) not in group_keys for c in sg.find_columns(node)
+    )
 
 
 def _window_is_in_scope(w: exp.Window, sel: exp.Select) -> bool:

@@ -283,6 +283,94 @@ def test_fanout_finding_carries_join_line() -> None:
     assert findings[0].line_start == 3
 
 
+# --- fan-out collapsed in-query before a sensitive consumer (#170) ---
+
+
+def test_fanout_silent_when_collapsed_by_group_with_insensitive_aggregate() -> None:
+    # The fan-out is real, but `group by` collapses it and the only consumer of the
+    # joined rows is `max`, which is duplicate-insensitive. No output hazard.
+    parsed = _parse(
+        "select f.id, f.entity, max(d.seen_at) as last_seen "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id, f.entity"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_flagged_when_group_feeds_a_sensitive_aggregate() -> None:
+    # `sum` folds the duplicated rows, so the grouping does not rescue it: still a hazard.
+    parsed = _parse(
+        "select f.id, sum(f.amount) as total "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.JOIN_FANOUT
+
+
+def test_fanout_silent_when_collapsed_group_uses_distinct_aggregate() -> None:
+    # count(distinct ...) deduplicates, so the fan-out cannot change it.
+    parsed = _parse(
+        "select f.id, count(distinct d.kind) as kinds "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_flagged_without_grouping_even_with_only_insensitive_aggregate() -> None:
+    # No GROUP BY: the multiplied rows flow straight to the output, so a windowed or
+    # ungrouped read is not collapsed. Raw passthrough keeps the finding firing.
+    parsed = _parse("select f.id, d.seen_at from facts f join dim d on f.segment = d.segment")
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert len(findings) == 1
+
+
+def test_fanout_unknown_udf_aggregate_keeps_firing_unless_declared_idempotent() -> None:
+    parsed = _parse(
+        "select f.id, geo_mean(d.v) as gm "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id"
+    )
+    # An unrecognized UDF aggregate is duplicate-sensitive by default, so the fan-out fires.
+    assert len(detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))) == 1
+    # The adapter naming it duplicate-safe clears the collapse.
+    cleared = detect_join_fanout(
+        parsed,
+        model_keys=_model_keys(dim=(("id",),)),
+        duplicate_safe_builtins=frozenset({"geo_mean"}),
+    )
+    assert cleared == ()
+
+
+def test_fanout_silent_when_scalar_udf_reads_only_grouping_keys() -> None:
+    # `fmt_region(f.region)` is a scalar function over a grouping key, constant within a
+    # group, so it cannot fold the multiplied rows. The only real aggregate is `max`
+    # (duplicate-safe), so the grouping collapses the fan-out: no output hazard.
+    parsed = _parse(
+        "select f.id, fmt_region(f.region) as region, max(d.x) as mx "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id, f.region"
+    )
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
+def test_fanout_collapse_ignores_aggregate_in_nested_subquery() -> None:
+    # The `sum(o.amt)` aggregate folds rows of `other` in a correlated subquery, a separate
+    # scope; it is not a consumer of the multiplied join rows. The outer grouping with only
+    # `max` collapses the fan-out.
+    parsed = _parse(
+        "select f.id, max(d.x) as mx, "
+        "(select sum(o.amt) from other o where o.id = f.id) as s "
+        "from facts f join dim d on f.segment = d.segment "
+        "group by f.id"
+    )
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
 # --- end-to-end key resolution through make_fact_grounded_detectors ----------
 #
 # The direct-call tests above hand the detector a ``model_keys`` map keyed the way

@@ -12,7 +12,12 @@ from __future__ import annotations
 import sqlglot
 import sqlglot.expressions as exp
 
-from dblect.sql import AggregateBehavior, aggregate_behavior
+from dblect.sql import (
+    AggregateBehavior,
+    aggregate_behavior,
+    duplicate_sensitive,
+    strips_duplicates,
+)
 
 
 def _agg(call: str) -> exp.AggFunc:
@@ -71,3 +76,39 @@ def test_lookup_walks_the_mro() -> None:
         pass
 
     assert aggregate_behavior(_MySum(this=exp.column("x"))) is AggregateBehavior.COMBINE
+
+
+# --- Multiplicity axis: idempotency and duplicate-sensitivity (hazard-algebra) ---
+
+
+def test_combining_and_counting_aggregates_are_duplicate_sensitive() -> None:
+    # A fan-out that duplicates rows distorts these: sum doubles, count over-counts,
+    # array_agg gathers the dupes, bit_xor cancels them.
+    for call in ("sum(x)", "avg(x)", "count(x)", "count(*)", "array_agg(x)", "bit_xor(x)"):
+        assert duplicate_sensitive(_agg(call)), call
+
+
+def test_duplicate_safe_aggregates_are_not_duplicate_sensitive() -> None:
+    # A duplicated row leaves the result unchanged (an idempotent combine, or a stable
+    # selection), so a fan-out into these is harmless.
+    for call in ("max(x)", "min(x)", "any_value(x)", "bool_and(x)", "bool_or(x)", "bit_and(x)"):
+        assert not duplicate_sensitive(_agg(call)), call
+
+
+def test_distinct_strips_duplicates_so_not_sensitive() -> None:
+    # count(distinct x) / sum(distinct x) deduplicate before folding, so a fan-out that
+    # only duplicates rows cannot change the result.
+    for call in ("count(distinct x)", "sum(distinct x)"):
+        assert strips_duplicates(_agg(call)), call
+        assert not duplicate_sensitive(_agg(call)), call
+    assert not strips_duplicates(_agg("sum(x)"))
+
+
+def test_unclassified_anonymous_aggregate_defaults_to_sensitive() -> None:
+    # An unrecognized UDF aggregate keeps a fan-out firing (the firewall default),
+    # unless the adapter names it duplicate-safe.
+    tree = sqlglot.parse_one("SELECT geometric_mean(x) AS v FROM t GROUP BY k", dialect="duckdb")
+    udf = tree.find(exp.Anonymous)
+    assert udf is not None
+    assert duplicate_sensitive(udf)
+    assert not duplicate_sensitive(udf, safe_builtins=frozenset({"geometric_mean"}))
