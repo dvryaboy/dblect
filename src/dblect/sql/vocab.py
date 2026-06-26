@@ -17,15 +17,20 @@ def array_literal_nonempty(expr: Expr) -> bool:
     """True when ``expr`` is an array constructor with one or more constructed elements,
     which cannot be empty.
 
-    ``ARRAY[e1, ..., en]`` and ``ARRAY(e1, ..., en)`` both parse to ``exp.Array`` with the
-    elements as ``expressions``, so a non-empty element list is a provably non-empty array.
-    The ``ARRAY(SELECT ...)`` array-subquery form parses to ``exp.Array`` too, but its single
-    element is a query that may return zero rows, so it carries no guarantee and disqualifies
-    the array. Used by both the ``array_nonemptiness`` property and the inner-flatten detector
-    so the two read the literal-array idiom the same way."""
+    A bracket array literal (``[e1, ..., en]`` / ``ARRAY[e1, ..., en]``) parses to ``exp.Array``
+    with each element as one ``expressions`` entry, so a non-empty list is a provably non-empty
+    array. The elements may be literals, structs, or even parenthesised scalar subqueries
+    (``[(SELECT AS STRUCT ...), ...]``, the wide-to-long pivot idiom), each of which contributes
+    exactly one element and parses as ``exp.Subquery``.
+
+    The one form that can still be empty is the ``ARRAY(<query>)`` array-subquery function: its
+    single element is a *bare* ``exp.Select`` / ``exp.Union`` (not wrapped in ``exp.Subquery``)
+    that may return zero rows. That bare-query element disqualifies the array. Used by both the
+    ``array_nonemptiness`` property and the inner-flatten detector so the two read the
+    literal-array idiom the same way."""
     if not isinstance(expr, exp.Array) or not expr.expressions:
         return False
-    return not any(isinstance(e, exp.Query) for e in expr.expressions)
+    return not any(isinstance(e, (exp.Select, exp.Union)) for e in expr.expressions)
 
 
 # --- surrogate-hash grammar --------------------------------------------------

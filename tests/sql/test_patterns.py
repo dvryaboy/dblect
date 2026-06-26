@@ -518,6 +518,17 @@ def test_inner_unnest_of_array_subquery_still_flagged() -> None:
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
 
 
+def test_inner_unnest_of_scalar_subquery_array_literal_not_flagged() -> None:
+    # The real-world pivot idiom: a bracket array of N parenthesised `(SELECT AS STRUCT ...)`
+    # scalar subqueries. Each contributes exactly one element, so the array is non-empty.
+    sql = (
+        "select t.id, m.metric_name, m.metric_value from t cross join unnest([ "
+        "(select as struct 'clicks' as metric_name, t.clicks as metric_value), "
+        "(select as struct 'impressions' as metric_name, t.impressions as metric_value)]) as m"
+    )
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "bigquery")) == ()
+
+
 def test_inner_unnest_of_column_still_flagged_without_a_map() -> None:
     # A column array's non-emptiness needs the propagated property; the bare structural
     # detector cannot prove it and keeps firing.
