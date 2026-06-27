@@ -230,7 +230,9 @@ def test_world_findings_honor_noqa_suppression() -> None:
         _node(
             "model.shop.stg_payments",
             kind=ResourceType.MODEL,
-            sql="SELECT amount FROM payments",
+            # The developer's `-- noqa` rides through `dbt compile` into the compiled SQL,
+            # so both texts carry it, the same way a real project's compiled artifact does.
+            sql="SELECT amount FROM payments  -- noqa: DBLECT_DOMAIN_TYPE_CONTRADICTION",
             raw="SELECT amount FROM payments  -- noqa: DBLECT_DOMAIN_TYPE_CONTRADICTION",
             columns=_cols(amount="DECIMAL"),
         ),

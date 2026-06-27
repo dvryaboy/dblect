@@ -210,31 +210,41 @@ def _suppressed_block(
     kind, how it was silenced (bare ``noqa`` or the specific ``noqa: DBLECT_<KIND>``),
     and the line the directive sat on."""
     lines = ["suppressed:"]
-    # (path, sort_start, sort_end, loc, kind, via, directive_line). ``loc`` is
-    # pre-formatted so each family carries its back-mapped span (and the compiled-relative
-    # marker when the back-map declined), computed from its own ``located_span``.
-    rows: list[tuple[str, int, int, str, str, str, int]] = []
+    # (path, sort_start, sort_end, loc, kind, via, at). ``loc`` is pre-formatted so each
+    # family carries its back-mapped span (and the compiled-relative marker when the
+    # back-map declined), computed from its own ``located_span``. ``at`` is the directive
+    # location, marked ``compiled L<n>`` when the directive was matched in compiled space
+    # (a macro body's ``-- noqa``), so its line number is never mistaken for a source line.
+    rows: list[tuple[str, int, int, str, str, str, str]] = []
     for s in structural:
         f = s.located.finding
         path = s.located.file_path or s.located.model_unique_id
         via = "noqa" if s.bare else f"noqa: {suppression_code(f.kind)}"
         span = s.located.located_span
         loc = _format_span(span)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, f.kind.value, via, s.directive_line)
-        )
+        at = _directive_location(span, s.directive_line)
+        rows.append((path, span.line_start, span.line_end, loc, f.kind.value, via, at))
     for c in declaration:
         cf = c.finding
         path = cf.file_path or cf.model_unique_id or "<project>"
         via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
         span = cf.located_span
         loc = _format_span(span)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, cf.kind.value, via, c.directive_line)
-        )
-    for path, _start, _end, loc, kind, via, directive_line in sorted(rows):
-        lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ L{directive_line}")
+        at = _directive_location(span, c.directive_line)
+        rows.append((path, span.line_start, span.line_end, loc, cf.kind.value, via, at))
+    for path, _start, _end, loc, kind, via, at in sorted(rows):
+        lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ {at}")
     return "\n".join(lines)
+
+
+def _directive_location(span: SourceSpan, directive_line: int) -> str:
+    """Where the directive sat, in the same coordinate frame the finding was matched in.
+    A compiled-relative finding (a macro-emitted construct) was silenced by a directive in
+    the compiled SQL, so its line is labelled ``compiled`` to set it apart from a source
+    line."""
+    if span.basis is SpanBasis.COMPILED:
+        return f"compiled L{directive_line}"
+    return f"L{directive_line}"
 
 
 def _skipped_block(skipped: Iterable[SkippedModel]) -> str:

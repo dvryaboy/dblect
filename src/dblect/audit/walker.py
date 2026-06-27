@@ -10,8 +10,11 @@ recorded on the report as skipped, with a reason. The walker never raises on
 per-model failure: one bad model shouldn't blind the audit to the rest of the
 project.
 
-Suppression directives (``-- noqa`` comments) are always read from ``raw_code``:
-they live in the source the developer wrote, not in the compiled output.
+Suppression directives (``-- noqa`` comments) are read from both the developer's
+template and the compiled SQL: a finding the back-map placed on a source line is
+silenced from the template, and one that stayed compiled-relative (a construct emitted
+inside a macro body) is silenced from the compiled output, where the macro's own
+``-- noqa`` renders next to the construct. The finding's span basis picks the frame.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
-from dblect.audit.suppress import apply, parse_directives
+from dblect.audit.suppress import FramedDirectives, apply
 from dblect.flatten.detector import make_array_nonemptiness_detectors
 from dblect.lineage.builder import build_manifest_graph
 from dblect.manifest import Manifest, Node, compilation_miss_reason
@@ -256,11 +259,13 @@ def _scan_one(
     raw_findings: list[Finding] = []
     for detector in detectors:
         raw_findings.extend(detector(tree))
-    # Directives live in the source the developer wrote, not the compiled
-    # output. Fall back to the compiled SQL only if `raw_code` is missing.
-    directives = parse_directives(node.raw_code or node.analysis_sql or "")
+    # Directives are read from both texts: the developer's template for findings the
+    # back-map placed on a source line, and the compiled SQL for findings that stayed
+    # compiled-relative (a construct emitted inside a macro, whose guarding `-- noqa`
+    # renders only into the compiled output). Each finding routes to its own frame.
+    directives = FramedDirectives.parse(raw=node.raw_code, compiled=node.analysis_sql)
     # Findings carry compiled-SQL spans; back-map them onto the source template once per
-    # model, then match directives against that source span. Locating before suppressing
+    # model, then match directives against the located span. Locating before suppressing
     # is what lets a `-- noqa` on the line the report shows silence a finding whose
     # compiled line a macro expansion pushed away from its source line.
     line_map = build_line_map(node.analysis_sql, node.raw_code)

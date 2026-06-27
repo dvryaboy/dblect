@@ -28,7 +28,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
-from dblect.audit.suppress import SuppressionDirective, apply, parse_directives
+from dblect.audit.suppress import FramedDirectives, apply
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.check.findings import (
     CheckFinding,
@@ -218,13 +218,14 @@ def suppress_check_findings(
 ) -> tuple[tuple[CheckFinding, ...], tuple[SuppressedCheckFinding, ...]]:
     """Apply ``-- noqa`` directives to declaration-level findings.
 
-    Directives are read per model from the source the developer wrote (``raw_code``,
-    falling back to the compiled SQL), the same place the structural audit reads them,
-    and matched against the finding's line provenance. A finding with no model or no
-    located line (a contract-resolution issue, a project-wide coverage finding) carries
-    no line, so the matcher leaves it active; only the line-located domain-type and
+    Directives are read per model from both the developer's template and the compiled SQL,
+    the same two frames the structural audit reads, and each finding routes to the frame
+    its located span sits in: a back-mapped finding to the template, a compiled-relative
+    one (a construct emitted inside a macro body) to the compiled SQL. A finding with no
+    model or no located line (a contract-resolution issue, a project-wide coverage finding)
+    carries no line, so the matcher leaves it active; only the line-located domain-type and
     aggregation findings are silenceable this way."""
-    directives_by_model: dict[str, tuple[SuppressionDirective, ...]] = {}
+    directives_by_model: dict[str, FramedDirectives] = {}
     active: list[CheckFinding] = []
     suppressed: list[SuppressedCheckFinding] = []
     for finding in findings:
@@ -234,7 +235,9 @@ def suppress_check_findings(
             active.append(finding)
             continue
         if uid not in directives_by_model:
-            directives_by_model[uid] = parse_directives(node.raw_code or node.analysis_sql or "")
+            directives_by_model[uid] = FramedDirectives.parse(
+                raw=node.raw_code, compiled=node.analysis_sql
+            )
         kept, hidden = apply((finding,), directives_by_model[uid])
         active.extend(kept)
         suppressed.extend(

@@ -154,22 +154,26 @@ def test_located_finding_carries_file_path_for_every_scanned_model(
 
 
 def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> None:
-    # A code-specific `-- noqa` on the GROUP BY line silences the null-group finding
-    # there. The directive has to share a line with the finding (or sit one line above)
-    # to apply, so we append it to the offending GROUP BY line.
+    # A code-specific `-- noqa` on the GROUP BY line silences the null-group finding there.
+    # This model's finding is compiled-relative (the back-map declines), so the directive
+    # is matched in compiled space. A developer edits the model source and `dbt compile`
+    # renders the comment into the compiled SQL on the same construct line, so the fixture
+    # carries it in both texts.
     customers = jaffle.nodes["model.jaffle_shop.customers"]
     assert customers.raw_code is not None
-    suppressed_sql = customers.raw_code.replace(
-        "group by orders.customer_id",
-        "group by orders.customer_id -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN",
-    )
-    assert suppressed_sql != customers.raw_code, "test setup failed to find target line"
+    assert customers.compiled_code is not None
+    coded = "group by orders.customer_id -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
+    suppressed_raw = customers.raw_code.replace("group by orders.customer_id", coded)
+    suppressed_compiled = customers.compiled_code.replace("group by orders.customer_id", coded)
+    assert suppressed_raw != customers.raw_code, "test setup failed to find target line"
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
-            customers.unique_id: replace(customers, raw_code=suppressed_sql),
+            customers.unique_id: replace(
+                customers, raw_code=suppressed_raw, compiled_code=suppressed_compiled
+            ),
         },
     )
     report = run_audit(altered, _DUCKDB)
@@ -193,19 +197,23 @@ def test_suppression_silences_matching_finding_end_to_end(jaffle: Manifest) -> N
 
 def test_bare_noqa_silences_all_kinds_on_its_line(jaffle: Manifest) -> None:
     # A bare `-- noqa` on the GROUP BY line silences every kind there, recorded as bare.
+    # The finding is compiled-relative, so the directive rides into the compiled SQL the
+    # same way `dbt compile` would carry the developer's comment.
     customers = jaffle.nodes["model.jaffle_shop.customers"]
     assert customers.raw_code is not None
-    suppressed_sql = customers.raw_code.replace(
-        "group by orders.customer_id",
-        "group by orders.customer_id -- noqa",
-    )
-    assert suppressed_sql != customers.raw_code, "test setup failed to find target line"
+    assert customers.compiled_code is not None
+    bare = "group by orders.customer_id -- noqa"
+    suppressed_raw = customers.raw_code.replace("group by orders.customer_id", bare)
+    suppressed_compiled = customers.compiled_code.replace("group by orders.customer_id", bare)
+    assert suppressed_raw != customers.raw_code, "test setup failed to find target line"
     altered = Manifest(
         schema_version=jaffle.schema_version,
         adapter_type=jaffle.adapter_type,
         nodes={
             **jaffle.nodes,
-            customers.unique_id: replace(customers, raw_code=suppressed_sql),
+            customers.unique_id: replace(
+                customers, raw_code=suppressed_raw, compiled_code=suppressed_compiled
+            ),
         },
     )
     report = run_audit(altered, _DUCKDB)
@@ -426,6 +434,42 @@ def test_noqa_on_the_macro_call_line_suppresses_a_macro_emitted_finding() -> Non
     span = hidden.located.located_span
     assert span.basis is SpanBasis.MACRO_CALL
     assert (span.line_start, span.line_end) == (3, 3)
+
+
+def test_noqa_in_the_macro_body_suppresses_a_macro_emitted_finding() -> None:
+    # The construct that trips the detector is emitted entirely by a macro, and the
+    # `-- noqa` that guards it lives in the macro body. It renders into the compiled SQL
+    # adjacent to the construct but has no line in the calling model's template. Two
+    # `{{ ... }}` call sites (a config header and the macro call) leave the emitted span
+    # with no single source anchor, so it stays compiled-relative; the directive is matched
+    # in compiled space, where the macro body's comment sits next to the construct. One
+    # comment in the shared macro then speaks for every model that calls it.
+    raw = "{{ config(materialized='table') }}\n{{ country_rollup(u) }}"
+    compiled = (
+        "select u.user_id, d.country, count(*) as n\n"
+        "from users u\n"
+        "left join dim_country d\n"
+        "  on u.country_code = d.code\n"
+        "group by u.user_id, d.country  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN"
+    )
+    manifest = _user_country(raw, compiled)
+    report = run_audit(manifest, _DUCKDB)
+
+    active = [
+        f for f in report.findings if f.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    assert active == [], "the noqa in the macro body should silence the emitted finding"
+    [hidden] = [
+        s for s in report.suppressed if s.located.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    ]
+    # The construct and its guarding comment share compiled line 5; the span stayed
+    # compiled-relative because two call sites left it without a single source anchor, so
+    # the directive matched in compiled space.
+    assert hidden.directive_line == 5
+    assert hidden.located.finding.line_start == 5
+    span = hidden.located.located_span
+    assert span.basis is SpanBasis.COMPILED
+    assert (span.line_start, span.line_end) == (5, 5)
 
 
 def test_resolved_adapter_reaches_non_determinism_detector(jaffle: Manifest) -> None:
