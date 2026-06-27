@@ -139,7 +139,9 @@ def test_default_detectors_includes_every_sql_detector_exactly_once() -> None:
     }
     default_set = set(DEFAULT_DETECTORS)
     assert sql_detectors - context_bound == default_set
-    assert not (context_bound & default_set), "a context-bound detector is also in DEFAULT_DETECTORS"
+    assert not (context_bound & default_set), (
+        "a context-bound detector is also in DEFAULT_DETECTORS"
+    )
     assert len(DEFAULT_DETECTORS) == len(default_set), "DEFAULT_DETECTORS contains duplicates"
 
 

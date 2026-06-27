@@ -591,6 +591,12 @@ class _Walker:
         group = sel.args.get("group")
         if not isinstance(group, exp.Group) or not group.expressions:
             return frozenset()
+        # ``GROUP BY ()`` is the grand-total grouping set: an empty ``exp.Tuple`` that
+        # folds the whole relation into one group, exactly like no GROUP BY. It grounds
+        # the same whole-relation facts as the empty case above rather than the
+        # "unresolvable keys" ``None`` below (which marks real but opaque group keys).
+        if all(isinstance(g, exp.Tuple) and not g.expressions for g in group.expressions):
+            return frozenset()
         out: set[ColumnRef] = set()
         for g in group.expressions:
             if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):

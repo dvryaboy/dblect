@@ -11,13 +11,19 @@ whether the element subquery reads a ``FROM``.
 from __future__ import annotations
 
 import pytest
-import sqlglot
+import sqlglot.expressions as exp
+from sqlglot import Expr
 
+from dblect.sql import parse_sql
 from dblect.sql.vocab import array_literal_nonempty
 
 
-def _array(frag: str) -> object:
-    return sqlglot.parse_one(f"SELECT {frag} AS a", read="bigquery").selects[0].this
+def _array(frag: str) -> Expr:
+    """The expression a single projection parses to, unwrapping its alias."""
+    select = parse_sql(f"SELECT {frag} AS a", dialect="bigquery")
+    assert isinstance(select, exp.Select)
+    projected = select.expressions[0]
+    return projected.this if isinstance(projected, exp.Alias) else projected
 
 
 @pytest.mark.parametrize(

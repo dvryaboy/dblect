@@ -546,7 +546,9 @@ def test_inner_unnest_of_column_cleared_by_model_nonempty_map() -> None:
 def test_model_nonempty_map_only_clears_the_named_column() -> None:
     sql = "select s.id, x from stg s cross join unnest(s.other) as x"
     tree = _parse_d(sql, "bigquery")
-    assert len(detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})})) == 1
+    assert (
+        len(detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})})) == 1
+    )
 
 
 def test_plain_cross_join_of_tables_not_flagged() -> None:

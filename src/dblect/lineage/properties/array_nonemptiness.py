@@ -86,16 +86,27 @@ def _is_grouped(agg: exp.AggFunc) -> bool:
     """Whether the aggregate folds per group rather than over the whole relation.
 
     Read off the :class:`AggregationSite` the builder stamps on every non-windowed
-    aggregate: an empty ``group_refs`` is the whole-relation fold (no GROUP BY),
-    a non-empty set is a resolved GROUP BY, and ``None`` is a GROUP BY whose keys
-    the builder could not resolve to plain columns (positional or computed). Any
-    GROUP BY at all guarantees at least one row per group, so the last two both
+    aggregate: an empty ``group_refs`` is the whole-relation fold (no GROUP BY, or
+    the ``GROUP BY ()`` grand-total grouping set), a non-empty set is a resolved
+    GROUP BY, and ``None`` is a GROUP BY whose keys the builder could not resolve to
+    plain columns (positional or computed). A non-empty set and the ``None`` case
+    both name a real GROUP BY that guarantees at least one row per group, so both
     count as grouped; only the empty set, or an absent site (a windowed aggregate,
     an unmodelled scope), is treated as whole-relation."""
     site = aggregation_site_meta(agg)
     if site is None:
         return False
     return site.group_refs != frozenset()
+
+
+def _aggregated_expr(agg: exp.AggFunc) -> Expr:
+    """The expression an aggregate folds, looking through an ``ORDER BY``.
+
+    ``ARRAY_AGG(STRUCT(...) ORDER BY ts)`` parses with ``agg.this`` an ``exp.Order``
+    wrapping the real argument, so reading ``agg.this`` directly would miss the
+    ``STRUCT`` underneath. The order clause changes element order, never element
+    presence, so it is transparent to non-emptiness."""
+    return agg.this.this if isinstance(agg.this, exp.Order) else agg.this
 
 
 def _array_agg_value(agg: exp.AggFunc, *, ignore_nulls: bool) -> Annotation[ArrayNonEmpty]:
@@ -105,13 +116,14 @@ def _array_agg_value(agg: exp.AggFunc, *, ignore_nulls: bool) -> Annotation[Arra
     contributes at least one element (a NULL element still counts), so the array is
     ``NON_EMPTY``. With ``IGNORE NULLS`` an all-NULL group collapses to ``[]``, so
     it is ``NON_EMPTY`` only when the aggregated expression is provably non-null;
-    a ``STRUCT(...)`` constructor is the one such form we recognise. A
-    whole-relation fold returns NULL over zero rows, so it stays ``UNKNOWN``."""
+    a ``STRUCT(...)`` constructor is the one such form we recognise (an ``ORDER BY``
+    on the argument is transparent). A whole-relation fold returns NULL over zero
+    rows, so it stays ``UNKNOWN``."""
     if not _is_grouped(agg):
         return _UNKNOWN
     if not ignore_nulls:
         return _NON_EMPTY
-    return _NON_EMPTY if isinstance(agg.this, exp.Struct) else _UNKNOWN
+    return _NON_EMPTY if isinstance(_aggregated_expr(agg), exp.Struct) else _UNKNOWN
 
 
 def _array_literal_rule(
@@ -145,6 +157,22 @@ def _array_agg_core(
     return _array_agg_value(expr, ignore_nulls=bool(expr.args.get("nulls_excluded")))
 
 
+def _filter_rule(
+    expr: Expr, kids: tuple[Annotation[ArrayNonEmpty], ...], _ctx: DepContext
+) -> Annotation[ArrayNonEmpty]:
+    """``ARRAY_AGG(expr) FILTER (WHERE cond)`` parses as a ``Filter`` wrapping the aggregate.
+    The filter keeps only the rows that match ``cond``, so a group whose rows all fail it
+    collapses to an empty array. The filtered aggregate therefore carries no non-emptiness
+    guarantee, whatever the inner (unfiltered) reduction proved. A ``Filter`` over anything
+    else passes its child through unchanged."""
+    inner = expr.this
+    if isinstance(inner, exp.ArrayAgg) or (
+        isinstance(inner, exp.IgnoreNulls) and isinstance(inner.this, exp.ArrayAgg)
+    ):
+        return _UNKNOWN
+    return kids[0] if kids else _UNKNOWN
+
+
 def _ground(_col: ColumnRef) -> Annotation[ArrayNonEmpty]:
     """Nothing is declared non-empty: every column grounds to the implicit top, and
     the transfers supply the only positive facts. A base-relation array column lands
@@ -158,6 +186,7 @@ array_nonemptiness: Property[ArrayNonEmpty, ColumnRef] = column_property(
     operators={
         exp.Array: _array_literal_rule,
         exp.IgnoreNulls: _ignore_nulls_rule,
+        exp.Filter: _filter_rule,
     },
     aggregates={exp.ArrayAgg: AggregateRule(core=_array_agg_core)},
     ground=_ground,

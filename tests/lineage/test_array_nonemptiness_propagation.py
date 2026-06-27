@@ -159,6 +159,50 @@ def test_array_agg_ignore_nulls_of_scalar_is_unknown() -> None:
     assert values[_col("model.app.stg", "tags")] is ArrayNonEmpty.UNKNOWN
 
 
+def test_array_agg_under_empty_grouping_set_is_unknown() -> None:
+    # GROUP BY () is the grand-total grouping set: it folds the whole relation into one
+    # group, so over zero input rows the single output row's ARRAY_AGG is NULL/empty,
+    # exactly like a whole-relation ARRAY_AGG. It must not be read as a per-group fold.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model("model.app.grand", "SELECT ARRAY_AGG(tag) AS tags FROM events GROUP BY ()"),
+    )
+    assert values[_col("model.app.grand", "tags")] is ArrayNonEmpty.UNKNOWN
+
+
+def test_array_agg_with_filter_is_unknown() -> None:
+    # ARRAY_AGG(x) FILTER (WHERE cond) keeps only matching rows, so a group whose rows
+    # all fail the filter collapses to an empty array, even under a real GROUP BY.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.stg",
+            "SELECT event_id, ARRAY_AGG(tag) FILTER (WHERE weight > 0) AS tags "
+            "FROM events GROUP BY event_id",
+        ),
+    )
+    assert values[_col("model.app.stg", "tags")] is ArrayNonEmpty.UNKNOWN
+
+
+def test_array_agg_ignore_nulls_of_ordered_struct_is_non_empty() -> None:
+    # ARRAY_AGG(STRUCT(...) ORDER BY ...) parses with an exp.Order wrapping the argument.
+    # The order clause changes element order, never presence, so a STRUCT under it is still
+    # provably non-null and the IGNORE NULLS group cannot empty out. This is the canonical
+    # rebuilt-array idiom, so it must clear.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.stg",
+            "SELECT event_id, ARRAY_AGG(STRUCT(tag, weight) ORDER BY weight IGNORE NULLS) AS tags "
+            "FROM events GROUP BY event_id",
+        ),
+    )
+    assert values[_col("model.app.stg", "tags")] is ArrayNonEmpty.NON_EMPTY
+
+
 def test_non_emptiness_carries_across_a_model_boundary() -> None:
     # The rebuilt array stays NON_EMPTY one model downstream (the (B) side).
     src = _source("source.app.raw.events")
