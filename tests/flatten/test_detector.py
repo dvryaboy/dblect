@@ -78,11 +78,16 @@ def _manifest() -> Manifest:
 
 
 def _findings(manifest: Manifest, consumer_uid: str) -> tuple[Finding, ...]:
-    detectors = make_array_nonemptiness_detectors(manifest, _BQ)
-    node = manifest.nodes[consumer_uid]
-    assert node.compiled_code is not None
-    tree = parse_sql(node.compiled_code, dialect="bigquery")
-    return tuple(f for detect in detectors for f in detect(tree))
+    # Mirror the audit: the factory stamps the shared trees with resolved refs, and the
+    # detector scans the same tree object, so the two see one resolution (as run_audit
+    # shares one `trees` dict between the factory and the scan loop).
+    trees = {
+        uid: parse_sql(n.compiled_code, dialect="bigquery")
+        for uid, n in manifest.nodes.items()
+        if n.compiled_code is not None
+    }
+    detectors = make_array_nonemptiness_detectors(manifest, _BQ, parsed=trees)
+    return tuple(f for detect in detectors for f in detect(trees[consumer_uid]))
 
 
 def test_unnest_of_raw_source_array_fires() -> None:
@@ -92,6 +97,23 @@ def test_unnest_of_raw_source_array_fires() -> None:
 
 def test_unnest_of_rebuilt_array_is_silent_across_the_model_boundary() -> None:
     assert _findings(_manifest(), _MART) == ()
+
+
+def test_unnest_of_array_rebuilt_in_a_cte_is_silent() -> None:
+    # The CTE-aware payoff: a CTE rebuilds the array with ARRAY_AGG under GROUP BY, and a
+    # later scope in the same model unnests that CTE column. Resolution follows the unnest
+    # argument through the CTE to the rebuilt (NON_EMPTY) column, so it stays quiet.
+    sql = (
+        "WITH built AS ("
+        "  SELECT event_id, ARRAY_AGG(STRUCT(tag, weight)) AS tags"
+        "  FROM raw_events GROUP BY event_id"
+        ") SELECT b.event_id, x.tag FROM built b CROSS JOIN UNNEST(b.tags) AS x"
+    )
+    nodes = [_source(_RAW), _model("model.app.in_model_rebuild", sql)]
+    manifest = Manifest(
+        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
+    )
+    assert _findings(manifest, "model.app.in_model_rebuild") == ()
 
 
 def test_run_audit_reports_the_flatten_finding_exactly_once() -> None:

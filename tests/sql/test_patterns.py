@@ -529,26 +529,26 @@ def test_inner_unnest_of_scalar_subquery_array_literal_not_flagged() -> None:
     assert detect_inner_flatten_row_drop(_parse_d(sql, "bigquery")) == ()
 
 
-def test_inner_unnest_of_column_still_flagged_without_a_map() -> None:
-    # A column array's non-emptiness needs the propagated property; the bare structural
-    # detector cannot prove it and keeps firing.
+def test_inner_unnest_of_column_still_flagged_without_a_predicate() -> None:
+    # A column array's non-emptiness needs the lineage-grounded predicate; the bare
+    # structural detector treats a column as opaque and keeps firing.
     sql = "select t.id, x from t cross join unnest(t.arr) as x"
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
 
 
-def test_inner_unnest_of_column_cleared_by_model_nonempty_map() -> None:
+def test_inner_unnest_of_column_cleared_by_predicate() -> None:
     sql = "select s.id, x from stg s cross join unnest(s.tags) as x"
     tree = _parse_d(sql, "bigquery")
     assert len(detect_inner_flatten_row_drop(tree)) == 1
-    assert detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})}) == ()
+    cleared = detect_inner_flatten_row_drop(tree, column_is_nonempty=lambda c: c.name == "tags")
+    assert cleared == ()
 
 
-def test_model_nonempty_map_only_clears_the_named_column() -> None:
+def test_predicate_only_clears_the_columns_it_vouches_for() -> None:
     sql = "select s.id, x from stg s cross join unnest(s.other) as x"
     tree = _parse_d(sql, "bigquery")
-    assert (
-        len(detect_inner_flatten_row_drop(tree, model_nonempty={"stg": frozenset({"tags"})})) == 1
-    )
+    findings = detect_inner_flatten_row_drop(tree, column_is_nonempty=lambda c: c.name == "tags")
+    assert len(findings) == 1
 
 
 def test_plain_cross_join_of_tables_not_flagged() -> None:
