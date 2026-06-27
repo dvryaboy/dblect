@@ -73,6 +73,12 @@ class CheckFinding:
         compiled-relative fallback when none is attached."""
         if self.source_span is not None:
             return self.source_span
+        return self.compiled_span
+
+    @property
+    def compiled_span(self) -> SourceSpan:
+        """The raw compiled coordinate the derivation node was stamped in, the frame a
+        macro body's ``-- noqa`` is matched against."""
         return SourceSpan.compiled(self.line_start, self.line_end)
 
 
@@ -80,11 +86,13 @@ class CheckFinding:
 class SuppressedCheckFinding:
     """A declaration-level finding a ``-- noqa`` directive silenced. ``directive_line``
     is where the directive sat; ``bare`` records whether it was a bare ``-- noqa`` (all
-    kinds) rather than a code-specific one."""
+    kinds) rather than a code-specific one; ``directive_in_compiled`` records whether the
+    directive was read in the compiled frame (a macro body's ``-- noqa``)."""
 
     finding: CheckFinding
     directive_line: int
     bare: bool
+    directive_in_compiled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

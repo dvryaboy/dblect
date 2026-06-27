@@ -27,14 +27,18 @@ There is no reason slot: SQLFluff noqa has none, and dropping it keeps our direc
 interchangeable with the linter's. Every suppression is still logged in the report's
 suppressed section, so a silenced finding is never invisible in review.
 
-A finding is matched against the directives of its own coordinate frame
-(:class:`FramedDirectives`). One the back-map placed on the developer's template (a
-``SOURCE`` or ``MACRO_CALL`` span) is matched against directives read from ``raw_code``.
-One that stayed compiled-relative lives entirely in macro-generated SQL with no source
-line of its own; it is matched against directives read from the compiled SQL, where a
-``-- noqa`` written in a macro body renders adjacent to the construct it guards. That
-compiled-frame path is what lets a single comment in a shared macro speak for every
-model the macro expands into, the case a source-only scan leaves unsuppressable.
+Directives are read from both of a model's texts (:class:`FramedDirectives`): the source
+frame from ``raw_code`` and the compiled frame from the rendered SQL. A finding is matched
+in each frame against the coordinate that indexes it. Its back-mapped ``located_span`` is
+matched against the source frame when the back-map placed it on a real source line, and
+its ``compiled_span`` is matched against the compiled frame. A macro-emitted construct
+occupies both: the ``{{ ... }}`` call line in the template and the emitted line in the
+compiled SQL. So a ``-- noqa`` on the call line silences it from the source frame, and one
+written in the macro body, which renders next to the construct in every expansion, silences
+it from the compiled frame. That compiled-frame path lets a single comment in a shared
+macro speak for every model the macro expands into, the case a source-only scan leaves
+unsuppressable. Matching each frame against its own coordinate keeps a source directive
+from silencing a compiled-relative finding by line-number coincidence.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ from dblect.sql import FindingKind, suppression_code
 
 if TYPE_CHECKING:
     from dblect.check.findings import CheckFindingKind
+    from dblect.manifest import Node
 
     # A directive can name a kind from either detector family: a structural
     # ``FindingKind`` or a declaration-level ``CheckFindingKind``. The same
@@ -61,21 +66,23 @@ if TYPE_CHECKING:
 
 
 class Suppressible(Protocol):
-    """What a directive needs to decide whether it silences a finding: the kind it
-    carries and the source-space span it occupies. Both families satisfy this, so
-    matching is written once over the protocol rather than per family.
+    """What a directive needs to decide whether it silences a finding: the kind it carries
+    and the two coordinates it can occupy. Both finding families satisfy this, so matching
+    is written once over the protocol rather than per family.
 
-    The span is the back-mapped ``located_span``, not the raw compiled span. Its ``basis``
-    selects the frame the directive is read from (:class:`FramedDirectives`): a back-mapped
-    span matches a directive on the line the report shows, even when macro expansion shifted
-    the compiled line; a compiled-relative span (a construct emitted inside a macro) matches
-    a directive in the compiled SQL, where the macro body's own ``-- noqa`` renders next to
-    the construct."""
+    ``located_span`` is the back-mapped span the report shows; ``compiled_span`` is the raw
+    compiled coordinate the parser observed. They differ only for a macro-emitted construct,
+    where ``located_span`` names the ``{{ ... }}`` call site in the template and
+    ``compiled_span`` names the emitted line in the compiled SQL. Matching consults each
+    frame against the coordinate that indexes it (:func:`apply`), so a ``-- noqa`` on the
+    call line and one in the macro body both reach the finding, each in its own text."""
 
     @property
     def kind(self) -> SuppressibleKind: ...
     @property
     def located_span(self) -> SourceSpan: ...
+    @property
+    def compiled_span(self) -> SourceSpan: ...
 
 
 _F = TypeVar("_F", bound=Suppressible)
@@ -162,40 +169,39 @@ def parse_directives(sql: str) -> tuple[SuppressionDirective, ...]:
     return tuple(directives)
 
 
-def directive_matches(directive: SuppressionDirective, finding: Suppressible) -> bool:
-    """True if `directive` silences `finding`.
+def _admits(directive: SuppressionDirective, span: SourceSpan, kind: SuppressibleKind) -> bool:
+    """True if `directive`, read in `span`'s coordinate frame, silences a `kind` finding
+    occupying `span`.
 
-    A directive applies when it sits on the line immediately above the finding's span
-    or anywhere within the span itself. The span is the finding's source-space
-    ``located_span``, so a directive the developer placed on the line they wrote matches
-    even when macro expansion shifted the compiled line. A bare directive
-    (``kinds is None``) silences every kind; a coded directive silences only the kinds it
-    names (and a kind from one family never matches a finding from the other, since the
-    codes are distinct). Findings without a line range (``line_start == 0``) are never
-    suppressed: a directive can't responsibly silence what it can't locate.
+    A directive applies when it sits on the line immediately above the span or anywhere
+    within it. A bare directive (``kinds is None``) silences every kind; a coded directive
+    silences only the kinds it names (and a kind from one family never matches a finding
+    from the other, since the codes are distinct). A span with no line range
+    (``line_start == 0``) is never matched: a directive can't responsibly silence what it
+    can't locate.
     """
-    span = finding.located_span
     if span.line_start == 0:
         return False
     if not (span.line_start - 1 <= directive.line <= span.line_end):
         return False
     if directive.kinds is None:
         return True
-    return finding.kind in directive.kinds
+    return kind in directive.kinds
+
+
+def directive_matches(directive: SuppressionDirective, finding: Suppressible) -> bool:
+    """True if `directive` silences `finding` on its back-mapped ``located_span``, the
+    coordinate the report shows. The full two-frame match lives in :func:`apply`."""
+    return _admits(directive, finding.located_span, finding.kind)
 
 
 @dataclass(frozen=True, slots=True)
 class FramedDirectives:
-    """The ``-- noqa`` directives a model offers, split by the coordinate frame a finding
-    can be located in.
+    """The ``-- noqa`` directives a model offers, split by the text they were read from.
 
     ``source`` directives come from ``raw_code`` (the developer's template); ``compiled``
-    directives come from the rendered SQL. A finding routes to one frame by its span's
-    ``basis``: a ``COMPILED`` span (a construct emitted inside a macro, with no source line
-    of its own) reads the compiled frame, where the macro body's ``-- noqa`` renders next
-    to the construct; every other span reads the source frame. Routing by basis keeps a
-    directive from matching across coordinate spaces by coincidence, the over-claim a
-    single shared scan would invite once both texts are in play."""
+    directives come from the rendered SQL. :func:`apply` matches a finding against each
+    frame using the coordinate that indexes it, so the two never cross."""
 
     source: tuple[SuppressionDirective, ...]
     compiled: tuple[SuppressionDirective, ...]
@@ -207,27 +213,67 @@ class FramedDirectives:
         directives rather than failing."""
         return cls(parse_directives(raw or ""), parse_directives(compiled or ""))
 
-    def for_basis(self, basis: SpanBasis) -> tuple[SuppressionDirective, ...]:
-        """The directives a finding with this span ``basis`` is matched against."""
-        return self.compiled if basis is SpanBasis.COMPILED else self.source
+    @classmethod
+    def for_node(cls, node: Node) -> FramedDirectives:
+        """Both frames for a manifest node: the source frame from its template and the
+        compiled frame from the SQL the analysis layer parses. The single place the
+        node-field-to-frame binding lives, shared by the structural and declaration runs."""
+        return cls.parse(raw=node.raw_code, compiled=node.analysis_sql)
+
+
+def format_directive_location(*, in_compiled: bool, line: int) -> str:
+    """Render where a directive sat for a human-facing surface. A compiled-frame match (a
+    macro body's ``-- noqa``) is tagged ``compiled`` so its line is read in compiled space
+    rather than mistaken for a source line. Shared by the text report and the SARIF log so
+    the two label a suppression the same way."""
+    return f"compiled L{line}" if in_compiled else f"L{line}"
 
 
 def apply(
     findings: Iterable[_F],
     directives: FramedDirectives,
-) -> tuple[tuple[_F, ...], tuple[tuple[_F, SuppressionDirective], ...]]:
-    """Partition `findings` into (active, suppressed-with-directive). Generic over the
-    finding family: it works the same for a structural ``Finding`` and a
-    declaration-level ``CheckFinding``, since both carry the kind and located span the
-    match reads. Each finding is matched only against the directives of its own frame
-    (:meth:`FramedDirectives.for_basis`)."""
+) -> tuple[tuple[_F, ...], tuple[tuple[_F, SuppressionDirective, bool], ...]]:
+    """Partition `findings` into (active, suppressed). Each suppressed entry is the finding,
+    the directive that silenced it, and whether that directive was read in the compiled
+    frame. Generic over the finding family: it works the same for a structural ``Finding``
+    and a declaration-level ``CheckFinding``, since both expose the protocol the match reads.
+
+    A finding is matched in each frame against the coordinate that indexes it: the source
+    frame against its ``located_span`` when the back-map anchored it to a real source line
+    (``SOURCE`` or ``MACRO_CALL``), and the compiled frame against its ``compiled_span``
+    whenever that span is a genuine compiled coordinate (``MACRO_CALL`` or ``COMPILED``). A
+    macro-emitted construct occupies both, so a call-line ``-- noqa`` and a macro-body one
+    each reach it. The source frame is preferred when both match, since it names the line the
+    developer wrote. A purely source-anchored finding is never matched against the compiled
+    frame (its compiled coordinate is the same text), and a compiled-relative one is never
+    matched against the source frame, so a source directive cannot silence it by coincidence.
+    """
     active: list[_F] = []
-    suppressed: list[tuple[_F, SuppressionDirective]] = []
+    suppressed: list[tuple[_F, SuppressionDirective, bool]] = []
     for f in findings:
-        candidates = directives.for_basis(f.located_span.basis)
-        match = next((d for d in candidates if directive_matches(d, f)), None)
+        match = _suppressing_directive(f, directives)
         if match is None:
             active.append(f)
         else:
-            suppressed.append((f, match))
+            suppressed.append((f, match[0], match[1]))
     return tuple(active), tuple(suppressed)
+
+
+def _suppressing_directive(
+    finding: Suppressible, directives: FramedDirectives
+) -> tuple[SuppressionDirective, bool] | None:
+    """The directive that silences `finding`, paired with whether it came from the compiled
+    frame, or ``None`` if none does. Source frame first (the line the developer wrote)."""
+    located = finding.located_span
+    if located.basis is not SpanBasis.COMPILED:
+        source = next((d for d in directives.source if _admits(d, located, finding.kind)), None)
+        if source is not None:
+            return source, False
+    if located.basis is not SpanBasis.SOURCE:
+        compiled_span = finding.compiled_span
+        compiled = next(
+            (d for d in directives.compiled if _admits(d, compiled_span, finding.kind)), None
+        )
+        if compiled is not None:
+            return compiled, True
+    return None

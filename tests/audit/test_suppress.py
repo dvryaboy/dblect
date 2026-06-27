@@ -248,6 +248,30 @@ def _macro_emitted_finding(
     )
 
 
+def _macro_call_finding(
+    *,
+    call_line: int,
+    compiled_line: int,
+    kind: FindingKind = FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+) -> LocatedFinding:
+    # A macro-emitted construct the back-map anchored to a single `{{ ... }}` call site.
+    # It occupies two real coordinates: the call line in the template (its located span,
+    # MACRO_CALL basis) and the emitted line in the compiled SQL (its compiled span), so a
+    # `-- noqa` on either the call line or in the macro body silences it.
+    return LocatedFinding(
+        model_unique_id="model.shop.m",
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=kind,
+            message="x",
+            sql_snippet="snippet",
+            line_start=compiled_line,
+            line_end=compiled_line,
+        ),
+        source_span=SourceSpan(call_line, call_line, SpanBasis.MACRO_CALL),
+    )
+
+
 def test_apply_partitions_findings() -> None:
     framed = _source_frame(SuppressionDirective(line=5, kinds=None))
     findings = (
@@ -278,11 +302,14 @@ def test_apply_uses_first_matching_directive() -> None:
     assert suppressed[0][1].kinds is None
 
 
-# --- frame routing: a finding is matched against the directives of its own frame ---
+# --- frame routing: a finding is matched in each frame it genuinely occupies ---
 #
-# Routing by the located span's basis keeps a directive from matching across coordinate
-# spaces by coincidence. A source-written `-- noqa` lives in `raw_code`; a macro body's
-# `-- noqa` lives only in the compiled SQL, adjacent to the construct it emitted.
+# A source-written `-- noqa` lives in `raw_code` and silences a finding whose located span
+# the back-map placed on a source line. A macro body's `-- noqa` lives only in the compiled
+# SQL, adjacent to the construct it emitted, and silences the finding on its compiled span.
+# A macro-emitted finding anchored to a single call site occupies both coordinates, so
+# either directive reaches it. Matching each frame against the span that indexes it keeps a
+# source directive from silencing a compiled-relative finding by line-number coincidence.
 
 
 def test_compiled_basis_finding_is_silenced_by_a_compiled_frame_directive() -> None:
@@ -325,6 +352,37 @@ def test_compiled_frame_directive_respects_the_finding_kind() -> None:
     assert len(surviving) == 1
 
 
+def test_macro_call_finding_is_silenced_by_a_macro_body_directive() -> None:
+    # The headline fix: a macro emitted the construct and its guarding `-- noqa` together,
+    # so the directive rides into the compiled SQL on the construct's line even though the
+    # template shows only the `{{ ... }}` call. A single call site is the common shape, and
+    # the macro-body directive must still reach it.
+    framed = _compiled_frame(SuppressionDirective(line=5, kinds=None))
+    active, suppressed = apply((_macro_call_finding(call_line=3, compiled_line=5),), framed)
+    assert active == ()
+    assert len(suppressed) == 1
+    assert suppressed[0][2] is True  # matched in the compiled frame
+
+
+def test_macro_call_finding_is_silenced_by_a_call_line_directive() -> None:
+    # The template-side path: a `-- noqa` the developer wrote on the macro call line
+    # silences the emitted finding, reported as a source-frame match.
+    framed = _source_frame(SuppressionDirective(line=3, kinds=None))
+    active, suppressed = apply((_macro_call_finding(call_line=3, compiled_line=5),), framed)
+    assert active == ()
+    assert len(suppressed) == 1
+    assert suppressed[0][2] is False  # matched in the source frame
+
+
+def test_macro_call_finding_ignores_a_source_directive_on_the_compiled_line() -> None:
+    # Coincidence guard: a source directive sitting at the construct's *compiled* line
+    # number must not reach a finding whose source coordinate is the call line.
+    framed = _source_frame(SuppressionDirective(line=5, kinds=None))
+    active, suppressed = apply((_macro_call_finding(call_line=3, compiled_line=5),), framed)
+    assert len(active) == 1
+    assert suppressed == ()
+
+
 def test_framed_parse_splits_directives_by_text() -> None:
     framed = FramedDirectives.parse(
         raw="select 1\n-- noqa: DBLECT_JOIN_FANOUT\n",
@@ -332,9 +390,6 @@ def test_framed_parse_splits_directives_by_text() -> None:
     )
     assert [d.line for d in framed.source] == [2]
     assert [d.line for d in framed.compiled] == [3]
-    assert framed.for_basis(SpanBasis.SOURCE) == framed.source
-    assert framed.for_basis(SpanBasis.MACRO_CALL) == framed.source
-    assert framed.for_basis(SpanBasis.COMPILED) == framed.compiled
 
 
 @pytest.mark.parametrize("kind", list(FindingKind))

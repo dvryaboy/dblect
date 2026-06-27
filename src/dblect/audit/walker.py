@@ -94,6 +94,12 @@ class LocatedFinding:
         compiled-relative fallback when none is attached."""
         if self.source_span is not None:
             return self.source_span
+        return self.compiled_span
+
+    @property
+    def compiled_span(self) -> SourceSpan:
+        """The raw compiled coordinate the parser observed, the frame a macro body's
+        ``-- noqa`` is matched against."""
         return SourceSpan.compiled(self.finding.line_start, self.finding.line_end)
 
 
@@ -101,11 +107,14 @@ class LocatedFinding:
 class SuppressedFinding:
     """A finding that a ``-- noqa`` directive silenced. ``directive_line`` is where the
     directive sat; ``bare`` records whether it was a bare ``-- noqa`` (all kinds) rather
-    than a code-specific one, so the report can show how the finding was silenced."""
+    than a code-specific one; ``directive_in_compiled`` records whether the directive was
+    read in the compiled frame (a macro body's ``-- noqa``), so the report can label its
+    line as compiled space rather than a source line."""
 
     located: LocatedFinding
     directive_line: int
     bare: bool
+    directive_in_compiled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,11 +268,11 @@ def _scan_one(
     raw_findings: list[Finding] = []
     for detector in detectors:
         raw_findings.extend(detector(tree))
-    # Directives are read from both texts: the developer's template for findings the
-    # back-map placed on a source line, and the compiled SQL for findings that stayed
-    # compiled-relative (a construct emitted inside a macro, whose guarding `-- noqa`
-    # renders only into the compiled output). Each finding routes to its own frame.
-    directives = FramedDirectives.parse(raw=node.raw_code, compiled=node.analysis_sql)
+    # Directives are read from both texts: the template for a finding the back-map placed on
+    # a source line, and the compiled SQL for one a macro emitted, whose guarding `-- noqa`
+    # renders only into the compiled output. Each finding is matched in the frame(s) it
+    # occupies.
+    directives = FramedDirectives.for_node(node)
     # Findings carry compiled-SQL spans; back-map them onto the source template once per
     # model, then match directives against the located span. Locating before suppressing
     # is what lets a `-- noqa` on the line the report shows silence a finding whose
@@ -272,8 +281,10 @@ def _scan_one(
     located = [_locate(node, f, line_map) for f in raw_findings]
     active, suppressed = apply(located, directives)
     located_suppressed = [
-        SuppressedFinding(located=lf, directive_line=d.line, bare=d.kinds is None)
-        for lf, d in suppressed
+        SuppressedFinding(
+            located=lf, directive_line=d.line, bare=d.kinds is None, directive_in_compiled=ic
+        )
+        for lf, d, ic in suppressed
     ]
     return _Scanned(
         findings=tuple(active),
