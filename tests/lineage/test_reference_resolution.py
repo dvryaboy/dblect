@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import sqlglot
 import sqlglot.expressions as exp
+from sqlglot import Expr
 from sqlglot.optimizer.qualify import qualify
 
 _SQL = "with c as (select id, amount from raw) select id, amount from c"
-_SCHEMA = {"raw": {"id": "INT64", "amount": "FLOAT64"}}
+_SCHEMA: dict[str, object] = {"raw": {"id": "INT64", "amount": "FLOAT64"}}
 
 
-def _tagged_original() -> exp.Expression:
+def _tagged_original() -> Expr:
     tree = sqlglot.parse_one(_SQL, read="bigquery")
     for i, col in enumerate(tree.find_all(exp.Column)):
         col.meta["orig_id"] = i

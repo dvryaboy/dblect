@@ -262,8 +262,11 @@ def build_model_graph(
     plus all materialised intermediates (CTEs, derived tables, UNION outputs).
 
     ``tree`` lets a caller share an already-parsed tree (the audit walker does) so the
-    SQL is parsed once. It is copied before qualification, which mutates in place, so
-    the caller's tree is left untouched.
+    SQL is parsed once. Qualification runs on a copy, so the caller's tree keeps its
+    un-qualified structure. The walk does enrich the shared tree's column ``.meta`` with
+    the resolved ``ColumnRef`` of every reference (see :func:`_walk_model` and
+    :meth:`_Walker.stamp_original`), so a detector reading that tree gets the builder's
+    resolution; structure and node identities are otherwise untouched.
     """
     walker = _walk_model(
         model_uid=model_uid,

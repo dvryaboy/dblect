@@ -551,6 +551,25 @@ def test_predicate_only_clears_the_columns_it_vouches_for() -> None:
     assert len(findings) == 1
 
 
+def test_predicate_does_not_clear_a_column_from_the_nullable_join_side() -> None:
+    # A column vouched non-empty where it is produced can still arrive NULL through the
+    # nullable side of an outer join, where UNNEST(NULL) drops the row; the predicate must
+    # not clear it. The same column on a preserved side (cross join) clears as usual.
+    nullable = (
+        "select d.id, x from drv d left join stg s on s.id = d.id cross join unnest(s.tags) as x"
+    )
+    tree = _parse_d(nullable, "bigquery")
+    assert (
+        len(detect_inner_flatten_row_drop(tree, column_is_nonempty=lambda c: c.name == "tags")) == 1
+    )
+
+    preserved = "select s.id, x from stg s cross join unnest(s.tags) as x"
+    cleared = _parse_d(preserved, "bigquery")
+    assert (
+        detect_inner_flatten_row_drop(cleared, column_is_nonempty=lambda c: c.name == "tags") == ()
+    )
+
+
 def test_plain_cross_join_of_tables_not_flagged() -> None:
     # A cartesian product of two relations is not an array flatten; not our hazard.
     sql = "select * from a cross join b"

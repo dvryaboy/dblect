@@ -116,6 +116,26 @@ def test_unnest_of_array_rebuilt_in_a_cte_is_silent() -> None:
     assert _findings(manifest, "model.app.in_model_rebuild") == ()
 
 
+def test_unnest_of_nonempty_array_through_a_left_join_still_fires() -> None:
+    # Non-emptiness is proved where the array is built (grouped ARRAY_AGG in the CTE), but a
+    # LEFT JOIN to that CTE NULL-pads `built.tags` for unmatched driver rows, and UNNEST(NULL)
+    # drops them. The clear must not reach a column read through the nullable join side.
+    sql = (
+        "WITH built AS ("
+        "  SELECT event_id, ARRAY_AGG(STRUCT(tag, weight)) AS tags"
+        "  FROM raw_events GROUP BY event_id"
+        ") SELECT d.event_id, x.tag FROM raw_events d "
+        "LEFT JOIN built ON d.event_id = built.event_id CROSS JOIN UNNEST(built.tags) AS x"
+    )
+    nodes = [_source(_RAW), _model("model.app.left_join_unnest", sql)]
+    manifest = Manifest(
+        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
+    )
+    assert [f.kind for f in _findings(manifest, "model.app.left_join_unnest")] == [
+        FindingKind.INNER_FLATTEN_ROW_DROP
+    ]
+
+
 def test_run_audit_reports_the_flatten_finding_exactly_once() -> None:
     # End to end: the structural form is no longer in DEFAULT_DETECTORS, so the finding
     # comes solely through the fact-grounded factory. The raw-source unnest in staging

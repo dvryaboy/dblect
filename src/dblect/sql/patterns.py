@@ -511,13 +511,14 @@ def detect_inner_flatten_row_drop(
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
+        nullable = _nullable_tables(sel)
         for j in sg.joins_of(sel):
             kernel = _flatten_arm(j.this)
             if kernel is None:
                 continue
             if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_preserves_rows(kernel):
                 continue
-            if _unnest_arg_provably_nonempty(kernel, column_is_nonempty):
+            if _unnest_arg_provably_nonempty(kernel, column_is_nonempty, nullable):
                 continue
             out.append(_inner_flatten_finding(j))
         for lat in sg.laterals_of(sel):
@@ -707,7 +708,9 @@ def _has_outer_kwarg(fn: Expr) -> bool:
 
 
 def _unnest_arg_provably_nonempty(
-    kernel: Expr, column_is_nonempty: Callable[[exp.Column], bool] | None
+    kernel: Expr,
+    column_is_nonempty: Callable[[exp.Column], bool] | None,
+    nullable_tables: set[str],
 ) -> bool:
     """True when every array ``kernel`` unnests is provably non-empty, so no parent row drops.
 
@@ -720,23 +723,45 @@ def _unnest_arg_provably_nonempty(
     args = [a for a in kernel.expressions if isinstance(a, Expr)]
     if not args:
         return False
-    return all(_array_expr_nonempty(a, column_is_nonempty) for a in args)
+    return all(_array_expr_nonempty(a, column_is_nonempty, nullable_tables) for a in args)
 
 
 def _array_expr_nonempty(
-    arg: Expr, column_is_nonempty: Callable[[exp.Column], bool] | None
+    arg: Expr,
+    column_is_nonempty: Callable[[exp.Column], bool] | None,
+    nullable_tables: set[str],
 ) -> bool:
     """Whether one unnested expression is provably non-empty.
 
     A literal ``ARRAY[...]`` with one or more constructed elements is non-empty by
     construction (the always-on local case). For a column, the answer comes from
     ``column_is_nonempty``, the lineage-grounded predicate the audit supplies; without it,
-    a column is treated as opaque, so the detector module stays free of lineage types."""
+    a column is treated as opaque, so the detector module stays free of lineage types.
+
+    Non-emptiness is proved where the array is *produced*. A column that arrives through the
+    nullable side of an outer join can still be NULL at the unnest, and ``UNNEST(NULL)`` drops
+    the row, so a column read from an outer-join-optional relation is never cleared here even
+    when its value is non-empty wherever it exists."""
     if array_literal_nonempty(arg):
         return True
     if column_is_nonempty is None or not isinstance(arg, exp.Column):
         return False
+    if _read_through_nullable_join(arg, nullable_tables):
+        return False
     return column_is_nonempty(arg)
+
+
+def _read_through_nullable_join(col: exp.Column, nullable_tables: set[str]) -> bool:
+    """Whether ``col`` is read from a relation an outer join can NULL-pad in its scope.
+
+    A qualified column is unsafe exactly when its table is one of ``nullable_tables``. An
+    unqualified column cannot be pinned to a preserved side once any relation in scope is
+    nullable, so it is treated as unsafe too, which keeps the clear sound at the cost of a
+    little precision."""
+    if not nullable_tables:
+        return False
+    table = sg.column_table(col)
+    return table is None or table in nullable_tables
 
 
 def _inner_flatten_finding(node: Expr) -> Finding:
