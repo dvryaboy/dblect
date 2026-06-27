@@ -302,8 +302,9 @@ def _walk_model(
     the write-back rides a reference-id tag set before the copy."""
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
     original = tree
+    originals: dict[int, exp.Column] = {}
     if original is not None:
-        _tag_references(original)
+        originals = _tag_references(original)
     expression: Expr = original.copy() if original is not None else parse_sql(sql, dialect=dialect)
     expression = qualify(
         expression,
@@ -319,7 +320,7 @@ def _walk_model(
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
     walker.walk(root_scope, scope_path=())
     if original is not None:
-        walker.stamp_original(original, root_scope)
+        walker.stamp_original(originals, root_scope)
     return walker
 
 
@@ -329,11 +330,17 @@ def _walk_model(
 _REFERENCE_ID_META_KEY = "dblect_reference_id"
 
 
-def _tag_references(tree: Expr) -> None:
-    """Tag every column on ``tree`` with a per-tree identity, so a ref resolved on the
-    qualified copy can be written back to the original node it came from."""
+def _tag_references(tree: Expr) -> dict[int, exp.Column]:
+    """Tag every column on ``tree`` with a per-tree identity and return the id-to-node map.
+
+    The tag lets a ref resolved on the qualified copy be written back to the original node
+    it came from; the returned map is that write-back's inverse lookup, built in the same
+    walk so the stamper does not re-traverse the tree to rebuild it."""
+    originals: dict[int, exp.Column] = {}
     for i, col in enumerate(tree.find_all(exp.Column)):
         col.meta[_REFERENCE_ID_META_KEY] = i
+        originals[i] = col
+    return originals
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,24 +568,19 @@ class _Walker:
             return None
         return ColumnRef(source=scope_ref, column=root)
 
-    def stamp_original(self, original: Expr, root_scope: Scope) -> None:
-        """Write each column reference's resolved ``ColumnRef`` onto ``original``'s nodes.
+    def stamp_original(self, originals: Mapping[int, exp.Column], root_scope: Scope) -> None:
+        """Write each column reference's resolved ``ColumnRef`` onto the original nodes.
 
         The walk resolves columns on the qualified copy; this carries that resolution back
         to the caller's tree so a detector reading it gets the builder's answer (including
         through CTE and derived-table scopes) without re-deriving lexical scope. Every scope
         is visited, not just projections, so a reference in any position (an ``UNNEST``
-        argument, a join key, a filter) is resolved. Correspondence is the reference-id tag
-        :func:`_tag_references` set before the copy; a node ``qualify`` added by expanding a
-        star carries no tag and has no original to write to, which is correct. A reference
-        that does not resolve leaves its original unstamped, which a consumer reads as
-        "unknown" exactly as an unresolved projection column does.
+        argument, a join key, a filter) is resolved. ``originals`` is the reference-id-to-node
+        map :func:`_tag_references` built on the caller's tree before the copy; a node
+        ``qualify`` added by expanding a star carries no tag and has no original to write to,
+        which is correct. A reference that does not resolve leaves its original unstamped,
+        which a consumer reads as "unknown" exactly as an unresolved projection column does.
         """
-        originals = {
-            col.meta[_REFERENCE_ID_META_KEY]: col
-            for col in original.find_all(exp.Column)
-            if _REFERENCE_ID_META_KEY in col.meta
-        }
         for scope in root_scope.traverse():
             for col in scope.columns:
                 rid = col.meta.get(_REFERENCE_ID_META_KEY)

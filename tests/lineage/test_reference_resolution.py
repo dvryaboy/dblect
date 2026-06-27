@@ -1,11 +1,11 @@
 """Characterisation of the sqlglot behaviour shared reference resolution rests on.
 
-The plan (``docs/design/shared-reference-resolution.md``) is to let detectors read
-the builder's resolution off their own parsed tree. That works only if a node's
-``.meta`` identity survives the copy-and-qualify the builder performs, so resolved
-refs can be written back onto the original nodes. These tests pin exactly that, so
-a future sqlglot upgrade that broke the assumption would fail here rather than
-silently stranding the resolution on the builder's private copy.
+Detectors read the builder's resolution off their own parsed tree. That works only if
+a node's ``.meta`` identity survives the copy-and-qualify the builder performs, so
+resolved refs can be written back onto the original nodes (see ``_Walker.stamp_original``
+in ``builder.py``). These tests pin exactly that, so a future sqlglot upgrade that broke
+the assumption would fail here rather than silently stranding the resolution on the
+builder's private copy.
 """
 
 from __future__ import annotations
