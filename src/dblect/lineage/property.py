@@ -406,6 +406,14 @@ def attach_column_ref(col: exp.Column, ref: ColumnRef) -> None:
     col.meta[COLUMNREF_META_KEY] = ref
 
 
+def resolved_column_ref(col: exp.Column) -> ColumnRef | None:
+    """The ``ColumnRef`` the builder resolved ``col`` to, or ``None`` if unresolved.
+
+    The public reader a detector uses to consume the builder's resolution off a shared
+    tree (written back by ``_Walker.stamp_original``), instead of re-walking lexical scope."""
+    return _column_ref_meta(col)
+
+
 # The operator-transfer alias re-exported for callers that build properties next
 # to the propagator; the canonical definition lives in dblect.lineage.facts.
 __all__ = [
@@ -414,5 +422,6 @@ __all__ = [
     "UnionConfluence",
     "attach_column_ref",
     "propagate",
+    "resolved_column_ref",
     "run",
 ]
