@@ -110,9 +110,27 @@ Each stage is behaviour-preserving and independently landable.
    `_relation_names` / `cte_names` resolution and makes it CTE-aware: an
    `UNNEST` of a CTE-internal column now consults the propagated
    `array_nonemptiness` annotation.
-5. **Migrate the uniqueness detector's scope index** (`relation_scope_keys`,
-   `_cte_body_for`) onto the shared resolver, deleting the hand-rolled `WITH`
-   walk.
+5. **Reassessed: leave the uniqueness scope index where it is.** On inspection
+   `relation_scope_keys` / `activated_scope_keys` run the uniqueness *relation
+   algebra* (`_RelationWalk`, bottom-up candidate-key inference with the join,
+   group, and union key rules) over one tree. That is property-specific key
+   computation, not a re-derivation of the builder's column resolution. The only
+   lexical piece, `_cte_body_for`, exists to key that property-specific scope
+   index by CTE body, so routing it through the column resolver would not delete
+   the scope index, only swap one small `WITH` walk for a relation-resolution
+   facility the resolver does not yet expose. Folding the key algebra into the
+   shared resolver would be over-generalisation (the same smell that motivated
+   keeping per-scope fact computation property-local in the name-resolution
+   cleanup), so the uniqueness scope index stays as it is. The shared duplication
+   it once had, the name convention, was already removed by `index_by_name`.
+
+## Outcome
+
+Stages 1 through 4 land the goal: one resolver (the builder) computes column and
+relation identity, writes it onto the shared tree, and the inner-flatten detector
+consumes it with zero re-derivation, gaining CTE-awareness as a result. Stage 5's
+target turned out to be property-specific rather than shared, so it is left in
+place by design rather than forced through the resolver.
 
 ## Risks and how each is contained
 
