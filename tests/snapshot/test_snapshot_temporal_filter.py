@@ -26,8 +26,7 @@ from dblect.adapters import profile_for_adapter
 from dblect.audit import run_audit
 from dblect.manifest import Manifest
 from dblect.snapshot import detect_snapshot_temporal_filter
-from dblect.sql import parse_sql
-from dblect.sql.patterns import FindingKind
+from dblect.sql import FindingKind, parse_sql
 
 # A default-named snapshot and a snapshot that renamed its validity columns.
 _DEFAULT = {"orders_snapshot": ("dbt_valid_from", "dbt_valid_to")}

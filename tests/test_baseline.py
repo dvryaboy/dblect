@@ -15,7 +15,7 @@ from __future__ import annotations
 from dblect.audit.walker import LocatedFinding
 from dblect.baseline import introduced_findings
 from dblect.check.findings import CheckFinding, CheckFindingKind
-from dblect.sql.patterns import Finding, FindingKind
+from dblect.sql import Finding, FindingKind
 
 
 def _structural(

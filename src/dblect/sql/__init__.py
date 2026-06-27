@@ -7,6 +7,13 @@ from dblect.sql.aggregates import (
     duplicate_sensitive,
     strips_duplicates,
 )
+from dblect.sql.findings import (
+    Finding,
+    FindingKind,
+    finding_at,
+    suppression_code,
+    suppression_hint,
+)
 from dblect.sql.parse import (
     MultiResultScript,
     NoResultScript,
@@ -19,8 +26,6 @@ from dblect.sql.parse import (
 from dblect.sql.patterns import (
     PORTABLE_NON_DETERMINISTIC_BUILTINS,
     AggregateSummary,
-    Finding,
-    FindingKind,
     GroupBySummary,
     JoinSide,
     JoinSummary,
@@ -32,15 +37,12 @@ from dblect.sql.patterns import (
     detect_unordered_aggregate,
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
-    finding_at,
     list_aggregations,
     list_group_bys,
     list_joins,
     list_windows,
     make_non_determinism_detector,
     scan_all,
-    suppression_code,
-    suppression_hint,
 )
 from dblect.sql.vocab import (
     SURROGATE_HASH_FUNCTIONS,
