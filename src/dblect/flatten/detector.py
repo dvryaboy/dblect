@@ -17,8 +17,8 @@ from collections.abc import Callable, Mapping
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.lineage.builder import build_manifest_graph
-from dblect.lineage.graph import SourceKind, SourceRef
+from dblect.lineage.builder import build_manifest_graph, index_by_name
+from dblect.lineage.graph import SourceRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
@@ -47,31 +47,11 @@ def make_array_nonemptiness_detectors(
     for ref, ann in annotations.items():
         if ann.value is ArrayNonEmpty.NON_EMPTY:
             by_source.setdefault(ref.source, set()).add(ref.column)
-    model_nonempty = _by_name(manifest, by_source)
+    model_nonempty = index_by_name(
+        manifest, {ref: frozenset(cols) for ref, cols in by_source.items()}
+    )
 
     def flatten(tree: Expr) -> tuple[Finding, ...]:
         return detect_inner_flatten_row_drop(tree, model_nonempty=model_nonempty)
 
     return (flatten,)
-
-
-def _by_name(
-    manifest: Manifest, by_source: Mapping[SourceRef, set[str]]
-) -> dict[str, frozenset[str]]:
-    """Index the non-empty column sets by the relation name as it appears in compiled SQL.
-
-    A source resolves under ``identifier or name`` (dbt compiles ``{{ source(...) }}`` to its
-    ``identifier``), a model under ``name``, matching the column-graph builder's name
-    resolution so a name the detector looks up lands on the relation the propagation
-    annotated. Models win over sources on a name collision, the way a ``ref`` resolves.
-    """
-    by_name: dict[str, frozenset[str]] = {}
-    models: dict[str, frozenset[str]] = {}
-    for ref, columns in by_source.items():
-        node = manifest.nodes.get(ref.unique_id)
-        if node is None:
-            continue
-        target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = frozenset(columns)
-    by_name.update(models)
-    return by_name
