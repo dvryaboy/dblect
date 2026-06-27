@@ -592,7 +592,11 @@ def outer_join_nullable_columns(
 
 
 def activated_nullability(
-    manifest: Manifest, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    parsed: Mapping[str, Expr] | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> Mapping[ColumnRef, Annotation[Nullability]]:
     """Per-column nullability with outer-join optional sides tainted NULLABLE and
     conditional NON_NULL facts activated against the predicate flow.
@@ -603,15 +607,18 @@ def activated_nullability(
     relations, the flow says which scopes satisfy the predicate, and every activated
     column folds NON_NULL into its annotation. ``parsed`` shares the audit's already-parsed
     trees so the whole pass re-parses nothing; the nullability detectors are its consumer.
-    ``profile`` is the run's resolved target, fixing both the parse dialect and the
-    enforcement semantics so they agree.
+    ``column_graph`` lets the audit pass the manifest column graph it built once, so the
+    qualify-and-resolve walk is not repeated per fact family. ``profile`` is the run's
+    resolved target, fixing both the parse dialect and the enforcement semantics so they
+    agree.
     """
     dialect = profile.sqlglot_dialect
-    tainted = taint_outer_joins(
-        build_manifest_graph(manifest, dialect=dialect, parsed=parsed).graph,
-        manifest,
-        parsed=parsed,
+    base_graph = (
+        column_graph
+        if column_graph is not None
+        else build_manifest_graph(manifest, dialect=dialect, parsed=parsed).graph
     )
+    tainted = taint_outer_joins(base_graph, manifest, parsed=parsed)
     base = dict(propagate(tainted, nullability_property(manifest, profile, name_to_source={})))
     relation_graph = build_relation_graph(manifest, dialect=dialect, parsed=parsed).graph
     carrier = propagate(relation_graph, _conditional_notnull_carrier(manifest, profile))

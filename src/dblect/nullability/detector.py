@@ -27,7 +27,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.lineage.facts.model import Annotation
-from dblect.lineage.graph import ColumnRef, SourceKind
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind
 from dblect.lineage.properties import Nullability
 from dblect.lineage.properties.nullability import (
     activated_nullability,
@@ -397,6 +397,7 @@ def make_nullability_detectors(
     profile: AdapterProfile,
     *,
     parsed: Mapping[str, Expr] | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the nullability-consuming detectors against the propagated annotations.
 
@@ -404,11 +405,12 @@ def make_nullability_detectors(
     activation, via ``activated_nullability``), indexes the proven-NULLABLE columns by
     relation name, and curries the GROUP BY, join-key, and NOT-IN detectors against that
     index. ``profile`` is the run's resolved target (its dialect parses, its semantics
-    ground); ``parsed`` lets the walker share its pre-parsed trees. The detectors read
-    only the per-relation index.
+    ground); ``parsed`` lets the walker share its pre-parsed trees. ``column_graph`` lets the
+    audit pass the manifest column graph it already built, so the qualify-and-resolve walk is
+    not repeated per fact family. The detectors read only the per-relation index.
     """
     nullable_by_name = _nullable_by_name(
-        manifest, activated_nullability(manifest, profile, parsed=parsed)
+        manifest, activated_nullability(manifest, profile, parsed=parsed, column_graph=column_graph)
     )
     cause_by_name = _cause_by_name(manifest, parsed=parsed)
 

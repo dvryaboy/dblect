@@ -30,7 +30,7 @@ from sqlglot import Expr
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph, index_by_name
 from dblect.lineage.facts.model import Annotation
-from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceRef
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
@@ -345,6 +345,7 @@ def make_cross_model_fanout_detectors(
     *,
     parsed: Mapping[str, Expr] | None = None,
     relation_keys: RelationUniqueness | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the cross-model fan-out detector against two propagated properties.
 
@@ -353,7 +354,9 @@ def make_cross_model_fanout_detectors(
     propagated once over the whole manifest; ``parsed`` shares the audit's already-parsed
     trees so neither graph re-parses. ``relation_keys`` lets the audit pass the
     already-propagated uniqueness (see :func:`relation_uniqueness`) so the fixpoint, also
-    needed by :func:`make_fact_grounded_detectors`, is not run twice.
+    needed by :func:`make_fact_grounded_detectors`, is not run twice. ``column_graph``
+    likewise lets the audit pass the manifest column graph it built once, so the heavy
+    qualify-and-resolve walk is not repeated per fact family.
     """
     _, keys = (
         relation_keys
@@ -362,7 +365,11 @@ def make_cross_model_fanout_detectors(
     )
     keys_by_source: dict[SourceRef, CandidateKeySet] = {ref: ann.value for ref, ann in keys.items()}
 
-    col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    col_graph = (
+        column_graph
+        if column_graph is not None
+        else build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    )
     provenance = propagate(col_graph, where_provenance)
     provenance_by_source = _provenance_by_source(provenance)
     name_to_ref = index_by_name(manifest, {ref: ref for ref in keys_by_source})

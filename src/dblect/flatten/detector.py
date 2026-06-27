@@ -19,7 +19,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph
-from dblect.lineage.graph import ColumnRef
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
 from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
@@ -33,17 +33,27 @@ def make_array_nonemptiness_detectors(
     profile: AdapterProfile,
     *,
     parsed: Mapping[str, Expr] | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the inner-flatten detector against propagated array non-emptiness.
 
     Building the graph with ``parsed`` resolves each model on a qualified copy and writes the
     resolved ``ColumnRef`` back onto those shared trees, so the detector reads an unnested
     column's identity straight off the tree it scans, through CTE and model boundaries alike.
-    The property is propagated once over the same graph; the non-empty ``ColumnRef``s are the
-    set the predicate tests membership in. ``profile`` is the run's resolved target, fixing
-    the parse dialect.
+    The property is propagated once over that graph; the non-empty ``ColumnRef``s are the set
+    the predicate tests membership in. ``profile`` is the run's resolved target, fixing the
+    parse dialect.
+
+    ``column_graph`` lets the audit pass the manifest column graph it already built over the
+    same ``parsed`` trees, so the heavy qualify-and-resolve walk (which is also what stamped
+    those trees) runs once per audit rather than once per fact family. When it is omitted the
+    factory builds its own graph over ``parsed``, the standalone posture tests use.
     """
-    graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    graph = (
+        column_graph
+        if column_graph is not None
+        else build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    )
     annotations = propagate(graph, array_nonemptiness)
     nonempty_refs = frozenset(
         ref for ref, ann in annotations.items() if ann.value is ArrayNonEmpty.NON_EMPTY
