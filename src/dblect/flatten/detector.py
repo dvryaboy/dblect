@@ -14,13 +14,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
+import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.lineage.builder import build_manifest_graph, index_by_name
-from dblect.lineage.graph import SourceRef
+from dblect.lineage.builder import build_manifest_graph
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
-from dblect.lineage.property import propagate
+from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import Finding, detect_inner_flatten_row_drop
 
@@ -32,26 +33,37 @@ def make_array_nonemptiness_detectors(
     profile: AdapterProfile,
     *,
     parsed: Mapping[str, Expr] | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the inner-flatten detector against propagated array non-emptiness.
 
-    The property is propagated once over the whole-manifest column graph; ``parsed``
-    shares the audit's already-parsed trees so the graph build does not re-parse.
-    ``profile`` is the run's resolved target, fixing the parse dialect. The result is a
-    per-relation-name map of output columns proved non-empty, which the detector uses to
-    clear an ``UNNEST`` of one of them.
+    Building the graph with ``parsed`` resolves each model on a qualified copy and writes the
+    resolved ``ColumnRef`` back onto those shared trees, so the detector reads an unnested
+    column's identity straight off the tree it scans, through CTE and model boundaries alike.
+    The property is propagated once over that graph; the non-empty ``ColumnRef``s are the set
+    the predicate tests membership in. ``profile`` is the run's resolved target, fixing the
+    parse dialect.
+
+    ``column_graph`` lets the audit pass the manifest column graph it already built over the
+    same ``parsed`` trees, so the heavy qualify-and-resolve walk (which is also what stamped
+    those trees) runs once per audit rather than once per fact family. When it is omitted the
+    factory builds its own graph over ``parsed``, the standalone posture tests use.
     """
-    graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    graph = (
+        column_graph
+        if column_graph is not None
+        else build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    )
     annotations = propagate(graph, array_nonemptiness)
-    by_source: dict[SourceRef, set[str]] = {}
-    for ref, ann in annotations.items():
-        if ann.value is ArrayNonEmpty.NON_EMPTY:
-            by_source.setdefault(ref.source, set()).add(ref.column)
-    model_nonempty = index_by_name(
-        manifest, {ref: frozenset(cols) for ref, cols in by_source.items()}
+    nonempty_refs = frozenset(
+        ref for ref, ann in annotations.items() if ann.value is ArrayNonEmpty.NON_EMPTY
     )
 
+    def column_is_nonempty(col: exp.Column) -> bool:
+        ref: ColumnRef | None = resolved_column_ref(col)
+        return ref is not None and ref in nonempty_refs
+
     def flatten(tree: Expr) -> tuple[Finding, ...]:
-        return detect_inner_flatten_row_drop(tree, model_nonempty=model_nonempty)
+        return detect_inner_flatten_row_drop(tree, column_is_nonempty=column_is_nonempty)
 
     return (flatten,)

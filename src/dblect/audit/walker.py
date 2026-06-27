@@ -26,6 +26,7 @@ from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import apply, parse_directives
 from dblect.flatten.detector import make_array_nonemptiness_detectors
+from dblect.lineage.builder import build_manifest_graph
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
@@ -170,12 +171,19 @@ def run_audit(
     # The fact-grounded and cross-model fan-out factories both rest on the relation graph's
     # propagated uniqueness; propagate it once and share it so the fixpoint runs a single time.
     rel_keys = relation_uniqueness(manifest, profile, parsed=trees)
+    # The column graph is the heavy shared substrate: qualifying and scope-resolving every
+    # model (which is also what stamps the shared trees with their resolved column refs).
+    # Build it once and hand it to each column-graph fact family so the walk runs a single
+    # time per audit rather than once per family.
+    col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=trees).graph
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
-        *make_cross_model_fanout_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
-        *make_nullability_detectors(manifest, profile, parsed=trees),
-        *make_array_nonemptiness_detectors(manifest, profile, parsed=trees),
+        *make_cross_model_fanout_detectors(
+            manifest, profile, parsed=trees, relation_keys=rel_keys, column_graph=col_graph
+        ),
+        *make_nullability_detectors(manifest, profile, parsed=trees, column_graph=col_graph),
+        *make_array_nonemptiness_detectors(manifest, profile, parsed=trees, column_graph=col_graph),
         *make_snapshot_detectors(manifest),
     )
     effective_detectors: tuple[Detector, ...] = (*tuple(detectors), *contextual)

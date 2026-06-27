@@ -262,8 +262,11 @@ def build_model_graph(
     plus all materialised intermediates (CTEs, derived tables, UNION outputs).
 
     ``tree`` lets a caller share an already-parsed tree (the audit walker does) so the
-    SQL is parsed once. It is copied before qualification, which mutates in place, so
-    the caller's tree is left untouched.
+    SQL is parsed once. Qualification runs on a copy, so the caller's tree keeps its
+    un-qualified structure. The walk does enrich the shared tree's column ``.meta`` with
+    the resolved ``ColumnRef`` of every reference (see :func:`_walk_model` and
+    :meth:`_Walker.stamp_original`), so a detector reading that tree gets the builder's
+    resolution; structure and node identities are otherwise untouched.
     """
     walker = _walk_model(
         model_uid=model_uid,
@@ -290,9 +293,19 @@ def _walk_model(
     The walker carries both the graph entries (``edges``, ``expressions``) and the
     resolution counts. ``build_model_graph`` keeps only the graph; the manifest
     build also reads the counts. Splitting it here is what lets coverage ride
-    alongside the graph without changing ``build_model_graph``'s return type."""
+    alongside the graph without changing ``build_model_graph``'s return type.
+
+    When ``tree`` is a caller's shared tree, the resolved ``ColumnRef`` of every
+    reference is written back onto its original nodes after the walk, so a detector
+    reading that same tree gets the builder's resolution without re-walking scope
+    (see :meth:`_Walker.stamp_original`). The builder works on a qualified copy, so
+    the write-back rides a reference-id tag set before the copy."""
     self_ref = SourceRef(kind=SourceKind.MODEL, unique_id=model_uid)
-    expression: Expr = tree.copy() if tree is not None else parse_sql(sql, dialect=dialect)
+    original = tree
+    originals: dict[int, exp.Column] = {}
+    if original is not None:
+        originals = _tag_references(original)
+    expression: Expr = original.copy() if original is not None else parse_sql(sql, dialect=dialect)
     expression = qualify(
         expression,
         dialect=dialect,
@@ -306,7 +319,28 @@ def _walk_model(
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
     walker.walk(root_scope, scope_path=())
+    if original is not None:
+        walker.stamp_original(originals, root_scope)
     return walker
+
+
+# Meta key carrying the reference-id tag that lets the builder map a column on its
+# qualified copy back to the same node on the caller's original tree. Set before the
+# copy, preserved by ``copy`` and ``qualify``, read only during write-back.
+_REFERENCE_ID_META_KEY = "dblect_reference_id"
+
+
+def _tag_references(tree: Expr) -> dict[int, exp.Column]:
+    """Tag every column on ``tree`` with a per-tree identity and return the id-to-node map.
+
+    The tag lets a ref resolved on the qualified copy be written back to the original node
+    it came from; the returned map is that write-back's inverse lookup, built in the same
+    walk so the stamper does not re-traverse the tree to rebuild it."""
+    originals: dict[int, exp.Column] = {}
+    for i, col in enumerate(tree.find_all(exp.Column)):
+        col.meta[_REFERENCE_ID_META_KEY] = i
+        originals[i] = col
+    return originals
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +567,31 @@ class _Walker:
         if scope_ref is None:
             return None
         return ColumnRef(source=scope_ref, column=root)
+
+    def stamp_original(self, originals: Mapping[int, exp.Column], root_scope: Scope) -> None:
+        """Write each column reference's resolved ``ColumnRef`` onto the original nodes.
+
+        The walk resolves columns on the qualified copy; this carries that resolution back
+        to the caller's tree so a detector reading it gets the builder's answer (including
+        through CTE and derived-table scopes) without re-deriving lexical scope. Every scope
+        is visited, not just projections, so a reference in any position (an ``UNNEST``
+        argument, a join key, a filter) is resolved. ``originals`` is the reference-id-to-node
+        map :func:`_tag_references` built on the caller's tree before the copy; a node
+        ``qualify`` added by expanding a star carries no tag and has no original to write to,
+        which is correct. A reference that does not resolve leaves its original unstamped,
+        which a consumer reads as "unknown" exactly as an unresolved projection column does.
+        """
+        for scope in root_scope.traverse():
+            for col in scope.columns:
+                rid = col.meta.get(_REFERENCE_ID_META_KEY)
+                if rid is None:
+                    continue
+                target = originals.get(rid)
+                if target is None:
+                    continue
+                ref = self._resolve_column(col, scope=scope)
+                if ref is not None:
+                    attach_column_ref(target, ref)
 
     def _stamp_aggregates(self, projection: Expr, *, scope: Scope) -> None:
         """Stamp each aggregate call in ``projection`` with its scope's
