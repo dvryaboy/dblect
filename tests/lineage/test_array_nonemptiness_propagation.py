@@ -102,6 +102,25 @@ def test_array_literal_is_non_empty() -> None:
     assert values[_col("model.app.pivot", "metrics")] is ArrayNonEmpty.NON_EMPTY
 
 
+def test_array_of_filtered_set_subqueries_is_unknown() -> None:
+    # ARRAY((SELECT AS STRUCT ... FROM unnest(...) WHERE ...)) is set-returning: the filter can
+    # match nothing, so the array can be empty even though it is built inline. Concatenating two
+    # such arrays does not change that. (The real-world shape that exposed the bug: a column an
+    # UNNEST later reads, which must stay flagged.)
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.filtered",
+            "SELECT event_id, ARRAY_CONCAT("
+            "  ARRAY((SELECT AS STRUCT name, value FROM UNNEST(raw_metrics) WHERE name IN ('a'))),"
+            "  ARRAY((SELECT AS STRUCT name, value FROM UNNEST(raw_metrics) WHERE name IN ('b')))"
+            ") AS metrics FROM events",
+        ),
+    )
+    assert values[_col("model.app.filtered", "metrics")] is ArrayNonEmpty.UNKNOWN
+
+
 def test_raw_source_array_stays_unknown() -> None:
     # The raw array column's emptiness is an ingestion fact we cannot see; a pure
     # passthrough must not claim non-emptiness (the (A) side of the worked example).
