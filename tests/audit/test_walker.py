@@ -127,13 +127,21 @@ def test_default_detectors_includes_every_sql_detector_exactly_once() -> None:
     # outside this guard by design.
     import dblect.sql as sql_module
 
+    # `detect_inner_flatten_row_drop` is exported structurally (for standalone scans) but
+    # run in run_audit only through its fact-grounded factory, which threads the
+    # cross-model array-non-emptiness map in; wiring it into DEFAULT_DETECTORS too would
+    # double-report it. So it is deliberately context-bound, like the `make_*` factories.
+    context_bound = {sql_module.detect_inner_flatten_row_drop}
     sql_detectors = {
         getattr(sql_module, name)
         for name in dir(sql_module)
         if name.startswith("detect_") and callable(getattr(sql_module, name))
     }
     default_set = set(DEFAULT_DETECTORS)
-    assert sql_detectors == default_set
+    assert sql_detectors - context_bound == default_set
+    assert not (context_bound & default_set), (
+        "a context-bound detector is also in DEFAULT_DETECTORS"
+    )
     assert len(DEFAULT_DETECTORS) == len(default_set), "DEFAULT_DETECTORS contains duplicates"
 
 

@@ -46,6 +46,7 @@ from dblect.sql.vocab import (
     SURROGATE_HASH_FUNCTIONS,
     SURROGATE_HASH_PASSTHROUGH,
     SURROGATE_HASH_STRUCTURAL,
+    array_literal_nonempty,
 )
 
 __all__ = [
@@ -69,6 +70,7 @@ __all__ = [
     "WindowSummary",
     "aggregate_behavior",
     "all_findings",
+    "array_literal_nonempty",
     "detect_coalesce_on_join_key",
     "detect_inner_flatten_row_drop",
     "detect_null_group_after_outer_join",

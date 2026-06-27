@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import TypeVar, cast
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
@@ -124,7 +124,7 @@ def build_relation_graph(
     and seeds carry no derivation; they enter only as recursion targets that
     ground from facts.
     """
-    name_to_source = _build_name_to_source(manifest)
+    name_to_source = build_name_to_source(manifest)
     derivations: dict[SourceRef, Expr] = {}
     issues: list[BuildIssue] = []
     for uid, model in manifest.models.items():
@@ -177,7 +177,7 @@ def build_manifest_graph(
     SQL are skipped and reported in ``BuildResult.issues``. ``parsed`` lets a caller
     share already-parsed trees so the SQL is parsed once (the audit walker does).
     """
-    name_to_source = _build_name_to_source(manifest)
+    name_to_source = build_name_to_source(manifest)
     # The schema starts from documented columns (the only source for DAG leaves,
     # which have no SQL of their own) and grows as the walk proceeds: a model's
     # resolved output columns are folded in before its dependents are qualified.
@@ -591,6 +591,12 @@ class _Walker:
         group = sel.args.get("group")
         if not isinstance(group, exp.Group) or not group.expressions:
             return frozenset()
+        # ``GROUP BY ()`` is the grand-total grouping set: an empty ``exp.Tuple`` that
+        # folds the whole relation into one group, exactly like no GROUP BY. It grounds
+        # the same whole-relation facts as the empty case above rather than the
+        # "unresolvable keys" ``None`` below (which marks real but opaque group keys).
+        if all(isinstance(g, exp.Tuple) and not g.expressions for g in group.expressions):
+            return frozenset()
         out: set[ColumnRef] = set()
         for g in group.expressions:
             if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
@@ -820,13 +826,18 @@ def _projection_leaves(expr: Expr) -> tuple[list[exp.Column], list[exp.Subquery]
     return direct, subqueries
 
 
-def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
+def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     """Map every name that can appear as a table qualifier to its ``SourceRef``.
 
     Includes models (by ``name``), sources (by ``identifier or name`` since
     dbt compiles ``{{ source(...) }}`` to ``identifier``), and seeds. On a
     name collision, models win — matching the convention that ``ref('x')``
     refers to a model named ``x`` over a source that happens to share it.
+
+    This is the single owner of the compiled-SQL name resolution convention. The
+    relation-graph builder keys the propagation on the ``SourceRef``s it returns,
+    and a detector that needs name-keyed lookup composes it via :func:`index_by_name`
+    rather than re-deriving the convention, so the two cannot drift.
     """
     out: dict[str, SourceRef] = {}
     for uid, src in manifest.sources.items():
@@ -839,6 +850,26 @@ def _build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     for uid, model in manifest.models.items():
         out[model.name] = SourceRef(SourceKind.MODEL, uid)
     return out
+
+
+_ByName = TypeVar("_ByName")
+
+
+def index_by_name(manifest: Manifest, by_source: Mapping[SourceRef, _ByName]) -> dict[str, _ByName]:
+    """Re-key a per-relation map by the relation name as it appears in compiled SQL.
+
+    A detector propagates a property to a ``Mapping[SourceRef, ...]`` but looks relations
+    up by the name in a parsed tree. Rather than re-encode the name convention (the
+    fragile-cooperation hazard), it composes the one resolver, :func:`build_name_to_source`,
+    with its own ``SourceRef``-keyed facts. A name whose relation has no entry in
+    ``by_source`` is omitted, so a lookup miss reads as "no fact" exactly as a per-relation
+    absence would; on a model/source name collision the model wins, as in ``ref`` resolution.
+    """
+    return {
+        name: by_source[ref]
+        for name, ref in build_name_to_source(manifest).items()
+        if ref in by_source
+    }
 
 
 def _build_schema(manifest: Manifest) -> Mapping[str, Mapping[str, str]]:

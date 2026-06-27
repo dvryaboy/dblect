@@ -193,9 +193,11 @@ class AggregationSite:
     * ``input_source``: the single FROM relation the scope aggregates over, when
       it is one resolvable relation with no joins; ``None`` closes the dependency
       read (the FD property has no scope to answer for).
-    * ``group_refs``: the GROUP BY columns; ``None`` marks a group shape the
-      builder cannot resolve to plain columns (positional or computed group keys),
-      which a guard must treat as unprovable rather than as an empty group key.
+    * ``group_refs``: the GROUP BY columns; the empty set is the whole-relation
+      fold (no GROUP BY, or the ``GROUP BY ()`` grand-total grouping set), and
+      ``None`` marks a group shape the builder cannot resolve to plain columns
+      (positional or computed group keys), which a guard must treat as unprovable
+      rather than as an empty group key.
     * ``pinned``: columns the scope's own WHERE equates to a literal, constant
       across every group by construction.
     """

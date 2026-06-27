@@ -23,15 +23,14 @@ inline-subquery scopes, which are not relations the propagator annotates.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from typing import TypeVar
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.lineage.builder import build_manifest_graph, build_relation_graph
+from dblect.lineage.builder import build_manifest_graph, build_relation_graph, index_by_name
 from dblect.lineage.facts.model import Annotation
-from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
@@ -244,9 +243,11 @@ def make_fact_grounded_detectors(
     conditional_scopes = [ref for ref, ann in keys.items() if ann.value.conditional]
     flow = propagate(graph, predicate_flow_property(), subjects=conditional_scopes)
     activated = activate_conditional(keys, flow)
-    model_keys = _by_name(manifest, activated, lambda _ref, cks: cks.keys)
-    conditional_by_name = _by_name(manifest, keys, lambda _ref, ann: ann.value.conditional)
-    flow_by_name = _by_name(manifest, flow, lambda _ref, ann: ann.value)
+    model_keys = index_by_name(manifest, {ref: cks.keys for ref, cks in activated.items()})
+    conditional_by_name = index_by_name(
+        manifest, {ref: ann.value.conditional for ref, ann in keys.items()}
+    )
+    flow_by_name = index_by_name(manifest, {ref: ann.value for ref, ann in flow.items()})
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -364,7 +365,7 @@ def make_cross_model_fanout_detectors(
     col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
     provenance = propagate(col_graph, where_provenance)
     provenance_by_source = _provenance_by_source(provenance)
-    name_to_ref = _by_name(manifest, keys_by_source, lambda ref, _v: ref)
+    name_to_ref = index_by_name(manifest, {ref: ref for ref in keys_by_source})
 
     def fanout(tree: Expr) -> tuple[Finding, ...]:
         return detect_cross_model_fanout(
@@ -473,36 +474,6 @@ def _provenance_by_source(
     for col_ref, ann in provenance.items():
         by_source.setdefault(col_ref.source, {})[col_ref.column] = ann.value
     return by_source
-
-
-_V = TypeVar("_V")
-_R = TypeVar("_R")
-
-
-def _by_name(
-    manifest: Manifest, anns: Mapping[SourceRef, _V], extract: Callable[[SourceRef, _V], _R]
-) -> dict[str, _R]:
-    """Index a per-relation value by the relation name as it appears in compiled SQL.
-
-    A source resolves under ``identifier or name`` (dbt compiles
-    ``{{ source(...) }}`` to its ``identifier``, which can diverge from ``name``);
-    a model resolves under ``name``. This must match the relation-graph builder's
-    ``_build_name_to_source`` so a name the detectors look up by lands on the same
-    relation the propagation annotated. Models win over sources on a name collision
-    (applied last), matching how a ``ref`` resolves. ``extract`` pulls the value the
-    caller wants (keys, conditional keys, flow, or the ``SourceRef`` itself) from each
-    relation's ``(ref, annotation)`` pair.
-    """
-    by_name: dict[str, _R] = {}
-    models: dict[str, _R] = {}
-    for ref, value in anns.items():
-        node = manifest.nodes.get(ref.unique_id)
-        if node is None:
-            continue
-        target = models if ref.kind is SourceKind.MODEL else by_name
-        target[node.identifier or node.name] = extract(ref, value)
-    by_name.update(models)
-    return by_name
 
 
 def _scope_index_for(
