@@ -43,6 +43,10 @@ def where_of(sel: exp.Select) -> exp.Where | None:
     return cast("exp.Where | None", sel.args.get("where"))
 
 
+def qualify_of(sel: exp.Select) -> exp.Qualify | None:
+    return cast("exp.Qualify | None", sel.args.get("qualify"))
+
+
 def joins_of(sel: exp.Select) -> list[exp.Join]:
     return cast("list[exp.Join]", sel.args.get("joins") or [])
 
@@ -93,6 +97,18 @@ def partition_of(w: exp.Window) -> list[Expr]:
 
 def fn_of(w: exp.Window) -> Expr | None:
     return cast("Expr | None", w.this)
+
+
+def window_output_alias(w: exp.Window) -> str | None:
+    """The SELECT-list alias a window is projected under (``rn`` in ``row_number() ... as rn``).
+
+    ``None`` when the window is not directly aliased (an unaliased projection, or one where the
+    window is nested inside a larger expression that carries the alias). Callers use this to
+    recognise a later reference to the window by name, e.g. a ``qualify rn = 1`` that names the
+    rank rather than inlining the window.
+    """
+    parent = w.parent
+    return parent.alias if isinstance(parent, exp.Alias) else None
 
 
 def join_side_of(j: exp.Join) -> JoinSide:
@@ -202,6 +218,15 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
+def column_key(c: exp.Column) -> tuple[str | None, str]:
+    """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
+
+    Two references share a key when they name the same column, ``a.id`` distinct from a bare
+    ``id`` (an under-qualified reference matches conservatively, never spuriously).
+    """
+    return (column_table(c), column_name(c))
+
+
 def find_columns(e: Expr) -> list[exp.Column]:
     return list(e.find_all(exp.Column))
 
@@ -292,9 +317,7 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append(
-            ((column_table(left), column_name(left)), (column_table(right), column_name(right)))
-        )
+        sides.append((column_key(left), column_key(right)))
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()
