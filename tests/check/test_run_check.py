@@ -525,6 +525,44 @@ def test_sum_over_a_scaled_amount_is_flagged() -> None:
     assert "currency" in agg.message
 
 
+def test_sum_grouped_by_a_computed_key_is_flagged() -> None:
+    # `GROUP BY date_trunc('month', created_at)` is a real grouping the builder cannot
+    # resolve to plain columns (a computed key), so the site stamps `group_refs=None`.
+    # The currency companion is no more held by an opaque group than by a resolved one
+    # that omits it, and the guard records the clear "rather than guessing" it is safe,
+    # so the reduction is flagged. Only a windowed aggregate (an unstamped site) is the
+    # deferred case; an opaque GROUP BY is not windowed.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", created_at="TIMESTAMP"),
+        ),
+        _node(
+            "model.shop.monthly",
+            kind=ResourceType.MODEL,
+            sql=(
+                "SELECT date_trunc('month', created_at) AS m, SUM(amount) AS total "
+                "FROM payments GROUP BY date_trunc('month', created_at)"
+            ),
+            columns=_cols(m="TIMESTAMP", total="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert agg.column == "total"
+    assert "currency" in agg.message
+
+
 def test_declared_dependency_discharges_the_sum() -> None:
     class Payments(ModelContract):
         dbt_model = "payments"

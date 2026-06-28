@@ -621,8 +621,9 @@ def domain_type_display(tag: DomainTag) -> AxisDisplay:
 
 def join_key_conflicts(
     on: Expr, tag_of: Callable[[exp.Column], DomainTag | None]
-) -> tuple[tuple[exp.Column, exp.Column], ...]:
-    """The join-key equalities in ``on`` whose two sides carry conflicting domain tags.
+) -> tuple[tuple[exp.Column, exp.Column, DomainTag, DomainTag], ...]:
+    """The join-key equalities in ``on`` whose two sides carry conflicting domain tags,
+    each with the two tags that conflict.
 
     Joining a ``MoneyUSD`` column against a ``MoneyEUR`` one, or two incompatible nominal
     tags (an ISO-2 ``Country`` against an ISO-3), equates values that cannot mean the same
@@ -630,20 +631,21 @@ def join_key_conflicts(
     A no-claim side (``tag_of`` returns ``None`` or ``NAKED``) never conflicts, the lenient
     posture.
 
-    It returns the offending column pairs rather than producing a finding, so the same
-    signal serves any caller; the check renders it as the ``JOIN_KEY_TYPE_MISMATCH``
+    It returns the offending columns alongside the tags that conflict rather than producing
+    a finding, so the same signal serves any caller and the renderer reuses the tags rather
+    than resolving them a second time; the check renders it as the ``JOIN_KEY_TYPE_MISMATCH``
     finding. ``tag_of`` is injected rather than wired to a specific resolution so the
     signal stays decoupled from how a tag is looked up: the check reads the builder's
     ``ColumnRef`` stamp off the ON-clause column (the builder stamps these the same as a
     projection column) and falls back to the column's declared grounding for a join key
     that is never projected, so an unprojected key is still typed."""
-    out: list[tuple[exp.Column, exp.Column]] = []
+    out: list[tuple[exp.Column, exp.Column, DomainTag, DomainTag]] = []
     for left, right in sg.equality_column_pairs(on):
         tag_left, tag_right = tag_of(left), tag_of(right)
         if tag_left is None or tag_right is None:
             continue
         if DOMAIN_TYPE_LATTICE.meet(tag_left, tag_right) is CONFLICT:
-            out.append((left, right))
+            out.append((left, right, tag_left, tag_right))
     return tuple(out)
 
 

@@ -15,6 +15,7 @@ single-statement door the detectors call; it sees through a prelude and raises
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import sqlglot
@@ -118,3 +119,25 @@ def parse_sql(sql: str, dialect: str | None = None) -> Expr:
                 "compiled SQL has no result-producing statement to analyse",
                 sql=sql,
             )
+
+
+def parse_models(
+    sql_by_model: Mapping[str, str | None], *, dialect: str | None
+) -> dict[str, Expr | SQLParseError]:
+    """Parse each model's analysis SQL exactly once.
+
+    Maps each model id to its parsed result statement, or to the :class:`SQLParseError`
+    that prevented parsing. A model whose SQL is ``None`` (no compiled body) is absent
+    from the result, the same "no SQL to follow" absence every caller reads. Callers that
+    want only the trees keep the :class:`Expr` values and treat an error or absence as
+    unbuilt; callers that surface the failure read the error value.
+    """
+    out: dict[str, Expr | SQLParseError] = {}
+    for uid, sql in sql_by_model.items():
+        if sql is None:
+            continue
+        try:
+            out[uid] = parse_sql(sql, dialect=dialect)
+        except SQLParseError as e:
+            out[uid] = e
+    return out

@@ -72,7 +72,7 @@ from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
-from dblect.sql.parse import SQLParseError, parse_sql
+from dblect.sql.parse import parse_models
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -92,10 +92,18 @@ class CheckGraphs:
     column_build: BuildResult
     contracts_resolved: int
     parsed: Mapping[str, Expr]
-    """Each model's stamped statement tree, parsed once and fed to both builds so the
-    SQL is parsed a single time and the column build's ``ColumnRef`` stamps land on the
-    trees the check keeps. The join-key check reads ON-clause columns off these (a
-    projection derivation alone does not carry the join)."""
+    """The stamped statement tree of each model the column build built, parsed once and
+    fed to both builds so the SQL is parsed a single time and the column build's
+    ``ColumnRef`` stamps land on the trees the check keeps. The join-key check reads
+    ON-clause columns off these (a projection derivation alone does not carry the join).
+    A model the build skipped (a compilation miss, a build error) is absent, so the check
+    never reads an unstamped tree as a clean one."""
+    join_key_ground: Callable[[ColumnRef], Annotation[DomainTag]]
+    """The declared-grounding fallback the join-key check reads a never-projected key's
+    tag through. Folded once here, alongside the graph it is judged against, rather than
+    per world: it derives from the world-invariant declared facts, so colocating it with
+    the graph build keeps it in step with the graph instead of resting on the assumption
+    that successive worlds share one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +144,21 @@ def build_check_graphs(
     across an enumeration."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
-    parsed = _parse_models(manifest, profile.sqlglot_dialect)
-    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed)
-    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed)
+    dialect = profile.sqlglot_dialect
+    trees = {
+        uid: tree
+        for uid, tree in parse_models(
+            {uid: m.analysis_sql for uid, m in manifest.models.items()}, dialect=dialect
+        ).items()
+        if isinstance(tree, Expr)
+    }
+    relation_build = build_relation_graph(manifest, dialect=dialect, parsed=trees)
+    column_build = build_manifest_graph(manifest, dialect=dialect, parsed=trees)
+    # A model the column build skipped (a compilation miss, a build error) leaves its tree
+    # unstamped; drop it so the join-key check reads only stamped trees and its model set
+    # matches the build's rather than diverging onto an unvalidated one.
+    unbuilt = {issue.model_unique_id for issue in column_build.issues}
+    parsed = {uid: tree for uid, tree in trees.items() if uid not in unbuilt}
     return CheckGraphs(
         manifest=manifest,
         resolved=resolved,
@@ -146,23 +166,8 @@ def build_check_graphs(
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
+        join_key_ground=domain_type_grounding(_by_scope(resolved.tag_facts)),
     )
-
-
-def _parse_models(manifest: Manifest, dialect: str | None) -> dict[str, Expr]:
-    """Parse each model's analysis SQL once. A model whose SQL does not parse is
-    omitted; the builds, finding no tree for it, surface it as unbuilt, so a parse
-    failure is never read as a clean model."""
-    out: dict[str, Expr] = {}
-    for uid, model in manifest.models.items():
-        sql = model.analysis_sql
-        if sql is None:
-            continue
-        try:
-            out[uid] = parse_sql(sql, dialect=dialect)
-        except SQLParseError:
-            continue
-    return out
 
 
 def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
@@ -306,7 +311,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             graphs.manifest,
             graphs.parsed,
             world.domain_type,
-            domain_type_grounding(_by_scope(graphs.resolved.tag_facts)),
+            graphs.join_key_ground,
             line_maps,
         )
     )
@@ -485,8 +490,13 @@ def _aggregation_findings(
     the event rather than re-inferring it from an ambiguous ``output == NAKED`` (which
     cannot tell a cleared live tag from an operand that was naked before the reduction).
     A ``SELECT`` clear (``min``/``max`` widening a tag-blind selection) is not this
-    finding, so only the combining class is rendered; a clear with no resolvable group
-    scope (a windowed aggregate) is the deferred windowed obligation, left for later."""
+    finding, so only the combining class is rendered. A clear whose site is unstamped
+    (a windowed aggregate) is the deferred windowed obligation, left for later; an opaque
+    group shape (a positional or computed GROUP BY, ``group_refs is None``) is surfaced,
+    since the companion is no more held by a group the builder cannot enumerate than by a
+    resolved one that omits it, and the guard recorded the clear rather than guessing."""
+    if not clears:
+        return []
     owners = _aggregate_owners(column_graph)
     out: list[CheckFinding] = []
     for clear in clears:
@@ -494,7 +504,7 @@ def _aggregation_findings(
         if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
             continue
         site = clear.site
-        if site is None or site.group_refs is None:
+        if site is None:
             continue
         owner = owners.get(id(agg))
         if owner is None:
@@ -573,9 +583,7 @@ def _operand_label(agg: exp.AggFunc) -> str:
     """A short label for what the aggregate reduced: a bare column by name, any other
     expression by its rendered SQL (``amount * rate``)."""
     this = agg.this
-    if isinstance(this, exp.Column):
-        return this.name
-    return sg.render_sql(this) if isinstance(this, Expr) else "?"
+    return this.name if isinstance(this, exp.Column) else sg.render_sql(this)
 
 
 def _join_key_findings(
@@ -609,12 +617,12 @@ def _join_key_findings(
             on = join.args.get("on")
             if not isinstance(on, Expr):
                 continue
-            for left, right in join_key_conflicts(on, tag_of):
+            for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
                 line_start, line_end = _span_of(left, right, on)
                 out.append(
                     CheckFinding(
                         kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
-                        message=_join_key_message(left, right, tag_of(left), tag_of(right)),
+                        message=_join_key_message(left, right, left_tag, right_tag),
                         model_unique_id=uid,
                         file_path=_file_of(manifest, source),
                         column=left.name or None,
@@ -630,15 +638,15 @@ def _join_key_findings(
 def _join_key_message(
     left: exp.Column,
     right: exp.Column,
-    left_tag: DomainTag | None,
-    right_tag: DomainTag | None,
+    left_tag: DomainTag,
+    right_tag: DomainTag,
 ) -> str:
     """Name the two keys and the domain types being equated, each read through the
-    property's display hook so the reader sees the conflict the meet found."""
-    left_disp = domain_type_display(left_tag).name if left_tag is not None else "an untyped value"
-    right_disp = (
-        domain_type_display(right_tag).name if right_tag is not None else "an untyped value"
-    )
+    property's display hook so the reader sees the conflict the meet found. A conflict
+    carries a tag on each side by construction (a no-claim side never conflicts), so both
+    render through the hook rather than an untyped fallback."""
+    left_disp = domain_type_display(left_tag).name
+    right_disp = domain_type_display(right_tag).name
     return (
         f"join key {_qualified(left)} = {_qualified(right)} equates {left_disp} with "
         f"{right_disp}; the two domain types conflict, so the equated values cannot mean "
