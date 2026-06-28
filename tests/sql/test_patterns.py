@@ -264,7 +264,9 @@ def test_coalesce_on_filter_pushed_into_on_clause_not_detected() -> None:
 
 
 def test_unordered_row_number_detected() -> None:
-    p = _parse("select row_number() over (partition by x) as rn from t")
+    # The label lands on an arbitrary row, and that row's `payload` is surfaced, so which
+    # value pairs with rank 1 is observable: a genuine non-determinism.
+    p = _parse("select payload, row_number() over (partition by x) as rn from t")
     findings = detect_unordered_window(p)
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
@@ -273,6 +275,128 @@ def test_unordered_row_number_detected() -> None:
 def test_ordered_row_number_not_flagged() -> None:
     p = _parse("select row_number() over (order by ts) as rn from t")
     assert detect_unordered_window(p) == ()
+
+
+# --- row_number() dedup whose PARTITION BY covers the carried columns (#171) ---
+# An ORDER-BY-less row_number() is non-deterministic only when the row each rank lands on
+# is observable. When every column the ranked scope carries forward is a partition key,
+# all rows in a partition are identical on the surfaced columns, so the result bag is the
+# same whichever physical row each rank picks. These dedups are silent. The moment a
+# non-partition column is surfaced, which row wins is observable again and the finding
+# returns.
+
+
+def test_row_number_qualify_dedup_partition_covers_projection_silent() -> None:
+    sql = "select id, a, b from src qualify row_number() over (partition by id, a, b) = 1"
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_subquery_dedup_partition_covers_projection_silent() -> None:
+    sql = """
+    select id, a, b
+    from (
+      select id, a, b, row_number() over (partition by id, a, b) as rn from src
+    ) where rn = 1
+    """
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_cte_dedup_partition_covers_projection_silent() -> None:
+    sql = """
+    with d as (
+      select id, a, b, row_number() over (partition by id, a, b) as rn from src
+    )
+    select id, a, b from d where rn = 1
+    """
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_dedup_surfacing_only_covered_columns_silent() -> None:
+    # rn itself is carried forward, but the ranked scope's own output bag is already
+    # deterministic (identical rows get the rank labels 1..n as a fixed bag), so a
+    # consumer that surfaces rn stays deterministic.
+    sql = """
+    select id, a, b, rn
+    from (
+      select id, a, b, row_number() over (partition by id, a, b) as rn from src
+    ) where rn = 1
+    """
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_dedup_projection_expression_over_covered_columns_silent() -> None:
+    sql = "select id, lower(b) as lb from src qualify row_number() over (partition by id, b) = 1"
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_dedup_carrying_non_partition_column_fires() -> None:
+    sql = """
+    select id, payload
+    from (
+      select id, payload, row_number() over (partition by id) as rn from src
+    ) where rn = 1
+    """
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
+
+
+def test_row_number_qualify_mixing_non_covered_predicate_fires() -> None:
+    # The QUALIFY combines the rank with a predicate on a non-partition column, so whether
+    # the surviving row also satisfies `payload > 5` depends on which row got rank 1.
+    sql = "select id from src qualify row_number() over (partition by id) = 1 and payload > 5"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_row_number_dedup_star_projection_fires() -> None:
+    # A star can carry any column out of the partition key, so coverage is unprovable.
+    sql = "select * from src qualify row_number() over (partition by id) = 1"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_unordered_rank_dedup_not_suppressed() -> None:
+    # The coverage argument is sound for other ranking functions too, but the dedup idiom
+    # this refinement targets is row_number(); rank()/dense_rank() stay flagged.
+    sql = "select id, a, b from src qualify rank() over (partition by id, a, b) = 1"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_value_window_over_covered_partition_not_suppressed() -> None:
+    # first_value reads a value rather than a rank label; the refinement is scoped to
+    # row_number(), so a value window stays flagged even when its inputs are covered.
+    sql = "select id, a, first_value(a) over (partition by id, a) as fa from src"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_row_number_no_partition_stays_flagged() -> None:
+    sql = "select id, row_number() over () as rn from t"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_row_number_dedup_with_group_by_stays_flagged() -> None:
+    # A GROUP BY changes what the ranked scope carries; the dedup coverage argument does
+    # not apply, so stay conservative.
+    sql = "select id from src group by id qualify row_number() over (partition by id) = 1"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_two_unordered_row_numbers_in_one_scope_stay_flagged() -> None:
+    # The output-bag argument needs the row_number() to be the only window shaping the
+    # scope's output; a second unordered window keeps both findings live.
+    sql = """
+    select id,
+           row_number() over (partition by id) as rn,
+           row_number() over (partition by id) as rn2
+    from src
+    """
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 2
 
 
 @pytest.mark.parametrize(
@@ -755,6 +879,23 @@ def test_no_windows_implies_no_window_findings(table: str, col: str) -> None:
     """A query with no window expression cannot produce window-ordering findings."""
     p = _parse(f"select sum({col}) as s from {table}")
     assert detect_unordered_window(p) == ()
+
+
+@given(cols=st.lists(_IDENT, min_size=1, max_size=4, unique=True), extra=_IDENT)
+@settings(max_examples=50, deadline=None)
+def test_qualify_dedup_silent_iff_projection_covered(cols: list[str], extra: str) -> None:
+    """A row_number()=1 dedup is silent exactly when the projection stays within the
+    partition key; surfacing any column outside it brings the finding back."""
+    pcsv = ", ".join(cols)
+    covered = f"select {pcsv} from src qualify row_number() over (partition by {pcsv}) = 1"
+    assert detect_unordered_window(_parse(covered)) == ()
+    if extra in cols:
+        return
+    uncovered = (
+        f"select {pcsv}, {extra} from src qualify row_number() over (partition by {pcsv}) = 1"
+    )
+    findings = detect_unordered_window(_parse(uncovered))
+    assert len(findings) == 1
 
 
 @given(

@@ -43,6 +43,10 @@ def where_of(sel: exp.Select) -> exp.Where | None:
     return cast("exp.Where | None", sel.args.get("where"))
 
 
+def qualify_of(sel: exp.Select) -> exp.Qualify | None:
+    return cast("exp.Qualify | None", sel.args.get("qualify"))
+
+
 def joins_of(sel: exp.Select) -> list[exp.Join]:
     return cast("list[exp.Join]", sel.args.get("joins") or [])
 

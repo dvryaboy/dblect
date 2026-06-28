@@ -309,12 +309,85 @@ def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
     return tuple(out)
 
 
+def _partition_column_keys(w: exp.Window) -> frozenset[tuple[str | None, str]] | None:
+    """The PARTITION BY columns of ``w`` as ``(table, name)`` keys.
+
+    ``None`` when the partition is empty or any term is not a bare column: an expression like
+    ``partition by lower(id)`` is one we cannot match against a projected column, so the
+    caller stays conservative.
+    """
+    keys: set[tuple[str | None, str]] = set()
+    for term in sg.partition_of(w):
+        if not isinstance(term, exp.Column):
+            return None
+        keys.add((sg.column_table(term), sg.column_name(term)))
+    return frozenset(keys) if keys else None
+
+
+def _columns_outside_windows_covered(node: Expr, keys: frozenset[tuple[str | None, str]]) -> bool:
+    """True when every column ``node`` carries forward is one of ``keys``.
+
+    Columns inside a window spec are excluded: those are the dedup's own PARTITION BY terms,
+    which are the keys by construction. A star or subquery makes coverage unprovable (its
+    columns are not enumerable here), so either one is reported as not covered.
+    """
+    if node.find(exp.Star) is not None:
+        return False
+    if node.find(exp.Subquery) is not None or node.find(exp.Select) is not None:
+        return False
+    for col in sg.find_columns(node):
+        if col.find_ancestor(exp.Window) is not None:
+            continue
+        if (sg.column_table(col), sg.column_name(col)) not in keys:
+            return False
+    return True
+
+
+def _row_number_dedup_is_order_insensitive(w: exp.Window) -> bool:
+    """True when an ORDER-BY-less ``row_number()`` cannot affect its query's result bag.
+
+    A ``row_number()`` with no ORDER BY labels rows in an arbitrary within-partition order.
+    That label is observable only through the columns the ranked scope carries forward. When
+    every carried column is a partition key, all rows in a partition are identical on the
+    surfaced columns, so the scope's output bag is the same whichever physical row each rank
+    lands on: the labels ``1..n`` attach to indistinguishable rows. A consumer of a
+    deterministic bag is itself deterministic, so the decision rests on the ranked scope
+    alone, whether the dedup filter sits in a QUALIFY here or a ``where rn = 1`` one level out.
+
+    Scoped to ``row_number()`` as the sole window of a non-aggregating scope, the dedup idiom
+    the refinement targets. ``rank()``/``dense_rank()``/value windows, and multi-window or
+    grouped scopes, stay flagged: the output-bag argument does not carry to them unchanged.
+    """
+    if not isinstance(sg.fn_of(w), exp.RowNumber):
+        return False
+    keys = _partition_column_keys(w)
+    if keys is None:
+        return False
+    scope = w.find_ancestor(exp.Select)
+    if scope is None or sg.group_of(scope) is not None:
+        return False
+    scope_windows = [
+        win for win in sg.find_all_windows(scope) if win.find_ancestor(exp.Select) is scope
+    ]
+    if scope_windows != [w]:
+        return False
+    if not all(_columns_outside_windows_covered(proj, keys) for proj in scope.expressions):
+        return False
+    qualify = sg.qualify_of(scope)
+    return qualify is None or _columns_outside_windows_covered(qualify.this, keys)
+
+
 def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
     """Flag ranking window functions with no deterministic ORDER BY.
 
     ``ROW_NUMBER()``, ``RANK()``, and friends produce different results across
     runs unless an ORDER BY pins the order. ``LAG``/``LEAD``/``FIRST_VALUE``/
     ``LAST_VALUE`` are similarly meaningless without an ordering.
+
+    The exception is the dedup where a ``row_number() = 1`` keeps one row per partition and
+    the partition key covers every column the ranked scope carries forward: the surviving
+    rows are then identical on all surfaced columns, so the missing ORDER BY does not change
+    the output (see :func:`_row_number_dedup_is_order_insensitive`).
     """
     out: list[Finding] = []
     for w in sg.find_all_windows(tree):
@@ -322,17 +395,20 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
         if fn is None or type(fn) not in _RANKING_FUNCTIONS:
             continue
         order = sg.order_of(w)
-        if order is None or not order.expressions:
-            out.append(
-                finding_at(
-                    FindingKind.UNORDERED_RANKING_WINDOW,
-                    message=(
-                        f"{type(fn).__name__.upper()} window function has no ORDER BY; "
-                        "result is non-deterministic"
-                    ),
-                    node=w,
-                )
+        if order is not None and order.expressions:
+            continue
+        if _row_number_dedup_is_order_insensitive(w):
+            continue
+        out.append(
+            finding_at(
+                FindingKind.UNORDERED_RANKING_WINDOW,
+                message=(
+                    f"{type(fn).__name__.upper()} window function has no ORDER BY; "
+                    "result is non-deterministic"
+                ),
+                node=w,
             )
+        )
     return tuple(out)
 
 
