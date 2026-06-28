@@ -668,6 +668,7 @@ def relation_reduce(
     recurse: Callable[[SourceRef], Annotation[CandidateKeySet]],
     _ctx: DepContext,
     _default: Annotation[CandidateKeySet],
+    _sink: object = None,
 ) -> Annotation[CandidateKeySet]:
     """Reduce a model's relational tree to its inferred candidate-key set.
 

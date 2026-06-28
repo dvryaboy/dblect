@@ -43,7 +43,7 @@ from dblect.sql import (
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
     make_non_determinism_detector,
-    parse_sql,
+    parse_models,
 )
 from dblect.uniqueness.detector import (
     make_cross_model_fanout_detectors,
@@ -178,7 +178,10 @@ def run_audit(
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
     is never dropped by being forgotten.
     """
-    parsed = _parse_models_for_audit(manifest, dialect=profile.sqlglot_dialect)
+    parsed = parse_models(
+        {uid: m.analysis_sql for uid, m in manifest.models.items()},
+        dialect=profile.sqlglot_dialect,
+    )
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
     # The fact-grounded and cross-model fan-out factories both rest on the relation graph's
     # propagated uniqueness; propagate it once and share it so the fixpoint runs a single time.
@@ -217,28 +220,6 @@ def run_audit(
         skipped=tuple(skipped),
         models_scanned=scanned,
     )
-
-
-def _parse_models_for_audit(
-    manifest: Manifest, *, dialect: str | None
-) -> Mapping[str, Expr | SQLParseError]:
-    """Parse each model's analysis SQL exactly once.
-
-    Returns a mapping from model unique_id to either the parsed tree or the
-    `SQLParseError` that prevented parsing. Models with no analysis SQL are
-    absent from the mapping; the walker treats absence as "no compiled SQL"
-    when it iterates.
-    """
-    out: dict[str, Expr | SQLParseError] = {}
-    for uid, model in manifest.models.items():
-        sql = model.analysis_sql
-        if sql is None:
-            continue
-        try:
-            out[uid] = parse_sql(sql, dialect=dialect)
-        except SQLParseError as e:
-            out[uid] = e
-    return out
 
 
 @dataclass(frozen=True, slots=True)

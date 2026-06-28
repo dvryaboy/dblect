@@ -107,6 +107,7 @@ def _flow_reduce(
     recurse: Callable[[SourceRef], Annotation[RowFilter]],
     _ctx: DepContext,
     _default: Annotation[RowFilter],
+    _sink: object = None,
 ) -> Annotation[RowFilter]:
     """Reduce a model's relational tree to its inferred row filter.
 

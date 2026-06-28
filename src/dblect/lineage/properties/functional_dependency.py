@@ -485,6 +485,7 @@ def functional_dependency_property(
         recurse: Callable[[SourceRef], Annotation[FDSet]],
         ctx: DepContext,
         _default: Annotation[FDSet],
+        _sink: object = None,
     ) -> Annotation[FDSet]:
         provisional = False
 

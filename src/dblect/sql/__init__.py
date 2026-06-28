@@ -20,6 +20,7 @@ from dblect.sql.parse import (
     ResultStatement,
     SingleResult,
     SQLParseError,
+    parse_models,
     parse_result_statement,
     parse_sql,
 )
@@ -86,6 +87,7 @@ __all__ = [
     "list_joins",
     "list_windows",
     "make_non_determinism_detector",
+    "parse_models",
     "parse_result_statement",
     "parse_sql",
     "scan_all",

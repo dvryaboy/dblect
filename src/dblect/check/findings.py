@@ -35,6 +35,11 @@ class CheckFindingKind(StrEnum):
     """A reduction over one field of a multi-field type whose other fields are not
     provably constant across the group (the mixed-currency sum)."""
 
+    JOIN_KEY_TYPE_MISMATCH = auto()
+    """A join's ON-clause equality equates two columns whose domain types meet to a
+    conflict (a ``MoneyUSD`` key against a ``MoneyEUR`` one, an ISO-2 country against an
+    ISO-3), so the equated values cannot mean the same thing."""
+
     RESOLUTION_BELOW_FLOOR = auto()
     """Lineage resolution across the project sits below the configured floor, so
     the analysis covers only a fraction of columns and a clean report would

@@ -30,6 +30,7 @@ from dblect.types import IssueCode, ModelContract
 _DUCKDB = profile_for_adapter("duckdb")
 
 MoneyUSD = Money.refine(currency=Currency.USD)
+MoneyEUR = Money.refine(currency=Currency.EUR)
 
 
 def _cols(**types: str) -> Mapping[str, Column]:
@@ -490,6 +491,78 @@ def test_sum_over_a_case_expression_is_not_flagged() -> None:
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 
+def test_sum_over_a_scaled_amount_is_flagged() -> None:
+    # `sum(amount * 2)` keeps the per-row currency through the scalar factor, so the
+    # reduction is just as not-well-typed as `sum(amount)`. The signal flags it because
+    # the operand still carries a live companion; the earlier bare-column restriction
+    # dropped this common shape (`amount * rate`, `price * quantity`) and the recall is
+    # back now that the check reads the guard's clear rather than the operand's shape.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+        ),
+        _node(
+            "model.shop.scaled",
+            kind=ResourceType.MODEL,
+            sql="SELECT country, SUM(amount * 2) AS v FROM payments GROUP BY country",
+            columns=_cols(country="VARCHAR", v="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert agg.column == "v"
+    assert "currency" in agg.message
+
+
+def test_sum_grouped_by_a_computed_key_is_flagged() -> None:
+    # `GROUP BY date_trunc('month', created_at)` is a real grouping the builder cannot
+    # resolve to plain columns (a computed key), so the site stamps `group_refs=None`.
+    # The currency companion is no more held by an opaque group than by a resolved one
+    # that omits it, and the guard records the clear "rather than guessing" it is safe,
+    # so the reduction is flagged. Only a windowed aggregate (an unstamped site) is the
+    # deferred case; an opaque GROUP BY is not windowed.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", created_at="TIMESTAMP"),
+        ),
+        _node(
+            "model.shop.monthly",
+            kind=ResourceType.MODEL,
+            sql=(
+                "SELECT date_trunc('month', created_at) AS m, SUM(amount) AS total "
+                "FROM payments GROUP BY date_trunc('month', created_at)"
+            ),
+            columns=_cols(m="TIMESTAMP", total="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert agg.column == "total"
+    assert "currency" in agg.message
+
+
 def test_declared_dependency_discharges_the_sum() -> None:
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -501,6 +574,73 @@ def test_declared_dependency_discharges_the_sum() -> None:
 
     report = run_check(_agg_manifest(), _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+# --- join-key type compatibility (C2) -------------------------------------------
+
+
+def _join_keys_manifest() -> Manifest:
+    # The join key is named ``amount`` because ``MoneyUSD`` binds its magnitude to the
+    # field column ``amount``; the key being a money value is what makes the currency
+    # mismatch a domain-type conflict.
+    nodes = (
+        _node(
+            "source.shop.raw.usd_ledger",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL"),
+        ),
+        _node(
+            "source.shop.raw.eur_ledger",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL"),
+        ),
+        _node(
+            "model.shop.reconciled",
+            kind=ResourceType.MODEL,
+            sql=(
+                "SELECT u.amount AS amount FROM usd_ledger AS u "
+                "JOIN eur_ledger AS e ON u.amount = e.amount"
+            ),
+            columns=_cols(amount="DECIMAL"),
+        ),
+    )
+    return Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+
+def test_join_on_incompatible_domain_types_is_flagged() -> None:
+    # Equating a USD-pinned key against a EUR-pinned one joins values that cannot mean
+    # the same thing: the two tags meet to a conflict. The check reads that off the ON
+    # clause and reports it, the join-key counterpart of the not-well-typed reduction.
+    class UsdLedger(ModelContract):
+        dbt_model = "usd_ledger"
+        amount: MoneyUSD
+
+    class EurLedger(ModelContract):
+        dbt_model = "eur_ledger"
+        amount: MoneyEUR
+
+    report = run_check(_join_keys_manifest(), _DUCKDB)
+    [jk] = [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
+    assert jk.model_unique_id == "model.shop.reconciled"
+    assert "amount" in jk.message
+
+
+def test_join_on_compatible_domain_types_is_quiet() -> None:
+    # Both keys USD: the tags agree, so the equality is well typed and nothing fires.
+    class UsdLedger(ModelContract):
+        dbt_model = "usd_ledger"
+        amount: MoneyUSD
+
+    class EurLedger(ModelContract):
+        dbt_model = "eur_ledger"
+        amount: MoneyUSD
+
+    report = run_check(_join_keys_manifest(), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
 
 
 # --- coverage -------------------------------------------------------------------

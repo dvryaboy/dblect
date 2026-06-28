@@ -49,6 +49,9 @@ def test_mixed_currency_join_key_is_a_conflict() -> None:
     on = _on("SELECT 1 FROM a JOIN b ON a.amt = b.amt")
     conflicts = join_key_conflicts(on, _resolver({("a", "amt"): _USD, ("b", "amt"): _EUR}))
     assert len(conflicts) == 1
+    # The conflicting tags ride along, so a renderer reuses them rather than re-resolving.
+    _left, _right, left_tag, right_tag = conflicts[0]
+    assert (left_tag, right_tag) == (_USD, _EUR)
 
 
 def test_matching_currency_join_key_is_clean() -> None:
@@ -77,5 +80,5 @@ def test_only_the_conflicting_conjunct_is_flagged() -> None:
     tags = {("a", "amt"): _USD, ("b", "amt"): _EUR, ("a", "k"): _USD, ("b", "k"): _USD}
     conflicts = join_key_conflicts(on, _resolver(tags))
     assert len(conflicts) == 1
-    left, right = conflicts[0]
+    left, right, _left_tag, _right_tag = conflicts[0]
     assert (left.name.lower(), right.name.lower()) == ("amt", "amt")

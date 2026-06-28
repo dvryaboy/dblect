@@ -46,6 +46,7 @@ from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AxisDisplay,
     CoherenceGuard,
     DepContext,
     OperatorTransfer,
@@ -569,13 +570,60 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
     return frozenset(out)
 
 
+# --- the seam-diagnostic display ---------------------------------------------
+
+
+def _unit_label(unit: Unit) -> str:
+    """A unit's human name: a pinned literal as itself, a companion column as the
+    per-row column it rides on."""
+    if isinstance(unit, Concrete):
+        return unit.name
+    return f"per-row {unit.column.column}"
+
+
+def _dimension_label(dim: DimClaim) -> str | None:
+    """The dimensional monomial as a product of unit names, or ``None`` when the tag
+    makes no dimensional claim (no-claim, polymorphic, or dimensionless)."""
+    if not isinstance(dim, Dimension) or dim.is_dimensionless:
+        return None
+    parts = [
+        label if power == 1 else f"{label}^{power}"
+        for label, power in sorted((_unit_label(unit), power) for unit, power in dim.exponents)
+    ]
+    return " * ".join(parts)
+
+
+def domain_type_display(tag: DomainTag) -> AxisDisplay:
+    """The structural name the seam diagnostic renders a tag through: the dimensional
+    monomial and the nominal bindings the tag carries.
+
+    This is the fallback rendering the :class:`AxisDisplay` hook documents, off the tag
+    value alone. Naming the declared type the tag came from (``Money over (amount,
+    currency)``, with the contract's file) is the declaration-trace follow-on (#48);
+    the value here carries the structure, not the declaration."""
+    if isinstance(tag, _Conflict):
+        return AxisDisplay(name="conflicting domain types")
+    pieces: list[str] = []
+    dim = _dimension_label(tag.dimension)
+    if dim is not None:
+        pieces.append(dim)
+    pieces.extend(
+        f"{name}={_unit_label(binding)}"
+        for name, binding in sorted(tag.nominal, key=lambda nb: nb[0])
+    )
+    if not pieces:
+        return AxisDisplay(name="an untagged magnitude")
+    return AxisDisplay(name="a magnitude in " + ", ".join(pieces))
+
+
 # --- join-key type compatibility (substrate signal) -----------------------------
 
 
 def join_key_conflicts(
     on: Expr, tag_of: Callable[[exp.Column], DomainTag | None]
-) -> tuple[tuple[exp.Column, exp.Column], ...]:
-    """The join-key equalities in ``on`` whose two sides carry conflicting domain tags.
+) -> tuple[tuple[exp.Column, exp.Column, DomainTag, DomainTag], ...]:
+    """The join-key equalities in ``on`` whose two sides carry conflicting domain tags,
+    each with the two tags that conflict.
 
     Joining a ``MoneyUSD`` column against a ``MoneyEUR`` one, or two incompatible nominal
     tags (an ISO-2 ``Country`` against an ISO-3), equates values that cannot mean the same
@@ -583,17 +631,21 @@ def join_key_conflicts(
     A no-claim side (``tag_of`` returns ``None`` or ``NAKED``) never conflicts, the lenient
     posture.
 
-    This is the substrate signal only: it returns the offending column pairs rather than
-    raising or producing a finding, because the user-facing finding surface (the seam
-    diagnostic) is a later build. ``tag_of`` resolves a column to its tag, since the
-    builder stamps projection columns but not ON-clause columns."""
-    out: list[tuple[exp.Column, exp.Column]] = []
+    It returns the offending columns alongside the tags that conflict rather than producing
+    a finding, so the same signal serves any caller and the renderer reuses the tags rather
+    than resolving them a second time; the check renders it as the ``JOIN_KEY_TYPE_MISMATCH``
+    finding. ``tag_of`` is injected rather than wired to a specific resolution so the
+    signal stays decoupled from how a tag is looked up: the check reads the builder's
+    ``ColumnRef`` stamp off the ON-clause column (the builder stamps these the same as a
+    projection column) and falls back to the column's declared grounding for a join key
+    that is never projected, so an unprojected key is still typed."""
+    out: list[tuple[exp.Column, exp.Column, DomainTag, DomainTag]] = []
     for left, right in sg.equality_column_pairs(on):
         tag_left, tag_right = tag_of(left), tag_of(right)
         if tag_left is None or tag_right is None:
             continue
         if DOMAIN_TYPE_LATTICE.meet(tag_left, tag_right) is CONFLICT:
-            out.append((left, right))
+            out.append((left, right, tag_left, tag_right))
     return tuple(out)
 
 
@@ -652,5 +704,6 @@ def domain_type_property(
         operators=DOMAIN_TYPE_OPERATORS,
         aggregates=_aggregate_rules(guard=guard),
         ground=ground,
+        display=domain_type_display,
         depends_on=() if fd is None else (fd,),
     )

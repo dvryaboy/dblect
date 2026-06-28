@@ -19,7 +19,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -45,22 +45,22 @@ from dblect.lineage.builder import (
     build_relation_graph,
 )
 from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, WorldRef
+from dblect.lineage.facts.property import CoherenceClear
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
-    AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
     SourceKind,
     SourceRef,
-    aggregation_site_meta,
 )
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
-    companion_columns,
+    domain_type_display,
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
+    join_key_conflicts,
 )
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -68,10 +68,11 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
-from dblect.lineage.property import COLUMNREF_META_KEY, propagate
+from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
+from dblect.sql.parse import parse_models
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -90,6 +91,19 @@ class CheckGraphs:
     relation_build: RelationBuildResult
     column_build: BuildResult
     contracts_resolved: int
+    parsed: Mapping[str, Expr]
+    """The stamped statement tree of each model the column build built, parsed once and
+    fed to both builds so the SQL is parsed a single time and the column build's
+    ``ColumnRef`` stamps land on the trees the check keeps. The join-key check reads
+    ON-clause columns off these (a projection derivation alone does not carry the join).
+    A model the build skipped (a compilation miss, a build error) is absent, so the check
+    never reads an unstamped tree as a clean one."""
+    join_key_ground: Callable[[ColumnRef], Annotation[DomainTag]]
+    """The declared-grounding fallback the join-key check reads a never-projected key's
+    tag through. Folded once here, alongside the graph it is judged against, rather than
+    per world: it derives from the world-invariant declared facts, so colocating it with
+    the graph build keeps it in step with the graph instead of resting on the assumption
+    that successive worlds share one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,10 +122,15 @@ class WorldFacts:
 class WorldAnnotations:
     """One world's propagation result, keyed by the world it holds under. A bundle
     rather than a bare mapping so a later property can ride alongside the domain-type
-    annotations without changing ``propagate_world``'s signature."""
+    annotations without changing ``propagate_world``'s signature.
+
+    ``coherence_clears`` are the aggregate-guard clears the domain-type walk emitted in
+    this world: the structured reason a sum cleared its tag, which the aggregation
+    finding reads instead of re-inferring the event from the cleared output."""
 
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
+    coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
 
 
 def build_check_graphs(
@@ -125,14 +144,29 @@ def build_check_graphs(
     across an enumeration."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
-    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect)
-    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
+    dialect = profile.sqlglot_dialect
+    trees = {
+        uid: tree
+        for uid, tree in parse_models(
+            {uid: m.analysis_sql for uid, m in manifest.models.items()}, dialect=dialect
+        ).items()
+        if isinstance(tree, Expr)
+    }
+    relation_build = build_relation_graph(manifest, dialect=dialect, parsed=trees)
+    column_build = build_manifest_graph(manifest, dialect=dialect, parsed=trees)
+    # A model the column build skipped (a compilation miss, a build error) leaves its tree
+    # unstamped; drop it so the join-key check reads only stamped trees and its model set
+    # matches the build's rather than diverging onto an unvalidated one.
+    unbuilt = {issue.model_unique_id for issue in column_build.issues}
+    parsed = {uid: tree for uid, tree in trees.items() if uid not in unbuilt}
     return CheckGraphs(
         manifest=manifest,
         resolved=resolved,
         relation_build=relation_build,
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
+        parsed=parsed,
+        join_key_ground=domain_type_grounding(_by_scope(resolved.tag_facts)),
     )
 
 
@@ -159,8 +193,11 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         fd=fd_prop.ref,
     )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
-    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx)
-    return WorldAnnotations(world=facts.world, domain_type=domain_type)
+    clears: list[CoherenceClear[DomainTag]] = []
+    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx, sink=clears)
+    return WorldAnnotations(
+        world=facts.world, domain_type=domain_type, coherence_clears=tuple(clears)
+    )
 
 
 def run_check(
@@ -264,8 +301,17 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     findings.extend(
         _aggregation_findings(
             graphs.manifest,
-            world.domain_type,
+            world.coherence_clears,
             graphs.column_build.graph,
+            line_maps,
+        )
+    )
+    findings.extend(
+        _join_key_findings(
+            graphs.manifest,
+            graphs.parsed,
+            world.domain_type,
+            graphs.join_key_ground,
             line_maps,
         )
     )
@@ -433,126 +479,187 @@ def _contradiction_findings(
 
 def _aggregation_findings(
     manifest: Manifest,
-    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    clears: tuple[CoherenceClear[DomainTag], ...],
     column_graph: ColumnLineageGraph,
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
-    """One finding per aggregate output whose tag cleared to naked while an operand
-    it summed still carried one: a reduction the algebra cannot call well typed."""
+    """One finding per combining aggregate the coherence guard cleared: a reduction
+    over a value whose per-row companion nothing holds constant per group.
+
+    The guard already decided this and recorded *why* in the clear, so the check reads
+    the event rather than re-inferring it from an ambiguous ``output == NAKED`` (which
+    cannot tell a cleared live tag from an operand that was naked before the reduction).
+    A ``SELECT`` clear (``min``/``max`` widening a tag-blind selection) is not this
+    finding, so only the combining class is rendered. A clear whose site is unstamped
+    (a windowed aggregate) is the deferred windowed obligation, left for later; an opaque
+    group shape (a positional or computed GROUP BY, ``group_refs is None``) is surfaced,
+    since the companion is no more held by a group the builder cannot enumerate than by a
+    resolved one that omits it, and the guard recorded the clear rather than guessing."""
+    if not clears:
+        return []
+    owners = _aggregate_owners(column_graph)
     out: list[CheckFinding] = []
-    for ref, ann in _sorted(annotations):
-        if ann.value != NAKED:
+    for clear in clears:
+        agg = clear.aggregate
+        if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
             continue
-        derivation = column_graph.derivation(ref)
-        if derivation is None:
+        site = clear.site
+        if site is None:
             continue
-        operands = column_graph.edges.get(ref, frozenset())
-        tagged = frozenset(up for up in operands if annotations.get(up, _NO_ANN).value != NAKED)
-        agg = _culprit_aggregate(derivation, tagged) if tagged else None
-        if agg is None:
+        owner = owners.get(id(agg))
+        if owner is None:
             continue
-        # The aggregate node pins the line; the projection derivation is the fallback
-        # so the finding still lands near the right place when the aggregate carries no
-        # stamped identifier (a literal-only shape).
-        line_start, line_end = _span_of(agg, derivation)
-        uid = ref.source.unique_id
+        # The aggregate node pins the line; the projection derivation is the fallback so
+        # the finding still lands near the right place when the aggregate carries no
+        # stamped line (a literal-only shape).
+        line_start, line_end = _span_of(agg, column_graph.derivation(owner))
+        uid = owner.source.unique_id
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
-                message=_aggregation_message(ref, agg, annotations),
+                message=_aggregation_message(owner, clear),
                 model_unique_id=uid,
-                file_path=_file_of(manifest, ref.source),
-                column=ref.column,
+                file_path=_file_of(manifest, owner.source),
+                column=owner.column,
                 line_start=line_start,
                 line_end=line_end,
                 source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
             )
         )
+    # The clear order follows the propagation walk; sort so the report is deterministic.
+    out.sort(key=lambda f: (f.model_unique_id or "", f.column or "", f.line_start))
     return out
 
 
-_GENERIC_AGG_MESSAGE = (
-    "reducing {col!r} mixes a per-row companion that nothing holds constant per group; "
-    "the aggregation is not well typed"
-)
+def _aggregate_owners(column_graph: ColumnLineageGraph) -> dict[int, ColumnRef]:
+    """Map each aggregate call's identity to the output column whose derivation holds
+    it, so a clear (which carries the call, not the output) lands on its column and line.
+
+    The propagator walked these very derivations, so the ``AggFunc`` in a clear is the
+    same object found here; keyed on ``id`` because two distinct calls can be equal by
+    value. The first owner wins, which is unambiguous since each projection subtree is a
+    distinct output column's own."""
+    owners: dict[int, ColumnRef] = {}
+    for ref in column_graph.subjects():
+        derivation = column_graph.derivation(ref)
+        if derivation is None:
+            continue
+        for agg in derivation.find_all(exp.AggFunc):
+            owners.setdefault(id(agg), ref)
+    return owners
 
 
-def _aggregation_message(
-    output: ColumnRef,
-    agg: exp.AggFunc,
-    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
-) -> str:
-    """Name what the coherence guard reasoned about: the aggregate and the column it
-    reduced, the per-row companion that is not held constant, and the grouping that
-    fails to hold it.
-
-    Faithful by construction: it reads the same ``AggregationSite`` the builder
-    stamped (and the guard judged) and the same ``companion_columns`` the guard
-    called, so the message describes the decision rather than re-deriving it. When the
-    reduced operand carries no tag or the companion cannot be pinpointed (an
-    unmodelled shape), it falls back to the generic wording rather than guess."""
-    operand = agg.this.meta.get(COLUMNREF_META_KEY)
-    if not isinstance(operand, ColumnRef) or operand not in annotations:
-        return _GENERIC_AGG_MESSAGE.format(col=output.column)
-    site = aggregation_site_meta(agg)
-    pinned: frozenset[ColumnRef] = site.pinned if site is not None else frozenset()
-    group_refs = site.group_refs if site is not None else None
-
-    companions = companion_columns(annotations[operand].value)
-    # A companion in the group key or pinned by the scope's WHERE is held constant;
-    # the rest are what the grouping leaves varying. If subtracting empties the set
-    # (an exotic multi-companion shape), name the companions rather than nothing.
-    held: frozenset[ColumnRef] = pinned | (group_refs or frozenset())
-    varying = frozenset(c for c in companions if c not in held) or companions
-    if not varying:
-        return _GENERIC_AGG_MESSAGE.format(col=output.column)
-
+def _aggregation_message(output: ColumnRef, clear: CoherenceClear[DomainTag]) -> str:
+    """Name what the coherence guard reasoned about: the aggregate and what it reduced,
+    the per-row companion that is not held constant, and the grouping that fails to hold
+    it. Built from the clear the guard recorded, so it describes the decision rather than
+    re-deriving it, and reads the operand tag through the property's display hook."""
+    agg = clear.aggregate
     func = agg.key  # the lowercased aggregate name: "sum", "avg", ...
-    companion_list = ", ".join(repr(c.column) for c in sorted(varying, key=lambda r: r.column))
-    one = len(varying) == 1
+    operand = _operand_label(agg)
+    descriptor = domain_type_display(clear.cleared_value).name
+
+    companions = sorted({u.companion.column for u in clear.undischarged})
+    companion_list = ", ".join(repr(c) for c in companions)
+    one = len(companions) == 1
     word, verb = ("companion", "is") if one else ("companions", "are")
+
+    group_refs = clear.site.group_refs if clear.site is not None else None
     if group_refs:
         groups = ", ".join(repr(g.column) for g in sorted(group_refs, key=lambda r: r.column))
         tail = f"grouping on {groups}"
+    elif group_refs == frozenset():
+        tail = "the whole-relation reduction"
     else:
         tail = "the grouping, which does not resolve to columns,"
     return (
-        f"reducing {output.column!r} with {func}({operand.column}): its per-row {word} "
-        f"{companion_list} {verb} not held constant by {tail}; the aggregation is not well typed"
+        f"reducing {output.column!r} with {func}({operand}): {descriptor}, whose per-row "
+        f"{word} {companion_list} {verb} not held constant by {tail}; "
+        "the aggregation is not well typed"
     )
 
 
-def _culprit_aggregate(
-    derivation: Expr,
-    tagged: frozenset[ColumnRef],
-) -> exp.AggFunc | None:
-    """The bare-column **combining** aggregate the finding is about: a non-windowed
-    ``COMBINE`` aggregate over a single column in ``tagged``, carrying the stamped site
-    the coherence guard judged.
+def _operand_label(agg: exp.AggFunc) -> str:
+    """A short label for what the aggregate reduced: a bare column by name, any other
+    expression by its rendered SQL (``amount * rate``)."""
+    this = agg.this
+    return this.name if isinstance(this, exp.Column) else sg.render_sql(this)
 
-    Only combining aggregates carry the obligation (the classification lives in
-    :mod:`dblect.sql.aggregates`): a ``SELECT`` like ``min``/``max`` returns a real value
-    and merely widens its tag, and a ``COUNT`` is a tag-free cardinality, so neither is a
-    not-well-typed reduction. Restricting to a bare-column operand keeps it precise: an
-    aggregate over an expression (``sum(CASE WHEN ... THEN amount ELSE 0 END)``) already
-    clears to naked at the expression by mixing a magnitude with a dimensionless literal,
-    a different concern than a companion that is not constant per group."""
-    for agg in derivation.find_all(exp.AggFunc):
-        if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
-            continue
-        if not isinstance(agg.this, exp.Column):
-            continue
-        if not isinstance(aggregation_site_meta(agg), AggregationSite):
-            continue
-        operand = agg.this.meta.get(COLUMNREF_META_KEY)
-        if isinstance(operand, ColumnRef) and operand in tagged:
-            return agg
-    return None
+
+def _join_key_findings(
+    manifest: Manifest,
+    parsed: Mapping[str, Expr],
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    line_maps: dict[str, LineMap],
+) -> list[CheckFinding]:
+    """One finding per ON-clause equality whose two columns carry conflicting domain
+    types: equating a ``MoneyUSD`` key against a ``MoneyEUR`` one, or two incompatible
+    nominal tags, joins values that cannot mean the same thing.
+
+    The ON columns are read off the stamped statement tree, since a projection
+    derivation alone does not carry the join. A column's tag is its propagated value
+    where the lineage reached it, falling back to its declared grounding for a join key
+    that is never projected, so a key that appears only in the ON clause is still typed.
+    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps)."""
+
+    def tag_of(col: exp.Column) -> DomainTag | None:
+        ref = resolved_column_ref(col)
+        if ref is None:
+            return None
+        ann = annotations.get(ref)
+        return ann.value if ann is not None else ground(ref).value
+
+    out: list[CheckFinding] = []
+    for uid, tree in parsed.items():
+        source = SourceRef(SourceKind.MODEL, uid)
+        for join in tree.find_all(exp.Join):
+            on = join.args.get("on")
+            if not isinstance(on, Expr):
+                continue
+            for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
+                line_start, line_end = _span_of(left, right, on)
+                out.append(
+                    CheckFinding(
+                        kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                        message=_join_key_message(left, right, left_tag, right_tag),
+                        model_unique_id=uid,
+                        file_path=_file_of(manifest, source),
+                        column=left.name or None,
+                        line_start=line_start,
+                        line_end=line_end,
+                        source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
+                    )
+                )
+    out.sort(key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""))
+    return out
+
+
+def _join_key_message(
+    left: exp.Column,
+    right: exp.Column,
+    left_tag: DomainTag,
+    right_tag: DomainTag,
+) -> str:
+    """Name the two keys and the domain types being equated, each read through the
+    property's display hook so the reader sees the conflict the meet found. A conflict
+    carries a tag on each side by construction (a no-claim side never conflicts), so both
+    render through the hook rather than an untyped fallback."""
+    left_disp = domain_type_display(left_tag).name
+    right_disp = domain_type_display(right_tag).name
+    return (
+        f"join key {_qualified(left)} = {_qualified(right)} equates {left_disp} with "
+        f"{right_disp}; the two domain types conflict, so the equated values cannot mean "
+        "the same thing"
+    )
+
+
+def _qualified(col: exp.Column) -> str:
+    """A column rendered with its table qualifier when it has one (``p.amount``)."""
+    return f"{col.table}.{col.name}" if col.table else col.name
 
 
 # --- helpers --------------------------------------------------------------------
-
-_NO_ANN: Annotation[DomainTag] = Annotation(NAKED)
 
 
 def _sorted(
