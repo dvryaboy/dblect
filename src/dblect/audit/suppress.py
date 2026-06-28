@@ -189,12 +189,6 @@ def _admits(directive: SuppressionDirective, span: SourceSpan, kind: Suppressibl
     return kind in directive.kinds
 
 
-def directive_matches(directive: SuppressionDirective, finding: Suppressible) -> bool:
-    """True if `directive` silences `finding` on its back-mapped ``located_span``, the
-    coordinate the report shows. The full two-frame match lives in :func:`apply`."""
-    return _admits(directive, finding.located_span, finding.kind)
-
-
 @dataclass(frozen=True, slots=True)
 class FramedDirectives:
     """The ``-- noqa`` directives a model offers, split by the text they were read from.

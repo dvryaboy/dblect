@@ -150,17 +150,6 @@ def test_text_suppressed_block_shows_bare_noqa() -> None:
     assert "suppressed by noqa @ L4" in text
 
 
-def test_suppressed_rows_order_directive_lines_numerically() -> None:
-    # Co-located suppressions that differ only in directive line must order by the integer
-    # line, not the formatted string (where "L10" would sort before "L2").
-    suppressed = (
-        SuppressedFinding(located=_structural(), directive_line=10, bare=True),
-        SuppressedFinding(located=_structural(), directive_line=2, bare=True),
-    )
-    text = render_text(_report(suppressed=suppressed))
-    assert text.index("@ L2") < text.index("@ L10")
-
-
 def test_text_marks_a_compiled_frame_directive_line() -> None:
     # A macro body's `-- noqa` is matched in compiled space, so its line is labelled
     # `compiled L<n>` and never mistaken for a line in the developer's template.

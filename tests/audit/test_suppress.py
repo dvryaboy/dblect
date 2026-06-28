@@ -7,9 +7,9 @@ import pytest
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import (
     FramedDirectives,
+    Suppressible,
     SuppressionDirective,
     apply,
-    directive_matches,
     parse_directives,
 )
 from dblect.audit.walker import LocatedFinding
@@ -128,87 +128,6 @@ def test_noqa_lookalikes_produce_no_directive(comment: str) -> None:
     assert parse_directives(f"select 1  {comment}\n") == ()
 
 
-# --- directive_matches ---
-
-
-def test_directive_on_same_line_matches() -> None:
-    d = SuppressionDirective(line=5, kinds=None)
-    assert directive_matches(d, _finding(line_start=5))
-
-
-def test_directive_on_previous_line_matches() -> None:
-    d = SuppressionDirective(line=4, kinds=None)
-    assert directive_matches(d, _finding(line_start=5))
-
-
-def test_directive_two_lines_up_does_not_match() -> None:
-    d = SuppressionDirective(line=3, kinds=None)
-    assert not directive_matches(d, _finding(line_start=5))
-
-
-def test_directive_within_multi_line_finding_matches() -> None:
-    d = SuppressionDirective(line=6, kinds=None)
-    assert directive_matches(d, _finding(line_start=5, line_end=7))
-
-
-def test_coded_directive_only_silences_its_kind() -> None:
-    d = SuppressionDirective(line=5, kinds=frozenset({FindingKind.NULL_GROUP_AFTER_OUTER_JOIN}))
-    same_kind = _finding(line_start=5, kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN)
-    other_kind = _finding(line_start=5, kind=FindingKind.COALESCE_ON_JOIN_KEY)
-    assert directive_matches(d, same_kind)
-    assert not directive_matches(d, other_kind)
-
-
-def test_empty_kinds_directive_silences_nothing() -> None:
-    d = SuppressionDirective(line=5, kinds=frozenset())
-    assert not directive_matches(d, _finding(line_start=5))
-
-
-def test_finding_without_line_is_never_suppressed() -> None:
-    d = SuppressionDirective(line=0, kinds=None)
-    f = _finding(line_start=0, line_end=0)
-    assert not directive_matches(d, f)
-
-
-def test_directive_matches_the_source_span_not_the_compiled_span() -> None:
-    # Macro expansion shifts the finding's compiled line (7) away from the source line
-    # the developer wrote (3). A directive on the source line matches; the compiled line
-    # does not. This is the contract that makes the line the report shows suppressible.
-    f = LocatedFinding(
-        model_unique_id="model.shop.m",
-        file_path="models/m.sql",
-        finding=Finding(
-            kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
-            message="x",
-            sql_snippet="snippet",
-            line_start=7,
-            line_end=7,
-        ),
-        source_span=SourceSpan(3, 3, SpanBasis.SOURCE),
-    )
-    assert directive_matches(SuppressionDirective(line=3, kinds=None), f)
-    assert not directive_matches(SuppressionDirective(line=7, kinds=None), f)
-
-
-def test_compiled_basis_finding_falls_back_to_the_compiled_line() -> None:
-    # A construct emitted inside a macro has no source line; its located_span stays
-    # compiled-relative, so matching falls back to the compiled line (the honest, if
-    # imperfect, behavior until macro-emitted findings get their own suppression path).
-    f = LocatedFinding(
-        model_unique_id="model.shop.m",
-        file_path="models/m.sql",
-        finding=Finding(
-            kind=FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
-            message="x",
-            sql_snippet="snippet",
-            line_start=5,
-            line_end=5,
-        ),
-        source_span=SourceSpan(5, 5, SpanBasis.COMPILED),
-    )
-    assert directive_matches(SuppressionDirective(line=5, kinds=None), f)
-
-
 # --- apply ---
 
 
@@ -222,6 +141,13 @@ def _compiled_frame(*directives: SuppressionDirective) -> FramedDirectives:
     """Directives placed in the compiled frame, where a macro body's `-- noqa` renders
     adjacent to the construct it guards. A COMPILED-basis finding is matched against these."""
     return FramedDirectives(source=(), compiled=directives)
+
+
+def _suppressed(finding: Suppressible, framed: FramedDirectives) -> bool:
+    """Whether `apply` silences a single `finding`, the public boundary the admission and
+    kind contracts below are pinned through."""
+    _, hidden = apply((finding,), framed)
+    return len(hidden) == 1
 
 
 def _macro_emitted_finding(
@@ -302,6 +228,55 @@ def test_apply_uses_first_matching_directive() -> None:
     assert suppressed[0][1].kinds is None
 
 
+# --- admission: the line window, the kind contract, and cross-family isolation ---
+#
+# A directive admits a finding when it sits on the line immediately above the finding's span
+# or anywhere within it, and (when coded) only for the kinds it names. The window and kind
+# logic is frame-agnostic, so one frame exercises it for both.
+
+
+@pytest.mark.parametrize(
+    ("directive_line", "expected"),
+    [
+        (4, True),  # the line immediately above the finding
+        (5, True),  # the finding's own line
+        (3, False),  # two lines above is outside the window
+        (6, False),  # below a single-line finding is outside the window
+    ],
+)
+def test_directive_admits_only_within_its_line_window(directive_line: int, expected: bool) -> None:
+    framed = _source_frame(SuppressionDirective(line=directive_line, kinds=None))
+    assert _suppressed(_finding(line_start=5), framed) is expected
+
+
+def test_directive_within_a_multi_line_finding_matches() -> None:
+    framed = _source_frame(SuppressionDirective(line=6, kinds=None))
+    assert _suppressed(_finding(line_start=5, line_end=7), framed)
+
+
+def test_coded_directive_only_silences_its_kind() -> None:
+    framed = _source_frame(
+        SuppressionDirective(line=5, kinds=frozenset({FindingKind.NULL_GROUP_AFTER_OUTER_JOIN}))
+    )
+    assert _suppressed(_finding(line_start=5), framed)
+    assert not _suppressed(_finding(line_start=5, kind=FindingKind.COALESCE_ON_JOIN_KEY), framed)
+
+
+def test_empty_kinds_directive_silences_nothing() -> None:
+    framed = _source_frame(SuppressionDirective(line=5, kinds=frozenset()))
+    assert not _suppressed(_finding(line_start=5), framed)
+
+
+def test_finding_without_a_line_is_never_suppressed() -> None:
+    # A finding with no line range can't be responsibly located, so no directive reaches it
+    # in either frame.
+    everywhere = FramedDirectives(
+        source=(SuppressionDirective(line=1, kinds=None),),
+        compiled=(SuppressionDirective(line=1, kinds=None),),
+    )
+    assert not _suppressed(_finding(line_start=0, line_end=0), everywhere)
+
+
 # --- frame routing: a finding is matched in each frame it genuinely occupies ---
 #
 # A source-written `-- noqa` lives in `raw_code` and silences a finding whose located span
@@ -337,19 +312,6 @@ def test_source_basis_finding_ignores_a_compiled_frame_directive() -> None:
     active, suppressed = apply((_finding(line_start=5),), framed)
     assert len(active) == 1
     assert suppressed == ()
-
-
-def test_compiled_frame_directive_respects_the_finding_kind() -> None:
-    # A coded macro-body directive silences only the kind it names, the same kind contract
-    # the source frame honors.
-    other = FindingKind.COALESCE_ON_JOIN_KEY
-    framed = _compiled_frame(
-        SuppressionDirective(line=5, kinds=frozenset({FindingKind.NULL_GROUP_AFTER_OUTER_JOIN}))
-    )
-    silenced, _ = apply((_macro_emitted_finding(line_start=5),), framed)
-    surviving, _ = apply((_macro_emitted_finding(line_start=5, kind=other),), framed)
-    assert silenced == ()
-    assert len(surviving) == 1
 
 
 def test_macro_call_finding_is_silenced_by_a_macro_body_directive() -> None:
@@ -429,34 +391,31 @@ def test_every_check_kind_code_round_trips(kind: CheckFindingKind) -> None:
     assert kind in d.kinds
 
 
-def test_bare_noqa_silences_a_check_finding() -> None:
-    d = SuppressionDirective(line=5, kinds=None)
-    assert directive_matches(d, _check_finding(line_start=5))
-
-
 def test_coded_directive_only_silences_its_check_kind() -> None:
-    d = SuppressionDirective(line=5, kinds=frozenset({CheckFindingKind.AGGREGATION_NOT_WELL_TYPED}))
-    same = _check_finding(line_start=5, kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED)
-    other = _check_finding(line_start=5, kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION)
-    assert directive_matches(d, same)
-    assert not directive_matches(d, other)
-
-
-def test_check_finding_without_line_is_never_suppressed() -> None:
-    d = SuppressionDirective(line=0, kinds=None)
-    assert not directive_matches(d, _check_finding(line_start=0, line_end=0))
+    # A check finding carries no back-mapped source span, so it routes to the compiled frame.
+    framed = _compiled_frame(
+        SuppressionDirective(line=5, kinds=frozenset({CheckFindingKind.AGGREGATION_NOT_WELL_TYPED}))
+    )
+    assert _suppressed(_check_finding(line_start=5), framed)
+    assert not _suppressed(
+        _check_finding(line_start=5, kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION), framed
+    )
 
 
 def test_structural_code_does_not_silence_a_check_finding() -> None:
-    # A structural code is kind-specific to its family; it leaves a same-line
-    # declaration finding active rather than blanket-silencing it.
-    d = SuppressionDirective(line=5, kinds=frozenset({FindingKind.NULL_GROUP_AFTER_OUTER_JOIN}))
-    assert not directive_matches(d, _check_finding(line_start=5))
+    # A structural code is kind-specific to its family; it leaves a same-line declaration
+    # finding active rather than blanket-silencing it.
+    framed = _compiled_frame(
+        SuppressionDirective(line=5, kinds=frozenset({FindingKind.NULL_GROUP_AFTER_OUTER_JOIN}))
+    )
+    assert not _suppressed(_check_finding(line_start=5), framed)
 
 
 def test_check_code_does_not_silence_a_structural_finding() -> None:
-    d = SuppressionDirective(line=5, kinds=frozenset({CheckFindingKind.AGGREGATION_NOT_WELL_TYPED}))
-    assert not directive_matches(d, _finding(line_start=5))
+    framed = _source_frame(
+        SuppressionDirective(line=5, kinds=frozenset({CheckFindingKind.AGGREGATION_NOT_WELL_TYPED}))
+    )
+    assert not _suppressed(_finding(line_start=5), framed)
 
 
 def test_apply_partitions_check_findings() -> None:

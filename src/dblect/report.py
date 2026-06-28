@@ -211,35 +211,30 @@ def _suppressed_block(
     kind, how it was silenced (bare ``noqa`` or the specific ``noqa: DBLECT_<KIND>``),
     and the line the directive sat on."""
     lines = ["suppressed:"]
-    # (path, sort_start, sort_end, loc, kind, via, directive_line, at). ``loc`` is
+    # (path, sort_start, sort_end, loc, kind, via, directive_line, in_compiled). ``loc`` is
     # pre-formatted so each family carries its back-mapped span (and the compiled-relative
-    # marker when the back-map declined), computed from its own ``located_span``. ``at`` is
-    # the directive location, marked ``compiled L<n>`` when the directive was matched in the
-    # compiled frame (a macro body's ``-- noqa``), so its line is never mistaken for a source
-    # line. ``directive_line`` rides alongside as the integer sort key so co-located rows
-    # order numerically rather than by the formatted string.
-    rows: list[tuple[str, int, int, str, str, str, int, str]] = []
+    # marker when the back-map declined), computed from its own ``located_span``. The
+    # directive location is held as its (line, in_compiled) parts rather than a formatted
+    # string, so sorting orders co-located rows by the numeric line and renders only at print.
+    rows: list[tuple[str, int, int, str, str, str, int, bool]] = []
     for s in structural:
         f = s.located.finding
         path = s.located.file_path or s.located.model_unique_id
         via = "noqa" if s.bare else f"noqa: {suppression_code(f.kind)}"
         span = s.located.located_span
         loc = _format_span(span)
-        at = format_directive_location(in_compiled=s.directive_in_compiled, line=s.directive_line)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, f.kind.value, via, s.directive_line, at)
-        )
+        cols = (f.kind.value, via, s.directive_line, s.directive_in_compiled)
+        rows.append((path, span.line_start, span.line_end, loc, *cols))
     for c in declaration:
         cf = c.finding
         path = cf.file_path or cf.model_unique_id or "<project>"
         via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
         span = cf.located_span
         loc = _format_span(span)
-        at = format_directive_location(in_compiled=c.directive_in_compiled, line=c.directive_line)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, cf.kind.value, via, c.directive_line, at)
-        )
-    for path, _start, _end, loc, kind, via, _dline, at in sorted(rows):
+        cols = (cf.kind.value, via, c.directive_line, c.directive_in_compiled)
+        rows.append((path, span.line_start, span.line_end, loc, *cols))
+    for path, _start, _end, loc, kind, via, dline, in_compiled in sorted(rows):
+        at = format_directive_location(in_compiled=in_compiled, line=dline)
         lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ {at}")
     return "\n".join(lines)
 
