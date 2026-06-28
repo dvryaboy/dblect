@@ -40,11 +40,15 @@ from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     AggregateRule,
+    CoherenceClear,
     CoherenceGuard,
+    CoherenceSink,
     DepContext,
+    DischargePath,
     OperatorTransfer,
     Property,
     Reducer,
+    UndischargedCompanion,
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
@@ -97,6 +101,7 @@ def propagate(
     *,
     dep_context: DepContext = _NULL_DEP_CONTEXT,
     subjects: Iterable[S] | None = None,
+    sink: CoherenceSink[K] | None = None,
 ) -> Mapping[S, Annotation[K]]:
     """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
@@ -121,6 +126,12 @@ def propagate(
     no-information default if recursion ever revisits a subject mid-walk, so a
     malformed input degrades instead of looping forever (a manifest-derived graph
     is acyclic).
+
+    ``sink`` collects the :class:`CoherenceClear` events an aggregate guard records
+    when it clears a tag, so a caller (the check) reads *why* a tag went to top rather
+    than re-inferring it from the output. It is per-call: the propagator never mutates
+    the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
+    silently (the substrate-only path).
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
@@ -148,7 +159,7 @@ def propagate(
                 if deriv is None:
                     result = grounded  # a leaf anchors on its grounded value
                 else:
-                    inferred = reduce(deriv, prop, annotate, dep_context, default_ann)
+                    inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
                     result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
             annotations[subject] = result
             return result
@@ -228,6 +239,7 @@ def _column_reduce(
     annotate: Callable[[ColumnRef], Annotation[K]],
     dep_context: DepContext,
     default_ann: Annotation[K],
+    sink: CoherenceSink[K] | None = None,
 ) -> Annotation[K]:
     """The column-scoped reducer: reduce a projection ``expr`` to one annotation.
 
@@ -237,13 +249,16 @@ def _column_reduce(
     ``core``; any other expression consults ``operators`` and otherwise folds its
     children with the scalar combine. An expression with no children grounds to
     the lattice top.
+
+    ``sink`` rides the recursion so an aggregate guard reached at any depth records
+    its clear into the caller's collector.
     """
     lat = prop.lattice
 
     if isinstance(expr, exp.Alias):
         inner = expr.this
         return (
-            _column_reduce(inner, prop, annotate, dep_context, default_ann)
+            _column_reduce(inner, prop, annotate, dep_context, default_ann, sink)
             if isinstance(inner, Expr)
             else default_ann
         )
@@ -264,13 +279,13 @@ def _column_reduce(
             child = expr.this if isinstance(expr.this, Expr) else None
             if child is None:
                 return default_ann
-            child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann)
-            return _apply_aggregate(rule, expr, child_ann, dep_context, lat)
+            child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann, sink)
+            return _apply_aggregate(rule, expr, child_ann, dep_context, lat, sink)
         # An aggregate with no registered rule falls through to operator dispatch.
 
     op = _lookup_subclass(prop.operators, type(expr))
     child_anns = tuple(
-        _column_reduce(c, prop, annotate, dep_context, default_ann)
+        _column_reduce(c, prop, annotate, dep_context, default_ann, sink)
         for c in _expression_children(expr)
     )
     if op is not None:
@@ -287,57 +302,81 @@ def _apply_aggregate(
     child: Annotation[K],
     dep_context: DepContext,
     lat: Lattice[K],
+    sink: CoherenceSink[K] | None = None,
 ) -> Annotation[K]:
     """Apply an aggregate rule's pure ``core``, then its coherence guard.
 
     The guard is the one channel a dependency enters an aggregate through: where a
     per-row companion of the aggregated value is not provably constant per group,
     the result clears to the lattice top. The cleared top is IMPLICIT, so a
-    downstream seam warns on it rather than reading it as a declared opt-out.
+    downstream seam warns on it rather than reading it as a declared opt-out. When the
+    guard clears and a ``sink`` is collecting, the structured reason (the operand tag
+    and the undischarged companions with the paths checked) is recorded there, so the
+    consumer reads the event rather than re-inferring it from the cleared output.
     """
     result = rule.core(expr, child)
     guard = rule.coherence
-    if guard is None or _coherent(guard, child.value, aggregation_site_meta(expr), dep_context):
+    if guard is None:
         return result
+    site = aggregation_site_meta(expr)
+    undischarged = _undischarged(guard, child.value, site, dep_context)
+    if not undischarged:
+        return result
+    if sink is not None:
+        sink.append(
+            CoherenceClear(
+                aggregate=expr, site=site, cleared_value=child.value, undischarged=undischarged
+            )
+        )
     return Annotation(lat.top, Opacity.IMPLICIT, provisional=child.provisional)
 
 
-def _coherent(
+def _undischarged(
     guard: CoherenceGuard[K, Any],
     value: K,
     site: AggregationSite | None,
     dep_context: DepContext,
-) -> bool:
-    """Whether every companion column the aggregated value references is constant
-    within each group: in the group key, pinned by the scope's own filter, or
-    functionally determined by the group columns at the aggregation input.
+) -> tuple[UndischargedCompanion, ...]:
+    """The companion columns the aggregated value references that are *not* provably
+    constant within each group, each with the discharge paths the guard checked.
+
+    A companion is discharged when it is in the group key, pinned by the scope's own
+    filter, or functionally determined by the group columns at the aggregation input.
+    The empty result means every companion discharged (the aggregate keeps its tag); a
+    non-empty result is the clear.
 
     Posture is silent-when-unproven. No stamped site (a windowed aggregate, an
-    unmodelled scope) or an unresolvable group shape fails the guard rather than
-    guessing. The dependency path applies only to a companion bound to a column of
-    the aggregation input itself: a binding that survived from a relation further
-    upstream is not chased (rebinding companions through projections is a later
-    build), so it discharges only through group membership or a pin.
+    unmodelled scope) or an unresolvable group shape leaves every companion
+    undischarged with no path checkable, rather than guessing. The dependency path
+    applies only to a companion bound to a column of the aggregation input itself: a
+    binding that survived from a relation further upstream is not chased (rebinding
+    companions through projections is a later build), so it discharges only through
+    group membership or a pin.
     """
     companions = guard.companions(value)
     if not companions:
-        return True
+        return ()
     if site is None or site.group_refs is None:
-        return False
+        return tuple(UndischargedCompanion(c, frozenset()) for c in companions)
     fd_ann = (
         dep_context.annotation(guard.fd, site.input_source)
         if site.input_source is not None
         else None
     )
     antecedent = frozenset(g.column for g in site.group_refs if g.source == site.input_source)
+    out: list[UndischargedCompanion] = []
     for companion in companions:
         if companion in site.group_refs or companion in site.pinned:
             continue
-        if fd_ann is None or companion.source != site.input_source:
-            return False
-        if not guard.entails(fd_ann.value, antecedent, companion.column):
-            return False
-    return True
+        # GROUP_KEY and PIN were both checked above; the FD path is reachable only when
+        # the dependency property answers for this companion's own relation.
+        paths = {DischargePath.GROUP_KEY, DischargePath.PIN}
+        if fd_ann is not None and companion.source == site.input_source:
+            paths.add(DischargePath.FD)
+            if guard.entails(fd_ann.value, antecedent, companion.column):
+                continue
+        out.append(UndischargedCompanion(companion, frozenset(paths)))
+    return tuple(out)
 
 
 def _fold(

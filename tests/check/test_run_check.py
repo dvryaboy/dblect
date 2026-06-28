@@ -490,6 +490,40 @@ def test_sum_over_a_case_expression_is_not_flagged() -> None:
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
 
 
+def test_sum_over_a_scaled_amount_is_flagged() -> None:
+    # `sum(amount * 2)` keeps the per-row currency through the scalar factor, so the
+    # reduction is just as not-well-typed as `sum(amount)`. The signal flags it because
+    # the operand still carries a live companion; the earlier bare-column restriction
+    # dropped this common shape (`amount * rate`, `price * quantity`) and the recall is
+    # back now that the check reads the guard's clear rather than the operand's shape.
+    nodes = (
+        _node(
+            "source.shop.raw.payments",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
+        ),
+        _node(
+            "model.shop.scaled",
+            kind=ResourceType.MODEL,
+            sql="SELECT country, SUM(amount * 2) AS v FROM payments GROUP BY country",
+            columns=_cols(country="VARCHAR", v="DECIMAL"),
+        ),
+    )
+    manifest = Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    report = run_check(manifest, _DUCKDB)
+    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    assert agg.column == "v"
+    assert "currency" in agg.message
+
+
 def test_declared_dependency_discharges_the_sum() -> None:
     class Payments(ModelContract):
         dbt_model = "payments"

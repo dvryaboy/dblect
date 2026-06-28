@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, final, runtime_checkable
 
 import sqlglot.expressions as exp
@@ -22,7 +23,7 @@ from sqlglot import Expr
 
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, ScopeKind
-from dblect.lineage.graph import ColumnRef, SourceRef
+from dblect.lineage.graph import AggregationSite, ColumnRef, SourceRef
 from dblect.lineage.semiring import Semiring
 
 if TYPE_CHECKING:
@@ -100,6 +101,55 @@ class CoherenceGuard(Generic[K, F]):
     fd: PropertyRef[F, SourceRef]
     companions: Callable[[K], Collection[ColumnRef]]
     entails: Callable[[F, frozenset[str], str], bool]
+
+
+class DischargePath(StrEnum):
+    """A way a coherence guard can prove a per-row companion constant within each
+    group. The closed set the guard checks, recorded on a clear so a diagnostic can
+    say which proofs were attempted and failed."""
+
+    GROUP_KEY = auto()
+    """Membership in the GROUP BY key."""
+    PIN = auto()
+    """A literal binding, or an equality filter in the aggregating scope's WHERE."""
+    FD = auto()
+    """A functional dependency from the group columns to the companion, read from the
+    ``fd`` property at the aggregation input."""
+
+
+@dataclass(frozen=True, slots=True)
+class UndischargedCompanion:
+    """A per-row companion the guard could not prove constant per group, with every
+    :class:`DischargePath` it actually checked. A path absent from ``paths_tried`` was
+    not available to check (the FD path is closed when the aggregation input is not a
+    single relation the dependency property annotates), not silently passed."""
+
+    companion: ColumnRef
+    paths_tried: frozenset[DischargePath]
+
+
+@dataclass(frozen=True, slots=True)
+class CoherenceClear(Generic[K]):
+    """The structured event a coherence guard records when it clears an aggregate: the
+    real reason the output tag went to top, surfaced rather than re-inferred downstream.
+
+    ``cleared_value`` is the operand's tag at the moment of the clear (the tag that
+    carried the live companions, the one a diagnostic renders through
+    :attr:`Property.display`). ``aggregate`` is the cleared call (its line and function),
+    ``site`` the scope it was judged in, and ``undischarged`` the companions that blocked
+    it. An empty ``undischarged`` is never recorded: the guard clears only when at least
+    one companion survives, so a naked operand (no companion) emits nothing."""
+
+    aggregate: exp.AggFunc
+    site: AggregationSite | None
+    cleared_value: K
+    undischarged: tuple[UndischargedCompanion, ...]
+
+
+# The channel a guard records a clear into during propagation. A plain list kept by the
+# caller of :func:`propagate`: the propagator appends, the consumer reads. ``None`` means
+# the caller is not collecting, so the guard clears silently (the substrate-only path).
+CoherenceSink = list[CoherenceClear[K]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,10 +260,20 @@ class Property(Generic[K, S]):
 # It is the *only* scope-specific step of propagation; grounding, reconcile, the
 # cycle guard, and memoisation are shared. A relation property carries its reducer
 # on ``Property.reducer``; column scope uses the propagator's generic default. The
-# signature erases to ``Any`` because the propagator dispatches it dynamically
-# while keeping its public ``propagate`` precisely typed.
+# trailing ``CoherenceSink`` is the channel a reduction may surface a structured
+# diagnostic into (the column reducer's aggregate guard records a clear there); a
+# reduction that emits nothing ignores it. The signature erases to ``Any`` because the
+# propagator dispatches it dynamically while keeping its public ``propagate`` precisely
+# typed.
 Reducer = Callable[
-    [Expr, Property[Any, Any], Callable[[Any], Annotation[Any]], DepContext, Annotation[Any]],
+    [
+        Expr,
+        Property[Any, Any],
+        Callable[[Any], Annotation[Any]],
+        DepContext,
+        Annotation[Any],
+        "CoherenceSink[Any] | None",
+    ],
     Annotation[Any],
 ]
 

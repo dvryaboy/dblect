@@ -22,6 +22,7 @@ from collections.abc import Mapping
 
 from dblect.lineage.builder import build_model_graph, build_relation_graph
 from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact, Opacity
+from dblect.lineage.facts.property import CoherenceClear, DischargePath
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.domain_type import (
@@ -85,17 +86,16 @@ def _node(ref: SourceRef, sql: str | None) -> Node:
     )
 
 
-def _run(
+def _propagate(
     sql: str,
     *,
     amount: DomainTag = _PER_ROW,
     fds: FDSet = NO_FDS,
     stg_sql: str | None = None,
-    out: str = "total",
-) -> Annotation[DomainTag]:
+) -> tuple[Mapping[ColumnRef, Annotation[DomainTag]], tuple[CoherenceClear[DomainTag], ...]]:
     """Propagate functional dependencies over the relation graph, then domain type
-    over the column graph with the FD store as its dependency context, and read the
-    aggregate output column ``out`` of the leaf model."""
+    over the column graph with the FD store as its dependency context, returning every
+    column's annotation alongside the coherence clears the guard emitted into the sink."""
     nodes = [_node(_SRC, None), _node(_CUSTOMERS, None), _node(_MODEL, sql)]
     if stg_sql is not None:
         nodes.append(_node(_STG, stg_sql))
@@ -132,8 +132,34 @@ def _run(
                 schema=_SCHEMA,
             )
         )
-    anns = propagate(graph, dt_prop, dep_context=ctx)
+    clears: list[CoherenceClear[DomainTag]] = []
+    anns = propagate(graph, dt_prop, dep_context=ctx, sink=clears)
+    return anns, tuple(clears)
+
+
+def _run(
+    sql: str,
+    *,
+    amount: DomainTag = _PER_ROW,
+    fds: FDSet = NO_FDS,
+    stg_sql: str | None = None,
+    out: str = "total",
+) -> Annotation[DomainTag]:
+    """The aggregate output column ``out`` of the leaf model after propagation."""
+    anns, _ = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql)
     return anns[ColumnRef(_MODEL, out)]
+
+
+def _clears(
+    sql: str,
+    *,
+    amount: DomainTag = _PER_ROW,
+    fds: FDSet = NO_FDS,
+    stg_sql: str | None = None,
+) -> tuple[CoherenceClear[DomainTag], ...]:
+    """The coherence clears the guard emitted while propagating ``sql``."""
+    _, clears = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql)
+    return clears
 
 
 _HEADLINE = "SELECT country, SUM(amount) AS total FROM payments GROUP BY country"
@@ -262,3 +288,62 @@ def test_windowed_aggregate_clears() -> None:
     the guard reads window structure it stays silent-when-unproven."""
     sql = "SELECT SUM(amount) OVER (PARTITION BY currency) AS total FROM payments"
     assert _run(sql).value == NAKED
+
+
+# --- the emitted clear signal --------------------------------------------------
+#
+# The clear is the substrate's record of *why* the tag went to top: the guard fired
+# on a live per-row companion, not the operand arriving naked. A downstream check
+# reads this instead of re-inferring the event from an ambiguous ``output == NAKED``.
+
+_CURRENCY = ColumnRef(_SRC, "currency")
+
+
+def test_undischarged_sum_emits_a_clear() -> None:
+    """The headline clear carries the reduced tag and the undischarged companion with
+    every discharge path the guard checked and failed."""
+    (clear,) = _clears(_HEADLINE)
+    assert clear.cleared_value == _PER_ROW
+    (undischarged,) = clear.undischarged
+    assert undischarged.companion == _CURRENCY
+    assert undischarged.paths_tried == frozenset(
+        {DischargePath.GROUP_KEY, DischargePath.PIN, DischargePath.FD}
+    )
+
+
+def test_expression_operand_still_emits_a_clear() -> None:
+    """``sum(amount * 2)`` keeps the per-row currency through the scalar factor, so the
+    guard fires on the product just as it does on the bare column: the recall the
+    bare-column restriction dropped."""
+    (clear,) = _clears("SELECT country, SUM(amount * 2) AS total FROM payments GROUP BY country")
+    assert clear.cleared_value == _PER_ROW
+    assert {u.companion for u in clear.undischarged} == {_CURRENCY}
+
+
+def test_naked_operand_emits_no_clear() -> None:
+    """``sum(CASE WHEN .. THEN amount ELSE 0 END)`` mixes the magnitude with a
+    dimensionless literal, so the operand is already naked before the reduction. No
+    companion is live, the guard never fires, and nothing is emitted: precision the
+    output-only proxy could not keep without the bare-column restriction."""
+    sql = (
+        "SELECT country, SUM(CASE WHEN country = 'us' THEN amount ELSE 0 END) AS total "
+        "FROM payments GROUP BY country"
+    )
+    assert _run(sql, out="total").value == NAKED
+    assert _clears(sql) == ()
+
+
+def test_group_membership_discharge_emits_no_clear() -> None:
+    """A discharged companion is not a clear: the tag survives and the sink stays empty."""
+    sql = "SELECT country, currency, SUM(amount) AS total FROM payments GROUP BY country, currency"
+    assert _clears(sql) == ()
+
+
+def test_declared_fd_discharge_emits_no_clear() -> None:
+    fds = FDSet.of(FD(frozenset({"country"}), "currency"))
+    assert _clears(_HEADLINE, fds=fds) == ()
+
+
+def test_concrete_binding_emits_no_clear() -> None:
+    """A pinned literal currency has no companion, so the guard has nothing to clear."""
+    assert _clears(_HEADLINE, amount=_USD) == ()
