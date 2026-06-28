@@ -10,7 +10,8 @@ from __future__ import annotations
 import pytest
 
 from dblect.audit.walker import LocatedFinding
-from dblect.severity import Severity, exceeds_threshold
+from dblect.check.findings import CheckFinding, CheckFindingKind
+from dblect.severity import Severity, exceeds_threshold, severity_of
 from dblect.sql import Finding, FindingKind
 
 # A kind at each level so the test names levels, not kinds: JOIN_FANOUT is error,
@@ -78,3 +79,21 @@ def test_highest_finding_decides() -> None:
     findings = (_finding(_WARN_KIND), _finding(_ERROR_KIND))
     # A warn-level run plus one error fails an error threshold on the strength of the error.
     assert exceeds_threshold(findings, Severity.ERROR) is True
+
+
+@pytest.mark.parametrize("kind", list(CheckFindingKind))
+def test_every_check_finding_kind_has_a_severity(kind: CheckFindingKind) -> None:
+    # The severity map closes over CheckFindingKind with assert_never, so a new kind that
+    # forgets to pick a level is a type error there. Enumerating the kinds pins that at
+    # runtime too: each resolves to a real level rather than raising.
+    finding = CheckFinding(kind=kind, message="", model_unique_id="model.p.m")
+    assert severity_of(finding) in set(Severity)
+
+
+def test_join_key_type_mismatch_is_an_error() -> None:
+    # A declared type conflict at a join key is a disagreement between the declared
+    # meaning and the SQL, so it fails a run like the other type-disagreement findings.
+    finding = CheckFinding(
+        kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH, message="", model_unique_id="model.p.m"
+    )
+    assert severity_of(finding) is Severity.ERROR

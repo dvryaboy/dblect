@@ -109,6 +109,7 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             CheckFindingKind.CONTRACT_ISSUE
             | CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
             | CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+            | CheckFindingKind.JOIN_KEY_TYPE_MISMATCH
         ):
             return Severity.ERROR
         # A coverage gap, warned so thin coverage is visible without failing a run that
