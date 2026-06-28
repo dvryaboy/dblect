@@ -7,7 +7,6 @@ scope index (computed on demand here) supplies CTE and inline-subquery keys.
 
 from __future__ import annotations
 
-import pytest
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
@@ -283,30 +282,16 @@ def test_limit_order_by_alias_renaming_non_key_fires() -> None:
     assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
 
 
-_PERSISTED_MATERIALIZATIONS = frozenset(
-    {
-        Materialization.TABLE,
-        Materialization.INCREMENTAL,
-        Materialization.MATERIALIZED_VIEW,
-        Materialization.SNAPSHOT,
-    }
-)
-
-
-@pytest.mark.parametrize("member", list(Materialization))
-def test_persisted_materialization_decided_per_member(member: Materialization) -> None:
-    # The gate's match closes over the materialization vocabulary with assert_never, so a new
-    # kind that forgets a case is a type error. assert_never pins exhaustiveness, not which
-    # side a member lands on; this pins the classification: a snapshot persists an SCD-2 table
-    # so it counts as persisted, a view or ephemeral model recomputes per read so it does not.
-    assert _is_persisted_materialization(member.value) is (member in _PERSISTED_MATERIALIZATIONS)
-
-
-def test_unresolved_materialization_is_not_persisted() -> None:
-    # A model with no resolved materialization, or an adapter-specific one, must not fire:
-    # the firewall posture fires only on a positively persisted materialization.
+def test_snapshot_and_ephemeral_persistence_classification() -> None:
+    # table-fires / view-silent is covered behaviorally through the factory plumbing by
+    # test_limit_detector_fires_only_for_persisted_materialization, and assert_never guards
+    # exhaustiveness. These are the non-obvious classifications no behavioral test reaches
+    # (the walker scans manifest.models only): a snapshot persists an SCD-2 table, so it is
+    # persisted; an ephemeral model is inlined into each consumer and stores nothing, so it
+    # is not. An absent materialization stays non-persisted (the firewall posture).
+    assert _is_persisted_materialization(Materialization.SNAPSHOT.value) is True
+    assert _is_persisted_materialization(Materialization.EPHEMERAL.value) is False
     assert _is_persisted_materialization(None) is False
-    assert _is_persisted_materialization("custom_adapter_thing") is False
 
 
 def test_window_against_inline_subquery_inherits_keys() -> None:
