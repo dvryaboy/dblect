@@ -81,6 +81,14 @@ def test_highest_finding_decides() -> None:
     assert exceeds_threshold(findings, Severity.ERROR) is True
 
 
+@pytest.mark.parametrize("kind", list(FindingKind))
+def test_every_structural_finding_kind_has_a_severity(kind: FindingKind) -> None:
+    # The structural severity map closes over FindingKind with assert_never, so a new
+    # kind that forgets to pick a level is a type error there. Enumerating the kinds pins
+    # it at runtime too: each resolves to a real level rather than raising.
+    assert severity_of(_finding(kind)) in set(Severity)
+
+
 @pytest.mark.parametrize("kind", list(CheckFindingKind))
 def test_every_check_finding_kind_has_a_severity(kind: CheckFindingKind) -> None:
     # The severity map closes over CheckFindingKind with assert_never, so a new kind that

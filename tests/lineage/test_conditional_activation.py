@@ -319,7 +319,7 @@ def _fanout_kinds(*nodes: Node) -> list[FindingKind]:
         adapter_type="duckdb",
         nodes={n.unique_id: n for n in nodes},
     )
-    _window, fanout = make_fact_grounded_detectors(manifest, _DUCKDB)
+    _window, fanout, _limit = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in fanout(parse_sql(_CONSUMER, dialect="duckdb"))]
 
 
@@ -385,7 +385,7 @@ def _window_kinds(model_sql: str, *nodes: Node) -> list[FindingKind]:
         adapter_type="duckdb",
         nodes={n.unique_id: n for n in nodes},
     )
-    window_keys, _fanout = make_fact_grounded_detectors(manifest, _DUCKDB)
+    window_keys, _fanout, _limit = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in window_keys(parse_sql(model_sql, dialect="duckdb"))]
 
 

@@ -90,6 +90,7 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.NOT_IN_NULLABLE_SUBQUERY
             | FindingKind.INNER_FLATTEN_ROW_DROP
             | FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING
+            | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
         ):
             return Severity.ERROR
         case (

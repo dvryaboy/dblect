@@ -10,10 +10,11 @@ from __future__ import annotations
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
-from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
-from dblect.sql import FindingKind, parse_sql
+from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
+from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
     detect_join_fanout,
+    detect_limit_without_deterministic_order,
     detect_non_unique_window_order_keys,
     make_fact_grounded_detectors,
 )
@@ -116,6 +117,108 @@ def test_window_against_cte_covered_via_propagation_is_silent() -> None:
         "select row_number() over (partition by id order by ts) from src"
     )
     findings = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys(raw=(("id",),)))
+    assert findings == ()
+
+
+# --- top-level LIMIT without a deterministic ORDER BY ------------------------
+#
+# A materialization whose top scope has `LIMIT n` keeps an arbitrary slice of rows
+# unless the `ORDER BY` totally orders the source. No `ORDER BY` is unconditionally
+# non-deterministic; a present `ORDER BY` is decided against the source's keys the
+# same way the window detector decides a ranking's order.
+
+
+def _limit(sql: str, keys: _Keys, *, materialized: bool = True) -> tuple[Finding, ...]:
+    return detect_limit_without_deterministic_order(
+        _parse(sql), model_keys=keys, is_materialized=materialized
+    )
+
+
+def test_limit_without_order_is_flagged() -> None:
+    # No ORDER BY at all: the slice is arbitrary regardless of what keys exist.
+    findings = _limit("select id, total from orders limit 10", _model_keys(orders=(("id",),)))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+def test_limit_without_order_fires_even_without_known_keys() -> None:
+    # The no-ORDER-BY case needs no grounding: it is non-deterministic on its face.
+    findings = _limit("select id from orders limit 10", _model_keys())
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+def test_limit_with_non_unique_order_is_flagged() -> None:
+    # `orders` is unique on (id); ordering by `total` does not cover that key, so the
+    # rows at the cutoff are tie-broken arbitrarily.
+    findings = _limit(
+        "select id, total from orders order by total limit 10", _model_keys(orders=(("id",),))
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+def test_limit_with_covering_order_is_silent() -> None:
+    findings = _limit(
+        "select id, total from orders order by id limit 10", _model_keys(orders=(("id",),))
+    )
+    assert findings == ()
+
+
+def test_limit_with_superkey_order_is_silent() -> None:
+    # (id, total) is a superkey of the unique (id), so the order is still total.
+    findings = _limit(
+        "select id, total from orders order by id, total limit 10",
+        _model_keys(orders=(("id",),)),
+    )
+    assert findings == ()
+
+
+def test_no_limit_is_silent() -> None:
+    findings = _limit("select id from orders order by id", _model_keys(orders=(("id",),)))
+    assert findings == ()
+
+
+def test_limit_in_view_materialization_is_exempt() -> None:
+    # A view recomputes the LIMIT at query time; the determinism question is the
+    # consumer's, so a view is never flagged.
+    findings = _limit(
+        "select id from orders limit 10", _model_keys(orders=(("id",),)), materialized=False
+    )
+    assert findings == ()
+
+
+def test_limit_with_order_but_unknown_source_keys_is_silent() -> None:
+    # An ORDER BY is present but no key is known, so we cannot prove the order is
+    # non-unique. Firewall posture: stay silent rather than guess.
+    findings = _limit("select id from orders order by total limit 10", _model_keys())
+    assert findings == ()
+
+
+def test_limit_with_order_expression_is_silent() -> None:
+    # An ORDER BY over a non-column expression needs an equivalence check we do not
+    # model; stay silent rather than misjudge its coverage.
+    findings = _limit(
+        "select id from orders order by date_trunc('day', ts) limit 10",
+        _model_keys(orders=(("id",),)),
+    )
+    assert findings == ()
+
+
+def test_limit_only_in_subquery_is_out_of_scope() -> None:
+    # The top scope carries no LIMIT; an inner-scope LIMIT is out of scope here.
+    findings = _limit(
+        "select id from (select id from orders limit 5) s", _model_keys(orders=(("id",),))
+    )
+    assert findings == ()
+
+
+def test_top_level_union_limit_is_out_of_scope() -> None:
+    # A UNION top scope has no single source to ground keys against; stay silent.
+    findings = _limit(
+        "(select id from orders) union all (select id from returns) limit 5",
+        _model_keys(orders=(("id",),), returns=(("id",),)),
+    )
     assert findings == ()
 
 
@@ -445,7 +548,7 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
         nodes={n.unique_id: n for n in (src, test, model)},
     )
     tree = _parse(sql)
-    window_keys, _fanout = make_fact_grounded_detectors(
+    window_keys, _fanout, _limit = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}
     )
     findings = window_keys(tree)
@@ -453,3 +556,46 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
     # covered, so the non-deterministic ranking is flagged.
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS
+
+
+def _materialized_model(uid: str, sql: str, *, materialized: str) -> Node:
+    return Node(
+        unique_id=uid,
+        name=uid.split(".")[-1],
+        resource_type=ResourceType.MODEL,
+        fqn=(uid,),
+        package_name="shop",
+        schema="analytics",
+        raw_code=None,
+        compiled_code=sql,
+        original_file_path=None,
+        columns={},
+        config=ModelConfig(materialized=materialized),
+    )
+
+
+def test_limit_detector_fires_only_for_persisted_materialization() -> None:
+    """The factory reads each model's resolved materialization and exempts views.
+
+    A ``table`` model with a top-level unordered ``LIMIT`` is a persisted arbitrary
+    sample and fires; the same SQL materialized as a ``view`` is recomputed per query
+    and stays silent. This pins the materialization plumbing the per-tree detector
+    relies on (it learns a tree's materialization through the factory)."""
+    sql = "select id from orders limit 10"
+    table = _materialized_model("model.shop.t", sql, materialized="table")
+    view = _materialized_model("model.shop.v", sql, materialized="view")
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in (table, view)},
+    )
+    table_tree, view_tree = _parse(sql), _parse(sql)
+    _window, _fanout, limit_order = make_fact_grounded_detectors(
+        manifest,
+        _DUCKDB,
+        parsed={table.unique_id: table_tree, view.unique_id: view_tree},
+    )
+    table_findings = limit_order(table_tree)
+    assert len(table_findings) == 1
+    assert table_findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+    assert limit_order(view_tree) == ()

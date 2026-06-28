@@ -14,7 +14,7 @@ from dblect.audit import (
     SpanBasis,
     run_audit,
 )
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest, ModelConfig, Node, ResourceType
 from dblect.sql import FindingKind
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -283,6 +283,46 @@ def test_run_audit_parses_each_model_once(
     assert set(counts) == model_sqls, "every model's compiled SQL should be parsed"
     repeated = {n for n in counts.values() if n > 1}
     assert not repeated, f"each model's SQL should parse exactly once; counts: {counts.values()}"
+
+
+def test_non_deterministic_limit_fires_through_run_audit() -> None:
+    # End-to-end through run_audit: the materialization map the factory builds is keyed by
+    # the tree object the walker hands the detector, so the table model fires and the view
+    # with the same SQL stays exempt. This pins the per-tree plumbing the unit tests mock.
+    sql = "select id from raw limit 10"
+    table = Node(
+        unique_id="model.pkg.sampled_table",
+        name="sampled_table",
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", "sampled_table"),
+        package_name="pkg",
+        schema=None,
+        raw_code=sql,
+        compiled_code=sql,
+        original_file_path="models/sampled_table.sql",
+        columns={},
+        config=ModelConfig(materialized="table"),
+    )
+    view = replace(
+        table,
+        unique_id="model.pkg.sampled_view",
+        name="sampled_view",
+        fqn=("pkg", "sampled_view"),
+        original_file_path="models/sampled_view.sql",
+        config=ModelConfig(materialized="view"),
+    )
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in (table, view)},
+    )
+    report = run_audit(manifest, _DUCKDB)
+    fired = {
+        lf.model_unique_id
+        for lf in report.findings
+        if lf.finding.kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+    }
+    assert fired == {table.unique_id}
 
 
 def _user_country(raw: str, compiled: str) -> Manifest:

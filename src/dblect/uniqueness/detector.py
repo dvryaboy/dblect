@@ -9,6 +9,9 @@ to make a claim, and stay silent otherwise):
 * ``detect_join_fanout``: JOINs whose joined-in side has known keys, none of
   which is covered by the join's equality predicate columns, so the join can
   multiply rows.
+* ``detect_limit_without_deterministic_order``: a persisted model whose top-scope
+  ``LIMIT`` has no ``ORDER BY``, or one whose order keys are not covered by a known
+  uniqueness key, so a re-run materializes a different slice of rows.
 * ``detect_cross_model_fanout``: a duplicate-sensitive aggregate that folds a
   magnitude an upstream fan-out replicated, over a relation no longer keyed at the
   magnitude's grain. This one also reads ``where_provenance`` to find the origin a
@@ -48,7 +51,7 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
-from dblect.sql import Finding, FindingKind, duplicate_sensitive
+from dblect.sql import Finding, FindingKind, duplicate_sensitive, suppression_hint
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -186,6 +189,101 @@ def detect_join_fanout(
     return tuple(out)
 
 
+def detect_limit_without_deterministic_order(
+    tree: Expr,
+    *,
+    model_keys: ModelKeys,
+    scope_index: ScopeIndex | None = None,
+    is_materialized: bool,
+) -> tuple[Finding, ...]:
+    """Flag a persisted model whose top scope ``LIMIT``s without a total ordering.
+
+    A ``LIMIT n`` keeps an arbitrary slice unless the rows are totally ordered first, so a
+    re-run can materialize a different set of rows. This is the ``LIMIT`` analog of
+    :func:`detect_non_unique_window_order_keys`: the same uniqueness keys decide whether an
+    ``ORDER BY`` is total. Two shapes fire:
+
+    * No ``ORDER BY`` at all. The slice is arbitrary on its face, so this fires without
+      grounding (no source key is needed to know the rows are unpinned).
+    * An ``ORDER BY`` whose keys are not covered by any known uniqueness key of the source.
+      Ties at the cutoff are broken arbitrarily, so which rows survive drifts.
+
+    ``is_materialized`` gates the whole check: a view (or ephemeral model) recomputes the
+    ``LIMIT`` per query, so the determinism question is the consumer's and the caller passes
+    ``False``. Only a persisted materialization (``table``, ``incremental``,
+    ``materialized_view``) stores the sampled rows.
+
+    Conservative toward silence: it reasons only about the top scope (an inner-scope
+    ``LIMIT`` in a CTE or subquery is left for later), only about a single-source top scope
+    the uniqueness machinery can ground (a join or ``UNION`` top scope stays silent), and
+    only about bare-column order keys (an ``ORDER BY`` over an expression needs an
+    equivalence check we do not model). When an ``ORDER BY`` is present but no source key is
+    known, it stays silent rather than guess the ordering is non-unique.
+    """
+    if not is_materialized or not isinstance(tree, exp.Select):
+        return ()
+    limit = tree.args.get("limit")
+    if not isinstance(limit, exp.Limit):
+        return ()
+    order = tree.args.get("order")
+    if not isinstance(order, exp.Order) or not order.expressions:
+        return (_limit_finding(limit, ordered=False),)
+    source_keys = _single_source_keys(
+        tree, model_keys=model_keys, scope_index=_scope_index_for(tree, model_keys, scope_index)
+    )
+    if source_keys is None:
+        return ()
+    order_cols = _bare_column_names(order.expressions)
+    if order_cols is None:
+        return ()
+    key_set = frozenset(order_cols)
+    if any(k <= key_set for k in source_keys):
+        return ()
+    return (_limit_finding(limit, ordered=True, order_cols=order_cols),)
+
+
+# dbt materializations that persist their rows, so a non-deterministic LIMIT freezes an
+# arbitrary slice. A view or ephemeral model recomputes the query, so its LIMIT is the
+# consumer's determinism question; default and unknown materializations are treated as
+# non-persisted (the firewall posture: fire only on a positively persisted materialization).
+_PERSISTED_MATERIALIZATIONS: frozenset[str] = frozenset(
+    {"table", "incremental", "materialized_view"}
+)
+
+
+def _is_persisted_materialization(materialized: str | None) -> bool:
+    return materialized is not None and materialized.lower() in _PERSISTED_MATERIALIZATIONS
+
+
+def _limit_finding(
+    limit: exp.Limit, *, ordered: bool, order_cols: list[str] | None = None
+) -> Finding:
+    """Build the LIMIT finding, located at the ``LIMIT`` clause. ``ordered`` picks the
+    message: a present-but-non-unique ORDER BY versus no ORDER BY at all."""
+    if ordered:
+        detail = (
+            f"its `ORDER BY {sorted(order_cols or [])}` is not covered by any known "
+            "uniqueness key on the source, so ties at the cutoff are broken arbitrarily and "
+            "which rows survive can drift across runs"
+        )
+    else:
+        detail = (
+            "it has no `ORDER BY`, so it materializes an arbitrary sample of rows that can "
+            "differ across runs"
+        )
+    return Finding(
+        kind=FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER,
+        message=(
+            f"top-level `LIMIT` in a persisted model is not deterministic: {detail}. "
+            "Order by a key that uniquely identifies a row (add a tiebreaker), or drop the "
+            f"`LIMIT`. {suppression_hint(FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER)}"
+        ),
+        sql_snippet=sg.render_sql(limit),
+        line_start=_line_start(limit),
+        line_end=_line_end(limit),
+    )
+
+
 # The relation graph and the uniqueness annotations propagated over it. The fact-grounded
 # and cross-model fan-out factories both rest on this pair, so an audit computes it once and
 # threads it into both rather than re-running the fixpoint per factory.
@@ -227,7 +325,20 @@ def make_fact_grounded_detectors(
     semantics ground the uniqueness keys, so parsing and enforcement agree.
     ``relation_keys`` lets the audit pass an already-propagated graph/keys pair (see
     :func:`relation_uniqueness`) so the fixpoint is not re-run.
+
+    The LIMIT-without-deterministic-order detector also needs each tree's resolved
+    materialization (it exempts views), which the bare tree does not carry. It is read
+    from ``parsed`` here and addressed by ``id(tree)``, the same per-tree addressing the
+    scope-index cache uses; a caller that omits ``parsed`` leaves that detector silent
+    (no tree-to-materialization map to consult) while the key-grounded pair still works.
     """
+    materialized_by_tree: dict[int, bool] = {}
+    for uid, tree in (parsed or {}).items():
+        node = manifest.models.get(uid)
+        config = node.config if node is not None else None
+        materialized_by_tree[id(tree)] = _is_persisted_materialization(
+            config.materialized if config is not None else None
+        )
     graph, keys = (
         relation_keys
         if relation_keys is not None
@@ -271,7 +382,15 @@ def make_fact_grounded_detectors(
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
         )
 
-    return (window_keys, fanout)
+    def limit_order(tree: Expr) -> tuple[Finding, ...]:
+        return detect_limit_without_deterministic_order(
+            tree,
+            model_keys=model_keys,
+            scope_index=scope_index(tree),
+            is_materialized=materialized_by_tree.get(id(tree), False),
+        )
+
+    return (window_keys, fanout, limit_order)
 
 
 # Per-relation views the cross-model fan-out detector reads, all keyed by the relation's

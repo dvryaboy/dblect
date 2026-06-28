@@ -163,7 +163,8 @@ def run_audit(
     Context-bound detectors run alongside the configured `detectors` list, each
     built from the resolved profile and the pre-parsed trees: the non-determinism
     detector (its builtin names come from the profile), the uniqueness window
-    order-keys and join-fanout detectors (grounded against declared keys), the
+    order-keys, join-fanout, and non-deterministic-``LIMIT`` detectors (grounded
+    against declared keys, the last also against each model's materialization), the
     nullability hazard detectors (GROUP BY, join key, and NOT IN on an
     inherited-nullable column, grounded against the propagated nullability
     property), the inner-flatten row-drop detector (grounded against the
