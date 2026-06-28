@@ -30,6 +30,7 @@ from dblect.types import IssueCode, ModelContract
 _DUCKDB = profile_for_adapter("duckdb")
 
 MoneyUSD = Money.refine(currency=Currency.USD)
+MoneyEUR = Money.refine(currency=Currency.EUR)
 
 
 def _cols(**types: str) -> Mapping[str, Column]:
@@ -535,6 +536,73 @@ def test_declared_dependency_discharges_the_sum() -> None:
 
     report = run_check(_agg_manifest(), _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+
+
+# --- join-key type compatibility (C2) -------------------------------------------
+
+
+def _join_keys_manifest() -> Manifest:
+    # The join key is named ``amount`` because ``MoneyUSD`` binds its magnitude to the
+    # field column ``amount``; the key being a money value is what makes the currency
+    # mismatch a domain-type conflict.
+    nodes = (
+        _node(
+            "source.shop.raw.usd_ledger",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL"),
+        ),
+        _node(
+            "source.shop.raw.eur_ledger",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(amount="DECIMAL"),
+        ),
+        _node(
+            "model.shop.reconciled",
+            kind=ResourceType.MODEL,
+            sql=(
+                "SELECT u.amount AS amount FROM usd_ledger AS u "
+                "JOIN eur_ledger AS e ON u.amount = e.amount"
+            ),
+            columns=_cols(amount="DECIMAL"),
+        ),
+    )
+    return Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+
+def test_join_on_incompatible_domain_types_is_flagged() -> None:
+    # Equating a USD-pinned key against a EUR-pinned one joins values that cannot mean
+    # the same thing: the two tags meet to a conflict. The check reads that off the ON
+    # clause and reports it, the join-key counterpart of the not-well-typed reduction.
+    class UsdLedger(ModelContract):
+        dbt_model = "usd_ledger"
+        amount: MoneyUSD
+
+    class EurLedger(ModelContract):
+        dbt_model = "eur_ledger"
+        amount: MoneyEUR
+
+    report = run_check(_join_keys_manifest(), _DUCKDB)
+    [jk] = [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
+    assert jk.model_unique_id == "model.shop.reconciled"
+    assert "amount" in jk.message
+
+
+def test_join_on_compatible_domain_types_is_quiet() -> None:
+    # Both keys USD: the tags agree, so the equality is well typed and nothing fires.
+    class UsdLedger(ModelContract):
+        dbt_model = "usd_ledger"
+        amount: MoneyUSD
+
+    class EurLedger(ModelContract):
+        dbt_model = "eur_ledger"
+        amount: MoneyUSD
+
+    report = run_check(_join_keys_manifest(), _DUCKDB)
+    assert not [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
 
 
 # --- coverage -------------------------------------------------------------------

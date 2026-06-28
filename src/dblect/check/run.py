@@ -19,7 +19,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -60,6 +60,7 @@ from dblect.lineage.properties.domain_type import (
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
+    join_key_conflicts,
 )
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -67,10 +68,11 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
-from dblect.lineage.property import propagate
+from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
+from dblect.sql.parse import SQLParseError, parse_sql
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -89,6 +91,11 @@ class CheckGraphs:
     relation_build: RelationBuildResult
     column_build: BuildResult
     contracts_resolved: int
+    parsed: Mapping[str, Expr]
+    """Each model's stamped statement tree, parsed once and fed to both builds so the
+    SQL is parsed a single time and the column build's ``ColumnRef`` stamps land on the
+    trees the check keeps. The join-key check reads ON-clause columns off these (a
+    projection derivation alone does not carry the join)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,15 +136,33 @@ def build_check_graphs(
     across an enumeration."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
-    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect)
-    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect)
+    parsed = _parse_models(manifest, profile.sqlglot_dialect)
+    relation_build = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed)
+    column_build = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed)
     return CheckGraphs(
         manifest=manifest,
         resolved=resolved,
         relation_build=relation_build,
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
+        parsed=parsed,
     )
+
+
+def _parse_models(manifest: Manifest, dialect: str | None) -> dict[str, Expr]:
+    """Parse each model's analysis SQL once. A model whose SQL does not parse is
+    omitted; the builds, finding no tree for it, surface it as unbuilt, so a parse
+    failure is never read as a clean model."""
+    out: dict[str, Expr] = {}
+    for uid, model in manifest.models.items():
+        sql = model.analysis_sql
+        if sql is None:
+            continue
+        try:
+            out[uid] = parse_sql(sql, dialect=dialect)
+        except SQLParseError:
+            continue
+    return out
 
 
 def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
@@ -273,6 +298,15 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             graphs.manifest,
             world.coherence_clears,
             graphs.column_build.graph,
+            line_maps,
+        )
+    )
+    findings.extend(
+        _join_key_findings(
+            graphs.manifest,
+            graphs.parsed,
+            world.domain_type,
+            domain_type_grounding(_by_scope(graphs.resolved.tag_facts)),
             line_maps,
         )
     )
@@ -542,6 +576,79 @@ def _operand_label(agg: exp.AggFunc) -> str:
     if isinstance(this, exp.Column):
         return this.name
     return sg.render_sql(this) if isinstance(this, Expr) else "?"
+
+
+def _join_key_findings(
+    manifest: Manifest,
+    parsed: Mapping[str, Expr],
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    line_maps: dict[str, LineMap],
+) -> list[CheckFinding]:
+    """One finding per ON-clause equality whose two columns carry conflicting domain
+    types: equating a ``MoneyUSD`` key against a ``MoneyEUR`` one, or two incompatible
+    nominal tags, joins values that cannot mean the same thing.
+
+    The ON columns are read off the stamped statement tree, since a projection
+    derivation alone does not carry the join. A column's tag is its propagated value
+    where the lineage reached it, falling back to its declared grounding for a join key
+    that is never projected, so a key that appears only in the ON clause is still typed.
+    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps)."""
+
+    def tag_of(col: exp.Column) -> DomainTag | None:
+        ref = resolved_column_ref(col)
+        if ref is None:
+            return None
+        ann = annotations.get(ref)
+        return ann.value if ann is not None else ground(ref).value
+
+    out: list[CheckFinding] = []
+    for uid, tree in parsed.items():
+        source = SourceRef(SourceKind.MODEL, uid)
+        for join in tree.find_all(exp.Join):
+            on = join.args.get("on")
+            if not isinstance(on, Expr):
+                continue
+            for left, right in join_key_conflicts(on, tag_of):
+                line_start, line_end = _span_of(left, right, on)
+                out.append(
+                    CheckFinding(
+                        kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                        message=_join_key_message(left, right, tag_of(left), tag_of(right)),
+                        model_unique_id=uid,
+                        file_path=_file_of(manifest, source),
+                        column=left.name or None,
+                        line_start=line_start,
+                        line_end=line_end,
+                        source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
+                    )
+                )
+    out.sort(key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""))
+    return out
+
+
+def _join_key_message(
+    left: exp.Column,
+    right: exp.Column,
+    left_tag: DomainTag | None,
+    right_tag: DomainTag | None,
+) -> str:
+    """Name the two keys and the domain types being equated, each read through the
+    property's display hook so the reader sees the conflict the meet found."""
+    left_disp = domain_type_display(left_tag).name if left_tag is not None else "an untyped value"
+    right_disp = (
+        domain_type_display(right_tag).name if right_tag is not None else "an untyped value"
+    )
+    return (
+        f"join key {_qualified(left)} = {_qualified(right)} equates {left_disp} with "
+        f"{right_disp}; the two domain types conflict, so the equated values cannot mean "
+        "the same thing"
+    )
+
+
+def _qualified(col: exp.Column) -> str:
+    """A column rendered with its table qualifier when it has one (``p.amount``)."""
+    return f"{col.table}.{col.name}" if col.table else col.name
 
 
 # --- helpers --------------------------------------------------------------------
