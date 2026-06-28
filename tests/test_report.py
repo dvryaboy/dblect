@@ -150,6 +150,18 @@ def test_text_suppressed_block_shows_bare_noqa() -> None:
     assert "suppressed by noqa @ L4" in text
 
 
+def test_text_marks_a_compiled_frame_directive_line() -> None:
+    # A macro body's `-- noqa` is matched in compiled space, so its line is labelled
+    # `compiled L<n>` and never mistaken for a line in the developer's template.
+    suppressed = (
+        SuppressedFinding(
+            located=_structural(), directive_line=5, bare=False, directive_in_compiled=True
+        ),
+    )
+    text = render_text(_report(suppressed=suppressed))
+    assert "suppressed by noqa: DBLECT_JOIN_FANOUT @ compiled L5" in text
+
+
 def test_json_tags_each_finding_with_its_family() -> None:
     payload = json.loads(
         render_json(_report(structural=(_structural(),), declaration=(_declaration(),)))
@@ -297,11 +309,29 @@ def test_unlocated_declaration_finding_reports_null_source_span() -> None:
 
 
 def test_json_suppression_payload_carries_directive_line_and_bare() -> None:
-    # A -- noqa has no reason slot, so a suppression serializes as {directive_line, bare}.
+    # A -- noqa has no reason slot, so a suppression serializes as the directive line, the
+    # bare flag, and whether the directive was read in the compiled frame.
     suppressed = (SuppressedFinding(located=_structural(), directive_line=8, bare=False),)
     payload = json.loads(render_json(_report(structural=(_structural(),), suppressed=suppressed)))
     [entry] = payload["suppressed"]
-    assert entry["suppression"] == {"directive_line": 8, "bare": False}
+    assert entry["suppression"] == {
+        "directive_line": 8,
+        "bare": False,
+        "directive_in_compiled": False,
+    }
+
+
+def test_json_suppression_payload_marks_compiled_frame_directive() -> None:
+    # A macro body's `-- noqa` is recorded as a compiled-frame match so a JSON consumer can
+    # read its line in compiled space rather than mislocating it to the source template.
+    suppressed = (
+        SuppressedFinding(
+            located=_structural(), directive_line=5, bare=False, directive_in_compiled=True
+        ),
+    )
+    payload = json.loads(render_json(_report(structural=(_structural(),), suppressed=suppressed)))
+    [entry] = payload["suppressed"]
+    assert entry["suppression"]["directive_in_compiled"] is True
 
 
 # --- the noqa suppression hint -----------------------------------------------

@@ -270,6 +270,29 @@ def test_suppressed_finding_is_marked_suppressed_not_dropped() -> None:
     assert result["suppressions"][0]["justification"] == "noqa: DBLECT_JOIN_FANOUT @ L8"
 
 
+def test_suppressed_finding_justification_marks_compiled_frame_directive() -> None:
+    # A macro body's `-- noqa` is matched in compiled space; the justification labels its
+    # line `compiled L<n>` so a code-scanning consumer does not point at the source template.
+    suppressed = (
+        SuppressedFinding(
+            located=_located(line=9), directive_line=5, bare=False, directive_in_compiled=True
+        ),
+    )
+    audit = AuditReport(findings=(), suppressed=suppressed, skipped=(), models_scanned=1)
+    check = CheckReport(
+        findings=(),
+        load_issues=(),
+        unbuilt=(),
+        contracts_resolved=0,
+        models_propagated=1,
+        predicates_collected=0,
+    )
+    report = AnalysisReport(findings=(), check=check, audit=audit)
+
+    (result,) = _validate(render_sarif(report, version=_VERSION))["runs"][0]["results"]
+    assert result["suppressions"][0]["justification"] == "noqa: DBLECT_JOIN_FANOUT @ compiled L5"
+
+
 def test_suppressed_declaration_finding_reaches_sarif() -> None:
     from dblect.check.findings import SuppressedCheckFinding
 

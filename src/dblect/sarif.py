@@ -17,6 +17,7 @@ from typing import Literal, TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport, cross_world_identity
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
+from dblect.audit.suppress import format_directive_location
 from dblect.audit.walker import LocatedFinding, SkippedModel
 from dblect.check.findings import CheckFinding, CheckFindingKind, UnbuiltModel
 from dblect.loader import LoadIssue
@@ -148,18 +149,24 @@ _SarifLog = TypedDict("_SarifLog", {"$schema": str, "version": str, "runs": list
 def render_sarif(report: AnalysisReport, *, version: str, indent_spaces: int = 2) -> str:
     """Render ``report`` as a SARIF 2.1.0 log. ``version`` stamps the tool driver."""
     active = list(report.findings)
-    # Both families' suppressions ride along: a -- noqa'd structural or declaration
-    # finding stays visible as a triaged result, normalized to (finding, bare, line).
-    suppressed: list[tuple[AnalysisFinding, bool, int]] = [
-        (s.located, s.bare, s.directive_line) for s in report.audit.suppressed
+    # Both families' suppressions ride along: a -- noqa'd structural or declaration finding
+    # stays visible as a triaged result, normalized to (finding, bare, line, in_compiled).
+    suppressed: list[tuple[AnalysisFinding, bool, int, bool]] = [
+        (s.located, s.bare, s.directive_line, s.directive_in_compiled)
+        for s in report.audit.suppressed
     ]
-    suppressed.extend((s.finding, s.bare, s.directive_line) for s in report.check.suppressed)
+    suppressed.extend(
+        (s.finding, s.bare, s.directive_line, s.directive_in_compiled)
+        for s in report.check.suppressed
+    )
 
-    rules, rule_index = _build_rules(active, [f for f, _, _ in suppressed])
+    rules, rule_index = _build_rules(active, [f for f, *_ in suppressed])
     results: list[_Result] = [_result_for(f, rule_index) for f in active]
     results.extend(
-        _suppressed_result(f, bare=bare, directive_line=line, rule_index=rule_index)
-        for f, bare, line in suppressed
+        _suppressed_result(
+            f, bare=bare, directive_line=line, directive_in_compiled=ic, rule_index=rule_index
+        )
+        for f, bare, line, ic in suppressed
     )
 
     driver: _ToolComponent = {
@@ -238,13 +245,19 @@ def _result_for(finding: AnalysisFinding, rule_index: dict[str, int]) -> _Result
 
 
 def _suppressed_result(
-    finding: AnalysisFinding, *, bare: bool, directive_line: int, rule_index: dict[str, int]
+    finding: AnalysisFinding,
+    *,
+    bare: bool,
+    directive_line: int,
+    directive_in_compiled: bool,
+    rule_index: dict[str, int],
 ) -> _Result:
     # A suppressed finding is still a result, so a surface can show what was triaged
     # away rather than silently dropping it. Works for either family's finding.
     result = _result_for(finding, rule_index)
     via = "noqa" if bare else f"noqa: {suppression_code(_suppression_kind(finding))}"
-    result["suppressions"] = [{"kind": "inSource", "justification": f"{via} @ L{directive_line}"}]
+    at = format_directive_location(in_compiled=directive_in_compiled, line=directive_line)
+    result["suppressions"] = [{"kind": "inSource", "justification": f"{via} @ {at}"}]
     return result
 
 

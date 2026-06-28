@@ -18,6 +18,7 @@ from typing import TypedDict, assert_never
 
 from dblect.analysis import AnalysisFinding, AnalysisReport
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
+from dblect.audit.suppress import format_directive_location
 from dblect.audit.walker import LocatedFinding, SkippedModel, SuppressedFinding
 from dblect.check.findings import CheckFinding, SuppressedCheckFinding
 from dblect.severity import severity_of
@@ -210,30 +211,31 @@ def _suppressed_block(
     kind, how it was silenced (bare ``noqa`` or the specific ``noqa: DBLECT_<KIND>``),
     and the line the directive sat on."""
     lines = ["suppressed:"]
-    # (path, sort_start, sort_end, loc, kind, via, directive_line). ``loc`` is
+    # (path, sort_start, sort_end, loc, kind, via, directive_line, in_compiled). ``loc`` is
     # pre-formatted so each family carries its back-mapped span (and the compiled-relative
-    # marker when the back-map declined), computed from its own ``located_span``.
-    rows: list[tuple[str, int, int, str, str, str, int]] = []
+    # marker when the back-map declined), computed from its own ``located_span``. The
+    # directive location is held as its (line, in_compiled) parts rather than a formatted
+    # string, so sorting orders co-located rows by the numeric line and renders only at print.
+    rows: list[tuple[str, int, int, str, str, str, int, bool]] = []
     for s in structural:
         f = s.located.finding
         path = s.located.file_path or s.located.model_unique_id
         via = "noqa" if s.bare else f"noqa: {suppression_code(f.kind)}"
         span = s.located.located_span
         loc = _format_span(span)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, f.kind.value, via, s.directive_line)
-        )
+        cols = (f.kind.value, via, s.directive_line, s.directive_in_compiled)
+        rows.append((path, span.line_start, span.line_end, loc, *cols))
     for c in declaration:
         cf = c.finding
         path = cf.file_path or cf.model_unique_id or "<project>"
         via = "noqa" if c.bare else f"noqa: {suppression_code(cf.kind)}"
         span = cf.located_span
         loc = _format_span(span)
-        rows.append(
-            (path, span.line_start, span.line_end, loc, cf.kind.value, via, c.directive_line)
-        )
-    for path, _start, _end, loc, kind, via, directive_line in sorted(rows):
-        lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ L{directive_line}")
+        cols = (cf.kind.value, via, c.directive_line, c.directive_in_compiled)
+        rows.append((path, span.line_start, span.line_end, loc, *cols))
+    for path, _start, _end, loc, kind, via, dline, in_compiled in sorted(rows):
+        at = format_directive_location(in_compiled=in_compiled, line=dline)
+        lines.append(f"  {path}:{loc}  {kind}  suppressed by {via} @ {at}")
     return "\n".join(lines)
 
 
@@ -318,6 +320,9 @@ class JsonFinding(TypedDict):
 class JsonSuppression(TypedDict):
     directive_line: int
     bare: bool
+    # True when the directive was read in the compiled frame (a macro body's ``-- noqa``),
+    # so ``directive_line`` indexes the compiled SQL rather than the source template.
+    directive_in_compiled: bool
 
 
 class JsonSuppressedFinding(JsonFinding):
@@ -395,11 +400,21 @@ def render_json(report: AnalysisReport, *, indent_spaces: int = 2) -> str:
         "findings": [_finding_payload(f) for f in report.findings],
         "suppressed": [
             *(
-                _suppressed_payload(s.located, directive_line=s.directive_line, bare=s.bare)
+                _suppressed_payload(
+                    s.located,
+                    directive_line=s.directive_line,
+                    bare=s.bare,
+                    directive_in_compiled=s.directive_in_compiled,
+                )
                 for s in report.audit.suppressed
             ),
             *(
-                _suppressed_payload(c.finding, directive_line=c.directive_line, bare=c.bare)
+                _suppressed_payload(
+                    c.finding,
+                    directive_line=c.directive_line,
+                    bare=c.bare,
+                    directive_in_compiled=c.directive_in_compiled,
+                )
                 for c in report.check.suppressed
             ),
         ],
@@ -463,8 +478,15 @@ def _finding_payload(finding: AnalysisFinding) -> JsonFinding:
 
 
 def _suppressed_payload(
-    finding: AnalysisFinding, *, directive_line: int, bare: bool
+    finding: AnalysisFinding, *, directive_line: int, bare: bool, directive_in_compiled: bool
 ) -> JsonSuppressedFinding:
     # Both families' suppressions share this shape; the caller unwraps its own dataclass.
     base = _finding_payload(finding)
-    return {**base, "suppression": {"directive_line": directive_line, "bare": bare}}
+    return {
+        **base,
+        "suppression": {
+            "directive_line": directive_line,
+            "bare": bare,
+            "directive_in_compiled": directive_in_compiled,
+        },
+    }
