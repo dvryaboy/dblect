@@ -99,6 +99,18 @@ def fn_of(w: exp.Window) -> Expr | None:
     return cast("Expr | None", w.this)
 
 
+def window_output_alias(w: exp.Window) -> str | None:
+    """The SELECT-list alias a window is projected under (``rn`` in ``row_number() ... as rn``).
+
+    ``None`` when the window is not directly aliased (an unaliased projection, or one where the
+    window is nested inside a larger expression that carries the alias). Callers use this to
+    recognise a later reference to the window by name, e.g. a ``qualify rn = 1`` that names the
+    rank rather than inlining the window.
+    """
+    parent = w.parent
+    return parent.alias if isinstance(parent, exp.Alias) else None
+
+
 def join_side_of(j: exp.Join) -> JoinSide:
     """The side of `j` as a `JoinSide`.
 

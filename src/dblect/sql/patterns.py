@@ -374,7 +374,14 @@ def _row_number_dedup_is_order_insensitive(w: exp.Window) -> bool:
     if not all(_columns_outside_windows_covered(proj, keys) for proj in scope.expressions):
         return False
     qualify = sg.qualify_of(scope)
-    return qualify is None or _columns_outside_windows_covered(qualify.this, keys)
+    if qualify is None:
+        return True
+    # A QUALIFY commonly names the window by its SELECT alias (``qualify rn = 1``) instead of
+    # inlining it. That reference is this window's rank label, covered by the same output-bag
+    # argument as the inline form, so admit it alongside the partition keys.
+    alias = sg.window_output_alias(w)
+    qualify_keys = keys | {(None, alias)} if alias is not None else keys
+    return _columns_outside_windows_covered(qualify.this, qualify_keys)
 
 
 def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:

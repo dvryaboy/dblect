@@ -349,6 +349,24 @@ def test_row_number_qualify_mixing_non_covered_predicate_fires() -> None:
     assert len(findings) == 1
 
 
+def test_row_number_qualify_referencing_window_alias_silent() -> None:
+    # QUALIFY names the window by its SELECT alias rather than inlining it. That reference is
+    # the rank label, not a carried data column, so the dedup is as silent as the inline form.
+    sql = "select id, a, b, row_number() over (partition by id, a, b) as rn from src qualify rn = 1"
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_row_number_qualify_alias_with_non_covered_predicate_fires() -> None:
+    # The alias reference is allowed, but the QUALIFY also pins a non-partition column, so
+    # which row survives is observable: the finding stays live.
+    sql = (
+        "select id, row_number() over (partition by id) as rn from src "
+        "qualify rn = 1 and payload > 5"
+    )
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
 def test_row_number_dedup_star_projection_fires() -> None:
     # A star can carry any column out of the partition key, so coverage is unprovable.
     sql = "select * from src qualify row_number() over (partition by id) = 1"
