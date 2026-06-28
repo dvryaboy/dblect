@@ -190,7 +190,7 @@ def list_group_bys(tree: Expr) -> tuple[GroupBySummary, ...]:
         targets = tuple(sg.render_sql(e) for e in g.expressions)
         cols: list[tuple[str | None, str]] = []
         for e in g.expressions:
-            cols.extend((sg.column_table(c), sg.column_name(c)) for c in sg.find_columns(e))
+            cols.extend(sg.column_key(c) for c in sg.find_columns(e))
         out.append(GroupBySummary(targets=targets, target_columns=tuple(cols)))
     return tuple(out)
 
@@ -283,7 +283,7 @@ def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
     for sel in sg.find_all_selects(tree):
         ons = [on for j in sg.joins_of(sel) if (on := sg.on_of(j)) is not None]
         keys: set[tuple[str | None, str]] = {
-            (sg.column_table(c), sg.column_name(c))
+            sg.column_key(c)
             for on in ons
             for eq in on.find_all(exp.EQ)
             for c in sg.find_columns(eq)
@@ -295,7 +295,7 @@ def detect_coalesce_on_join_key(tree: Expr) -> tuple[Finding, ...]:
                 first = coalesce.this
                 if not isinstance(first, exp.Column):
                     continue
-                if (sg.column_table(first), sg.column_name(first)) in keys:
+                if sg.column_key(first) in keys:
                     out.append(
                         finding_at(
                             FindingKind.COALESCE_ON_JOIN_KEY,
@@ -320,7 +320,7 @@ def _partition_column_keys(w: exp.Window) -> frozenset[tuple[str | None, str]] |
     for term in sg.partition_of(w):
         if not isinstance(term, exp.Column):
             return None
-        keys.add((sg.column_table(term), sg.column_name(term)))
+        keys.add(sg.column_key(term))
     return frozenset(keys) if keys else None
 
 
@@ -331,16 +331,30 @@ def _columns_outside_windows_covered(node: Expr, keys: frozenset[tuple[str | Non
     which are the keys by construction. A star or subquery makes coverage unprovable (its
     columns are not enumerable here), so either one is reported as not covered.
     """
-    if node.find(exp.Star) is not None:
-        return False
-    if node.find(exp.Subquery) is not None or node.find(exp.Select) is not None:
+    if node.find(exp.Star, exp.Subquery, exp.Select) is not None:
         return False
     for col in sg.find_columns(node):
         if col.find_ancestor(exp.Window) is not None:
             continue
-        if (sg.column_table(col), sg.column_name(col)) not in keys:
+        if sg.column_key(col) not in keys:
             return False
     return True
+
+
+def _scope_is_aggregating(scope: exp.Select) -> bool:
+    """True when ``scope`` collapses its rows: an explicit GROUP BY, or a bare aggregate that
+    triggers implicit grouping (``select count(1) from src`` is one group with no GROUP BY).
+
+    An aggregate inside the window spec or a nested subquery belongs elsewhere and does not
+    count. A collapsing scope carries different rows than the per-row dedup argument assumes,
+    so the caller stays conservative when this holds.
+    """
+    if sg.group_of(scope) is not None:
+        return True
+    return any(
+        agg.find_ancestor(exp.Select) is scope and agg.find_ancestor(exp.Window) is None
+        for agg in sg.find_all_aggfunc(scope)
+    )
 
 
 def _row_number_dedup_is_order_insensitive(w: exp.Window) -> bool:
@@ -356,7 +370,8 @@ def _row_number_dedup_is_order_insensitive(w: exp.Window) -> bool:
 
     Scoped to ``row_number()`` as the sole window of a non-aggregating scope, the dedup idiom
     the refinement targets. ``rank()``/``dense_rank()``/value windows, and multi-window or
-    grouped scopes, stay flagged: the output-bag argument does not carry to them unchanged.
+    aggregating scopes (see :func:`_scope_is_aggregating`), stay flagged: the output-bag
+    argument does not carry to them unchanged.
     """
     if not isinstance(sg.fn_of(w), exp.RowNumber):
         return False
@@ -364,7 +379,7 @@ def _row_number_dedup_is_order_insensitive(w: exp.Window) -> bool:
     if keys is None:
         return False
     scope = w.find_ancestor(exp.Select)
-    if scope is None or sg.group_of(scope) is not None:
+    if scope is None or _scope_is_aggregating(scope):
         return False
     scope_windows = [
         win for win in sg.find_all_windows(scope) if win.find_ancestor(exp.Select) is scope

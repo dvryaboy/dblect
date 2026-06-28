@@ -404,6 +404,15 @@ def test_row_number_dedup_with_group_by_stays_flagged() -> None:
     assert len(findings) == 1
 
 
+def test_row_number_dedup_with_implicit_aggregate_stays_flagged() -> None:
+    # A bare aggregate with no GROUP BY collapses the scope to one row per group; the
+    # per-row dedup coverage argument does not apply, so stay conservative. count(1) carries
+    # no column, so the coverage check alone would wave it through.
+    sql = "select count(1) from src qualify row_number() over (partition by id) = 1"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+
+
 def test_two_unordered_row_numbers_in_one_scope_stay_flagged() -> None:
     # The output-bag argument needs the row_number() to be the only window shaping the
     # scope's output; a second unordered window keeps both findings live.

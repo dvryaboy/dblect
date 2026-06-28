@@ -218,6 +218,15 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
+def column_key(c: exp.Column) -> tuple[str | None, str]:
+    """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
+
+    Two references share a key when they name the same column, ``a.id`` distinct from a bare
+    ``id`` (an under-qualified reference matches conservatively, never spuriously).
+    """
+    return (column_table(c), column_name(c))
+
+
 def find_columns(e: Expr) -> list[exp.Column]:
     return list(e.find_all(exp.Column))
 
@@ -308,9 +317,7 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append(
-            ((column_table(left), column_name(left)), (column_table(right), column_name(right)))
-        )
+        sides.append((column_key(left), column_key(right)))
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()
