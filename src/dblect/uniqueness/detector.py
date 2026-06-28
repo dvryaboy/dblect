@@ -26,6 +26,7 @@ inline-subquery scopes, which are not relations the propagator annotates.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
+from typing import assert_never
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -50,7 +51,7 @@ from dblect.lineage.properties.uniqueness import (
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest
+from dblect.manifest import Manifest, Materialization
 from dblect.sql import Finding, FindingKind, duplicate_sensitive, suppression_hint
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
@@ -218,12 +219,18 @@ def detect_limit_without_deterministic_order(
     the uniqueness machinery can ground (a join or ``UNION`` top scope stays silent), and
     only about bare-column order keys (an ``ORDER BY`` over an expression needs an
     equivalence check we do not model). When an ``ORDER BY`` is present but no source key is
-    known, it stays silent rather than guess the ordering is non-unique.
+    known, it stays silent rather than guess the ordering is non-unique. A top scope that
+    yields a single row (an ungrouped aggregate) is exempt: SQL's implicit grouping collapses
+    it to one row, so a ``LIMIT`` cannot drop a row. Order keys are resolved through the
+    projection's aliases before being matched, so an ``order by <alias>`` of a key counts as
+    covering (and a renamed non-key column does not pass as the key).
     """
     if not is_materialized or not isinstance(tree, exp.Select):
         return ()
     limit = tree.args.get("limit")
     if not isinstance(limit, exp.Limit):
+        return ()
+    if _is_single_row_scope(tree):
         return ()
     order = tree.args.get("order")
     if not isinstance(order, exp.Order) or not order.expressions:
@@ -236,23 +243,35 @@ def detect_limit_without_deterministic_order(
     order_cols = _bare_column_names(order.expressions)
     if order_cols is None:
         return ()
-    key_set = frozenset(order_cols)
-    if any(k <= key_set for k in source_keys):
+    projection = _projection_aliases(tree)
+    covered = frozenset(projection.get(c, c) for c in order_cols)
+    if any(k <= covered for k in source_keys):
         return ()
     return (_limit_finding(limit, ordered=True, order_cols=order_cols),)
 
 
-# dbt materializations that persist their rows, so a non-deterministic LIMIT freezes an
-# arbitrary slice. A view or ephemeral model recomputes the query, so its LIMIT is the
-# consumer's determinism question; default and unknown materializations are treated as
-# non-persisted (the firewall posture: fire only on a positively persisted materialization).
-_PERSISTED_MATERIALIZATIONS: frozenset[str] = frozenset(
-    {"table", "incremental", "materialized_view"}
-)
-
-
 def _is_persisted_materialization(materialized: str | None) -> bool:
-    return materialized is not None and materialized.lower() in _PERSISTED_MATERIALIZATIONS
+    """True when the materialization stores its rows, so a non-deterministic ``LIMIT`` freezes
+    an arbitrary slice. Decided exhaustively over the closed materialization vocabulary so a
+    new kind is a type error here rather than a silent fall-through: a view or ephemeral model
+    recomputes the query per read (its ``LIMIT`` is the consumer's determinism question), and
+    an adapter-specific or absent materialization is treated as non-persisted (the firewall
+    posture: fire only on a positively persisted materialization). A snapshot persists an SCD-2
+    table, so it counts as persisted; snapshot trees do not reach this detector today (the
+    audit walker scans ``manifest.models`` only), but the classification stays truthful for any
+    future consumer."""
+    kind = Materialization.from_raw(materialized)
+    match kind:
+        case (
+            Materialization.TABLE
+            | Materialization.INCREMENTAL
+            | Materialization.MATERIALIZED_VIEW
+            | Materialization.SNAPSHOT
+        ):
+            return True
+        case Materialization.VIEW | Materialization.EPHEMERAL | Materialization.OTHER:
+            return False
+    assert_never(kind)
 
 
 def _limit_finding(
@@ -282,6 +301,57 @@ def _limit_finding(
         line_start=_line_start(limit),
         line_end=_line_end(limit),
     )
+
+
+def _is_single_row_scope(sel: exp.Select) -> bool:
+    """True when ``sel`` is an ungrouped aggregate, so it yields exactly one row.
+
+    SQL's implicit grouping collapses a SELECT with a collapsing aggregate in its projection
+    or HAVING and no GROUP BY to a single row, so a ``LIMIT`` cannot drop a row and the slice
+    is deterministic. A windowed aggregate (``count(*) over ()``) preserves rows and does not
+    establish the shape; an adapter-unknown UDF might not aggregate at all, so neither does it
+    (the check stays conservative and lets the ``LIMIT`` fire). A GROUP BY produces one row per
+    group, so it is not single-row.
+    """
+    if sg.group_of(sel) is not None:
+        return False
+    consumers: list[Expr] = list(sel.expressions)
+    having = sel.args.get("having")
+    if isinstance(having, exp.Having) and isinstance(having.this, Expr):
+        consumers.append(having.this)
+    for root in consumers:
+        for node in root.walk():
+            if (
+                isinstance(node, exp.AggFunc)
+                and node.find_ancestor(exp.Select) is sel
+                and not _within_window(node, sel)
+            ):
+                return True
+    return False
+
+
+def _within_window(node: Expr, sel: exp.Select) -> bool:
+    """True when ``node`` sits inside an ``OVER`` window belonging to ``sel``: a windowed
+    aggregate preserves rows, unlike a collapsing one."""
+    cur = node.parent
+    while cur is not None and cur is not sel:
+        if isinstance(cur, exp.Window):
+            return True
+        cur = cur.parent
+    return False
+
+
+def _projection_aliases(sel: exp.Select) -> dict[str, str]:
+    """Map each output name in ``sel``'s projection that renames a bare column to that source
+    column. ``ORDER BY`` resolves a bare name to a SELECT-list alias, so translating order keys
+    through this map lets an ``order by <alias>`` be matched against the source's uniqueness
+    keys, and stops a column renamed to a key's name from passing as that key. An alias over an
+    expression has no single source column and is omitted."""
+    out: dict[str, str] = {}
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
+            out[proj.alias_or_name] = sg.column_name(proj.this)
+    return out
 
 
 # The relation graph and the uniqueness annotations propagated over it. The fact-grounded

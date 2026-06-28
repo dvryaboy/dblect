@@ -7,12 +7,21 @@ scope index (computed on demand here) supplies CTE and inline-subquery keys.
 
 from __future__ import annotations
 
+import pytest
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
-from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
+from dblect.manifest import (
+    DbtTestMetadata,
+    Manifest,
+    Materialization,
+    ModelConfig,
+    Node,
+    ResourceType,
+)
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
+    _is_persisted_materialization,
     detect_join_fanout,
     detect_limit_without_deterministic_order,
     detect_non_unique_window_order_keys,
@@ -220,6 +229,84 @@ def test_top_level_union_limit_is_out_of_scope() -> None:
         _model_keys(orders=(("id",),), returns=(("id",),)),
     )
     assert findings == ()
+
+
+def test_limit_on_ungrouped_aggregate_is_silent() -> None:
+    # An aggregate with no GROUP BY yields exactly one row by SQL's implicit grouping, so a
+    # LIMIT cannot drop a row: the slice is deterministic regardless of ordering.
+    for sql in (
+        "select count(*) from orders limit 10",
+        "select sum(total) as t from orders limit 1",
+        "select max(total) as m from orders limit 5",
+    ):
+        assert _limit(sql, _model_keys(orders=(("id",),))) == (), sql
+
+
+def test_limit_on_grouped_aggregate_still_fires() -> None:
+    # A GROUP BY produces one row per group, so which groups survive an unordered LIMIT is
+    # arbitrary: the implicit-single-row exemption must not extend to a grouped aggregate.
+    findings = _limit(
+        "select customer_id, count(*) from orders group by customer_id limit 10",
+        _model_keys(orders=(("id",),)),
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+def test_limit_on_windowed_aggregate_still_fires() -> None:
+    # A windowed aggregate preserves rows (it does not collapse to one), so an unordered
+    # LIMIT still freezes an arbitrary slice; the exemption is for collapsing aggregates only.
+    findings = _limit(
+        "select id, count(*) over () as c from orders limit 10",
+        _model_keys(orders=(("id",),)),
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+def test_limit_order_by_projection_alias_of_key_is_silent() -> None:
+    # `order by oid` references the SELECT-list alias for the unique key `id`; once the
+    # alias is resolved the order is total, so the slice is deterministic.
+    findings = _limit(
+        "select id as oid from orders order by oid limit 10", _model_keys(orders=(("id",),))
+    )
+    assert findings == ()
+
+
+def test_limit_order_by_alias_renaming_non_key_fires() -> None:
+    # `order by id` resolves to the projection alias, which renames `other`, not the source's
+    # key column `id`. Resolving the alias keeps a renamed column from passing as the key.
+    findings = _limit(
+        "select other as id from orders order by id limit 10", _model_keys(orders=(("id",),))
+    )
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
+
+
+_PERSISTED_MATERIALIZATIONS = frozenset(
+    {
+        Materialization.TABLE,
+        Materialization.INCREMENTAL,
+        Materialization.MATERIALIZED_VIEW,
+        Materialization.SNAPSHOT,
+    }
+)
+
+
+@pytest.mark.parametrize("member", list(Materialization))
+def test_persisted_materialization_decided_per_member(member: Materialization) -> None:
+    # The gate's match closes over the materialization vocabulary with assert_never, so a new
+    # kind that forgets a case is a type error. assert_never pins exhaustiveness, not which
+    # side a member lands on; this pins the classification: a snapshot persists an SCD-2 table
+    # so it counts as persisted, a view or ephemeral model recomputes per read so it does not.
+    assert _is_persisted_materialization(member.value) is (member in _PERSISTED_MATERIALIZATIONS)
+
+
+def test_unresolved_materialization_is_not_persisted() -> None:
+    # A model with no resolved materialization, or an adapter-specific one, must not fire:
+    # the firewall posture fires only on a positively persisted materialization.
+    assert _is_persisted_materialization(None) is False
+    assert _is_persisted_materialization("custom_adapter_thing") is False
 
 
 def test_window_against_inline_subquery_inherits_keys() -> None:

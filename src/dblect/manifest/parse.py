@@ -111,6 +111,35 @@ class ConstraintType(StrEnum):
             return cls.OTHER
 
 
+class Materialization(StrEnum):
+    """How dbt persists (or does not persist) a node's rows.
+
+    The vocabulary is closed, so a check that turns on whether a relation stores its rows can
+    branch over these members exhaustively rather than test membership in a raw-string set.
+    ``OTHER`` covers adapter-specific materializations (and the absence of a resolved value) so
+    the parse stays total; comparisons go through the members to keep typos out of call sites.
+    A ``SNAPSHOT`` is a first-class materialization as well as a :class:`ResourceType`: dbt sets
+    a snapshot node's ``config.materialized`` to ``"snapshot"``.
+    """
+
+    VIEW = "view"
+    TABLE = "table"
+    INCREMENTAL = "incremental"
+    MATERIALIZED_VIEW = "materialized_view"
+    EPHEMERAL = "ephemeral"
+    SNAPSHOT = "snapshot"
+    OTHER = "other"
+
+    @classmethod
+    def from_raw(cls, raw: str | None) -> Materialization:
+        if raw is None:
+            return cls.OTHER
+        try:
+            return cls(raw.lower())
+        except ValueError:
+            return cls.OTHER
+
+
 @dataclass(frozen=True, slots=True)
 class ConstraintSpec:
     """A constraint declared on a model or column in schema.yml (dbt 1.5+).
