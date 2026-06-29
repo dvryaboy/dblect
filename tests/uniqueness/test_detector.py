@@ -316,6 +316,14 @@ _AGG_ORDER_CASES = [
         _SRC_ON_ID,
         True,
     ),
+    # ANY_VALUE is the deliberately-arbitrary pick: the author opted into "whichever", so even
+    # in a top-n-looking shape it must stay silent (it is not an order-sensitive aggregate).
+    (
+        "any_value_not_order_sensitive",
+        "select g, any_value(x order by ts limit 1) from src group by g",
+        _SRC_ON_ID,
+        False,
+    ),
 ]
 
 
