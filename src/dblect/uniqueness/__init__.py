@@ -10,6 +10,7 @@ project's SQL.
 from dblect.uniqueness.detector import (
     detect_join_fanout,
     detect_limit_without_deterministic_order,
+    detect_non_unique_aggregate_order_keys,
     detect_non_unique_window_order_keys,
     make_fact_grounded_detectors,
 )
@@ -17,6 +18,7 @@ from dblect.uniqueness.detector import (
 __all__ = [
     "detect_join_fanout",
     "detect_limit_without_deterministic_order",
+    "detect_non_unique_aggregate_order_keys",
     "detect_non_unique_window_order_keys",
     "make_fact_grounded_detectors",
 ]

@@ -87,8 +87,6 @@ _RANKING_FUNCTIONS: frozenset[type[Expr]] = frozenset(
     }
 )
 
-_ORDERED_AGGREGATE_FUNCTIONS: frozenset[type[Expr]] = frozenset({exp.ArrayAgg, exp.GroupConcat})
-
 _NULL_INTOLERANT_COMPARISONS: frozenset[type[Expr]] = frozenset(
     {
         exp.EQ,
@@ -437,7 +435,7 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
 def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
     """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY."""
     out: list[Finding] = []
-    for node in tree.find_all(*_ORDERED_AGGREGATE_FUNCTIONS):
+    for node in sg.find_all_ordered_aggregates(tree):
         if isinstance(node.parent, exp.WithinGroup):
             continue
         if sg.aggregate_order_of(node) is not None:

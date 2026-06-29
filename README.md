@@ -167,6 +167,27 @@ This writes a harness-specific skill (`.claude/skills/`, `.cursor/rules/`, or an
 
 See the [demo walkthrough](docs/design/demo_walkthrough.md) for an end-to-end tour against `jaffle_shop_duckdb`, and [docs/current_state/architecture.md](docs/current_state/architecture.md) for what is built today.
 
+## Severity and CI
+
+Every finding carries a severity, and that severity is what turns `dblect check` into a CI gate:
+
+- **error** is a correctness hazard: the query can return wrong rows by silently dropping, duplicating, or mis-grouping them. A fan-out that double counts, a `WHERE` that inverts an outer join into an inner one, a nullable join key that drops unmatched rows. The output is wrong and no test fails.
+- **warn** is a determinism smell: each run is correct on its own, but the result is not pinned and can drift between runs. An `array_agg` or window with no `ORDER BY`, a top-level `LIMIT` with no total order, a top-n `LIMIT` inside an aggregate whose order key has ties, a nondeterministic builtin like `current_timestamp()` in a key.
+- **info** is an observation worth surfacing but not worth acting on by default.
+
+The report always prints every finding. `--fail-on` sets only the exit code: the run exits non-zero when an unsuppressed finding sits at or above the threshold, and `0` below it. The default threshold is `warn`.
+
+```bash
+dblect check .                  # default: fail on warn and above
+dblect check . --fail-on error  # gate only on correctness hazards; smells still print
+dblect check . --fail-on info   # strictest: any finding fails the run
+dblect check . --no-fail        # always exit 0, report only
+```
+
+The error/warn line is wrong-rows versus drift. An `error` means the data is incorrect today, so fix it. A `warn` means the data is correct today but not reproducible, so a rerun, a backfill, or a late-arriving row can change it. A determinism smell is real even when it is not urgent: `array_agg(order_id order by amount desc limit 10)` returns a genuine top ten by amount every run, yet a metric over those ten orders (their average basket size, say) can shift between runs when amounts tie at the cutoff, so add a stable tiebreaker where reproducibility matters.
+
+Two levers cover the smells you have already weighed. When one is intentional, record it with `-- noqa: DBLECT_<KIND>` so it moves to the `suppressed:` section instead of failing the build. When you want CI to block only on correctness and treat reproducibility as advisory, run `--fail-on error`. Start at the default so the smells stay visible, and tighten or loosen from there.
+
 ## Status
 
 Pre-alpha, and useful now. The structural audit and the typed-declaration check both run end-to-end against real dbt projects. The runtime layer (property-based testing of models against generated adversarial data, replay-determinism via differential execution) is designed and on the way; see [docs/](docs/) for the design notes and [questions_and_decisions.md](questions_and_decisions.md) for the decisions log.
