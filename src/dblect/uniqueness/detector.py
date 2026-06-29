@@ -132,6 +132,14 @@ def detect_non_unique_aggregate_order_keys(
     known uniqueness key of the single source. An aggregate with no ``GROUP BY`` folds the whole
     relation, so the order key alone must be unique.
 
+    The hazard is reproducibility, not correctness, which is why this is a ``warn`` (see
+    :func:`dblect.severity._structural_severity`): a top-n by ``k`` is a genuine top-n by ``k``,
+    every surviving element legitimately among the highest-ranked, so no row is *wrong*. What is
+    not pinned is which tied element the cutoff keeps. That still bites downstream: a metric
+    folded over the selected set (the average basket size of the ten most expensive orders, say)
+    is correct under whichever tie-break happened, yet drifts across runs. A stable tiebreaker
+    removes the drift.
+
     Only the top-n shape fires: an ordered aggregate with no inner ``LIMIT`` keeps every element,
     so its membership is deterministic regardless of ties (only the internal tie order is
     unstable, which the unordered-aggregate detector's territory). An aggregate with no
