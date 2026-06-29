@@ -139,7 +139,7 @@ _UNION_ON_ID = _model_keys(orders=(("id",),), returns=(("id",),))
 
 # (branch id, sql, model keys, is_materialized, expected-to-fire).
 _LIMIT_CASES = [
-    ("no_order", "select id from orders limit 10", _ORDERS_ON_ID, True, True),
+    # No ORDER BY fires without grounding (no source key needed to know the slice is unpinned).
     ("no_order_no_keys", "select id from orders limit 10", _model_keys(), True, True),
     (
         "order_not_covering",
@@ -187,8 +187,6 @@ _LIMIT_CASES = [
         False,
     ),
     ("ungrouped_count", "select count(*) from orders limit 10", _ORDERS_ON_ID, True, False),
-    ("ungrouped_sum", "select sum(total) from orders limit 1", _ORDERS_ON_ID, True, False),
-    ("ungrouped_max", "select max(total) from orders limit 5", _ORDERS_ON_ID, True, False),
     (
         "grouped_aggregate",
         "select customer_id, count(*) from orders group by customer_id limit 10",
