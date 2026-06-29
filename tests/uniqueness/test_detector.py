@@ -16,6 +16,7 @@ from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
     detect_join_fanout,
     detect_limit_without_deterministic_order,
+    detect_non_unique_aggregate_order_keys,
     detect_non_unique_window_order_keys,
     make_fact_grounded_detectors,
 )
@@ -230,6 +231,125 @@ def test_limit_verdict(sql: str, keys: _Keys, materialized: bool, fires: bool) -
         assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
     else:
         assert findings == ()
+
+
+# --- top-n aggregate (ARRAY_AGG/STRING_AGG ... ORDER BY k LIMIT n) -----------
+#
+# An ordered aggregate that keeps only some elements (`ARRAY_AGG(x ORDER BY k LIMIT n)`, the
+# top-n idiom) is deterministic in *which* elements survive only when the order key is unique
+# within the group. With ties at the cutoff the LIMIT keeps an arbitrary winner, so the result
+# drifts run to run. This is the aggregate analog of the window order-key check: the GROUP BY
+# columns play the partition's role. Each case is the minimal repro of one branch of the verdict.
+
+
+def _agg_order(sql: str, keys: _Keys) -> tuple[Finding, ...]:
+    return detect_non_unique_aggregate_order_keys(_parse(sql), model_keys=keys)
+
+
+_SRC_ON_ID = _model_keys(src=(("id",),))
+
+# (branch id, sql, model keys, expected-to-fire).
+_AGG_ORDER_CASES = [
+    # Whole-relation top-1 by a non-unique key: which row survives is arbitrary.
+    (
+        "whole_relation_non_unique",
+        "select array_agg(x order by ts limit 1) from src",
+        _SRC_ON_ID,
+        True,
+    ),
+    # Grouped top-1: within each group `ts` is not unique, so the combined (g, ts) key isn't
+    # covered by (id).
+    (
+        "grouped_non_unique",
+        "select g, array_agg(x order by ts limit 1) from src group by g",
+        _SRC_ON_ID,
+        True,
+    ),
+    # Order key is the source key: the top-n cut is total, silent.
+    ("order_covers_key", "select array_agg(x order by id limit 1) from src", _SRC_ON_ID, False),
+    # Group + order together cover a composite key, silent.
+    (
+        "group_plus_order_covers_key",
+        "select g, array_agg(x order by seq limit 1) from src group by g",
+        _model_keys(src=(("g", "seq"),)),
+        False,
+    ),
+    # Superkey of the unique key still totally orders, silent.
+    ("order_superkey", "select array_agg(x order by id, ts limit 1) from src", _SRC_ON_ID, False),
+    # No inner LIMIT: every element survives, so membership is deterministic (only the internal
+    # tie order is unstable, which this check leaves to the unordered-aggregate detector). Silent.
+    ("no_limit", "select array_agg(x order by ts) from src", _SRC_ON_ID, False),
+    # No ORDER BY at all is the unordered-aggregate detector's job, not this one. Silent here.
+    ("no_order", "select array_agg(x limit 1) from src", _SRC_ON_ID, False),
+    # No known key on the source: firewall posture, no positive fact to fire on.
+    ("no_keys", "select array_agg(x order by ts limit 1) from src", _model_keys(), False),
+    # Non-bare order key needs an equivalence we don't model, silent.
+    (
+        "order_expression",
+        "select array_agg(x order by date_trunc('day', ts) limit 1) from src",
+        _SRC_ON_ID,
+        False,
+    ),
+    # Non-bare grouping key, likewise silent.
+    (
+        "group_expression",
+        "select date_trunc('day', ts) d, array_agg(x order by k limit 1) from src "
+        "group by date_trunc('day', ts)",
+        _SRC_ON_ID,
+        False,
+    ),
+    # Multi-source scope needs column-level lineage, silent.
+    (
+        "join_out_of_scope",
+        "select array_agg(a.x order by a.ts limit 1) from src a join other b on a.k = b.k",
+        _model_keys(src=(("id",),), other=(("id",),)),
+        False,
+    ),
+    # Unresolved source name, silent.
+    ("unknown_source", "select array_agg(x order by ts limit 1) from unknown", _SRC_ON_ID, False),
+    # STRING_AGG (sqlglot's GroupConcat) is order-sensitive too, fires.
+    ("string_agg", "select string_agg(x, ',' order by ts limit 1) from src", _SRC_ON_ID, True),
+    # The DISTINCT modifier sqlglot wraps around the ORDER BY is seen through, fires.
+    (
+        "distinct_modifier",
+        "select array_agg(distinct x order by ts limit 1) from src",
+        _SRC_ON_ID,
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "keys", "fires"),
+    [case[1:] for case in _AGG_ORDER_CASES],
+    ids=[case[0] for case in _AGG_ORDER_CASES],
+)
+def test_aggregate_order_verdict(sql: str, keys: _Keys, fires: bool) -> None:
+    findings = _agg_order(sql, keys)
+    if fires:
+        assert len(findings) == 1
+        assert findings[0].kind is FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
+    else:
+        assert findings == ()
+
+
+def test_aggregate_order_against_cte_inherits_keys_via_propagation() -> None:
+    # The CTE `src` pass-throughs `raw`; its key (id) propagates. The top-1 by `ts` isn't
+    # covered, so flag — a CTE source is checkable like a ref'd model.
+    parsed = _parse(
+        "with src as (select * from raw) select array_agg(x order by ts limit 1) from src"
+    )
+    findings = detect_non_unique_aggregate_order_keys(
+        parsed, model_keys=_model_keys(raw=(("id",),))
+    )
+    assert len(findings) == 1
+
+
+def test_aggregate_order_finding_carries_line_number() -> None:
+    sql = "select\n  array_agg(x order by ts limit 1) as latest\nfrom src\n"
+    findings = detect_non_unique_aggregate_order_keys(_parse(sql), model_keys=_SRC_ON_ID)
+    assert len(findings) == 1
+    assert findings[0].line_start == 2
 
 
 def test_window_against_inline_subquery_inherits_keys() -> None:
@@ -558,7 +678,7 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
         nodes={n.unique_id: n for n in (src, test, model)},
     )
     tree = _parse(sql)
-    window_keys, _fanout, _limit = make_fact_grounded_detectors(
+    window_keys, _fanout, _limit, _agg = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}
     )
     findings = window_keys(tree)
@@ -566,6 +686,29 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
     # covered, so the non-deterministic ranking is flagged.
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS
+
+
+def test_aggregate_order_resolves_keys_through_factory_boundary() -> None:
+    """The top-n aggregate detector reaches production through ``make_fact_grounded_detectors``
+    and grounds on keys the indexer produces, the same boundary the window check uses."""
+    src = _source_with_identifier("source.shop.raw.orders", name="orders", identifier="orders_v2")
+    test = _unique_test("test.shop.u", column="id", target=src.unique_id)
+    sql = "select array_agg(line order by created_at limit 1) as latest from orders_v2"
+    model = _model("model.shop.latest_line", sql)
+    manifest = Manifest(
+        schema_version="v12",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in (src, test, model)},
+    )
+    tree = _parse(sql)
+    _window, _fanout, _limit, agg_order = make_fact_grounded_detectors(
+        manifest, _DUCKDB, parsed={model.unique_id: tree}
+    )
+    findings = agg_order(tree)
+    # `orders_v2` is unique on (id); the top-1 by `created_at` is not covered, so the
+    # non-deterministic winner is flagged.
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
 
 
 def _materialized_model(uid: str, sql: str, *, materialized: str | None) -> Node:
@@ -618,7 +761,7 @@ def test_limit_detector_fires_only_for_persisted_materialization(
         nodes={model.unique_id: model},
     )
     tree = _parse(sql)
-    _window, _fanout, limit_order = make_fact_grounded_detectors(
+    _window, _fanout, limit_order, _agg = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}
     )
     findings = limit_order(tree)

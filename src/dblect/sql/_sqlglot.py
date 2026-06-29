@@ -91,6 +91,22 @@ def aggregate_order_of(agg: Expr) -> exp.Order | None:
     return inner if isinstance(inner, exp.Order) else None
 
 
+def aggregate_limit_of(agg: Expr) -> exp.Limit | None:
+    """The top-n ``LIMIT`` modifier on an aggregate, if present.
+
+    ``ARRAY_AGG(x ORDER BY y LIMIT n)`` (the top-n idiom) keeps only the first ``n``
+    elements; the ``Limit`` sits among the modifiers stacked above the ORDER BY, so
+    walk through them the same way :func:`aggregate_order_of` does. Returns ``None``
+    when the aggregate folds every element (no inner ``LIMIT``).
+    """
+    inner = agg.this
+    while isinstance(inner, _AGGREGATE_CLAUSE_MODIFIERS):
+        if isinstance(inner, exp.Limit):
+            return inner
+        inner = inner.this
+    return None
+
+
 def partition_of(w: exp.Window) -> list[Expr]:
     return cast("list[Expr]", w.args.get("partition_by") or [])
 
@@ -245,6 +261,16 @@ def find_all_windows(e: Expr) -> list[exp.Window]:
 
 def find_all_aggfunc(e: Expr) -> list[Expr]:
     return cast("list[Expr]", list(e.find_all(exp.AggFunc)))
+
+
+# The order-sensitive aggregates: their element order is part of the result, so an absent or
+# non-total ORDER BY makes the output non-deterministic. ``GroupConcat`` is sqlglot's node for
+# both ``GROUP_CONCAT`` and ``STRING_AGG``.
+ORDERED_AGGREGATE_FUNCTIONS: tuple[type[Expr], ...] = (exp.ArrayAgg, exp.GroupConcat)
+
+
+def find_all_ordered_aggregates(e: Expr) -> list[Expr]:
+    return list(e.find_all(*ORDERED_AGGREGATE_FUNCTIONS))
 
 
 def render_sql(e: Expr) -> str:

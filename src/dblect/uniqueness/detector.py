@@ -6,6 +6,9 @@ to make a claim, and stay silent otherwise):
 * ``detect_non_unique_window_order_keys``: window functions whose combined
   (partition, order) columns are not covered by any candidate key of the scope's
   single source. Ties in the ordering produce non-deterministic rankings.
+* ``detect_non_unique_aggregate_order_keys``: the aggregate twin of the window check.
+  A top-n ordered aggregate (``ARRAY_AGG(x ORDER BY k LIMIT n)``) whose (group, order)
+  columns are not covered by a source key keeps an arbitrary winner among ties.
 * ``detect_join_fanout``: JOINs whose joined-in side has known keys, none of
   which is covered by the join's equality predicate columns, so the join can
   multiply rows.
@@ -84,21 +87,15 @@ def detect_non_unique_window_order_keys(
         if source_keys is None:
             continue
         for w in sg.find_all_windows(sel):
-            if not _window_is_in_scope(w, sel):
+            if not _node_in_scope(w, sel):
                 continue
             order = sg.order_of(w)
-            if order is None or not order.expressions:
+            if order is None:
                 continue
-            order_cols = _bare_column_names(order.expressions)
-            partition_cols = _bare_column_names(sg.partition_of(w))
-            if order_cols is None or partition_cols is None:
-                # We only reason about windows whose keys are bare columns.
-                # Expressions (`order by date_trunc(...)`) need an equivalence
-                # check we don't model yet; skip.
+            uncovered = _uncovered_order_keys(order.expressions, sg.partition_of(w), source_keys)
+            if uncovered is None:
                 continue
-            key_set = frozenset(order_cols) | frozenset(partition_cols)
-            if any(k <= key_set for k in source_keys):
-                continue
+            order_cols, partition_cols = uncovered
             rendered = sg.render_sql(w)
             out.append(
                 Finding(
@@ -113,6 +110,70 @@ def detect_non_unique_window_order_keys(
                     sql_snippet=rendered,
                     line_start=_line_start(w),
                     line_end=_line_end(w),
+                )
+            )
+    return tuple(out)
+
+
+def detect_non_unique_aggregate_order_keys(
+    tree: Expr,
+    *,
+    model_keys: ModelKeys,
+    scope_index: ScopeIndex | None = None,
+) -> tuple[Finding, ...]:
+    """Flag a top-n ordered aggregate whose order key is not unique within its group.
+
+    ``ARRAY_AGG(x ORDER BY k LIMIT n)`` (and ``STRING_AGG``/``GROUP_CONCAT`` likewise) keeps
+    only the first ``n`` elements, so *which* elements survive is deterministic only when the
+    order key totally orders the rows of each group. With ties at the cutoff the ``LIMIT`` keeps
+    an arbitrary winner, so the result drifts run to run even though an ``ORDER BY`` is present.
+    This is the aggregate analog of :func:`detect_non_unique_window_order_keys`: a ``GROUP BY``
+    plays the partition's role, and the combined (group, order) key set must be covered by a
+    known uniqueness key of the single source. An aggregate with no ``GROUP BY`` folds the whole
+    relation, so the order key alone must be unique.
+
+    Only the top-n shape fires: an ordered aggregate with no inner ``LIMIT`` keeps every element,
+    so its membership is deterministic regardless of ties (only the internal tie order is
+    unstable, which the unordered-aggregate detector's territory). An aggregate with no
+    ``ORDER BY`` at all is that detector's job too, and stays silent here.
+
+    Conservative toward silence, like the window check: single-source scopes only (a join or
+    ``UNION`` needs column-level lineage), bare-column order and group keys only (an expression
+    needs an equivalence we do not model), and silent when no source key is known (the firewall
+    posture, with no grain to name there is no positive fact to fire on).
+    """
+    scopes = _scope_index_for(tree, model_keys, scope_index)
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(tree):
+        source_keys = _single_source_keys(sel, model_keys=model_keys, scope_index=scopes)
+        if source_keys is None:
+            continue
+        group = sg.group_of(sel)
+        grouping = group.expressions if group is not None else []
+        for agg in sg.find_all_ordered_aggregates(sel):
+            if not _node_in_scope(agg, sel):
+                continue
+            order = sg.aggregate_order_of(agg)
+            if order is None or sg.aggregate_limit_of(agg) is None:
+                continue
+            uncovered = _uncovered_order_keys(order.expressions, grouping, source_keys)
+            if uncovered is None:
+                continue
+            order_cols, group_cols = uncovered
+            rendered = sg.render_sql(agg)
+            out.append(
+                Finding(
+                    kind=FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS,
+                    message=(
+                        f"top-n aggregate {rendered} orders by {sorted(order_cols)} "
+                        f"grouped by {sorted(group_cols) or '()'}, and no known uniqueness key "
+                        f"on the source covers the combined key set. The LIMIT keeps an arbitrary "
+                        f"winner among rows that tie on the order keys, so which elements survive "
+                        f"can drift across runs; add a stable tiebreaker."
+                    ),
+                    sql_snippet=rendered,
+                    line_start=_line_start(agg),
+                    line_end=_line_end(agg),
                 )
             )
     return tuple(out)
@@ -444,6 +505,11 @@ def make_fact_grounded_detectors(
             tree, model_keys=model_keys, scope_index=scope_index(tree)
         )
 
+    def aggregate_order_keys(tree: Expr) -> tuple[Finding, ...]:
+        return detect_non_unique_aggregate_order_keys(
+            tree, model_keys=model_keys, scope_index=scope_index(tree)
+        )
+
     def fanout(tree: Expr) -> tuple[Finding, ...]:
         return detect_join_fanout(
             tree,
@@ -460,7 +526,7 @@ def make_fact_grounded_detectors(
             is_materialized=materialized_by_tree.get(id(tree), False),
         )
 
-    return (window_keys, fanout, limit_order)
+    return (window_keys, fanout, limit_order, aggregate_order_keys)
 
 
 # Per-relation views the cross-model fan-out detector reads, all keyed by the relation's
@@ -822,14 +888,42 @@ def _reads_outside_grouping(node: Expr, group_keys: frozenset[tuple[str | None, 
     )
 
 
-def _window_is_in_scope(w: exp.Window, sel: exp.Select) -> bool:
-    """True when window ``w`` belongs to ``sel`` (not a nested sub-SELECT)."""
-    node: Expr | None = w.parent
-    while node is not None:
-        if isinstance(node, exp.Select):
-            return node is sel
-        node = node.parent
+def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
+    """True when ``node``'s nearest enclosing SELECT is ``sel`` (not a nested sub-SELECT).
+
+    Both the window and top-n-aggregate order-key checks read a node against ``sel``'s source
+    keys and grouping, so a window or aggregate that actually belongs to a nested SELECT must be
+    excluded: its keys and grouping are a different scope's."""
+    cur: Expr | None = node.parent
+    while cur is not None:
+        if isinstance(cur, exp.Select):
+            return cur is sel
+        cur = cur.parent
     return False
+
+
+def _uncovered_order_keys(
+    order: list[Expr], grouping: list[Expr], source_keys: frozenset[Key]
+) -> tuple[list[str], list[str]] | None:
+    """The bare order and grouping column names when their combined key set is not covered by a
+    known source key, signalling a non-total order; ``None`` when the order is provably total or
+    we cannot judge it.
+
+    The window and top-n-aggregate checks share this decision: the order is total iff some
+    candidate key fits within the (grouping + order) column set. ``None`` folds the three silent
+    cases both share: an empty order, an order or grouping key that is not a bare column (an
+    expression we do not model an equivalence for), or a combined set a known key already covers.
+    """
+    if not order:
+        return None
+    order_cols = _bare_column_names(order)
+    grouping_cols = _bare_column_names(grouping)
+    if order_cols is None or grouping_cols is None:
+        return None
+    key_set = frozenset(order_cols) | frozenset(grouping_cols)
+    if any(k <= key_set for k in source_keys):
+        return None
+    return order_cols, grouping_cols
 
 
 def _bare_column_names(expressions: list[Expr]) -> list[str] | None:
