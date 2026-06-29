@@ -162,7 +162,8 @@ def detect_non_unique_aggregate_order_keys(
             if not _node_in_scope(agg, sel):
                 continue
             order = sg.aggregate_order_of(agg)
-            if order is None or sg.aggregate_limit_of(agg) is None:
+            agg_limit = sg.aggregate_limit_of(agg)
+            if order is None or agg_limit is None or sg.limit_keeps_no_rows(agg_limit):
                 continue
             uncovered = _uncovered_order_keys(order.expressions, grouping, source_keys)
             if uncovered is None:
@@ -298,6 +299,8 @@ def detect_limit_without_deterministic_order(
         return ()
     limit = tree.args.get("limit")
     if not isinstance(limit, exp.Limit):
+        return ()
+    if sg.limit_keeps_no_rows(limit):
         return ()
     if _is_single_row_scope(tree):
         return ()
