@@ -75,8 +75,9 @@ _RANK: dict[Severity, int] = {Severity.INFO: 0, Severity.WARN: 1, Severity.ERROR
 
 
 def _structural_severity(kind: FindingKind) -> Severity:
-    """A structural finding's default severity. error: the query can return wrong rows.
-    warn: the rows are right but their order or value is not pinned, so they can drift."""
+    """A structural finding's default severity. error: the query can return wrong rows, by
+    silently dropping or duplicating or mis-grouping them. warn: each run is right on its own, but
+    the rows' order, selection, or value is not pinned, so the result drifts between runs."""
     match kind:
         case (
             FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
@@ -90,13 +91,13 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.NOT_IN_NULLABLE_SUBQUERY
             | FindingKind.INNER_FLATTEN_ROW_DROP
             | FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING
-            | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
         ):
             return Severity.ERROR
         case (
             FindingKind.UNORDERED_RANKING_WINDOW
             | FindingKind.UNORDERED_AGGREGATE
             | FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
+            | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
             | FindingKind.NON_DETERMINISTIC_FUNCTION
         ):
             return Severity.WARN
