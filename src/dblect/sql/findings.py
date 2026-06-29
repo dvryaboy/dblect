@@ -45,6 +45,7 @@ class FindingKind(StrEnum):
     NOT_IN_NULLABLE_SUBQUERY = "not_in_nullable_subquery"
     INNER_FLATTEN_ROW_DROP = "inner_flatten_row_drop"
     SNAPSHOT_TEMPORAL_FILTER_MISSING = "snapshot_temporal_filter_missing"
+    LIMIT_WITHOUT_DETERMINISTIC_ORDER = "limit_without_deterministic_order"
 
 
 def suppression_code(kind: FindingKind | CheckFindingKind) -> str:

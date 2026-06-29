@@ -65,6 +65,7 @@ from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
     Manifest,
+    Materialization,
     ResourceType,
     generic_test_target_uid,
 )
@@ -388,7 +389,9 @@ class _ConfigKeyDiscoverer:
             if node.resource_type is not ResourceType.MODEL:
                 continue
             config = node.config
-            if config is None or config.materialized != "incremental" or not config.unique_key:
+            if config is None or not config.unique_key:
+                continue
+            if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
                 continue
             strategy = self._profile.effective_strategy(config.incremental_strategy)
             if strategy not in DEDUP_STRATEGIES:
