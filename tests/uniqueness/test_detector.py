@@ -159,6 +159,16 @@ _LIMIT_CASES = [
     ),
     ("no_limit", "select id from orders order by id", _ORDERS_ON_ID, True, False),
     ("not_persisted", "select id from orders limit 10", _ORDERS_ON_ID, False, False),
+    # `LIMIT 0` keeps no rows (see `limit_keeps_no_rows`): silent with no ORDER BY and silent
+    # even with one a known key cannot cover.
+    ("limit_zero_no_order", "select id from orders limit 0", _model_keys(), True, False),
+    (
+        "limit_zero_ordered",
+        "select id from orders order by total limit 0",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
     (
         "order_unknown_keys",
         "select id from orders order by total limit 10",
@@ -281,6 +291,8 @@ _AGG_ORDER_CASES = [
     ("no_limit", "select array_agg(x order by ts) from src", _SRC_ON_ID, False),
     # No ORDER BY at all is the unordered-aggregate detector's job, not this one. Silent here.
     ("no_order", "select array_agg(x limit 1) from src", _SRC_ON_ID, False),
+    # `LIMIT 0` keeps no elements, so the top-n drift cannot arise (see `limit_keeps_no_rows`).
+    ("limit_zero", "select array_agg(x order by ts limit 0) from src", _SRC_ON_ID, False),
     # No known key on the source: firewall posture, no positive fact to fire on.
     ("no_keys", "select array_agg(x order by ts limit 1) from src", _model_keys(), False),
     # Non-bare order key needs an equivalence we don't model, silent.
