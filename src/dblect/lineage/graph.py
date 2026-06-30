@@ -144,6 +144,21 @@ class ColumnLineageGraph:
         """The projection expression that built ``subject``; ``None`` for a leaf."""
         return self.expressions.get(subject)
 
+    @staticmethod
+    def fold_into(
+        edges: dict[ColumnRef, frozenset[ColumnRef]],
+        expressions: dict[ColumnRef, Expr],
+        other: ColumnLineageGraph,
+    ) -> None:
+        """Fold ``other`` into the mutable ``edges``/``expressions`` accumulators in place:
+        edges union per column, expressions take ``other`` on collision. The single home of
+        the union rule, shared by :meth:`merge` and the cross-model build loop so the loop can
+        accumulate into one pair of dicts (O(total)) rather than re-copying a growing graph per
+        model (O(models x graph), the merge-in-a-loop cost)."""
+        for k, v in other.edges.items():
+            edges[k] = edges.get(k, frozenset()) | v
+        expressions.update(other.expressions)
+
     def merge(self, other: ColumnLineageGraph) -> ColumnLineageGraph:
         """Union two graphs. Edges union per column; expressions take ``other`` on collision.
 
@@ -154,10 +169,8 @@ class ColumnLineageGraph:
         exactly one model) but the rule keeps merge total.
         """
         merged_edges: dict[ColumnRef, frozenset[ColumnRef]] = dict(self.edges)
-        for k, v in other.edges.items():
-            merged_edges[k] = merged_edges.get(k, frozenset()) | v
         merged_exprs: dict[ColumnRef, Expr] = dict(self.expressions)
-        merged_exprs.update(other.expressions)
+        ColumnLineageGraph.fold_into(merged_edges, merged_exprs, other)
         return ColumnLineageGraph(edges=merged_edges, expressions=merged_exprs)
 
 

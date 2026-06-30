@@ -196,7 +196,12 @@ def build_manifest_graph(
     )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
-    graph = ColumnLineageGraph.empty()
+    # Accumulate edges/expressions into one pair of dicts and freeze once at the end, rather
+    # than `graph = graph.merge(per_model)` per model (which copies the whole growing graph each
+    # iteration: O(models x graph)). Topological order makes last-wins on expressions the same
+    # final map, and each output column is built by exactly one model anyway.
+    acc_edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
+    acc_exprs: dict[ColumnRef, Expr] = {}
     for uid in manifest.dag.topological_order():
         if uid not in manifest.models:
             continue
@@ -239,13 +244,14 @@ def build_manifest_graph(
                 unexpanded_stars=walker.unexpanded_stars,
             )
         )
-        graph = graph.merge(per_model)
+        ColumnLineageGraph.fold_into(acc_edges, acc_exprs, per_model)
         _record_output_columns(schema, model.name, uid, per_model)
         # Mirror the model's (documented + folded) columns into the live Schema so its
         # dependents qualify against them. `add_table` replaces the one table, so passing the
         # full accumulated entry preserves the documented-wins fold; it normalizes only this
         # table, not the whole schema.
         mapping_schema.add_table(model.name, schema[model.name], dialect=dialect, normalize=True)
+    graph = ColumnLineageGraph(edges=acc_edges, expressions=acc_exprs)
     return BuildResult(graph=graph, issues=tuple(issues), resolution=tuple(resolution))
 
 
