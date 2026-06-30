@@ -166,6 +166,49 @@ def _stamp_tables(tree: Expr, name_to_source: Mapping[str, SourceRef]) -> None:
             attach_source_ref(table, ref)
 
 
+_GCT_MISS = object()
+
+
+class _CachingMappingSchema(MappingSchema):
+    """A ``MappingSchema`` that memoizes ``get_column_type``.
+
+    Resolving an ``UNNEST`` of a nested STRUCT drives sqlglot's resolver to call
+    ``get_column_type`` ~2M times over ~11k distinct (table, column) pairs in a single build,
+    re-normalizing identifiers and re-finding the entry each time. The schema is fixed for a
+    lookup's lifetime (we only ever ``add_table`` between models, never change an existing
+    column's type mid-qualify), so the result is a pure function of (table identity, column,
+    dialect, normalize). Caching it skips the repeated normalize+find; ``add_table`` clears the
+    cache, since folding a model's outputs changes that table's columns. Returning a stored
+    ``DataType`` repeatedly is the same contract sqlglot's own ``DataType``-valued schemas rely
+    on (the resolver treats the result as read-only), so the build is byte-identical.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+        self._gct_cache: dict[object, exp.DataType] = {}
+
+    def get_column_type(
+        self,
+        table: exp.Table | str,
+        column: exp.Column | str,
+        dialect: object = None,
+        normalize: bool | None = None,
+    ) -> exp.DataType:
+        tkey = table if isinstance(table, str) else (table.catalog, table.db, table.name)
+        ckey = column if isinstance(column, str) else column.name
+        key = (tkey, ckey, dialect, normalize)
+        hit = self._gct_cache.get(key, _GCT_MISS)
+        if hit is not _GCT_MISS:
+            return cast("exp.DataType", hit)
+        value = super().get_column_type(table, column, dialect=dialect, normalize=normalize)  # pyright: ignore[reportArgumentType]
+        self._gct_cache[key] = value
+        return value
+
+    def add_table(self, *args: object, **kwargs: object) -> None:
+        self._gct_cache.clear()
+        super().add_table(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+
 def build_manifest_graph(
     manifest: Manifest,
     *,
@@ -191,7 +234,7 @@ def build_manifest_graph(
     # `add_table`-ing only the touched table per model makes each qualify normalize one small
     # table instead of the entire schema. `schema` stays the merge accumulator so the
     # documented-wins/UNKNOWN-for-new fold rule is unchanged; the Schema mirrors it table by table.
-    mapping_schema: Schema = MappingSchema(
+    mapping_schema: Schema = _CachingMappingSchema(
         cast("dict[str, object]", schema), dialect=dialect, normalize=True
     )
     issues: list[BuildIssue] = []
