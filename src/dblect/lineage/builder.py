@@ -34,6 +34,7 @@ from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
+from sqlglot.schema import MappingSchema, Schema
 
 from dblect.lineage.graph import (
     AggregationSite,
@@ -184,6 +185,15 @@ def build_manifest_graph(
     # Topological order is what makes that sound, so a `select *` or a qualified
     # reference resolves against an upstream model the project never documented.
     schema: dict[str, dict[str, str]] = {k: dict(v) for k, v in _build_schema(manifest).items()}
+    # One persistent MappingSchema, mutated in place as outputs are folded, rather than a raw
+    # dict handed to `qualify` per model. sqlglot's `ensure_schema` re-normalizes a raw dict on
+    # every call (tokenizing the whole ~table x column schema each time); reusing one Schema and
+    # `add_table`-ing only the touched table per model makes each qualify normalize one small
+    # table instead of the entire schema. `schema` stays the merge accumulator so the
+    # documented-wins/UNKNOWN-for-new fold rule is unchanged; the Schema mirrors it table by table.
+    mapping_schema: Schema = MappingSchema(
+        cast("dict[str, object]", schema), dialect=dialect, normalize=True
+    )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
     graph = ColumnLineageGraph.empty()
@@ -204,7 +214,7 @@ def build_manifest_graph(
                 model_uid=uid,
                 sql=sql,
                 name_to_source=name_to_source,
-                schema=schema,
+                schema=mapping_schema,
                 dialect=dialect,
                 tree=parsed.get(uid) if parsed is not None else None,
             )
@@ -231,6 +241,11 @@ def build_manifest_graph(
         )
         graph = graph.merge(per_model)
         _record_output_columns(schema, model.name, uid, per_model)
+        # Mirror the model's (documented + folded) columns into the live Schema so its
+        # dependents qualify against them. `add_table` replaces the one table, so passing the
+        # full accumulated entry preserves the documented-wins fold; it normalizes only this
+        # table, not the whole schema.
+        mapping_schema.add_table(model.name, schema[model.name], dialect=dialect, normalize=True)
     return BuildResult(graph=graph, issues=tuple(issues), resolution=tuple(resolution))
 
 
@@ -284,7 +299,7 @@ def _walk_model(
     model_uid: str,
     sql: str,
     name_to_source: Mapping[str, SourceRef],
-    schema: Mapping[str, Mapping[str, str]] | None = None,
+    schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
 ) -> _Walker:
@@ -309,7 +324,7 @@ def _walk_model(
     expression = qualify(
         expression,
         dialect=dialect,
-        schema=cast("dict[str, object] | None", schema),
+        schema=cast("dict[str, object] | Schema | None", schema),
         validate_qualify_columns=False,
         identify=False,
     )
