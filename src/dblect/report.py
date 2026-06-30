@@ -150,9 +150,12 @@ def _render_structural(lf: LocatedFinding) -> str:
     body_lines: list[str] = [head]
     body_lines.extend(indent(line, "    ") for line in lf.finding.message.splitlines() or [""])
     # The suppression nudge is presentation, not observation, so it lives here rather
-    # than in `Finding.message` (the JSON `message` stays the pure observation). Every
-    # structural finding is line-suppressible, so the hint rides all of them.
-    body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
+    # than in `Finding.message` (the JSON `message` stays the pure observation). A finding
+    # pinned to a line is line-suppressible, so it carries the nudge; a model-scoped one
+    # (line 0: a manifest-config finding) has no line to put a directive on, so the hint
+    # is omitted, the same convention the declaration block follows.
+    if lf.located_span.line_start > 0:
+        body_lines.append(indent(suppression_hint(lf.finding.kind), "    "))
     snippet = lf.finding.sql_snippet.strip()
     if snippet:
         body_lines.append(indent(f"snippet: {snippet}", "    "))
