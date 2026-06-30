@@ -43,13 +43,21 @@ jobs:
       - name: Type-check (pyright strict)
         run: uv run pyright
 
+      # -n auto parallelises across the runner's cores; loadscope keeps each module on
+      # one worker so the module-scoped dbt-compile fixtures still run once apiece.
+      # Coverage instrumentation adds ~45% to the test step (measured) and nothing gates
+      # on it, so it runs only on the main push that publishes the artifact, keeping the
+      # PR feedback path on the uninstrumented run of the same tests.
+      - name: Tests (pytest)
+        if: github.event_name != 'push'
+        run: uv run pytest -n auto --dist loadscope
+
       - name: Tests (pytest with coverage)
-        # -n auto parallelises across the runner's cores; loadscope keeps each module on
-        # one worker so the module-scoped dbt-compile fixtures still run once apiece.
+        if: github.event_name == 'push'
         run: uv run pytest -n auto --dist loadscope --cov --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage artifact
-        if: matrix.python-version == '3.13'
+        if: github.event_name == 'push' && matrix.python-version == '3.13'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-xml
