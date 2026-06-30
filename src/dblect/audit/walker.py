@@ -30,6 +30,7 @@ from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.flatten.detector import make_array_nonemptiness_detectors
 from dblect.lineage.builder import build_manifest_graph
+from dblect.lineage.graph import ColumnLineageGraph
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
@@ -149,6 +150,8 @@ def run_audit(
     profile: AdapterProfile,
     *,
     detectors: Sequence[Detector] = DEFAULT_DETECTORS,
+    parsed: Mapping[str, Expr | SQLParseError] | None = None,
+    column_graph: ColumnLineageGraph | None = None,
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
 
@@ -179,10 +182,14 @@ def run_audit(
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
     is never dropped by being forgotten.
     """
-    parsed = parse_models(
-        {uid: m.analysis_sql for uid, m in manifest.models.items()},
-        dialect=profile.sqlglot_dialect,
-    )
+    # ``analyze`` parses every model and builds the column graph once and shares both with
+    # the declaration family, since rebuilding the column graph (the heavy substrate) dominates
+    # a run. Omitted, this builds them itself, the standalone-audit path.
+    if parsed is None:
+        parsed = parse_models(
+            {uid: m.analysis_sql for uid, m in manifest.models.items()},
+            dialect=profile.sqlglot_dialect,
+        )
     trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
     # The fact-grounded and cross-model fan-out factories both rest on the relation graph's
     # propagated uniqueness; propagate it once and share it so the fixpoint runs a single time.
@@ -190,8 +197,13 @@ def run_audit(
     # The column graph is the heavy shared substrate: qualifying and scope-resolving every
     # model (which is also what stamps the shared trees with their resolved column refs).
     # Build it once and hand it to each column-graph fact family so the walk runs a single
-    # time per audit rather than once per family.
-    col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=trees).graph
+    # time per audit rather than once per family. A shared build (from ``analyze``) is stamped
+    # on these same trees, so the detectors read the same resolution either way.
+    col_graph = (
+        column_graph
+        if column_graph is not None
+        else build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=trees).graph
+    )
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
