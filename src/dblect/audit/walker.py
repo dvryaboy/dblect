@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
+from dblect.audit.incremental import incremental_findings
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.flatten.detector import make_array_nonemptiness_detectors
@@ -208,6 +209,11 @@ def run_audit(
     skipped: list[SkippedModel] = []
     scanned = 0
     for uid, node in sorted(manifest.models.items()):
+        # The incremental-config check reads the manifest, not the parsed SQL, so it runs
+        # for every model independent of whether the SQL compiled and parsed.
+        config_scan = _config_scan(node, profile)
+        active.extend(config_scan.findings)
+        suppressed.extend(config_scan.suppressed)
         outcome = _scan_one(node, parsed.get(uid), detectors=effective_detectors)
         if isinstance(outcome, _Scanned):
             scanned += 1
@@ -250,17 +256,43 @@ def _scan_one(
     raw_findings: list[Finding] = []
     for detector in detectors:
         raw_findings.extend(detector(tree))
-    # Directives are read from both texts: the template for a finding the back-map placed on
-    # a source line, and the compiled SQL for one a macro emitted, whose guarding `-- noqa`
-    # renders only into the compiled output. Each finding is matched in the frame(s) it
-    # occupies.
-    directives = FramedDirectives.for_node(node)
     # Findings carry compiled-SQL spans; back-map them onto the source template once per
     # model, then match directives against the located span. Locating before suppressing
     # is what lets a `-- noqa` on the line the report shows silence a finding whose
     # compiled line a macro expansion pushed away from its source line.
     line_map = build_line_map(node.analysis_sql, node.raw_code)
     located = [_locate(node, f, line_map) for f in raw_findings]
+    return _finalize(node, located)
+
+
+def _config_scan(node: Node, profile: AdapterProfile) -> _Scanned:
+    """The manifest-level findings for `node`: the incremental-config check, which reasons
+    over the node's config and the resolved adapter `profile` rather than its SQL.
+    Model-scoped (line 0). The common model (non-incremental, or keyed under a dedup
+    strategy) yields nothing, so it returns before parsing directives and the per-model
+    directive scan stays on the SQL path. A finding, when present, runs through the same
+    suppression as the SQL findings so the report shape stays uniform."""
+    findings = incremental_findings(node, profile)
+    if not findings:
+        return _Scanned(findings=(), suppressed=())
+    located = [
+        LocatedFinding(model_unique_id=node.unique_id, file_path=node.original_file_path, finding=f)
+        for f in findings
+    ]
+    return _finalize(node, located)
+
+
+def _finalize(node: Node, located: Sequence[LocatedFinding]) -> _Scanned:
+    """Apply `node`'s ``-- noqa`` directives to its located findings, partitioning into
+    active and suppressed. The single place the directive-match-and-record flow lives, so
+    the SQL scan and the manifest-config scan suppress findings the same way.
+
+    Directives are read from both texts: the template for a finding the back-map placed on
+    a source line, and the compiled SQL for one a macro emitted, whose guarding `-- noqa`
+    renders only into the compiled output. Each finding is matched in the frame(s) it
+    occupies.
+    """
+    directives = FramedDirectives.for_node(node)
     active, suppressed = apply(located, directives)
     located_suppressed = [
         SuppressedFinding(
@@ -268,10 +300,7 @@ def _scan_one(
         )
         for lf, d, ic in suppressed
     ]
-    return _Scanned(
-        findings=tuple(active),
-        suppressed=tuple(located_suppressed),
-    )
+    return _Scanned(findings=tuple(active), suppressed=tuple(located_suppressed))
 
 
 def _locate(node: Node, finding: Finding, line_map: LineMap) -> LocatedFinding:

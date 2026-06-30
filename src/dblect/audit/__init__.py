@@ -1,5 +1,6 @@
 """Audit pipeline: static detectors, replay-determinism, heuristic invariants."""
 
+from dblect.audit.incremental import incremental_findings
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import SuppressionDirective
 from dblect.audit.walker import (
@@ -22,5 +23,6 @@ __all__ = [
     "SpanBasis",
     "SuppressedFinding",
     "SuppressionDirective",
+    "incremental_findings",
     "run_audit",
 ]

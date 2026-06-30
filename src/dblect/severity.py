@@ -91,6 +91,7 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.NOT_IN_NULLABLE_SUBQUERY
             | FindingKind.INNER_FLATTEN_ROW_DROP
             | FindingKind.SNAPSHOT_TEMPORAL_FILTER_MISSING
+            | FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY
         ):
             return Severity.ERROR
         case (

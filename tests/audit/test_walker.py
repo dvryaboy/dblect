@@ -556,6 +556,60 @@ def test_bigquery_jaffle_audits_end_to_end(jaffle_bigquery_manifest_path: Path) 
     ), "the bigquery-compiled LEFT JOIN + GROUP BY should be flagged"
 
 
+def _incremental(uid: str, **config: object) -> Node:
+    short = uid.rsplit(".", 1)[-1]
+    sql = "select id from raw"
+    return Node(
+        unique_id=uid,
+        name=short,
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", short),
+        package_name="pkg",
+        schema=None,
+        raw_code=sql,
+        compiled_code=sql,
+        original_file_path=f"models/{short}.sql",
+        columns={},
+        config=ModelConfig(materialized="incremental", **config),  # type: ignore[arg-type]
+    )
+
+
+def test_incremental_without_key_fires_through_run_audit() -> None:
+    # The manifest-config check runs in the walker: an append-style incremental model
+    # with no unique_key is flagged model-scoped, while a sibling that declares a key is
+    # left alone.
+    unsafe = _incremental("model.pkg.events", incremental_strategy="append")
+    safe = _incremental("model.pkg.dims", incremental_strategy="merge", unique_key=("id",))
+    manifest = Manifest(
+        schema_version="x",
+        adapter_type="duckdb",
+        nodes={n.unique_id: n for n in (unsafe, safe)},
+    )
+    report = run_audit(manifest, _DUCKDB)
+    hits = [
+        lf
+        for lf in report.findings
+        if lf.finding.kind is FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY
+    ]
+    assert {lf.model_unique_id for lf in hits} == {unsafe.unique_id}
+    [hit] = hits
+    assert hit.file_path == "models/events.sql"
+    # Model-scoped: no SQL line to anchor to.
+    assert hit.finding.line_start == 0
+
+
+def test_incremental_check_runs_even_without_compiled_sql() -> None:
+    # The check reads config, not SQL, so it fires for a model dbt did not compile: that
+    # model is skipped for the SQL detectors yet still carries its config finding.
+    node = _without_sql(_incremental("model.pkg.events", incremental_strategy="append"))
+    manifest = Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    report = run_audit(manifest, _DUCKDB)
+    assert any(s.unique_id == node.unique_id for s in report.skipped)
+    assert any(
+        lf.finding.kind is FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY for lf in report.findings
+    )
+
+
 def _without_sql(node: Node) -> Node:
     return replace(node, raw_code=None, compiled_code=None)
 

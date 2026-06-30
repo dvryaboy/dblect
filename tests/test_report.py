@@ -351,6 +351,27 @@ def test_text_omits_hint_for_unlocated_declaration_findings() -> None:
     assert "noqa" not in text
 
 
+def test_text_omits_hint_for_model_scoped_structural_findings() -> None:
+    # A model-scoped structural finding (line 0: the incremental-config check) has no line
+    # to anchor a `-- noqa` on, so the hint must not ride it the way a span-located finding's
+    # does, the same convention the declaration block follows for an unlocated finding.
+    unlocated = LocatedFinding(
+        model_unique_id=_MODEL,
+        file_path="models/m.sql",
+        finding=Finding(
+            kind=FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY,
+            message="incremental model declares no unique_key",
+            sql_snippet="",
+            line_start=0,
+            line_end=0,
+        ),
+        source_span=None,
+    )
+    text = render_text(_report(structural=(unlocated,)))
+    assert "incremental_missing_unique_key" in text
+    assert "noqa" not in text
+
+
 def test_json_message_stays_the_pure_observation() -> None:
     # The hint is presentation: it rides the text reporter, never the JSON
     # `message`, which remains the detector's observation verbatim.

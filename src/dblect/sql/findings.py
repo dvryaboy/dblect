@@ -47,6 +47,7 @@ class FindingKind(StrEnum):
     INNER_FLATTEN_ROW_DROP = "inner_flatten_row_drop"
     SNAPSHOT_TEMPORAL_FILTER_MISSING = "snapshot_temporal_filter_missing"
     LIMIT_WITHOUT_DETERMINISTIC_ORDER = "limit_without_deterministic_order"
+    INCREMENTAL_MISSING_UNIQUE_KEY = "incremental_missing_unique_key"
 
 
 def suppression_code(kind: FindingKind | CheckFindingKind) -> str:
