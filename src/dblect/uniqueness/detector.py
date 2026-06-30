@@ -18,7 +18,10 @@ to make a claim, and stay silent otherwise):
 * ``detect_cross_model_fanout``: a duplicate-sensitive aggregate that folds a
   magnitude an upstream fan-out replicated, over a relation no longer keyed at the
   magnitude's grain. This one also reads ``where_provenance`` to find the origin a
-  magnitude traces to, the grain ``grain_preserved`` is asked about.
+  magnitude traces to, the grain ``grain_preserved`` is asked about. A COUNT fold
+  (``COUNT(*)``, ``COUNT(col)``) yields a cardinality, not a magnitude: it counts the
+  relation's rows, whose grain the relation preserves, so it stays silent (the ``SUM(qty)``
+  analog), unlike ``SUM(amount)``.
 
 The first two read keys from the lineage.facts uniqueness substrate: per-model keys
 come from cross-model propagation (``uniqueness_property`` over the relation graph),
@@ -62,7 +65,14 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Materialization
-from dblect.sql import Finding, FindingKind, duplicate_sensitive, suppression_hint
+from dblect.sql import (
+    AggregateBehavior,
+    Finding,
+    FindingKind,
+    aggregate_behavior,
+    duplicate_sensitive,
+    suppression_hint,
+)
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -624,13 +634,24 @@ def detect_cross_model_fanout(
     translated into ``R``'s column names through provenance. When no origin candidate key
     survives in ``R``, the fold can double count and we flag.
 
+    A grain-collapse guard precedes the per-aggregate check: when the relation is provably
+    unique at the GROUP BY grain (a candidate key fits within the grouping columns), every
+    bucket is a single row and no fold over it can over-count, so the whole select is silent.
+    This is the cross-model analog of the local ``_collapsed_before_sensitive_consumer`` guard,
+    and it clears the magnitude path's grouped-to-a-finer-grain case (``SUM(amount) GROUP BY
+    order_id, item_id`` over line-grain staging) as well.
+
     Silent when the FROM is not a single ref'd relation (a join or a CTE/subquery needs
     column-level reasoning kept for later), when the aggregate is duplicate-safe, and when the
     origin relation has no known key, the firewall posture: with no grain to name there is no
-    positive fact to fire on. Also silent on a star-argument fold (``COUNT(*)``): it names no
-    column, so there is no magnitude to trace to an origin grain. A star count over a
-    fanned-out relation does double count, so closing that gap (it needs the relation's own
-    row grain rather than a traced origin) is tracked as future work, not handled here.
+    positive fact to fire on. Also silent on a COUNT-behavior fold (``COUNT(*)``, ``COUNT(1)``,
+    ``COUNT(col)``, ``COUNT_IF``): it yields a cardinality, not a magnitude, so it counts the
+    relation's rows (whose grain the relation preserves) rather than summing a replicated value.
+    That makes every COUNT the ``SUM(qty)`` analog (a fold at the genuine, un-replicated grain),
+    not the ``SUM(amount)`` analog: a count per group reads distinct rows, so a single-level
+    fan-out does not make it double count. The fan-trap case where it would (independent
+    fan-outs leaving the relation with no key) is indistinguishable from an undeclared grain, so
+    the firewall keeps it silent there too (issue #179).
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -639,6 +660,13 @@ def detect_cross_model_fanout(
             continue
         rel_prov = provenance_by_source.get(ref, {})
         rel_keys = keys_by_source.get(ref, NO_KEYS)
+        group_cols = _group_by_columns(sel)
+        # Grain-collapse guard: when the relation is provably unique at the GROUP BY grain
+        # (a candidate key fits within the grouping columns), every bucket is a single row, so
+        # no fold over it can over-count, whatever magnitude it reads. This is the cross-model
+        # analog of the local ``_collapsed_before_sensitive_consumer`` guard.
+        if group_cols is not None and grain_preserved(rel_keys, group_cols):
+            continue
         for agg in _sensitive_aggregate_consumers(sel, safe_builtins=duplicate_safe_builtins):
             origin = _replicated_origin(
                 agg, rel_keys=rel_keys, rel_prov=rel_prov, keys_by_source=keys_by_source
@@ -729,6 +757,21 @@ def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | Non
     return name_to_ref.get(name)
 
 
+def _group_by_columns(sel: exp.Select) -> frozenset[str] | None:
+    """The GROUP BY key column names of ``sel`` when every grouping term is a bare column,
+    else ``None`` (no GROUP BY, or a positional/expression key whose grain we cannot size).
+
+    ``None`` carries the same "cannot judge" meaning as elsewhere: it disables the
+    grain-collapse guard, so an un-sizable grouping keeps the detector conservative rather than
+    proving a collapse it cannot.
+    """
+    group = sg.group_of(sel)
+    if group is None or not group.expressions:
+        return None
+    names = _bare_column_names(group.expressions)
+    return frozenset(names) if names is not None else None
+
+
 def _replicated_origin(
     agg: Expr,
     *,
@@ -743,7 +786,17 @@ def _replicated_origin(
     that origin's grain (translated into the relation's columns). The first origin that fails
     is the replicated side the fold double counts; an origin with no known key is skipped
     (nothing to claim).
+
+    A COUNT-behavior fold (``COUNT(*)``, ``COUNT(col)``, ``COUNT_IF``) yields a cardinality,
+    not a magnitude: it counts rows (modulo nulls), and the row grain is what the relation
+    preserves, so the replicated value a counted column carries is never summed and cannot
+    double count. ``COUNT(amount)`` over a fan-out reads distinct rows, not a replicated
+    magnitude, exactly like ``COUNT(*)`` and unlike ``SUM(amount)``. It returns ``None`` here.
+    The fan-trap where a COUNT would over-count leaves the relation with no key at all,
+    indistinguishable from an undeclared grain, so the firewall keeps it silent there too.
     """
+    if isinstance(agg, exp.AggFunc) and aggregate_behavior(agg) is AggregateBehavior.COUNT:
+        return None
     origin_refs: set[ColumnRef] = set()
     for c in {sg.column_name(c) for c in sg.find_columns(agg)}:
         origin_refs |= set(rel_prov.get(c, frozenset()))
