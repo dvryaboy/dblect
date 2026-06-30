@@ -30,6 +30,9 @@ from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.flatten.detector import make_array_nonemptiness_detectors
 from dblect.lineage.builder import build_manifest_graph
+from dblect.lineage.facts.model import Fact
+from dblect.lineage.graph import SourceRef
+from dblect.lineage.properties.functional_dependency import FDSet
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
@@ -149,6 +152,7 @@ def run_audit(
     profile: AdapterProfile,
     *,
     detectors: Sequence[Detector] = DEFAULT_DETECTORS,
+    fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
 
@@ -194,7 +198,9 @@ def run_audit(
     col_graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect, parsed=trees).graph
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
-        *make_fact_grounded_detectors(manifest, profile, parsed=trees, relation_keys=rel_keys),
+        *make_fact_grounded_detectors(
+            manifest, profile, parsed=trees, relation_keys=rel_keys, fd_facts=fd_facts
+        ),
         *make_cross_model_fanout_detectors(
             manifest, profile, parsed=trees, relation_keys=rel_keys, column_graph=col_graph
         ),

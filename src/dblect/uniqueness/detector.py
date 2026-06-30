@@ -36,9 +36,16 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph, index_by_name
-from dblect.lineage.facts.model import Annotation
+from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
+from dblect.lineage.properties.functional_dependency import (
+    NO_FDS,
+    FDSet,
+    determines,
+    functional_dependency_grounding,
+    functional_dependency_property,
+)
 from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
@@ -193,12 +200,22 @@ def detect_join_fanout(
     model_keys: ModelKeys,
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
+    target_fds: Mapping[str, FDSet] | None = None,
 ) -> tuple[Finding, ...]:
     """Flag JOINs whose joined-in side has keys that don't cover the join.
 
     For each JOIN whose joined-in side resolves to keys (an in-scope CTE or a
-    ref'd model), we ask whether any known key fits within the right-side equality
-    predicate columns. If yes, the join cannot multiply rows. If no, we flag.
+    ref'd model), we ask whether the join's equality columns cover a known key. If yes,
+    the join cannot multiply rows. If no, we flag.
+
+    Coverage is closure-based, not raw containment: a known key ``K`` is covered when the
+    join columns *functionally determine* every column of ``K`` under the joined-in side's
+    ``determines`` facts (``target_fds``). With no FDs known this reduces to ``K`` being a
+    subset of the join columns, the original test. The generalization removes a false
+    positive on a non-minimal declared key: a key carrying descriptive columns dependent on
+    an id (``(month, platform, project_family, wiki_id, wiki_name)`` with ``wiki_id``
+    determining ``project_family`` and ``wiki_name``) is covered by a join on
+    ``(month, platform, wiki_id)``, since the closure of the join columns reaches the rest.
 
     The finding is suppressed when the fan-out is collapsed in the same query before
     any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
@@ -236,7 +253,8 @@ def detect_join_fanout(
             joined_cols = sg.equality_cols_on_alias(on, target.alias_or_name)
             if not joined_cols:
                 continue
-            if any(k <= joined_cols for k in target_keys):
+            fds = (target_fds or {}).get(target.name, NO_FDS)
+            if any(all(determines(fds, joined_cols, col) for col in k) for k in target_keys):
                 continue
             if _collapsed_before_sensitive_consumer(sel, safe_builtins=duplicate_safe_builtins):
                 continue
@@ -451,6 +469,7 @@ def make_fact_grounded_detectors(
     *,
     parsed: Mapping[str, Expr] | None = None,
     relation_keys: RelationUniqueness | None = None,
+    fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against substrate-derived keys.
 
@@ -498,6 +517,19 @@ def make_fact_grounded_detectors(
         manifest, {ref: ann.value.conditional for ref, ann in keys.items()}
     )
     flow_by_name = index_by_name(manifest, {ref: ann.value for ref, ann in flow.items()})
+    # Propagate the functional-dependency property over the same relation graph and index it by
+    # name, so join-fanout can test key coverage through ``determines`` (a join covering a key's
+    # determinant covers the key). Grounded from the declared ``determines`` facts the caller
+    # threads in; with none, the property still derives structural FDs (a GROUP BY key, a join's
+    # ON equalities), and an undeclared relation grounds to ``NO_FDS`` so coverage falls back to
+    # plain containment, the original behaviour.
+    fd_by_scope: dict[SourceRef, tuple[Fact[FDSet, SourceRef], ...]] = {}
+    for fact in fd_facts:
+        fd_by_scope[fact.scope] = (*fd_by_scope.get(fact.scope, ()), fact)
+    fd_prop = functional_dependency_property(functional_dependency_grounding(fd_by_scope))
+    fd_by_name = index_by_name(
+        manifest, {ref: ann.value for ref, ann in propagate(graph, fd_prop).items()}
+    )
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -523,6 +555,7 @@ def make_fact_grounded_detectors(
             tree,
             model_keys=model_keys,
             scope_index=scope_index(tree),
+            target_fds=fd_by_name,
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
         )
 

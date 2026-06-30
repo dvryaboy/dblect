@@ -11,6 +11,7 @@ import pytest
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
+from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
@@ -439,6 +440,29 @@ def test_fanout_composite_key_silent_when_join_covers_all_columns() -> None:
 def test_fanout_composite_key_flagged_when_join_covers_only_one_column() -> None:
     parsed = _parse("select * from facts f join dim d on f.a = d.a")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("a", "b"),)))
+    assert len(findings) == 1
+
+
+def test_fanout_silent_when_fd_closure_covers_key() -> None:
+    # `dim` is unique on (a, b, c), but a determines b and c, so a join on `a` alone
+    # functionally determines the whole key and cannot fan out. This is the non-minimal-key
+    # case: a declared key carrying descriptive columns dependent on an id.
+    parsed = _parse("select * from facts f join dim d on f.a = d.a")
+    fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"a"}), "c"))}
+    findings = detect_join_fanout(
+        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), target_fds=fds
+    )
+    assert findings == ()
+
+
+def test_fanout_flagged_when_fd_closure_insufficient() -> None:
+    # a determines b but not c, so the closure of {a} is {a, b}, which does not cover the
+    # (a, b, c) key. The join can still fan out, so it fires.
+    parsed = _parse("select * from facts f join dim d on f.a = d.a")
+    fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"))}
+    findings = detect_join_fanout(
+        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), target_fds=fds
+    )
     assert len(findings) == 1
 
 
