@@ -27,11 +27,14 @@ from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import assert_never
 
+from sqlglot import Expr
+
 from dblect.adapters import AdapterProfile
 from dblect.audit import AuditReport, LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding, CheckReport
-from dblect.check.run import run_check
+from dblect.check.run import build_check_graphs, run_check
 from dblect.manifest import Manifest
+from dblect.sql import parse_models
 from dblect.types import ContractRegistry
 
 # The sealed set of findings any analysis surfaces: one member per detector family.
@@ -93,9 +96,23 @@ def analyze(
     inputs :func:`~dblect.check.run.run_check` takes. ``resolution_floor`` is forwarded
     to it unchanged. The merged ``findings`` carry both families so a consumer never
     has to enumerate the families itself.
+
+    The two families share one parse and one column-graph build. Building the column graph
+    (qualify + scope-resolve every model) dominates a run, and each family built it
+    independently; parsing once and threading the graphs into both removes the duplicate
+    build. The shared build stamps the parsed trees in place and ``propagate`` never mutates
+    them, so both families read the same resolution they would have built themselves.
     """
-    check = run_check(manifest, profile, registry=registry, resolution_floor=resolution_floor)
-    audit = run_audit(manifest, profile)
+    parsed = parse_models(
+        {uid: m.analysis_sql for uid, m in manifest.models.items()},
+        dialect=profile.sqlglot_dialect,
+    )
+    trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
+    graphs = build_check_graphs(manifest, profile, registry=registry, trees=trees)
+    check = run_check(
+        manifest, profile, registry=registry, resolution_floor=resolution_floor, graphs=graphs
+    )
+    audit = run_audit(manifest, profile, parsed=parsed, column_graph=graphs.column_build.graph)
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),
         check=check,
