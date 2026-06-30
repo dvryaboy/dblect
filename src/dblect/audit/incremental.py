@@ -1,146 +1,105 @@
 """Flag dbt incremental models that silently append duplicate rows.
 
-An incremental model without a ``unique_key`` (and without an incremental strategy that
-reconciles rows another way) appends every run's output to the existing table. A
-backfill, a rerun, or late-arriving data then lands the same logical row twice, a
-duplicate the model's own SQL never reveals because each run is internally correct. dbt's
-docs call this out; this raises it at audit time from the manifest config alone, with no
-SQL parse needed.
+An incremental model whose write does not reconcile a rerun's rows appends every run's
+output to the existing table. A backfill, a rerun, or late-arriving data then lands the
+same logical row twice, a duplicate the model's own SQL never reveals because each run is
+internally correct. dbt's docs call this out; this raises it at audit time from the
+manifest config alone, with no SQL parse needed.
 
-The decision is over the node's resolved ``config``: the materialization, the incremental
-strategy, and whether a ``unique_key`` is declared. The strategy space is classified into
-the append-style ones that need a key to stay idempotent (``append``, ``merge``, and
-``delete+insert``, plus the unset default, which every adapter resolves to one of these)
-and the ones that reconcile rows without a key (``insert_overwrite`` replaces a partition
-or the whole table; ``microbatch`` rebuilds per time batch). A strategy dblect does not
-recognize (a custom macro-defined one) is left alone: its idempotency is unknown, so the
-firewall stays silent rather than guess.
+The decision is over the node's resolved ``config`` and the run's adapter ``profile``: the
+materialization, whether a ``unique_key`` is declared, and the *effective* incremental
+strategy. The strategy is effective rather than declared because a model that leaves
+``incremental_strategy`` unset runs under the adapter's default, which is adapter-specific
+(``merge`` on Snowflake and BigQuery, ``delete+insert`` on Postgres and Redshift, and a
+value dblect has not validated on some others). :meth:`AdapterProfile.effective_strategy`
+owns that resolution, the same substrate the uniqueness property's config-key discoverer
+reasons over, so the audit and the property agree on what a given model's write does.
+:func:`_appends_on_rerun` then classifies that strategy against the declared key.
 
-The finding is model-scoped (line 0): the concern is the model's configuration as a
-whole, and the ``config()`` block is stripped from the compiled SQL the audit parses, so
-there is no SQL line to anchor it to.
+The finding is model-scoped (line 0): the concern is the model's configuration as a whole,
+and the ``config()`` block is stripped from the compiled SQL the audit parses, so there is
+no SQL line to anchor it to.
 """
 
 from __future__ import annotations
 
-from enum import Enum, StrEnum, auto
 from typing import assert_never
 
+from dblect.adapters import AdapterProfile, IncrementalStrategy
 from dblect.manifest import Materialization, Node
 from dblect.sql import Finding, FindingKind
 
 
-class IncrementalStrategy(StrEnum):
-    """A dbt ``incremental_strategy``, normalized to the names dblect classifies.
+def _appends_on_rerun(strategy: IncrementalStrategy | None, *, has_key: bool) -> bool:
+    """True when an incremental write under `strategy` appends a rerun's rows rather than
+    reconciling them, decided over the closed strategy set (plus ``None`` for a strategy
+    dblect cannot resolve to a known behavior).
 
-    The named strategies dbt ships across its adapters, plus ``OTHER`` for a strategy
-    dblect does not model (a custom macro-defined one). The set is closed so the
-    key-need classification branches over every member explicitly. A strategy left
-    unset is ``None`` rather than a member here: the absence is meaningful (it resolves
-    to an adapter default), so the caller keeps it distinct from a named strategy.
-    """
-
-    APPEND = "append"
-    MERGE = "merge"
-    DELETE_INSERT = "delete+insert"
-    INSERT_OVERWRITE = "insert_overwrite"
-    MICROBATCH = "microbatch"
-    OTHER = "other"
-
-    @classmethod
-    def from_raw(cls, raw: str | None) -> IncrementalStrategy | None:
-        """The strategy a raw config value names, or ``None`` when unset.
-
-        A recognized name (case-folded) maps to its member; an unrecognized non-empty
-        name maps to ``OTHER`` (a custom strategy); ``None`` or an empty/whitespace value
-        is the unset default, returned as ``None``.
-        """
-        if raw is None or not raw.strip():
-            return None
-        try:
-            return cls(raw.strip().lower())
-        except ValueError:
-            return cls.OTHER
-
-
-class _KeyNeed(Enum):
-    """Whether an incremental strategy needs a ``unique_key`` to stay idempotent."""
-
-    NEEDS_KEY = auto()
-    """Append-style: a rerun duplicates rows unless a key reconciles them."""
-    RECONCILES = auto()
-    """Replaces rows (a partition, the whole table, or a time batch), so it is idempotent
-    without a key."""
-    UNKNOWN = auto()
-    """A custom strategy whose idempotency dblect cannot judge; stay silent."""
-
-
-def _key_need(strategy: IncrementalStrategy) -> _KeyNeed:
-    """How `strategy` reconciles a rerun's rows, decided over the closed strategy set.
-
-    ``merge`` and ``delete+insert`` both take a ``unique_key`` to match or delete on;
-    without one dbt falls back to a plain append, so they sit with ``append`` as
-    needing a key. ``insert_overwrite`` and ``microbatch`` overwrite rather than append.
+    ``append`` ignores ``unique_key`` and inserts unconditionally, so it duplicates with or
+    without a key. ``merge`` and ``delete+insert`` reconcile on a key, but without one dbt
+    falls back to appending, so they duplicate exactly when no key is declared.
+    ``insert_overwrite`` and ``microbatch`` overwrite rather than append, so they are
+    idempotent without a key. ``None`` (a custom strategy, or an adapter default dblect does
+    not model) has unknown idempotency, so it stays silent.
     """
     match strategy:
-        case (
-            IncrementalStrategy.APPEND
-            | IncrementalStrategy.MERGE
-            | IncrementalStrategy.DELETE_INSERT
-        ):
-            return _KeyNeed.NEEDS_KEY
+        case None:
+            return False
+        case IncrementalStrategy.APPEND:
+            return True
+        case IncrementalStrategy.MERGE | IncrementalStrategy.DELETE_INSERT:
+            return not has_key
         case IncrementalStrategy.INSERT_OVERWRITE | IncrementalStrategy.MICROBATCH:
-            return _KeyNeed.RECONCILES
-        case IncrementalStrategy.OTHER:
-            return _KeyNeed.UNKNOWN
+            return False
     assert_never(strategy)
 
 
-def _strategy_clause(strategy: IncrementalStrategy | None) -> str:
-    """The phrase naming the strategy in the finding message. An unset strategy reads as
-    the adapter default rather than a named one."""
-    if strategy is None:
-        return "no incremental_strategy is set (the adapter default appends)"
-    return f"the '{strategy.value}' strategy appends without a key to reconcile on"
+def _message(strategy: IncrementalStrategy, *, has_key: bool) -> str:
+    """The finding text for a firing model. Only ``append`` and the dedup strategies reach
+    here (the strategies for which :func:`_appends_on_rerun` returns ``True``), and the fix
+    differs: ``append`` ignores a key, so the remedy is a different strategy, while a dedup
+    strategy with no key just needs one declared."""
+    tail = "so each run appends its rows: a rerun, backfill, or late-arriving data duplicates them."
+    if strategy is IncrementalStrategy.APPEND:
+        ignored = " (the declared unique_key has no effect under append)" if has_key else ""
+        return (
+            f"incremental model uses the 'append' strategy, which inserts every run's rows "
+            f"and ignores unique_key{ignored}, {tail} Use merge or delete+insert with a "
+            "unique_key, or an idempotent strategy (insert_overwrite, microbatch)."
+        )
+    return (
+        f"incremental model declares no unique_key and uses the '{strategy.value}' strategy, "
+        f"which deduplicates only on a unique_key, so dbt falls back to appending, {tail} "
+        "Declare a unique_key, or use an idempotent strategy (insert_overwrite, microbatch)."
+    )
 
 
-def incremental_findings(node: Node) -> tuple[Finding, ...]:
-    """Flag `node` when it is an incremental model that appends without a ``unique_key``.
+def incremental_findings(node: Node, profile: AdapterProfile) -> tuple[Finding, ...]:
+    """Flag `node` when it is an incremental model whose write appends duplicate rows.
 
-    Returns one model-scoped finding (line 0) when the materialization is
-    ``incremental``, no ``unique_key`` is declared, and the strategy is append-style (or
-    unset). Silent otherwise: a declared key reconciles rows, an overwriting strategy is
-    idempotent without one, a custom strategy's idempotency is unknown, and a
-    non-incremental model never appends.
+    Returns one model-scoped finding (line 0) when the materialization is ``incremental``
+    and the effective strategy (resolved against `profile` so an unset strategy reads as the
+    adapter's default) appends a rerun's rows without reconciling them. Silent otherwise: a
+    dedup strategy with a declared ``unique_key`` reconciles rows, an overwriting strategy is
+    idempotent without one, and a strategy dblect cannot resolve is left alone.
     """
     config = node.config
     if config is None:
         return ()
     if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
         return ()
-    if config.unique_key:
+    has_key = bool(config.unique_key)
+    strategy = profile.effective_strategy(config.incremental_strategy)
+    if not _appends_on_rerun(strategy, has_key=has_key):
         return ()
-    strategy = IncrementalStrategy.from_raw(config.incremental_strategy)
-    # An unset strategy resolves to an append-style default on every adapter, so it needs
-    # a key the same way the named append-style strategies do.
-    need = _KeyNeed.NEEDS_KEY if strategy is None else _key_need(strategy)
-    match need:
-        case _KeyNeed.RECONCILES | _KeyNeed.UNKNOWN:
-            return ()
-        case _KeyNeed.NEEDS_KEY:
-            message = (
-                f"incremental model declares no unique_key and {_strategy_clause(strategy)}, "
-                "so each run appends its rows: a rerun, backfill, or late-arriving data "
-                "duplicates them. Declare a unique_key, or use an idempotent strategy "
-                "(insert_overwrite, microbatch)."
-            )
-            return (
-                Finding(
-                    kind=FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY,
-                    message=message,
-                    sql_snippet="",
-                    line_start=0,
-                    line_end=0,
-                ),
-            )
-    assert_never(need)
+    # _appends_on_rerun is False for None, so a firing strategy is always a concrete member.
+    assert strategy is not None
+    return (
+        Finding(
+            kind=FindingKind.INCREMENTAL_MISSING_UNIQUE_KEY,
+            message=_message(strategy, has_key=has_key),
+            sql_snippet="",
+            line_start=0,
+            line_end=0,
+        ),
+    )

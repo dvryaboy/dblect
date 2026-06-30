@@ -211,7 +211,7 @@ def run_audit(
     for uid, node in sorted(manifest.models.items()):
         # The incremental-config check reads the manifest, not the parsed SQL, so it runs
         # for every model independent of whether the SQL compiled and parsed.
-        config_scan = _config_scan(node)
+        config_scan = _config_scan(node, profile)
         active.extend(config_scan.findings)
         suppressed.extend(config_scan.suppressed)
         outcome = _scan_one(node, parsed.get(uid), detectors=effective_detectors)
@@ -265,13 +265,19 @@ def _scan_one(
     return _finalize(node, located)
 
 
-def _config_scan(node: Node) -> _Scanned:
+def _config_scan(node: Node, profile: AdapterProfile) -> _Scanned:
     """The manifest-level findings for `node`: the incremental-config check, which reasons
-    over the node's config rather than its SQL. Model-scoped (line 0) and run through the
-    same suppression as the SQL findings, so the report shape stays uniform."""
+    over the node's config and the resolved adapter `profile` rather than its SQL.
+    Model-scoped (line 0). The common model (non-incremental, or keyed under a dedup
+    strategy) yields nothing, so it returns before parsing directives and the per-model
+    directive scan stays on the SQL path. A finding, when present, runs through the same
+    suppression as the SQL findings so the report shape stays uniform."""
+    findings = incremental_findings(node, profile)
+    if not findings:
+        return _Scanned(findings=(), suppressed=())
     located = [
         LocatedFinding(model_unique_id=node.unique_id, file_path=node.original_file_path, finding=f)
-        for f in incremental_findings(node)
+        for f in findings
     ]
     return _finalize(node, located)
 

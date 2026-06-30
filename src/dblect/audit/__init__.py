@@ -1,6 +1,6 @@
 """Audit pipeline: static detectors, replay-determinism, heuristic invariants."""
 
-from dblect.audit.incremental import IncrementalStrategy, incremental_findings
+from dblect.audit.incremental import incremental_findings
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import SuppressionDirective
 from dblect.audit.walker import (
@@ -17,7 +17,6 @@ __all__ = [
     "DEFAULT_DETECTORS",
     "AuditReport",
     "Detector",
-    "IncrementalStrategy",
     "LocatedFinding",
     "SkippedModel",
     "SourceSpan",
