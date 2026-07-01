@@ -72,7 +72,7 @@ from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
-from dblect.sql.parse import parse_models
+from dblect.sql.parse import parse_manifest_models
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -150,13 +150,7 @@ def build_check_graphs(
     resolved = resolve_contracts(manifest, registry=reg)
     dialect = profile.sqlglot_dialect
     if trees is None:
-        trees = {
-            uid: tree
-            for uid, tree in parse_models(
-                {uid: m.analysis_sql for uid, m in manifest.models.items()}, dialect=dialect
-            ).items()
-            if isinstance(tree, Expr)
-        }
+        _, trees = parse_manifest_models(manifest, dialect=dialect)
     relation_build = build_relation_graph(manifest, dialect=dialect, parsed=trees)
     column_build = build_manifest_graph(manifest, dialect=dialect, parsed=trees)
     # A model the column build skipped (a compilation miss, a build error) leaves its tree
