@@ -27,13 +27,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
+
+if TYPE_CHECKING:
+    from sqlglot.schema import ColumnMapping
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
+from sqlglot.dialects.dialect import DialectType
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
+from sqlglot.schema import MappingSchema, Schema
 
 from dblect.lineage.graph import (
     AggregationSite,
@@ -165,6 +170,65 @@ def _stamp_tables(tree: Expr, name_to_source: Mapping[str, SourceRef]) -> None:
             attach_source_ref(table, ref)
 
 
+def _identity_key(node: exp.Column | exp.Table | str) -> object:
+    """A hashable identity keyed on the same inputs sqlglot's normalization consumes: each
+    identifier's text and its ``quoted`` flag. Keeping the quoted flag stops a quoted and an
+    unquoted spelling of the same text from colliding under a dialect that distinguishes them."""
+    if isinstance(node, str):
+        return node
+    parts = node.parts if isinstance(node, exp.Table) else [node.this]
+    return tuple(
+        (p.name, p.quoted) if isinstance(p, exp.Identifier) else (p.name, False) for p in parts
+    )
+
+
+class _CachingMappingSchema(MappingSchema):
+    """A ``MappingSchema`` that memoizes ``get_column_type``.
+
+    Resolving an ``UNNEST`` of a nested STRUCT calls ``get_column_type`` ~2M times over ~11k
+    distinct keys in a single build, re-normalizing each time. The schema only changes via
+    ``add_table`` (between models), so the result is a pure function of (table, column, dialect,
+    normalize); ``add_table`` clears the cache. Returning a stored ``DataType`` repeatedly is the
+    read-only contract sqlglot's own ``DataType``-valued schemas already rely on.
+    """
+
+    def __init__(
+        self,
+        schema: dict[str, object] | None = None,
+        *,
+        dialect: DialectType = None,
+        normalize: bool = True,
+    ) -> None:
+        super().__init__(schema, dialect=dialect, normalize=normalize)
+        self._gct_cache: dict[object, exp.DataType] = {}
+
+    def get_column_type(
+        self,
+        table: exp.Table | str,
+        column: exp.Column | str,
+        dialect: DialectType = None,
+        normalize: bool | None = None,
+    ) -> exp.DataType:
+        key = (_identity_key(table), _identity_key(column), dialect, normalize)
+        hit = self._gct_cache.get(key)
+        if hit is not None:
+            return hit
+        value = super().get_column_type(table, column, dialect=dialect, normalize=normalize)
+        self._gct_cache[key] = value
+        return value
+
+    def add_table(
+        self,
+        table: exp.Table | str,
+        column_mapping: ColumnMapping | None = None,
+        dialect: DialectType = None,
+        normalize: bool | None = None,
+        match_depth: bool = True,
+    ) -> None:
+        self._gct_cache.clear()
+        super().add_table(table, column_mapping, dialect, normalize, match_depth)
+
+
 def build_manifest_graph(
     manifest: Manifest,
     *,
@@ -184,9 +248,19 @@ def build_manifest_graph(
     # Topological order is what makes that sound, so a `select *` or a qualified
     # reference resolves against an upstream model the project never documented.
     schema: dict[str, dict[str, str]] = {k: dict(v) for k, v in _build_schema(manifest).items()}
+    # One persistent Schema, `add_table`-ing only the touched table per model, rather than a raw
+    # dict `qualify` re-normalizes whole every call. `schema` stays the merge accumulator (the
+    # documented-wins/UNKNOWN-for-new fold); the Schema mirrors it table by table.
+    mapping_schema: Schema = _CachingMappingSchema(
+        cast("dict[str, object]", schema), dialect=dialect, normalize=True
+    )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
-    graph = ColumnLineageGraph.empty()
+    # Accumulate into one pair of dicts and freeze once, rather than `graph.merge(per_model)` per
+    # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
+    # last-wins on expressions the same final map; each output column is built by one model anyway.
+    acc_edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
+    acc_exprs: dict[ColumnRef, Expr] = {}
     for uid in manifest.dag.topological_order():
         if uid not in manifest.models:
             continue
@@ -204,9 +278,18 @@ def build_manifest_graph(
                 model_uid=uid,
                 sql=sql,
                 name_to_source=name_to_source,
-                schema=schema,
+                schema=mapping_schema,
                 dialect=dialect,
                 tree=parsed.get(uid) if parsed is not None else None,
+            )
+            per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
+            _record_output_columns(schema, model.name, uid, per_model)
+            # Mirror this model's columns into the live Schema so its dependents qualify against
+            # them. Inside the try so a schema-shape failure (e.g. a relation name `add_table`
+            # parses to a mismatched depth) degrades this one model to a BuildIssue rather than
+            # aborting the whole build.
+            mapping_schema.add_table(
+                model.name, schema[model.name], dialect=dialect, normalize=True
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -220,7 +303,6 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
-        per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
         resolution.append(
             ModelResolution(
                 unique_id=uid,
@@ -229,8 +311,8 @@ def build_manifest_graph(
                 unexpanded_stars=walker.unexpanded_stars,
             )
         )
-        graph = graph.merge(per_model)
-        _record_output_columns(schema, model.name, uid, per_model)
+        ColumnLineageGraph.fold_into(acc_edges, acc_exprs, per_model)
+    graph = ColumnLineageGraph(edges=acc_edges, expressions=acc_exprs)
     return BuildResult(graph=graph, issues=tuple(issues), resolution=tuple(resolution))
 
 
@@ -284,7 +366,7 @@ def _walk_model(
     model_uid: str,
     sql: str,
     name_to_source: Mapping[str, SourceRef],
-    schema: Mapping[str, Mapping[str, str]] | None = None,
+    schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
 ) -> _Walker:
@@ -309,7 +391,7 @@ def _walk_model(
     expression = qualify(
         expression,
         dialect=dialect,
-        schema=cast("dict[str, object] | None", schema),
+        schema=cast("dict[str, object] | Schema | None", schema),
         validate_qualify_columns=False,
         identify=False,
     )
