@@ -30,7 +30,7 @@ from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.flatten.detector import make_array_nonemptiness_detectors
 from dblect.lineage.builder import build_manifest_graph
-from dblect.lineage.graph import ColumnLineageGraph
+from dblect.lineage.graph import ColumnLineageGraph, RelationLineageGraph
 from dblect.manifest import Manifest, Node, compilation_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
@@ -43,8 +43,9 @@ from dblect.sql import (
     detect_unordered_aggregate,
     detect_unordered_window,
     detect_where_on_outer_joined_nullable,
+    expr_trees,
     make_non_determinism_detector,
-    parse_models,
+    parse_manifest_models,
 )
 from dblect.uniqueness.detector import (
     make_cross_model_fanout_detectors,
@@ -152,6 +153,7 @@ def run_audit(
     detectors: Sequence[Detector] = DEFAULT_DETECTORS,
     parsed: Mapping[str, Expr | SQLParseError] | None = None,
     column_graph: ColumnLineageGraph | None = None,
+    relation_graph: RelationLineageGraph | None = None,
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
 
@@ -182,23 +184,20 @@ def run_audit(
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
     is never dropped by being forgotten.
     """
-    # ``analyze`` parses every model and builds the column graph once and shares both with
-    # the declaration family, since rebuilding the column graph (the heavy substrate) dominates
-    # a run. Omitted, this builds them itself, the standalone-audit path.
+    # ``analyze`` shares the parse and both lineage graphs it already built (rebuilding them,
+    # the heavy substrate, dominates a run); omitted, this builds them, the standalone path.
     if parsed is None:
-        parsed = parse_models(
-            {uid: m.analysis_sql for uid, m in manifest.models.items()},
-            dialect=profile.sqlglot_dialect,
-        )
-    trees = {uid: t for uid, t in parsed.items() if isinstance(t, Expr)}
-    # The fact-grounded and cross-model fan-out factories both rest on the relation graph's
-    # propagated uniqueness; propagate it once and share it so the fixpoint runs a single time.
-    rel_keys = relation_uniqueness(manifest, profile, parsed=trees)
-    # The column graph is the heavy shared substrate: qualifying and scope-resolving every
-    # model (which is also what stamps the shared trees with their resolved column refs).
-    # Build it once and hand it to each column-graph fact family so the walk runs a single
-    # time per audit rather than once per family. A shared build (from ``analyze``) is stamped
-    # on these same trees, so the detectors read the same resolution either way.
+        parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
+    else:
+        trees = expr_trees(parsed)
+    # Propagate the relation graph's uniqueness once and share it across the fact-grounded and
+    # fan-out factories. A shared ``relation_graph`` skips the rebuild; the propagation still runs
+    # here (the check family propagates the FD property over the same graph, so only the build is
+    # shared).
+    rel_keys = relation_uniqueness(manifest, profile, parsed=trees, graph=relation_graph)
+    # The column graph is the heavy shared substrate: qualifying every model is also what stamps
+    # the shared trees with their resolved column refs. A shared build (from ``analyze``) is
+    # stamped on these same trees, so the detectors read the same resolution either way.
     col_graph = (
         column_graph
         if column_graph is not None

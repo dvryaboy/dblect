@@ -150,11 +150,10 @@ class ColumnLineageGraph:
         expressions: dict[ColumnRef, Expr],
         other: ColumnLineageGraph,
     ) -> None:
-        """Fold ``other`` into the mutable ``edges``/``expressions`` accumulators in place:
-        edges union per column, expressions take ``other`` on collision. The single home of
-        the union rule, shared by :meth:`merge` and the cross-model build loop so the loop can
-        accumulate into one pair of dicts (O(total)) rather than re-copying a growing graph per
-        model (O(models x graph), the merge-in-a-loop cost)."""
+        """Fold ``other`` into the mutable ``edges``/``expressions`` accumulators in place: edges
+        union per column, expressions take ``other`` on collision. The single home of the union
+        rule, shared by :meth:`merge` and the cross-model build loop (which accumulates into one
+        pair of dicts rather than re-copying a growing graph per model)."""
         for k, v in other.edges.items():
             edges[k] = edges.get(k, frozenset()) | v
         expressions.update(other.expressions)
