@@ -32,7 +32,7 @@ from dblect.audit import AuditReport, LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding, CheckReport
 from dblect.check.run import run_check
 from dblect.manifest import Manifest
-from dblect.types import ContractRegistry
+from dblect.types import ContractRegistry, resolve_contracts
 
 # The sealed set of findings any analysis surfaces: one member per detector family.
 # A ``match`` over this union closed by ``assert_never`` is exhaustiveness-checked,
@@ -93,9 +93,17 @@ def analyze(
     inputs :func:`~dblect.check.run.run_check` takes. ``resolution_floor`` is forwarded
     to it unchanged. The merged ``findings`` carry both families so a consumer never
     has to enumerate the families itself.
+
+    The resolved ``determines`` facts are threaded into the structural audit so join-fanout
+    grounds key coverage through functional dependencies (a declared ``wiki_id determines
+    wiki_name`` lets a join on the determinant cover a key carrying the dependent). The
+    declaration family already reads these; this hands the same facts to the structural one.
     """
-    check = run_check(manifest, profile, registry=registry, resolution_floor=resolution_floor)
-    audit = run_audit(manifest, profile)
+    resolved = resolve_contracts(manifest, registry=registry)
+    check = run_check(
+        manifest, profile, registry=registry, resolution_floor=resolution_floor, resolved=resolved
+    )
+    audit = run_audit(manifest, profile, fd_facts=resolved.fd_facts)
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),
         check=check,
