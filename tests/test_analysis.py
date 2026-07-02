@@ -37,35 +37,59 @@ def _manifest(compiled_sql: str) -> Manifest:
     return Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
 
 
-def test_analyze_is_the_union_of_both_detector_families() -> None:
-    # A LEFT JOIN feeding a GROUP BY trips a structural detector, so the audit family
-    # is non-empty. The door must return precisely what running each family by hand
-    # returns, in both directions: nothing dropped, nothing invented.
-    manifest = _manifest(
-        "select u.id, d.country, count(*) as n\n"
-        "from users u left join dim d on u.id = d.id\n"
-        "group by u.id, d.country"
+def _model_node(uid: str, name: str, sql: str, *, depends_on: frozenset[str] = frozenset()) -> Node:
+    return Node(
+        unique_id=uid,
+        name=name,
+        resource_type=ResourceType.MODEL,
+        fqn=("pkg", name),
+        package_name="pkg",
+        schema=None,
+        raw_code=sql,
+        compiled_code=sql,
+        original_file_path=f"models/{name}.sql",
+        columns={},
+        depends_on=depends_on,
     )
-    report = analyze(manifest, _DUCKDB)
 
-    check = run_check(manifest, _DUCKDB)
-    audit = run_audit(manifest, _DUCKDB)
-    assert report.findings == (*check.findings, *audit.findings)
+
+def _multi_model_manifest() -> Manifest:
+    # `mart` self-joins upstream `up` (resolving up's columns through the accumulated schema),
+    # and its LEFT JOIN feeding a GROUP BY trips a structural detector. Both families reach
+    # across more than one model, so the door exercises the shared build the single-model case
+    # would miss.
+    up = _model_node("model.pkg.up", "up", "select id, country from raw_users")
+    mart = _model_node(
+        "model.pkg.mart",
+        "mart",
+        "select u.id, d.country, count(*) as n\n"
+        "from up u left join up d on u.id = d.id\n"
+        "group by u.id, d.country",
+        depends_on=frozenset({"model.pkg.up"}),
+    )
+    return Manifest(
+        schema_version="x", adapter_type="duckdb", nodes={up.unique_id: up, mart.unique_id: mart}
+    )
+
+
+def test_analyze_is_the_union_of_both_detector_families() -> None:
+    # The door returns precisely what running each family by hand returns, both directions:
+    # nothing dropped, nothing invented. This bites if the shared build ever diverges from the
+    # per-family build.
+    manifest = _multi_model_manifest()
+    report = analyze(manifest, _DUCKDB)
+    assert report.findings == (
+        *run_check(manifest, _DUCKDB).findings,
+        *run_audit(manifest, _DUCKDB).findings,
+    )
 
 
 def test_analyze_carries_the_structural_family_a_check_only_consumer_would_miss() -> None:
-    # The exact shape the incremental check first dropped: a structural finding,
-    # located by span, reaching a consumer that reads ``analyze(...).findings``.
-    manifest = _manifest(
-        "select u.id, d.country, count(*) as n\n"
-        "from users u left join dim d on u.id = d.id\n"
-        "group by u.id, d.country"
-    )
-    report = analyze(manifest, _DUCKDB)
-
-    structural = [f for f in report.findings if isinstance(f, LocatedFinding)]
+    # The shape the incremental check first dropped: a structural finding, located by span,
+    # reaching a consumer that reads ``analyze(...).findings``.
+    manifest = _multi_model_manifest()
+    structural = [f for f in analyze(manifest, _DUCKDB).findings if isinstance(f, LocatedFinding)]
     assert any(f.finding.kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN for f in structural)
-    # And it agrees with the audit family run directly: the door is a pass-through.
     assert tuple(structural) == run_audit(manifest, _DUCKDB).findings
 
 

@@ -30,9 +30,10 @@ from typing import assert_never
 from dblect.adapters import AdapterProfile
 from dblect.audit import AuditReport, LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding, CheckReport
-from dblect.check.run import run_check
+from dblect.check.run import build_check_graphs, run_check
 from dblect.manifest import Manifest
-from dblect.types import ContractRegistry, resolve_contracts
+from dblect.sql import parse_manifest_models
+from dblect.types import ContractRegistry
 
 # The sealed set of findings any analysis surfaces: one member per detector family.
 # A ``match`` over this union closed by ``assert_never`` is exhaustiveness-checked,
@@ -94,16 +95,29 @@ def analyze(
     to it unchanged. The merged ``findings`` carry both families so a consumer never
     has to enumerate the families itself.
 
-    The resolved ``determines`` facts are threaded into the structural audit so join-fanout
-    grounds key coverage through functional dependencies (a declared ``wiki_id determines
-    wiki_name`` lets a join on the determinant cover a key carrying the dependent). The
-    declaration family already reads these; this hands the same facts to the structural one.
+    The two families share one parse and one lineage-graph build (the run's dominant cost),
+    threaded into both. The shared build stamps the parsed trees in place and ``propagate``
+    never mutates them, so both families read the same resolution they would have built
+    themselves. ``run_check`` takes ``graphs`` rather than ``registry`` here, since ``graphs``
+    already carries the resolved contracts.
+
+    The build's resolved ``determines`` facts are also threaded into the structural audit so
+    join-fanout grounds key coverage through functional dependencies (a declared ``wiki_id
+    determines wiki_name`` lets a join on the determinant cover a key carrying the dependent).
+    The declaration family already reads these off the shared build; this hands the same facts
+    to the structural one.
     """
-    resolved = resolve_contracts(manifest, registry=registry)
-    check = run_check(
-        manifest, profile, registry=registry, resolution_floor=resolution_floor, resolved=resolved
+    parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
+    graphs = build_check_graphs(manifest, profile, registry=registry, trees=trees)
+    check = run_check(manifest, profile, resolution_floor=resolution_floor, graphs=graphs)
+    audit = run_audit(
+        manifest,
+        profile,
+        parsed=parsed,
+        column_graph=graphs.column_build.graph,
+        relation_graph=graphs.relation_build.graph,
+        fd_facts=graphs.resolved.fd_facts,
     )
-    audit = run_audit(manifest, profile, fd_facts=resolved.fd_facts)
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),
         check=check,

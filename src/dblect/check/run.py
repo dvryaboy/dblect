@@ -71,7 +71,7 @@ from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
-from dblect.sql.parse import parse_models
+from dblect.sql.parse import parse_manifest_models
 from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
 
 
@@ -137,22 +137,22 @@ def build_check_graphs(
     profile: AdapterProfile,
     *,
     registry: ContractRegistry | None = None,
-    resolved: ResolvedContracts | None = None,
+    trees: Mapping[str, Expr] | None = None,
 ) -> CheckGraphs:
     """Resolve contracts and build both lineage graphs once. ``profile`` supplies the
     dialect every model parses under; the result is world-invariant and reusable
-    across an enumeration. ``resolved`` lets a caller share contracts it already resolved
-    (``analyze`` reads ``fd_facts`` off them) so the fold runs once; omitted, this resolves."""
+    across an enumeration.
+
+    ``trees`` lets a caller share already-parsed model trees (``analyze`` parses once and
+    feeds both families) so the SQL is parsed a single time; omitted, this parses them.
+
+    ``analyze`` reads the resolved ``fd_facts`` off the returned build to ground the
+    structural audit's join-fanout check, so the contracts are resolved a single time."""
     reg = registry if registry is not None else active_registry()
-    resolved = resolved if resolved is not None else resolve_contracts(manifest, registry=reg)
+    resolved = resolve_contracts(manifest, registry=reg)
     dialect = profile.sqlglot_dialect
-    trees = {
-        uid: tree
-        for uid, tree in parse_models(
-            {uid: m.analysis_sql for uid, m in manifest.models.items()}, dialect=dialect
-        ).items()
-        if isinstance(tree, Expr)
-    }
+    if trees is None:
+        _, trees = parse_manifest_models(manifest, dialect=dialect)
     relation_build = build_relation_graph(manifest, dialect=dialect, parsed=trees)
     column_build = build_manifest_graph(manifest, dialect=dialect, parsed=trees)
     # A model the column build skipped (a compilation miss, a build error) leaves its tree
@@ -207,13 +207,12 @@ def run_check(
     *,
     registry: ContractRegistry | None = None,
     resolution_floor: float | None = None,
-    resolved: ResolvedContracts | None = None,
+    graphs: CheckGraphs | None = None,
 ) -> CheckReport:
     """Resolve the registered contracts against ``manifest``, propagate, and return
     the declaration-level findings. ``profile`` is the run's resolved target, whose
     dialect parses every model. ``registry`` defaults to the active one (the loader
-    populates a fresh registry the CLI passes in). ``resolved`` lets ``analyze`` share the
-    contracts it resolved once for the structural family, so the fold is not repeated.
+    populates a fresh registry the CLI passes in).
 
     ``resolution_floor`` is the minimum share of column references the propagator
     must resolve before a clean report is trustworthy; when set and the project
@@ -226,8 +225,13 @@ def run_check(
     This is the declaration-level family alone. A consumer that needs every family's
     findings over a manifest (any multi-world or finding-threading path) calls
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
-    is never dropped by being forgotten."""
-    graphs = build_check_graphs(manifest, profile, registry=registry, resolved=resolved)
+    is never dropped by being forgotten.
+
+    ``graphs`` lets :func:`dblect.analysis.analyze` pass graphs it already built (and shares
+    with the structural audit) so the lineage graphs are built once per run; omitted, this
+    builds them."""
+    if graphs is None:
+        graphs = build_check_graphs(manifest, profile, registry=registry)
     world = propagate_world(graphs, base_world_facts(graphs.resolved))
 
     resolution = ResolutionCoverage.from_models(graphs.column_build.resolution)

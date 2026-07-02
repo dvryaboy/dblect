@@ -17,11 +17,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import sqlglot
 from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import ParseError
+
+if TYPE_CHECKING:
+    from dblect.manifest import Manifest
 
 
 class SQLParseError(ValueError):
@@ -141,3 +145,22 @@ def parse_models(
         except SQLParseError as e:
             out[uid] = e
     return out
+
+
+def expr_trees(parsed: Mapping[str, Expr | SQLParseError]) -> dict[str, Expr]:
+    """The walkable trees from a :func:`parse_models` result, with parse errors and absences
+    dropped."""
+    return {uid: tree for uid, tree in parsed.items() if isinstance(tree, Expr)}
+
+
+def parse_manifest_models(
+    manifest: Manifest, *, dialect: str | None
+) -> tuple[dict[str, Expr | SQLParseError], dict[str, Expr]]:
+    """Parse every model's analysis SQL once, returning the full result (carrying parse errors
+    for skip reporting) and the walkable :class:`Expr` trees. The one door ``analyze``,
+    ``run_audit``, and ``build_check_graphs`` share instead of re-spelling the projection, parse,
+    and Expr filter each."""
+    parsed = parse_models(
+        {uid: m.analysis_sql for uid, m in manifest.models.items()}, dialect=dialect
+    )
+    return parsed, expr_trees(parsed)

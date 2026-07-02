@@ -107,6 +107,21 @@ def aggregate_limit_of(agg: Expr) -> exp.Limit | None:
     return None
 
 
+def limit_keeps_no_rows(limit: exp.Limit) -> bool:
+    """True when ``limit`` provably keeps zero rows (its count is the literal ``0``).
+
+    ``LIMIT 0`` yields the empty set whatever the row order, so it is deterministic by
+    construction: there is no slice to pick and no tie to break. This is the schema-only
+    stub idiom (``select cast(null as ...) ... limit 0``, an empty table with a fixed
+    shape) and the empty-array aggregate (``array_agg(x ... limit 0)``). The check is
+    deliberately narrow: only a literal ``0`` count is provably empty, so a parameter or
+    an expression that might evaluate to ``0`` is not exempted and the caller keeps its
+    conservative posture.
+    """
+    count = limit.expression
+    return isinstance(count, exp.Literal) and not count.args.get("is_string") and count.this == "0"
+
+
 def partition_of(w: exp.Window) -> list[Expr]:
     return cast("list[Expr]", w.args.get("partition_by") or [])
 

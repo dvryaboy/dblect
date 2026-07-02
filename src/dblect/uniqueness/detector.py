@@ -169,7 +169,8 @@ def detect_non_unique_aggregate_order_keys(
             if not _node_in_scope(agg, sel):
                 continue
             order = sg.aggregate_order_of(agg)
-            if order is None or sg.aggregate_limit_of(agg) is None:
+            agg_limit = sg.aggregate_limit_of(agg)
+            if order is None or agg_limit is None or sg.limit_keeps_no_rows(agg_limit):
                 continue
             uncovered = _uncovered_order_keys(order.expressions, grouping, source_keys)
             if uncovered is None:
@@ -322,6 +323,8 @@ def detect_limit_without_deterministic_order(
     limit = tree.args.get("limit")
     if not isinstance(limit, exp.Limit):
         return ()
+    if sg.limit_keeps_no_rows(limit):
+        return ()
     if _is_single_row_scope(tree):
         return ()
     order = tree.args.get("order")
@@ -453,17 +456,23 @@ RelationUniqueness = tuple[RelationLineageGraph, Mapping[SourceRef, Annotation[C
 
 
 def relation_uniqueness(
-    manifest: Manifest, profile: AdapterProfile, *, parsed: Mapping[str, Expr] | None = None
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    parsed: Mapping[str, Expr] | None = None,
+    graph: RelationLineageGraph | None = None,
 ) -> RelationUniqueness:
     """Build the relation graph and propagate the uniqueness property over it.
 
     ``propagate`` memoizes only within a single call, so the two detector factories that need
     this pair would otherwise each rebuild the graph and re-run the whole-manifest uniqueness
-    fixpoint. :func:`dblect.audit.walker.run_audit` computes it once and passes it to both;
-    a standalone caller that omits it gets a fresh propagation. ``parsed`` shares the audit's
-    already-parsed trees so the graph build does not re-parse.
+    fixpoint. :func:`dblect.audit.walker.run_audit` computes it once and passes it to both.
+    ``parsed`` shares the audit's already-parsed trees; ``graph`` shares a relation graph the
+    check family already built (``analyze`` threads it) so the build runs once per run, while the
+    uniqueness fixpoint still runs here (the two families propagate different properties).
     """
-    graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
+    if graph is None:
+        graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
     keys = propagate(graph, uniqueness_property(manifest, profile, parsed=parsed))
     return graph, keys
 
