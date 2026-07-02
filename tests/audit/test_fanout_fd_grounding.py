@@ -19,7 +19,7 @@ from dblect.audit import run_audit
 from dblect.contracts import ContractSelf, contract
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.sql import FindingKind
-from dblect.types import ModelContract, resolve_contracts
+from dblect.types import ModelContract, isolated_registry, resolve_contracts
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -78,3 +78,50 @@ def test_declared_dependency_quiets_the_fanout() -> None:
     manifest = _manifest()
     assert len(resolve_contracts(manifest).fd_facts) == 2
     assert "model.shop.fact" not in _fanout_kinds(manifest, with_facts=True)
+
+
+def _node(name: str, sql: str) -> Node:
+    return Node(
+        unique_id=f"model.shop.{name}",
+        name=name,
+        resource_type=ResourceType.MODEL,
+        fqn=("shop", name),
+        package_name="shop",
+        schema="analytics",
+        raw_code=None,
+        compiled_code=sql,
+        original_file_path=None,
+        columns={},
+    )
+
+
+def test_cte_shadowing_a_declared_model_does_not_inherit_its_fds() -> None:
+    # `report` defines a query-local CTE named `dim` that shadows the model `dim`. The CTE is
+    # unique on (a, b, c) with `a` not determining b or c, and a join on `a` alone can fan out.
+    # The model `dim`'s declared `a determines b/c` describe a different relation: keys resolve
+    # the CTE but FDs only carry manifest relations, so the model's FDs must not cover the CTE's
+    # key. The fanout must fire.
+    report_sql = (
+        "WITH dim AS (SELECT k AS a, v AS b, w AS c FROM raw GROUP BY k, v, w) "
+        "SELECT r.x FROM fact_src AS r JOIN dim AS d ON r.a = d.a"
+    )
+    with isolated_registry():
+
+        class Dim(ModelContract):
+            dbt_model = "dim"
+
+            @contract
+            def a_determines_b(self: ContractSelf) -> object:
+                return self.a.determines(self.b)
+
+            @contract
+            def a_determines_c(self: ContractSelf) -> object:
+                return self.a.determines(self.c)
+
+        nodes = (_node("dim", "SELECT a, b, c FROM dim_src"), _node("report", report_sql))
+        manifest = Manifest(
+            schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+        )
+        assert len(resolve_contracts(manifest).fd_facts) == 2  # the model's FDs exist...
+        fired = _fanout_kinds(manifest, with_facts=True)
+    assert "model.shop.report" in fired  # ...but do not silence the shadowing CTE's fanout

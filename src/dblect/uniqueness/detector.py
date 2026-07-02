@@ -36,7 +36,7 @@ from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph, index_by_name
-from dblect.lineage.facts.model import Annotation, Fact
+from dblect.lineage.facts.model import Annotation, Fact, by_scope
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.functional_dependency import (
@@ -200,7 +200,7 @@ def detect_join_fanout(
     model_keys: ModelKeys,
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
-    target_fds: Mapping[str, FDSet] | None = None,
+    target_fds: Mapping[str, FDSet] = {},
 ) -> tuple[Finding, ...]:
     """Flag JOINs whose joined-in side has keys that don't cover the join.
 
@@ -210,12 +210,12 @@ def detect_join_fanout(
 
     Coverage is closure-based, not raw containment: a known key ``K`` is covered when the
     join columns *functionally determine* every column of ``K`` under the joined-in side's
-    ``determines`` facts (``target_fds``). With no FDs known this reduces to ``K`` being a
-    subset of the join columns, the original test. The generalization removes a false
-    positive on a non-minimal declared key: a key carrying descriptive columns dependent on
-    an id (``(month, platform, project_family, wiki_id, wiki_name)`` with ``wiki_id``
-    determining ``project_family`` and ``wiki_name``) is covered by a join on
-    ``(month, platform, wiki_id)``, since the closure of the join columns reaches the rest.
+    ``target_fds``. Where a relation has no FDs (``NO_FDS``), the closure test reduces to ``K``
+    being a subset of the join columns. The generalization removes a false positive on a
+    non-minimal key: a key carrying descriptive columns dependent on an id
+    (``(month, platform, project_family, wiki_id, wiki_name)`` with ``wiki_id`` determining
+    ``project_family`` and ``wiki_name``) is covered by a join on ``(month, platform,
+    wiki_id)``, since the closure of the join columns reaches the rest.
 
     The finding is suppressed when the fan-out is collapsed in the same query before
     any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
@@ -253,7 +253,12 @@ def detect_join_fanout(
             joined_cols = sg.equality_cols_on_alias(on, target.alias_or_name)
             if not joined_cols:
                 continue
-            fds = (target_fds or {}).get(target.name, NO_FDS)
+            # ``target_keys`` resolves a query-local CTE ahead of a same-named model, but
+            # ``target_fds`` only carries manifest relations. So for a CTE that shadows a model
+            # we must not read the model's FDs (they describe a different relation); fall back to
+            # NO_FDS, i.e. plain containment, which is always sound. A CTE genuinely unique on a
+            # subset already surfaces that subset as one of its structural keys.
+            fds = NO_FDS if target.name in cte_bodies else target_fds.get(target.name, NO_FDS)
             if any(all(determines(fds, joined_cols, col) for col in k) for k in target_keys):
                 continue
             if _collapsed_before_sensitive_consumer(sel, safe_builtins=duplicate_safe_builtins):
@@ -520,13 +525,9 @@ def make_fact_grounded_detectors(
     # Propagate the functional-dependency property over the same relation graph and index it by
     # name, so join-fanout can test key coverage through ``determines`` (a join covering a key's
     # determinant covers the key). Grounded from the declared ``determines`` facts the caller
-    # threads in; with none, the property still derives structural FDs (a GROUP BY key, a join's
-    # ON equalities), and an undeclared relation grounds to ``NO_FDS`` so coverage falls back to
-    # plain containment, the original behaviour.
-    fd_by_scope: dict[SourceRef, tuple[Fact[FDSet, SourceRef], ...]] = {}
-    for fact in fd_facts:
-        fd_by_scope[fact.scope] = (*fd_by_scope.get(fact.scope, ()), fact)
-    fd_prop = functional_dependency_property(functional_dependency_grounding(fd_by_scope))
+    # threads in; even with none, the property still derives structural FDs (a GROUP BY key, a
+    # join's ON equalities), which are sound and can cover a key on their own.
+    fd_prop = functional_dependency_property(functional_dependency_grounding(by_scope(fd_facts)))
     fd_by_name = index_by_name(
         manifest, {ref: ann.value for ref, ann in propagate(graph, fd_prop).items()}
     )

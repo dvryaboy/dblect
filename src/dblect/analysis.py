@@ -99,9 +99,11 @@ def analyze(
     wiki_name`` lets a join on the determinant cover a key carrying the dependent). The
     declaration family already reads these; this hands the same facts to the structural one.
     """
-    fd_facts = resolve_contracts(manifest, registry=registry).fd_facts
-    check = run_check(manifest, profile, registry=registry, resolution_floor=resolution_floor)
-    audit = run_audit(manifest, profile, fd_facts=fd_facts)
+    resolved = resolve_contracts(manifest, registry=registry)
+    check = run_check(
+        manifest, profile, registry=registry, resolution_floor=resolution_floor, resolved=resolved
+    )
+    audit = run_audit(manifest, profile, fd_facts=resolved.fd_facts)
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),
         check=check,
