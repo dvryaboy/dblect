@@ -134,6 +134,15 @@ class Fact(Generic[K, S]):
     condition: Predicate | None = None
 
 
+def by_scope(facts: tuple[Fact[K, S], ...]) -> dict[S, tuple[Fact[K, S], ...]]:
+    """Bucket ``facts`` by their scope, preserving order. The one grouping every
+    grounding fold takes (the check family and the audit's FD grounding both read it)."""
+    grouped: dict[S, list[Fact[K, S]]] = {}
+    for fact in facts:
+        grouped.setdefault(fact.scope, []).append(fact)
+    return {scope: tuple(items) for scope, items in grouped.items()}
+
+
 class Opacity(StrEnum):
     CONCRETE = "concrete"  # value carries information (value is not top)
     EXPLICIT = "explicit"  # value is top by a declared opt-out; flows silently

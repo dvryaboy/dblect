@@ -100,6 +100,12 @@ def analyze(
     never mutates them, so both families read the same resolution they would have built
     themselves. ``run_check`` takes ``graphs`` rather than ``registry`` here, since ``graphs``
     already carries the resolved contracts.
+
+    The build's resolved ``determines`` facts are also threaded into the structural audit so
+    join-fanout grounds key coverage through functional dependencies (a declared ``wiki_id
+    determines wiki_name`` lets a join on the determinant cover a key carrying the dependent).
+    The declaration family already reads these off the shared build; this hands the same facts
+    to the structural one.
     """
     parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
     graphs = build_check_graphs(manifest, profile, registry=registry, trees=trees)
@@ -110,6 +116,7 @@ def analyze(
         parsed=parsed,
         column_graph=graphs.column_build.graph,
         relation_graph=graphs.relation_build.graph,
+        fd_facts=graphs.resolved.fd_facts,
     )
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),

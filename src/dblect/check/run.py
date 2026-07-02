@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TypeVar
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -44,7 +43,7 @@ from dblect.lineage.builder import (
     build_manifest_graph,
     build_relation_graph,
 )
-from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, WorldRef
+from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, WorldRef, by_scope
 from dblect.lineage.facts.property import CoherenceClear
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
@@ -145,7 +144,10 @@ def build_check_graphs(
     across an enumeration.
 
     ``trees`` lets a caller share already-parsed model trees (``analyze`` parses once and
-    feeds both families) so the SQL is parsed a single time; omitted, this parses them."""
+    feeds both families) so the SQL is parsed a single time; omitted, this parses them.
+
+    ``analyze`` reads the resolved ``fd_facts`` off the returned build to ground the
+    structural audit's join-fanout check, so the contracts are resolved a single time."""
     reg = registry if registry is not None else active_registry()
     resolved = resolve_contracts(manifest, registry=reg)
     dialect = profile.sqlglot_dialect
@@ -165,7 +167,7 @@ def build_check_graphs(
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
-        join_key_ground=domain_type_grounding(_by_scope(resolved.tag_facts)),
+        join_key_ground=domain_type_grounding(by_scope(resolved.tag_facts)),
     )
 
 
@@ -181,14 +183,14 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     ``graphs``: a fresh ``AnnotationStore`` per call and no mutation of the shared
     build, so worlds re-run independently."""
     fd_prop = functional_dependency_property(
-        functional_dependency_grounding(_by_scope(facts.fd_facts))
+        functional_dependency_grounding(by_scope(facts.fd_facts))
     )
     store = AnnotationStore()
     for scope, ann in propagate(graphs.relation_build.graph, fd_prop).items():
         store.record(fd_prop.name, scope, ann)
 
     dt_prop = domain_type_property(
-        domain_type_grounding(_by_scope(facts.tag_facts)),
+        domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
     )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
@@ -337,17 +339,6 @@ def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:
 # --- propagation ----------------------------------------------------------------
 
 
-_V = TypeVar("_V")
-_S = TypeVar("_S", ColumnRef, SourceRef)
-
-
-def _by_scope(facts: tuple[Fact[_V, _S], ...]) -> dict[_S, tuple[Fact[_V, _S], ...]]:
-    grouped: dict[_S, list[Fact[_V, _S]]] = {}
-    for fact in facts:
-        grouped.setdefault(fact.scope, []).append(fact)
-    return {scope: tuple(items) for scope, items in grouped.items()}
-
-
 # --- coverage --------------------------------------------------------------------
 
 
@@ -371,8 +362,8 @@ def _grounding_coverage(
     model_columns = _model_scopes(resolved_columns)
     relation_subjects = _model_scopes(relation_build.graph.subjects())
 
-    tag_scopes = domain_type_grounded_scopes(_by_scope(resolved.tag_facts))
-    fd_scopes = functional_dependency_grounded_scopes(_by_scope(resolved.fd_facts))
+    tag_scopes = domain_type_grounded_scopes(by_scope(resolved.tag_facts))
+    fd_scopes = functional_dependency_grounded_scopes(by_scope(resolved.fd_facts))
 
     by_property = (
         PropertyGrounding(
