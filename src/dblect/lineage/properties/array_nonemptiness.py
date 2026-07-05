@@ -11,8 +11,10 @@ The value is driven entirely by intrinsic facts the transfers read off the SQL,
 not by anything a manifest declares, so the property needs no discoverer and
 every column grounds to the implicit top:
 
-* an ``ARRAY[...]`` / ``ARRAY(...)`` constructor with one or more elements is
-  ``NON_EMPTY`` (a literal array cannot be empty);
+* an intrinsic constructor whose non-emptiness the SQL vocabulary reads off the node
+  alone is ``NON_EMPTY``: an ``ARRAY[...]`` / ``ARRAY(...)`` with one or more elements, or
+  a ``GENERATE_ARRAY`` / ``GENERATE_SERIES`` / ``GENERATE_DATE_ARRAY`` whose literal bounds
+  make the range non-empty;
 * an ``ARRAY_AGG(expr)`` under a ``GROUP BY`` is ``NON_EMPTY`` per group, since a
   group has at least one row and so at least one element (even a NULL element
   counts toward non-emptiness). Without a ``GROUP BY`` the fold is over the whole
@@ -32,6 +34,7 @@ the inner-flatten row-drop detector, which treats an ``UNNEST`` of a provably
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
 
 import sqlglot.expressions as exp
@@ -46,7 +49,7 @@ from dblect.lineage.facts.property import (
     column_property,
 )
 from dblect.lineage.graph import ColumnRef, aggregation_site_meta
-from dblect.sql.vocab import array_literal_nonempty
+from dblect.sql.vocab import array_literal_nonempty, generator_provably_nonempty
 
 
 class ArrayNonEmpty(StrEnum):
@@ -126,13 +129,21 @@ def _array_agg_value(agg: exp.AggFunc, *, ignore_nulls: bool) -> Annotation[Arra
     return _NON_EMPTY if isinstance(_aggregated_expr(agg), exp.Struct) else _UNKNOWN
 
 
-def _array_literal_rule(
-    expr: Expr, _kids: tuple[Annotation[ArrayNonEmpty], ...], _ctx: DepContext
-) -> Annotation[ArrayNonEmpty]:
-    """An ``ARRAY[...]`` / ``ARRAY(...)`` constructor with one or more constructed
-    elements is non-empty by construction; an empty constructor or an array-subquery
-    (which can return zero rows) carries no guarantee."""
-    return _NON_EMPTY if array_literal_nonempty(expr) else _UNKNOWN
+def _intrinsic_constructor_rule(
+    predicate: Callable[[Expr], bool],
+) -> Callable[[Expr, tuple[Annotation[ArrayNonEmpty], ...], DepContext], Annotation[ArrayNonEmpty]]:
+    """A rule for a constructor whose non-emptiness the SQL vocabulary decides from the node
+    alone, with no lineage: a literal ``ARRAY[...]``, a bounded ``GENERATE_ARRAY``. ``predicate``
+    is the vocab check; a positive proof grounds ``NON_EMPTY``, anything else the ``UNKNOWN``
+    top. The inner-flatten detector consults the same vocab predicates on inline arguments, so
+    the local and cross-model paths recognise each constructor the same way."""
+
+    def rule(
+        expr: Expr, _kids: tuple[Annotation[ArrayNonEmpty], ...], _ctx: DepContext
+    ) -> Annotation[ArrayNonEmpty]:
+        return _NON_EMPTY if predicate(expr) else _UNKNOWN
+
+    return rule
 
 
 def _ignore_nulls_rule(
@@ -184,7 +195,9 @@ array_nonemptiness: Property[ArrayNonEmpty, ColumnRef] = column_property(
     name="array_nonemptiness",
     lattice=ARRAY_NONEMPTY_LATTICE,
     operators={
-        exp.Array: _array_literal_rule,
+        exp.Array: _intrinsic_constructor_rule(array_literal_nonempty),
+        exp.GenerateSeries: _intrinsic_constructor_rule(generator_provably_nonempty),
+        exp.GenerateDateArray: _intrinsic_constructor_rule(generator_provably_nonempty),
         exp.IgnoreNulls: _ignore_nulls_rule,
         exp.Filter: _filter_rule,
     },

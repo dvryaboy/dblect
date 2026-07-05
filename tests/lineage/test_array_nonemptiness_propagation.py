@@ -102,6 +102,50 @@ def test_array_literal_is_non_empty() -> None:
     assert values[_col("model.app.pivot", "metrics")] is ArrayNonEmpty.NON_EMPTY
 
 
+def test_generator_over_literal_bounds_is_non_empty() -> None:
+    # A GENERATE_ARRAY over literal bounds is an intrinsic constructor, the same kind of
+    # provably-non-empty array as ARRAY[...]; it clears through the column graph, so a
+    # downstream UNNEST of the column drops no row.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.spine",
+            "SELECT event_id, GENERATE_ARRAY(0, 23) AS hours FROM events",
+        ),
+    )
+    assert values[_col("model.app.spine", "hours")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_date_generator_over_literal_bounds_is_non_empty() -> None:
+    # A calendar spine over literal date bounds is an intrinsic constructor too; it clears
+    # through the column graph like the numeric generator and the literal array.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.calendar",
+            "SELECT event_id, GENERATE_DATE_ARRAY(DATE '2020-01-01', DATE '2020-12-31') AS days "
+            "FROM events",
+        ),
+    )
+    assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_generator_over_column_bounds_is_unknown() -> None:
+    # A column upper bound can be a count of 0, giving an empty range; not provable, so the
+    # column carries no non-emptiness guarantee.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.counted",
+            "SELECT event_id, GENERATE_SERIES(1, cnt) AS ns FROM events",
+        ),
+    )
+    assert values[_col("model.app.counted", "ns")] is ArrayNonEmpty.UNKNOWN
+
+
 def test_array_of_filtered_set_subqueries_is_unknown() -> None:
     # ARRAY((SELECT AS STRUCT ... FROM unnest(...) WHERE ...)) is set-returning: the filter can
     # match nothing, so the array can be empty even though it is built inline. Concatenating two

@@ -680,6 +680,46 @@ def test_inner_unnest_of_scalar_subquery_array_literal_not_flagged() -> None:
     assert detect_inner_flatten_row_drop(_parse_d(sql, "bigquery")) == ()
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # An hour-of-day spine: constant bounds 0 <= 23, so the range is non-empty
+        # unconditionally and the cross join drops no parent row.
+        "select t.id, hour from t cross join unnest(generate_series(0, 23)) as hour",
+        "select t.id, hour from t cross join unnest(generate_array(0, 23)) as hour",
+        # An explicit negative step running downward is likewise provably non-empty.
+        "select t.id, n from t cross join unnest(generate_series(10, 0, -2)) as n",
+        # A calendar spine over literal date bounds is the common date-dimension idiom.
+        "select t.id, d from t cross join "
+        "unnest(generate_date_array(date '2020-01-01', date '2020-12-31')) as d",
+    ],
+)
+def test_inner_unnest_of_provably_nonempty_generator_not_flagged(sql: str) -> None:
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "bigquery")) == ()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Descending literal bounds under the default (+1) step: an empty range, so the row
+        # drop is real.
+        "select t.id, n from t cross join unnest(generate_array(5, 1)) as n",
+        # A non-literal upper bound: a count of 0 yields an empty range, and dropping the row
+        # may be intended. Not provable from the call, so it stays firing.
+        "select t.id, n from t cross join unnest(generate_series(1, cast(t.cnt as int64))) as n",
+        # Column-bounded date generator: start > end or a zero-row input gives an empty array.
+        "select t.id, d from t cross join unnest(generate_date_array(t.a, t.b)) as d",
+        # A literal-bounded timestamp spine is deferred (timezone offsets defeat a raw literal
+        # compare), so it keeps firing even though the bounds are constants.
+        "select t.id, ts from t cross join unnest("
+        "generate_timestamp_array(timestamp '2020-01-01', timestamp '2020-01-02', interval 1 hour)"
+        ") as ts",
+    ],
+)
+def test_inner_unnest_of_not_provably_nonempty_generator_still_flagged(sql: str) -> None:
+    assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
+
+
 def test_inner_unnest_of_column_still_flagged_without_a_predicate() -> None:
     # A column array's non-emptiness needs the lineage-grounded predicate; the bare
     # structural detector treats a column as opaque and keeps firing.

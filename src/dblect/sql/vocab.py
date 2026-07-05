@@ -9,6 +9,8 @@ structural column combination as a key.
 
 from __future__ import annotations
 
+from datetime import date
+
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
@@ -35,6 +37,91 @@ def array_literal_nonempty(expr: Expr) -> bool:
     if not isinstance(expr, exp.Array) or not expr.expressions:
         return False
     return all(_array_element_present(e) for e in expr.expressions)
+
+
+def generator_provably_nonempty(expr: Expr) -> bool:
+    """True when ``expr`` is a series or date-spine generator whose literal bounds make the
+    produced range non-empty, so an ``UNNEST`` of it drops no parent row.
+
+    Covers ``GENERATE_SERIES``/``GENERATE_ARRAY`` over numeric literals and
+    ``GENERATE_DATE_ARRAY`` over literal dates; both map into one comparable domain (dates via
+    their calendar ordinal), so a single test serves them. Decidable only from the call, so a
+    non-literal bound (a ``CAST(n AS INT64)`` count that can be ``0``, a column start/end that
+    can invert) leaves the range possibly empty and keeps the caller firing. Timestamp
+    generators are deferred: a raw literal compare is unsound across timezone offsets, so they
+    are excluded by type and stay firing. The generator analog of
+    :func:`array_literal_nonempty`: silence only on a positive proof."""
+    bounds = _generator_bounds(expr)
+    if bounds is None:
+        return False
+    start, end, step, exclusive = bounds
+    if step == 0:  # a zero step has no well-defined range
+        return False
+    # A positive step needs a low-to-high range, a negative step high-to-low; an exclusive end
+    # (some dialects' half-open form) rules out the single-point range.
+    if step > 0:
+        return start < end if exclusive else start <= end
+    return start > end if exclusive else start >= end
+
+
+def _generator_bounds(expr: Expr) -> tuple[float, float, float, bool] | None:
+    """The ``(start, end, step, exclusive-end)`` of a generator whose bounds and step are all
+    literals, or ``None`` when any is not one we can read. Numeric and date generators reduce
+    to the same numeric domain; the step value carries only a sign, never a magnitude that
+    affects non-emptiness (an inclusive range always holds its start)."""
+    if isinstance(expr, exp.GenerateSeries):
+        step_arg = expr.args.get("step")
+        step = 1.0 if step_arg is None else _numeric_literal(step_arg)
+        start = _numeric_literal(expr.args.get("start"))
+        end = _numeric_literal(expr.args.get("end"))
+        exclusive = bool(expr.args.get("is_end_exclusive"))
+    elif isinstance(expr, exp.GenerateDateArray):
+        step_arg = expr.args.get("step")
+        step = 1.0 if step_arg is None else _interval_sign(step_arg)
+        start = _date_ordinal(expr.args.get("start"))
+        end = _date_ordinal(expr.args.get("end"))
+        exclusive = False
+    else:
+        return None
+    if start is None or end is None or step is None:
+        return None
+    return start, end, step, exclusive
+
+
+def _numeric_literal(expr: Expr | None) -> float | None:
+    # A negative literal parses as exp.Neg wrapping a positive one, so look through it.
+    if isinstance(expr, exp.Neg):
+        inner = _numeric_literal(expr.this)
+        return None if inner is None else -inner
+    if isinstance(expr, exp.Literal) and not expr.args.get("is_string"):
+        return float(expr.this)
+    return None
+
+
+def _date_ordinal(expr: Expr | None) -> float | None:
+    # A date bound is a bare date string the generator coerces or a DATE-typed CAST of one.
+    # Parsing to a real date makes the comparison chronological and rejects any spelling that
+    # is not a calendar point, which stays unproven rather than guessed at.
+    if isinstance(expr, (exp.Cast, exp.TryCast)) and expr.to.is_type(exp.DataType.Type.DATE):
+        expr = expr.this
+    if not (isinstance(expr, exp.Literal) and expr.args.get("is_string")):
+        return None
+    try:
+        return float(date.fromisoformat(expr.this).toordinal())
+    except ValueError:
+        return None
+
+
+def _interval_sign(expr: Expr | None) -> float | None:
+    # Only the step's direction matters, so read the sign off the interval's magnitude (a
+    # string-form number like '1' or '-1') and leave a non-literal magnitude unproven. The
+    # unit (DAY, MONTH, ...) never affects non-emptiness.
+    if not isinstance(expr, exp.Interval) or not isinstance(expr.this, exp.Literal):
+        return None
+    try:
+        return float(expr.this.this)
+    except ValueError:
+        return None
 
 
 def _array_element_present(element: Expr) -> bool:
