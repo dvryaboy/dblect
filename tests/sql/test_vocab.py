@@ -21,9 +21,9 @@ from dblect.sql import parse_sql
 from dblect.sql.vocab import array_literal_nonempty, generator_provably_nonempty
 
 
-def _array(frag: str) -> Expr:
+def _array(frag: str, dialect: str = "bigquery") -> Expr:
     """The expression a single projection parses to, unwrapping its alias."""
-    select = parse_sql(f"SELECT {frag} AS a", dialect="bigquery")
+    select = parse_sql(f"SELECT {frag} AS a", dialect=dialect)
     assert isinstance(select, exp.Select)
     projected = select.expressions[0]
     return projected.this if isinstance(projected, exp.Alias) else projected
@@ -109,6 +109,36 @@ def test_non_array_expression_is_not_a_literal_array() -> None:
 )
 def test_generator_provably_nonempty(frag: str, nonempty: bool) -> None:
     assert generator_provably_nonempty(_array(frag)) is nonempty
+
+
+@pytest.mark.parametrize(
+    ("frag", "nonempty"),
+    [
+        # A Postgres/Redshift date spine spells the same idiom as GENERATE_DATE_ARRAY, through
+        # generate_series over date-cast bounds with an explicit interval step. The comparable
+        # domain is read off the bounds, not the function name, so the calendar proof reaches
+        # this form too. Ascending bounds under a positive step are non-empty.
+        ("generate_series('2020-01-01'::date, '2020-01-31'::date, interval '1 day')", True),
+        # Descending bounds under a negative step run downward: still non-empty.
+        ("generate_series('2020-01-31'::date, '2020-01-01'::date, interval '-1 day')", True),
+        # Ascending bounds under a negative step (or descending under a positive one) is empty.
+        ("generate_series('2020-01-01'::date, '2020-01-31'::date, interval '-1 day')", False),
+        ("generate_series('2020-01-31'::date, '2020-01-01'::date, interval '1 day')", False),
+        # The raw-string cast spelling of the step ('1 day'::interval) reads the same sign.
+        ("generate_series('2020-01-01'::date, '2020-01-31'::date, '1 day'::interval)", True),
+        ("generate_series('2020-01-31'::date, '2020-01-01'::date, '-1 day'::interval)", True),
+        # A compound interval ('1 mon -1 day') has an ambiguous net direction, so its sign is
+        # not read off the leading component and it stays unproven.
+        (
+            "generate_series('2020-01-01'::date, '2020-01-31'::date, '1 mon -1 day'::interval)",
+            False,
+        ),
+        # Column date bounds can invert or be empty: not provable from the call.
+        ("generate_series(a::date, b::date, interval '1 day')", False),
+    ],
+)
+def test_generator_provably_nonempty_postgres_date_series(frag: str, nonempty: bool) -> None:
+    assert generator_provably_nonempty(_array(frag, dialect="postgres")) is nonempty
 
 
 def test_non_generator_expression_is_not_a_nonempty_generator() -> None:

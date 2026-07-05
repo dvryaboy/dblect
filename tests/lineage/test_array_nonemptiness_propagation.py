@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
+from dblect.adapters.model import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
@@ -20,6 +21,7 @@ from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Node, ResourceType
 
 _BQ = profile_for_adapter("bigquery")
+_PG = profile_for_adapter("postgres")
 
 
 def _model(uid: str, sql: str) -> Node:
@@ -52,13 +54,13 @@ def _source(uid: str) -> Node:
     )
 
 
-def _values(*nodes: Node) -> Mapping[ColumnRef, ArrayNonEmpty]:
+def _values(*nodes: Node, profile: AdapterProfile = _BQ) -> Mapping[ColumnRef, ArrayNonEmpty]:
     manifest = Manifest(
         schema_version="v12",
-        adapter_type="bigquery",
+        adapter_type=profile.adapter_type,
         nodes={n.unique_id: n for n in nodes},
     )
-    graph = build_manifest_graph(manifest, dialect=_BQ.sqlglot_dialect).graph
+    graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect).graph
     anns = propagate(graph, array_nonemptiness)
     return {ref: ann.value for ref, ann in anns.items()}
 
@@ -128,6 +130,24 @@ def test_date_generator_over_literal_bounds_is_non_empty() -> None:
             "SELECT event_id, GENERATE_DATE_ARRAY(DATE '2020-01-01', DATE '2020-12-31') AS days "
             "FROM events",
         ),
+    )
+    assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_postgres_date_generate_series_is_non_empty() -> None:
+    # The Postgres/Redshift calendar spine spells the same idiom through generate_series over
+    # date-cast bounds with an interval step; the domain read off the bounds proves it
+    # non-empty, so it clears cross-model like the GENERATE_DATE_ARRAY form.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.calendar",
+            "SELECT event_id, "
+            "generate_series('2020-01-01'::date, '2020-12-31'::date, interval '1 day') AS days "
+            "FROM events",
+        ),
+        profile=_PG,
     )
     assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
 

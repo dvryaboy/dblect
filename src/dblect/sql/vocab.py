@@ -43,11 +43,13 @@ def generator_provably_nonempty(expr: Expr) -> bool:
     """True when ``expr`` is a series or date-spine generator whose literal bounds make the
     produced range non-empty, so an ``UNNEST`` of it drops no parent row.
 
-    Covers ``GENERATE_SERIES``/``GENERATE_ARRAY`` over numeric literals and
-    ``GENERATE_DATE_ARRAY`` over literal dates; both map into one comparable domain (dates via
-    their calendar ordinal), so a single test serves them. Decidable only from the call, so a
-    non-literal bound (a ``CAST(n AS INT64)`` count that can be ``0``, a column start/end that
-    can invert) leaves the range possibly empty and keeps the caller firing. Timestamp
+    Covers ``GENERATE_SERIES``/``GENERATE_ARRAY`` over numeric literals and the calendar spine
+    over literal dates in either spelling: ``GENERATE_DATE_ARRAY`` and the Postgres/Redshift
+    ``generate_series`` over date-cast bounds with an interval step. All map into one comparable
+    domain (dates via their calendar ordinal), so a single test serves them. Decidable only from
+    the call, so a non-literal bound (a ``CAST(n AS INT64)`` count that can be ``0``, a column
+    start/end that can invert) leaves the range possibly empty and keeps the caller firing.
+    Timestamp
     generators are deferred: a raw literal compare is unsound across timezone offsets, so they
     are excluded by type and stay firing. The generator analog of
     :func:`array_literal_nonempty`: silence only on a positive proof."""
@@ -66,23 +68,25 @@ def generator_provably_nonempty(expr: Expr) -> bool:
 
 def _generator_bounds(expr: Expr) -> tuple[float, float, float, bool] | None:
     """The ``(start, end, step, exclusive-end)`` of a generator whose bounds and step are all
-    literals, or ``None`` when any is not one we can read. Numeric and date generators reduce
-    to the same numeric domain; the step value carries only a sign, never a magnitude that
-    affects non-emptiness (an inclusive range always holds its start)."""
-    if isinstance(expr, exp.GenerateSeries):
-        step_arg = expr.args.get("step")
-        step = 1.0 if step_arg is None else _numeric_literal(step_arg)
-        start = _numeric_literal(expr.args.get("start"))
-        end = _numeric_literal(expr.args.get("end"))
-        exclusive = bool(expr.args.get("is_end_exclusive"))
-    elif isinstance(expr, exp.GenerateDateArray):
-        step_arg = expr.args.get("step")
-        step = 1.0 if step_arg is None else _interval_sign(step_arg)
-        start = _date_ordinal(expr.args.get("start"))
-        end = _date_ordinal(expr.args.get("end"))
-        exclusive = False
-    else:
+    literals, or ``None`` when any is not one we can read. Numeric series and date spines reduce
+    to the same ordered scalar domain, chosen from the bounds rather than the function name: a
+    ``generate_series`` carries either numeric bounds (``generate_series(0, 23)``) or date-cast
+    bounds (the Postgres/Redshift calendar spine ``generate_series(d1, d2, interval '1 day')``),
+    and the date form is the same idiom as ``GENERATE_DATE_ARRAY``. The step value carries only a
+    sign, never a magnitude that affects non-emptiness (an inclusive range always holds its
+    start)."""
+    if not isinstance(expr, (exp.GenerateSeries, exp.GenerateDateArray)):
         return None
+    start_arg, end_arg, step_arg = (expr.args.get(k) for k in ("start", "end", "step"))
+    exclusive = bool(expr.args.get("is_end_exclusive"))
+    start = _numeric_literal(start_arg)
+    end = _numeric_literal(end_arg)
+    if start is not None and end is not None:
+        step = 1.0 if step_arg is None else _numeric_literal(step_arg)
+    else:
+        start = _date_ordinal(start_arg)
+        end = _date_ordinal(end_arg)
+        step = 1.0 if step_arg is None else _interval_sign(step_arg)
     if start is None or end is None or step is None:
         return None
     return start, end, step, exclusive
@@ -113,14 +117,29 @@ def _date_ordinal(expr: Expr | None) -> float | None:
 
 
 def _interval_sign(expr: Expr | None) -> float | None:
-    # Only the step's direction matters, so read the sign off the interval's magnitude (a
-    # string-form number like '1' or '-1') and leave a non-literal magnitude unproven. The
-    # unit (DAY, MONTH, ...) never affects non-emptiness.
-    if not isinstance(expr, exp.Interval) or not isinstance(expr.this, exp.Literal):
+    # Only the step's direction matters, so read the sign off the interval's magnitude and leave
+    # a non-literal or compound magnitude unproven. The unit (DAY, MONTH, ...) never affects
+    # non-emptiness. Two literal spellings reach here: the structured form (``INTERVAL 1 MONTH``,
+    # ``interval '1 day'``), where sqlglot splits the magnitude into its own literal, and the
+    # raw-string cast (``'1 day'::interval``), where the whole ``'<n> <unit>'`` string is one
+    # literal.
+    if isinstance(expr, (exp.Cast, exp.TryCast)) and expr.to.is_type(exp.DataType.Type.INTERVAL):
+        expr = expr.this
+    if isinstance(expr, exp.Interval) and isinstance(expr.this, exp.Literal):
+        magnitude = expr.this.this
+    elif isinstance(expr, exp.Literal) and expr.args.get("is_string"):
+        magnitude = expr.this
+    else:
+        return None
+    # A single-component magnitude is a signed number, optionally followed by one unit word
+    # ('1', '-1', '1 day'). A compound interval ('1 mon -1 day') has an ambiguous net direction,
+    # so it is left unproven rather than read off its leading term.
+    tokens = magnitude.split()
+    if len(tokens) > 2:
         return None
     try:
-        return float(expr.this.this)
-    except ValueError:
+        return float(tokens[0])
+    except (ValueError, IndexError):
         return None
 
 
