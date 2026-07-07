@@ -152,6 +152,23 @@ def test_postgres_date_generate_series_is_non_empty() -> None:
     assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
 
 
+def test_timestamp_generator_over_literal_bounds_is_non_empty() -> None:
+    # A literal timestamp spine is the clock-domain intrinsic constructor; its bounds parse to
+    # ordered instants, so it clears cross-model like the date and numeric generators.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.ticks",
+            "SELECT event_id, "
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', "
+            "INTERVAL 1 HOUR) AS ticks "
+            "FROM events",
+        ),
+    )
+    assert values[_col("model.app.ticks", "ticks")] is ArrayNonEmpty.NON_EMPTY
+
+
 def test_generator_over_column_bounds_is_unknown() -> None:
     # A column upper bound can be a count of 0, giving an empty range; not provable, so the
     # column carries no non-emptiness guarantee.

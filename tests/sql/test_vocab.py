@@ -7,8 +7,9 @@ guaranteed present) and a set-returning subquery element (which can be empty), s
 BigQuery's array-subquery form and a bracket of parenthesised scalar subqueries parse to the
 same ``exp.Array`` shape, separated only by whether the element subquery reads a ``FROM``. For
 ``generator_provably_nonempty`` the line is at literal, order-comparable bounds with a readable
-step sign: numeric series and literal date spines are proved; column bounds and timestamp
-generators (unsound to compare across timezone offsets) are left firing.
+step sign: numeric series, literal date spines, and literal timestamp spines are proved
+(timestamps by parsing the bounds to real instants, deferring only a naive/aware mix that has no
+sound order); column bounds are left firing.
 """
 
 from __future__ import annotations
@@ -98,10 +99,49 @@ def test_non_array_expression_is_not_a_literal_array() -> None:
         # A literal that is not a canonical date does not parse to a calendar point, so it is
         # left unproven rather than guessed at.
         ("GENERATE_DATE_ARRAY('2020-13-01', '2020-14-01')", False),
-        # Timestamp generators are deferred: a raw literal compare is unsound across timezone
-        # offsets, so they stay firing whether the bounds are literal or column.
+        # A literal timestamp spine is proved by parsing its bounds to real instants and
+        # ordering them, so the common naive-literal clock spine clears like the date one.
         (
             "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL 1 HOUR)",
+            True,
+        ),
+        # A single-point inclusive range is one element, still non-empty.
+        (
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-01', INTERVAL 1 HOUR)",
+            True,
+        ),
+        # Descending bounds under a positive step are empty; a negative step runs them downward.
+        (
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-02', TIMESTAMP '2020-01-01', INTERVAL 1 HOUR)",
+            False,
+        ),
+        (
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-02', TIMESTAMP '2020-01-01', INTERVAL -1 HOUR)",
+            True,
+        ),
+        # Offset-aware bounds order by absolute instant, so a compare across differing offsets is
+        # still sound: 12:00-05:00 is 17:00 UTC, after 00:00+00:00.
+        (
+            "GENERATE_TIMESTAMP_ARRAY("
+            "TIMESTAMP '2020-01-01 00:00:00+00:00', TIMESTAMP '2020-01-01 12:00:00-05:00', "
+            "INTERVAL 1 HOUR)",
+            True,
+        ),
+        # A naive bound and an offset-aware bound have no sound order (the naive bound's zone is
+        # unknown relative to the aware one), so the mix stays deferred in either order.
+        (
+            "GENERATE_TIMESTAMP_ARRAY("
+            "TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02 00:00:00+00:00', INTERVAL 1 HOUR)",
+            False,
+        ),
+        (
+            "GENERATE_TIMESTAMP_ARRAY("
+            "TIMESTAMP '2020-01-01 00:00:00+00:00', TIMESTAMP '2020-01-02', INTERVAL 1 HOUR)",
+            False,
+        ),
+        # A non-literal step magnitude leaves the sign unknown; column bounds are not literal.
+        (
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', INTERVAL n HOUR)",
             False,
         ),
         ("GENERATE_TIMESTAMP_ARRAY(a, b, INTERVAL 1 HOUR)", False),
@@ -135,6 +175,18 @@ def test_generator_provably_nonempty(frag: str, nonempty: bool) -> None:
         ),
         # Column date bounds can invert or be empty: not provable from the call.
         ("generate_series(a::date, b::date, interval '1 day')", False),
+        # The clock-domain spine runs through the same generate_series seam: literal timestamp
+        # bounds with an interval step clear when soundly ordered, and stay firing when reversed.
+        (
+            "generate_series('2020-01-01 00:00'::timestamp, '2020-01-02 00:00'::timestamp, "
+            "interval '1 hour')",
+            True,
+        ),
+        (
+            "generate_series('2020-01-02 00:00'::timestamp, '2020-01-01 00:00'::timestamp, "
+            "interval '1 hour')",
+            False,
+        ),
     ],
 )
 def test_generator_provably_nonempty_postgres_date_series(frag: str, nonempty: bool) -> None:

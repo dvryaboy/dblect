@@ -692,6 +692,10 @@ def test_inner_unnest_of_scalar_subquery_array_literal_not_flagged() -> None:
         # A calendar spine over literal date bounds is the common date-dimension idiom.
         "select t.id, d from t cross join "
         "unnest(generate_date_array(date '2020-01-01', date '2020-12-31')) as d",
+        # A literal timestamp spine clears too: the bounds parse to ordered instants.
+        "select t.id, ts from t cross join unnest("
+        "generate_timestamp_array(timestamp '2020-01-01', timestamp '2020-01-02', interval 1 hour)"
+        ") as ts",
     ],
 )
 def test_inner_unnest_of_provably_nonempty_generator_not_flagged(sql: str) -> None:
@@ -709,11 +713,10 @@ def test_inner_unnest_of_provably_nonempty_generator_not_flagged(sql: str) -> No
         "select t.id, n from t cross join unnest(generate_series(1, cast(t.cnt as int64))) as n",
         # Column-bounded date generator: start > end or a zero-row input gives an empty array.
         "select t.id, d from t cross join unnest(generate_date_array(t.a, t.b)) as d",
-        # A literal-bounded timestamp spine is deferred (timezone offsets defeat a raw literal
-        # compare), so it keeps firing even though the bounds are constants.
-        "select t.id, ts from t cross join unnest("
-        "generate_timestamp_array(timestamp '2020-01-01', timestamp '2020-01-02', interval 1 hour)"
-        ") as ts",
+        # A column-bounded timestamp spine can invert or be empty, so it stays firing even though
+        # a literal-bounded one now clears.
+        "select t.id, ts from t cross join "
+        "unnest(generate_timestamp_array(t.a, t.b, interval 1 hour)) as ts",
     ],
 )
 def test_inner_unnest_of_not_provably_nonempty_generator_still_flagged(sql: str) -> None:

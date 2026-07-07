@@ -13,8 +13,8 @@ every column grounds to the implicit top:
 
 * an intrinsic constructor whose non-emptiness the SQL vocabulary reads off the node
   alone is ``NON_EMPTY``: an ``ARRAY[...]`` / ``ARRAY(...)`` with one or more elements, or
-  a ``GENERATE_ARRAY`` / ``GENERATE_SERIES`` / ``GENERATE_DATE_ARRAY`` whose literal bounds
-  make the range non-empty;
+  a ``GENERATE_ARRAY`` / ``GENERATE_SERIES`` / ``GENERATE_DATE_ARRAY`` /
+  ``GENERATE_TIMESTAMP_ARRAY`` whose literal bounds make the range non-empty;
 * an ``ARRAY_AGG(expr)`` under a ``GROUP BY`` is ``NON_EMPTY`` per group, since a
   group has at least one row and so at least one element (even a NULL element
   counts toward non-emptiness). Without a ``GROUP BY`` the fold is over the whole
@@ -198,6 +198,7 @@ array_nonemptiness: Property[ArrayNonEmpty, ColumnRef] = column_property(
         exp.Array: _intrinsic_constructor_rule(array_literal_nonempty),
         exp.GenerateSeries: _intrinsic_constructor_rule(generator_provably_nonempty),
         exp.GenerateDateArray: _intrinsic_constructor_rule(generator_provably_nonempty),
+        exp.GenerateTimestampArray: _intrinsic_constructor_rule(generator_provably_nonempty),
         exp.IgnoreNulls: _ignore_nulls_rule,
         exp.Filter: _filter_rule,
     },
