@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
+from dblect.adapters.model import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
@@ -20,6 +21,7 @@ from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Node, ResourceType
 
 _BQ = profile_for_adapter("bigquery")
+_PG = profile_for_adapter("postgres")
 
 
 def _model(uid: str, sql: str) -> Node:
@@ -52,13 +54,13 @@ def _source(uid: str) -> Node:
     )
 
 
-def _values(*nodes: Node) -> Mapping[ColumnRef, ArrayNonEmpty]:
+def _values(*nodes: Node, profile: AdapterProfile = _BQ) -> Mapping[ColumnRef, ArrayNonEmpty]:
     manifest = Manifest(
         schema_version="v12",
-        adapter_type="bigquery",
+        adapter_type=profile.adapter_type,
         nodes={n.unique_id: n for n in nodes},
     )
-    graph = build_manifest_graph(manifest, dialect=_BQ.sqlglot_dialect).graph
+    graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect).graph
     anns = propagate(graph, array_nonemptiness)
     return {ref: ann.value for ref, ann in anns.items()}
 
@@ -100,6 +102,85 @@ def test_array_literal_is_non_empty() -> None:
         ),
     )
     assert values[_col("model.app.pivot", "metrics")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_generator_over_literal_bounds_is_non_empty() -> None:
+    # A GENERATE_ARRAY over literal bounds is an intrinsic constructor, the same kind of
+    # provably-non-empty array as ARRAY[...]; it clears through the column graph, so a
+    # downstream UNNEST of the column drops no row.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.spine",
+            "SELECT event_id, GENERATE_ARRAY(0, 23) AS hours FROM events",
+        ),
+    )
+    assert values[_col("model.app.spine", "hours")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_date_generator_over_literal_bounds_is_non_empty() -> None:
+    # A calendar spine over literal date bounds is an intrinsic constructor too; it clears
+    # through the column graph like the numeric generator and the literal array.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.calendar",
+            "SELECT event_id, GENERATE_DATE_ARRAY(DATE '2020-01-01', DATE '2020-12-31') AS days "
+            "FROM events",
+        ),
+    )
+    assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_postgres_date_generate_series_is_non_empty() -> None:
+    # The Postgres/Redshift calendar spine spells the same idiom through generate_series over
+    # date-cast bounds with an interval step; the domain read off the bounds proves it
+    # non-empty, so it clears cross-model like the GENERATE_DATE_ARRAY form.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.calendar",
+            "SELECT event_id, "
+            "generate_series('2020-01-01'::date, '2020-12-31'::date, interval '1 day') AS days "
+            "FROM events",
+        ),
+        profile=_PG,
+    )
+    assert values[_col("model.app.calendar", "days")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_timestamp_generator_over_literal_bounds_is_non_empty() -> None:
+    # A literal timestamp spine is the clock-domain intrinsic constructor; its bounds parse to
+    # ordered instants, so it clears cross-model like the date and numeric generators.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.ticks",
+            "SELECT event_id, "
+            "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', "
+            "INTERVAL 1 HOUR) AS ticks "
+            "FROM events",
+        ),
+    )
+    assert values[_col("model.app.ticks", "ticks")] is ArrayNonEmpty.NON_EMPTY
+
+
+def test_generator_over_column_bounds_is_unknown() -> None:
+    # A column upper bound can be a count of 0, giving an empty range; not provable, so the
+    # column carries no non-emptiness guarantee.
+    src = _source("source.app.raw.events")
+    values = _values(
+        src,
+        _model(
+            "model.app.counted",
+            "SELECT event_id, GENERATE_SERIES(1, cnt) AS ns FROM events",
+        ),
+    )
+    assert values[_col("model.app.counted", "ns")] is ArrayNonEmpty.UNKNOWN
 
 
 def test_array_of_filtered_set_subqueries_is_unknown() -> None:

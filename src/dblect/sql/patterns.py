@@ -30,7 +30,7 @@ from dblect.sql import _sqlglot as sg
 from dblect.sql import guards
 from dblect.sql._sqlglot import JoinSide
 from dblect.sql.findings import Finding, FindingKind, finding_at, suppression_code
-from dblect.sql.vocab import array_literal_nonempty
+from dblect.sql.vocab import array_literal_nonempty, generator_provably_nonempty
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,16 +754,17 @@ def _array_expr_nonempty(
 ) -> bool:
     """Whether one unnested expression is provably non-empty.
 
-    A literal ``ARRAY[...]`` with one or more constructed elements is non-empty by
-    construction (the always-on local case). For a column, the answer comes from
-    ``column_is_nonempty``, the lineage-grounded predicate the audit supplies; without it,
-    a column is treated as opaque, so the detector module stays free of lineage types.
+    The intrinsic constructors the SQL vocabulary proves from the node alone are the always-on
+    local cases: a literal ``ARRAY[...]``, a ``GENERATE_ARRAY`` over literal bounds. For a
+    column, the answer comes from ``column_is_nonempty``, the lineage-grounded predicate the
+    audit supplies; without it, a column is treated as opaque, so the detector module stays
+    free of lineage types.
 
     Non-emptiness is proved where the array is *produced*. A column that arrives through the
     nullable side of an outer join can still be NULL at the unnest, and ``UNNEST(NULL)`` drops
     the row, so a column read from an outer-join-optional relation is never cleared here even
     when its value is non-empty wherever it exists."""
-    if array_literal_nonempty(arg):
+    if array_literal_nonempty(arg) or generator_provably_nonempty(arg):
         return True
     if column_is_nonempty is None or not isinstance(arg, exp.Column):
         return False
