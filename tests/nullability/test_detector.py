@@ -22,6 +22,7 @@ import duckdb
 import pytest
 
 from dblect.adapters import profile_for_adapter
+from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import (
     NullableCause,
@@ -373,3 +374,88 @@ def test_composite_key_with_distinct_causes_names_each_inline() -> None:
     msg = findings[0].message
     assert "k1 (produced via a left join" in msg
     assert "k2 (produced via a right join" in msg
+
+
+# --- grounding on declared determines --------------------------------------------
+#
+# A denormalized join over a declared hierarchy (a fact table keyed on store_id, region_id,
+# country_id where store_id determines the rest) is one logical key, not three co-equal
+# suspicious columns. Given the declared ``determines`` chain, the detector reduces the
+# spanned columns to the chain's root, reports the declared key as one unit, and points at
+# dropping the redundant equalities. It stays one finding and never goes silent: the folded
+# columns are still nullable, so a genuine null-non-match risk remains. Silence is only ever
+# a non-null key's job.
+
+# The retail hierarchy: store_id -> region_id -> country_id, all nullable in ``dim``.
+_HIERARCHY_SQL = (
+    "SELECT f.v FROM fact f JOIN dim d "
+    "ON f.store_id = d.store_id AND f.region_id = d.region_id AND f.country_id = d.country_id"
+)
+_HIERARCHY_NULLABLE = {"dim": frozenset({"store_id", "region_id", "country_id"})}
+_HIERARCHY_FDS = {
+    "dim": FDSet.of(
+        FD(frozenset({"store_id"}), "region_id"), FD(frozenset({"region_id"}), "country_id")
+    )
+}
+
+
+def _join_keys_fd(
+    sql: str, nullable: dict[str, frozenset[str]], fd_by_name: dict[str, FDSet]
+) -> tuple[Finding, ...]:
+    return detect_join_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=nullable, fd_by_name=fd_by_name
+    )
+
+
+def test_declared_determines_chain_consolidates_to_the_root_key() -> None:
+    findings = _join_keys_fd(_HIERARCHY_SQL, _HIERARCHY_NULLABLE, _HIERARCHY_FDS)
+    assert len(findings) == 1
+    msg = findings[0].message
+    # The key reports as the declared root, singular, not three co-equal columns.
+    assert "keys on store_id, which is nullable upstream" in msg
+    # The determined members are named as redundant, with the drop-the-conditions remedy.
+    assert "region_id" in msg
+    assert "country_id" in msg
+    assert "functionally determined by the declared key store_id" in msg
+    assert "redundant" in msg.lower()
+    # The not_null guard targets the key that remains, not the folded members.
+    assert "not_null test on store_id in 'dim'" in msg
+
+
+def test_undeclared_hierarchy_lists_every_column_as_before() -> None:
+    """With no ``determines`` known nothing folds, so the join reads exactly as it did before
+    the grounding: all spanned columns listed, no redundancy clause."""
+    findings = _join_keys_fd(_HIERARCHY_SQL, _HIERARCHY_NULLABLE, {})
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert all(col in msg for col in ("store_id", "region_id", "country_id"))
+    assert "redundant" not in msg.lower()
+
+
+def test_partial_chain_folds_only_the_determined_column() -> None:
+    """Only ``store_id -> region_id`` is declared; ``country_id`` stands on its own. The cover
+    keeps both irreducible columns and folds only ``region_id``."""
+    fds = {"dim": FDSet.of(FD(frozenset({"store_id"}), "region_id"))}
+    findings = _join_keys_fd(_HIERARCHY_SQL, _HIERARCHY_NULLABLE, fds)
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "keys on country_id, store_id, which are nullable upstream" in msg
+    # The folded column is named as determined by the reported key (the cover determines every
+    # column it folded), so a partial chain keeps both irreducible columns as the key.
+    assert (
+        "region_id in 'dim' (functionally determined by the declared key country_id, store_id)"
+        in msg
+    )
+
+
+def test_determines_consolidates_but_never_silences() -> None:
+    """A non-null determinant does not license silence: the determined columns are still
+    nullable, so the null-non-match risk is real and the finding still fires, consolidated onto
+    the nullable root of the chain. Here ``store_id`` is non-null (absent from the index), so the
+    nullable key is ``region_id -> country_id``, reducing to ``region_id``."""
+    nullable = {"dim": frozenset({"region_id", "country_id"})}
+    findings = _join_keys_fd(_HIERARCHY_SQL, nullable, _HIERARCHY_FDS)
+    assert len(findings) == 1
+    msg = findings[0].message
+    assert "keys on region_id, which is nullable upstream" in msg
+    assert "country_id in 'dim' (functionally determined by the declared key region_id)" in msg

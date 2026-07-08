@@ -130,6 +130,30 @@ def determines(value: FDSet, given: frozenset[str], target: str) -> bool:
     return target in closure
 
 
+def minimal_cover(value: FDSet, cols: frozenset[str]) -> frozenset[str]:
+    """The irreducible subset of ``cols`` that still determines all of ``cols`` under
+    ``value``: fold each column into the others whenever they already entail it.
+
+    A join spanning a declared dependency chain (``store_id -> region_id ->
+    country_id``) is really keyed on the chain's root, the additional equalities
+    functionally redundant. This reduces the spanned columns to that root, so a detector
+    reports the declared key as one unit rather than treating co-determined columns as
+    independent. With no dependency known (``NO_FDS``) nothing is entailed by the rest,
+    so the result is ``cols`` unchanged.
+
+    Removal walks the columns in a fixed order and drops one only when the columns still
+    kept entail it, so the result is deterministic and irreducible: it determines every
+    original column (removals never lose coverage, since a dropped column stays in the
+    kept set's closure) and no member is entailed by the others (each survivor failed the
+    entailment test against a superset of the final kept set, and entailment is monotone
+    in the determinant)."""
+    kept = set(cols)
+    for col in sorted(cols):
+        if determines(value, frozenset(kept - {col}), col):
+            kept.discard(col)
+    return frozenset(kept)
+
+
 # --- grounding -----------------------------------------------------------------
 
 

@@ -29,6 +29,7 @@ from dblect.adapters import AdapterProfile
 from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind
 from dblect.lineage.properties import Nullability
+from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, minimal_cover
 from dblect.lineage.properties.nullability import (
     activated_nullability,
     outer_join_nullable_columns,
@@ -114,7 +115,11 @@ def detect_null_group_on_nullable_key(
 
 
 def detect_join_on_nullable_key(
-    tree: Expr, *, nullable_by_name: NullableByName, cause_by_name: CauseByName | None = None
+    tree: Expr,
+    *,
+    nullable_by_name: NullableByName,
+    cause_by_name: CauseByName | None = None,
+    fd_by_name: Mapping[str, FDSet] = {},
 ) -> tuple[Finding, ...]:
     """Flag a JOIN whose equality key is a column nullable in its upstream relation.
 
@@ -136,6 +141,17 @@ def detect_join_on_nullable_key(
     key the local SQL gives no hint about. One join is one decision to look at, so a
     composite-key join yields one finding listing the spanned key columns rather than one
     per column. Only bare-column equality keys are reasoned about.
+
+    When a declared ``determines`` chain relates the spanned columns (``store_id ->
+    region_id -> country_id``), the join is really keyed on the chain's root: the additional
+    equalities are functionally redundant. The nullable columns are reduced to their
+    :func:`minimal_cover` under the relation's ``fd_by_name``, so the finding reports the
+    declared key as one unit and points at dropping the redundant conditions rather than
+    treating co-determined columns as independent hazards. The reduction never silences the
+    finding (every folded column stays covered by a still-nullable root, so a genuine
+    null-non-match risk remains); only a non-null key, absent from ``nullable_by_name``,
+    yields silence. With no dependency known the cover is the columns unchanged, so an
+    undeclared project reads exactly as before.
     """
     causes_by_relation = cause_by_name or {}
     out: list[Finding] = []
@@ -154,6 +170,7 @@ def detect_join_on_nullable_key(
             if cols_by_alias is None:  # not a clean conjunction of column equalities
                 continue
             keys: list[_NullableKey] = []
+            determined: list[_NullableKey] = []
             for alias, cols in sorted(cols_by_alias.items()):
                 if alias in dropped:  # this outer join drops the no-match here: its intent
                     continue
@@ -164,12 +181,24 @@ def detect_join_on_nullable_key(
                 if not nullable:
                     continue
                 causes = causes_by_relation.get(relation, {})
+                nullable_here = frozenset(cols & nullable)
+                # ``or nullable_here`` keeps the reduction from ever emptying the reported key:
+                # a constant dependency (``{} -> c``) could fold the last column away, which
+                # would silence a genuine nullable-key hazard. Silence is only ever a non-null
+                # key's job, so fall back to the unreduced columns there.
+                cover = (
+                    minimal_cover(fd_by_name.get(relation, NO_FDS), nullable_here) or nullable_here
+                )
                 keys.extend(
                     _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
-                    for column in sorted(cols & nullable)
+                    for column in sorted(cover)
+                )
+                determined.extend(
+                    _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
+                    for column in sorted(nullable_here - cover)
                 )
             if keys:
-                out.append(_join_finding(join, keys, side=side))
+                out.append(_join_finding(join, keys, determined=determined, side=side))
     return tuple(out)
 
 
@@ -294,8 +323,14 @@ def _columns_and_cause(keys: Sequence[_NullableKey]) -> tuple[str, str]:
     return ", ".join(f"{col}{_cause_clause(resolved[col])}" for col in columns), ""
 
 
-def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSide) -> Finding:
-    """One finding per join, listing every nullable key column it spans.
+def _join_finding(
+    join: exp.Join,
+    keys: Sequence[_NullableKey],
+    *,
+    determined: Sequence[_NullableKey] = (),
+    side: JoinSide,
+) -> Finding:
+    """One finding per join, reporting the nullable key columns it spans.
 
     The framing follows the join side. An inner or semi join drops the row on a NULL key, so
     the message keeps the row-loss framing (a semi join filters its left rows, so a NULL key
@@ -306,7 +341,13 @@ def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSid
 
     The ``why nullable`` cause is attributed per column: columns that agree share one trailing
     clause, columns that differ each carry their own inline, so a mixed-cause composite key
-    stays one finding without one column's provenance bleeding onto another."""
+    stays one finding without one column's provenance bleeding onto another.
+
+    ``keys`` are the reduced key (the :func:`minimal_cover` of the spanned nullable columns);
+    ``determined`` are the nullable columns a declared ``determines`` folded into that key. When
+    present, the message names them as functionally redundant and recommends dropping their
+    equality conditions, which removes their null-non-match risk outright, ahead of a not_null
+    test on the key that remains."""
     distinct_columns = sorted({k.column for k in keys})
     plain_columns = ", ".join(distinct_columns)
     listing, cause = _columns_and_cause(keys)
@@ -314,6 +355,7 @@ def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSid
     is_are = "are" if len(distinct_columns) > 1 else "is"
     kind_word = _JOIN_KIND_WORD.get(side)
     prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
+    redundancy = _redundancy_clause(keys, determined)
     guard = (
         f"The durable guard is a not_null test on {plain_columns} in {sources}, which turns "
         f"this silent {{loss}} into a loud test failure on the producing model; or, locally, "
@@ -324,15 +366,41 @@ def _join_finding(join: exp.Join, keys: Sequence[_NullableKey], *, side: JoinSid
             f"{prefix} keys on {listing}, which {is_are} nullable upstream in "
             f"{sources}{cause}; the outer join keeps these rows, but NULL never equals NULL, "
             f"so a NULL key silently never matches and the row survives with the join target "
-            f"NULL-padded. {guard.format(loss='non-match')}"
+            f"NULL-padded.{redundancy} {guard.format(loss='non-match')}"
         )
     else:
         message = (
             f"{prefix} keys on {listing}, which {is_are} nullable upstream in {sources}{cause}; "
             f"NULL never equals NULL, so rows with a NULL key never match and are silently "
-            f"dropped. {guard.format(loss='row loss')}"
+            f"dropped.{redundancy} {guard.format(loss='row loss')}"
         )
     return finding_at(FindingKind.JOIN_ON_NULLABLE_KEY, message=message, node=join)
+
+
+def _redundancy_clause(keys: Sequence[_NullableKey], determined: Sequence[_NullableKey]) -> str:
+    """The clause naming the ``determines``-folded columns, when a declaration relates them.
+
+    Empty when nothing was folded, so an undeclared join reads exactly as before. Otherwise it
+    groups the folded columns by relation and names the declared key (the reported cover columns
+    of that relation) that determines them, so the reader sees one declared key rather than
+    several co-determined columns, and the recommended fix is to drop the redundant equalities."""
+    if not determined:
+        return ""
+    cover_by_relation: dict[str, set[str]] = {}
+    for k in keys:
+        cover_by_relation.setdefault(k.relation, set()).add(k.column)
+    determined_by_relation: dict[str, set[str]] = {}
+    for k in determined:
+        determined_by_relation.setdefault(k.relation, set()).add(k.column)
+    parts = [
+        f"{', '.join(sorted(cols))} in {relation!r} (functionally determined by the declared "
+        f"key {', '.join(sorted(cover_by_relation.get(relation, set())))})"
+        for relation, cols in sorted(determined_by_relation.items())
+    ]
+    return (
+        f" The join also equates {'; '.join(parts)}, so those equality conditions are "
+        f"redundant: joining on the declared key alone drops the null-non-match risk they add."
+    )
 
 
 def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
@@ -398,6 +466,7 @@ def make_nullability_detectors(
     *,
     parsed: Mapping[str, Expr] | None = None,
     column_graph: ColumnLineageGraph | None = None,
+    fd_by_name: Mapping[str, FDSet] = {},
 ) -> tuple[Detector, ...]:
     """Curry the nullability-consuming detectors against the propagated annotations.
 
@@ -407,7 +476,9 @@ def make_nullability_detectors(
     index. ``profile`` is the run's resolved target (its dialect parses, its semantics
     ground); ``parsed`` lets the walker share its pre-parsed trees. ``column_graph`` lets the
     audit pass the manifest column graph it already built, so the qualify-and-resolve walk is
-    not repeated per fact family. The detectors read only the per-relation index.
+    not repeated per fact family. ``fd_by_name`` is the propagated functional-dependency map
+    (the same one the fanout detector reads), letting the join-key detector fold a co-determined
+    key column into its declared key. The detectors read only the per-relation indexes.
     """
     nullable_by_name = _nullable_by_name(
         manifest, activated_nullability(manifest, profile, parsed=parsed, column_graph=column_graph)
@@ -419,7 +490,10 @@ def make_nullability_detectors(
 
     def join_on_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_join_on_nullable_key(
-            tree, nullable_by_name=nullable_by_name, cause_by_name=cause_by_name
+            tree,
+            nullable_by_name=nullable_by_name,
+            cause_by_name=cause_by_name,
+            fd_by_name=fd_by_name,
         )
 
     def not_in_nullable(tree: Expr) -> tuple[Finding, ...]:

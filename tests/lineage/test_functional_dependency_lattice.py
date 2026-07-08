@@ -33,6 +33,7 @@ from dblect.lineage.properties.functional_dependency import (
     NO_FDS,
     FDSet,
     determines,
+    minimal_cover,
 )
 from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
 
@@ -149,3 +150,55 @@ def test_transitivity_chains_dependencies() -> None:
     chain = FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"b"}), "c"))
     assert determines(chain, frozenset({"a"}), "c")
     assert not determines(chain, frozenset({"c"}), "a")
+
+
+# --- minimal cover ---------------------------------------------------------------
+#
+# ``minimal_cover`` reduces a set of columns to an irreducible subset that still
+# functionally determines the whole, the reduction the join detectors use to fold a
+# determined key column into the determinant that keys it. The contract is stated in
+# terms of ``determines`` (the pinned entailment procedure): the cover is a subset, it
+# determines every original column, and no member is redundant given the others.
+
+
+@given(_fd_sets, _col_sets)
+@settings(max_examples=1000)
+def test_minimal_cover_is_a_covering_subset(sigma: FDSet, cols: frozenset[str]) -> None:
+    cover = minimal_cover(sigma, cols)
+    assert cover <= cols
+    # The cover determines every column it dropped, so it stands in for the whole set.
+    for col in cols:
+        assert determines(sigma, cover, col)
+
+
+@given(_fd_sets, _col_sets)
+@settings(max_examples=1000)
+def test_minimal_cover_is_irreducible(sigma: FDSet, cols: frozenset[str]) -> None:
+    """No cover member is determined by the rest: dropping any one loses a column, so
+    the cover names exactly the columns that must be guarded independently."""
+    cover = minimal_cover(sigma, cols)
+    for col in cover:
+        assert not determines(sigma, cover - {col}, col)
+
+
+@given(_fd_sets, _col_sets)
+def test_minimal_cover_is_idempotent(sigma: FDSet, cols: frozenset[str]) -> None:
+    cover = minimal_cover(sigma, cols)
+    assert minimal_cover(sigma, cover) == cover
+
+
+@given(_col_sets)
+def test_minimal_cover_without_dependencies_is_identity(cols: frozenset[str]) -> None:
+    """With no dependency known, every column stands on its own: nothing folds in."""
+    assert minimal_cover(NO_FDS, cols) == cols
+
+
+def test_minimal_cover_folds_a_declared_chain() -> None:
+    """The retail hierarchy: ``store_id`` determines ``region_id`` determines
+    ``country_id``, so a join spanning all three reduces to the declared root key."""
+    chain = FDSet.of(
+        FD(frozenset({"store_id"}), "region_id"), FD(frozenset({"region_id"}), "country_id")
+    )
+    assert minimal_cover(chain, frozenset({"store_id", "region_id", "country_id"})) == frozenset(
+        {"store_id"}
+    )
