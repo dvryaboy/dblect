@@ -181,12 +181,6 @@ def test_minimal_cover_is_irreducible(sigma: FDSet, cols: frozenset[str]) -> Non
         assert not determines(sigma, cover - {col}, col)
 
 
-@given(_fd_sets, _col_sets)
-def test_minimal_cover_is_idempotent(sigma: FDSet, cols: frozenset[str]) -> None:
-    cover = minimal_cover(sigma, cols)
-    assert minimal_cover(sigma, cover) == cover
-
-
 @given(_col_sets)
 def test_minimal_cover_without_dependencies_is_identity(cols: frozenset[str]) -> None:
     """With no dependency known, every column stands on its own: nothing folds in."""

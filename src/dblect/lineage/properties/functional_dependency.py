@@ -141,12 +141,9 @@ def minimal_cover(value: FDSet, cols: frozenset[str]) -> frozenset[str]:
     independent. With no dependency known (``NO_FDS``) nothing is entailed by the rest,
     so the result is ``cols`` unchanged.
 
-    Removal walks the columns in a fixed order and drops one only when the columns still
-    kept entail it, so the result is deterministic and irreducible: it determines every
-    original column (removals never lose coverage, since a dropped column stays in the
-    kept set's closure) and no member is entailed by the others (each survivor failed the
-    entailment test against a superset of the final kept set, and entailment is monotone
-    in the determinant)."""
+    The fixed-order walk drops a column only when its survivors still entail it, which keeps
+    the result irreducible and coverage-preserving; the lattice tests pin both as properties
+    over ``determines``."""
     kept = set(cols)
     for col in sorted(cols):
         if determines(value, frozenset(kept - {col}), col):

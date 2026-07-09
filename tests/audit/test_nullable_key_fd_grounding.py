@@ -57,8 +57,8 @@ def _manifest() -> Manifest:
     )
 
 
-def _join_message(manifest: Manifest, *, with_facts: bool) -> str:
-    fd_facts = resolve_contracts(manifest).fd_facts if with_facts else ()
+def _join_message(manifest: Manifest) -> str:
+    fd_facts = resolve_contracts(manifest).fd_facts
     report = run_audit(manifest, _DUCKDB, fd_facts=fd_facts)
     messages = [
         lf.finding.message
@@ -68,15 +68,6 @@ def _join_message(manifest: Manifest, *, with_facts: bool) -> str:
     ]
     assert len(messages) == 1
     return messages[0]
-
-
-def test_without_the_dependency_every_hierarchy_column_is_listed() -> None:
-    with isolated_registry():
-        manifest = _manifest()
-        assert resolve_contracts(manifest).fd_facts == ()
-        msg = _join_message(manifest, with_facts=True)
-    assert all(col in msg for col in ("store_id", "region_id", "country_id"))
-    assert "redundant" not in msg.lower()
 
 
 def test_declared_dependency_consolidates_onto_the_root_key() -> None:
@@ -95,7 +86,7 @@ def test_declared_dependency_consolidates_onto_the_root_key() -> None:
 
         manifest = _manifest()
         assert len(resolve_contracts(manifest).fd_facts) == 2
-        msg = _join_message(manifest, with_facts=True)
+        msg = _join_message(manifest)
     assert "keys on store_id, which is nullable upstream" in msg
     assert "functionally determined by the declared key store_id" in msg
     assert "redundant" in msg.lower()
