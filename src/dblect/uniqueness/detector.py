@@ -477,6 +477,26 @@ def relation_uniqueness(
     return graph, keys
 
 
+def fd_annotations_by_name(
+    manifest: Manifest,
+    graph: RelationLineageGraph,
+    fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
+) -> dict[str, FDSet]:
+    """Propagate the functional-dependency property over the relation graph, indexed by the
+    relation name as it appears in compiled SQL.
+
+    Grounded from the declared ``determines`` facts the caller threads in; even with none, the
+    property still derives structural FDs (a GROUP BY key, a join's ON equalities), sound on
+    their own. Both the join-fanout detector (key coverage through ``determines``) and the
+    join-on-nullable-key detector (folding a co-determined key column into its declared key)
+    read this map, so :func:`dblect.audit.walker.run_audit` computes it once over the shared
+    graph and threads it into both factories rather than re-running the fixpoint per factory."""
+    fd_prop = functional_dependency_property(functional_dependency_grounding(by_scope(fd_facts)))
+    return index_by_name(
+        manifest, {ref: ann.value for ref, ann in propagate(graph, fd_prop).items()}
+    )
+
+
 def make_fact_grounded_detectors(
     manifest: Manifest,
     profile: AdapterProfile,
@@ -484,6 +504,7 @@ def make_fact_grounded_detectors(
     parsed: Mapping[str, Expr] | None = None,
     relation_keys: RelationUniqueness | None = None,
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
+    fd_by_name: Mapping[str, FDSet] | None = None,
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against substrate-derived keys.
 
@@ -531,15 +552,11 @@ def make_fact_grounded_detectors(
         manifest, {ref: ann.value.conditional for ref, ann in keys.items()}
     )
     flow_by_name = index_by_name(manifest, {ref: ann.value for ref, ann in flow.items()})
-    # Propagate the functional-dependency property over the same relation graph and index it by
-    # name, so join-fanout can test key coverage through ``determines`` (a join covering a key's
-    # determinant covers the key). Grounded from the declared ``determines`` facts the caller
-    # threads in; even with none, the property still derives structural FDs (a GROUP BY key, a
-    # join's ON equalities), which are sound and can cover a key on their own.
-    fd_prop = functional_dependency_property(functional_dependency_grounding(by_scope(fd_facts)))
-    fd_by_name = index_by_name(
-        manifest, {ref: ann.value for ref, ann in propagate(graph, fd_prop).items()}
-    )
+    # The functional-dependency map lets join-fanout test key coverage through ``determines`` (a
+    # join covering a key's determinant covers the key). ``run_audit`` propagates it once over the
+    # shared graph and threads it in; a standalone caller lets it default and we propagate here.
+    if fd_by_name is None:
+        fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:

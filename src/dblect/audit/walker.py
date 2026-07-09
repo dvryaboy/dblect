@@ -50,6 +50,7 @@ from dblect.sql import (
     parse_manifest_models,
 )
 from dblect.uniqueness.detector import (
+    fd_annotations_by_name,
     make_cross_model_fanout_detectors,
     make_fact_grounded_detectors,
     relation_uniqueness,
@@ -198,6 +199,11 @@ def run_audit(
     # here (the check family propagates the FD property over the same graph, so only the build is
     # shared).
     rel_keys = relation_uniqueness(manifest, profile, parsed=trees, graph=relation_graph)
+    # Propagate the functional-dependency property once over that same relation graph and share it
+    # across the fanout and nullable-key detectors, so a declared ``determines`` reaches both
+    # (fanout tests key coverage through it; the join-key detector folds a co-determined key column
+    # into its declared key) without re-running the fixpoint per factory.
+    fd_by_name = fd_annotations_by_name(manifest, rel_keys[0], fd_facts)
     # The column graph is the heavy shared substrate: qualifying every model is also what stamps
     # the shared trees with their resolved column refs. A shared build (from ``analyze``) is
     # stamped on these same trees, so the detectors read the same resolution either way.
@@ -209,12 +215,14 @@ def run_audit(
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(
-            manifest, profile, parsed=trees, relation_keys=rel_keys, fd_facts=fd_facts
+            manifest, profile, parsed=trees, relation_keys=rel_keys, fd_by_name=fd_by_name
         ),
         *make_cross_model_fanout_detectors(
             manifest, profile, parsed=trees, relation_keys=rel_keys, column_graph=col_graph
         ),
-        *make_nullability_detectors(manifest, profile, parsed=trees, column_graph=col_graph),
+        *make_nullability_detectors(
+            manifest, profile, parsed=trees, column_graph=col_graph, fd_by_name=fd_by_name
+        ),
         *make_array_nonemptiness_detectors(manifest, profile, parsed=trees, column_graph=col_graph),
         *make_snapshot_detectors(manifest),
     )
