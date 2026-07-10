@@ -23,10 +23,17 @@ later:
   keys, functional dependencies, grain, a declared nullability. We do not verify
   these by running; we consume them to discharge obligations along the DAG. These
   pay off the day they are written.
-- **[verdict]** A claim the analyser proves or refutes itself, by propagating
-  types and properties: unit and currency coherence, additivity, fan-out and grain
-  hazards, a nullability contradiction, a refinement that a transform breaks. The
-  static phase performs these.
+- **[verdict]** A claim the analyser settles itself, by propagating types and
+  properties: unit and currency coherence, additivity, fan-out and grain hazards,
+  a declared nullability the structure fails to preserve, a refinement that a
+  transform breaks. The verdicts
+  are one-sided in a way the report respects. A type-level coherence claim can be
+  genuinely refuted, since two incompatible meanings admit no data at all; a claim
+  about rows (fan-out and grain safety, a declared nullability) is either proven
+  safe or reported as *not established*, with the defeating operator named,
+  because the data may still satisfy what the structure fails to guarantee.
+  `refutation-and-verdicts.md` develops the distinction. The static phase performs
+  both kinds.
 - **[refine]** A domain-type refinement (a range, a sign, an accepted set). It
   behaves as a **[fact]** now (it propagates, and a downstream transform that could
   violate it is a static **[verdict]**), and it also carries a data-verification
@@ -172,7 +179,11 @@ data verification rides the runtime loop.
 
 The conservation shape is the runtime loop's centrepiece, not the static phase's:
 the analyser does not reason over an exact sum equality. Two members of this family
-are exceptions the static phase already owns.
+are exceptions the static phase already owns. A declared conservation predicate
+still pays statically before the loop runs: the reader sketched in
+`intent-supplying-contracts.md` walks the declared measure's lineage and flags the
+hop that defeats conservation (a fan-out, a drop, an opaque seam) as
+not-established findings, while the equality itself waits for execution.
 
 - **Sum conservation across a transform.** A measure is preserved between two
   models, grouped by a shared key.
@@ -188,9 +199,12 @@ are exceptions the static phase already owns.
 - **Reconciliation to an external total.** A model's aggregate matches a control
   figure in another table. **[exec]**
 - **Fan-out safety.** A join does not inflate a summed measure by duplicating the
-  measure side. The hazard algebra proves this statically. **[verdict]**
+  measure side. The hazard algebra proves safety when the join is pinned to a
+  covered key, and otherwise reports the join as an unproven hazard rather than a
+  violation. **[verdict]**
 - **Grain agreement.** A measure is summed at its own grain, not a grain the join
-  multiplied. Grain propagation decides it statically. **[verdict]**
+  multiplied. Grain propagation proves it, or reports it not established,
+  statically. **[verdict]**
 
 ## 8. Temporal and sequence invariants
 
@@ -252,7 +266,7 @@ propagating domain types. These are the entries most native to where we are now.
   already spelled or a small surface addition.
 - The single highest-leverage static-side addition is **refinements as first-class
   facts** (§5): ranges, signs, and accepted sets that propagate and can be
-  contradicted downstream. String and date literals are the small enabling piece,
+  defeated downstream. String and date literals are the small enabling piece,
   and fixing the string-`==` capture crash is a clean starting point.
 - The **[exec]** set (all of §7's conservation members, §8, §10, and the
   data-verification facet of §5, §6, §9) is what we hold. The discipline above
@@ -269,17 +283,28 @@ propagating domain types. These are the entries most native to where we are now.
 
 Under propagate-then-track the analyser assumes each declared contract holds,
 carries it as far downstream as the analysis can take it, and flags a contract only
-when it can show a model's construction violates it, or that two contracts conflict.
-A clean run therefore claims less than a reader might assume, and the report has to
-say so plainly.
+when it can show something concrete: that a model's construction cannot honour the
+declaration, that two contracts conflict, or that the construction visibly fails to
+establish a declaration it was expected to carry (a declared grain the SQL provably
+does not collapse to). A clean run therefore claims less than a reader might
+assume, and the report has to say so plainly.
 
 We resolve this with one standing caveat, not a per-contract status. The whole
 concept a reader needs is a single sentence:
 
-> dblect trusts the contracts you declare. It flags a contract only when the
-> analysis shows that a model's construction violates it, or that two contracts
-> conflict. A clean run means no contradictions were found, not that the contracts
-> are proven. Checking contracts against your data arrives with the execution layer.
+> dblect trusts the contracts you declare. It flags a contract when the analysis
+> shows a model's construction cannot honour it, when two contracts conflict, or
+> when the construction visibly fails to establish it. A clean run means no such
+> findings, not that the contracts are proven. Checking contracts against your
+> data arrives with the execution layer.
+
+A flagged contract surfaces as an ordinary finding, and the finding's wording
+carries its strength: "contradicted" where the declaration is genuinely
+incompatible with what upstream declarations mean, "declared but not established,
+defeated at this operator" where the data may still satisfy it
+(`refutation-and-verdicts.md` draws the line). The standing caveat covers only the
+remainder, the contracts the run trusted, so no per-contract status table is
+introduced on either path.
 
 Two things keep that sentence from being forgotten, without adding vocabulary a user
 has to learn:
