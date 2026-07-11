@@ -464,9 +464,12 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
 
     A predicate is cleared when the value-effect catalog neutralises the padding
     NULL: the column is wrapped in ``COALESCE`` or an ``IS [NOT] NULL`` check
-    before the comparison, or the comparison is one term of a top-level ``OR``
-    whose sibling disjunct keeps the unmatched rows alive (``where a.x > 0 or
-    b.y > 0`` does not invert the join). Cleared predicates are silent.
+    before the comparison, the comparison is the first argument of a ``COALESCE``
+    that defaults the unmatched-row NULL to a literal ``TRUE`` (``coalesce(b.x <>
+    a.x, true)``, kept; ``coalesce(..., false)`` still drops the rows and fires),
+    or the comparison is one term of a top-level ``OR`` whose sibling disjunct
+    keeps the unmatched rows alive (``where a.x > 0 or b.y > 0`` does not invert
+    the join). Cleared predicates are silent.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -478,6 +481,8 @@ def detect_where_on_outer_joined_nullable(tree: Expr) -> tuple[Finding, ...]:
             continue
         nullable_fs = frozenset(nullable)
         for cmp in where.find_all(*_NULL_INTOLERANT_COMPARISONS):
+            if guards.defaulted_true_by_coalesce(cmp, until=where):
+                continue
             risky_tables: set[str] = set()
             for c in sg.find_columns(cmp):
                 if guards.is_coalesced(c, until=cmp) or guards.is_null_checked(c, until=cmp):
@@ -522,9 +527,10 @@ def detect_inner_flatten_row_drop(
     silent. The construct parses dialect-specifically, so the detector reads the structural
     shape sqlglot produces rather than the surface syntax.
 
-    An ``UNNEST`` whose argument is provably non-empty drops no row, so it is silent too.
-    A literal ``ARRAY[...]`` constructor with one or more elements is the local, always-on
-    case (the wide-to-long pivot idiom). ``column_is_nonempty``, when supplied, answers
+    A flatten whose argument is provably non-empty drops no row, so it is silent too, in every
+    spelling (``UNNEST``, spark ``explode``, snowflake ``FLATTEN``): a literal ``ARRAY[...]``
+    constructor with one or more elements is the local, always-on case (the wide-to-long pivot
+    idiom). ``column_is_nonempty``, when supplied, answers
     whether an unnested *column* is provably non-empty; the audit builds it over the
     ``array_nonemptiness`` property resolved across model and CTE boundaries, so a
     rebuilt-then-unnested array stays quiet. The detector treats columns as opaque
@@ -539,7 +545,7 @@ def detect_inner_flatten_row_drop(
                 continue
             if sg.join_side_of(j) in _OUTER_JOIN_SIDES or _flatten_preserves_rows(kernel):
                 continue
-            if _unnest_arg_provably_nonempty(kernel, column_is_nonempty, nullable):
+            if _flatten_arg_provably_nonempty(kernel, column_is_nonempty, nullable):
                 continue
             out.append(_inner_flatten_finding(j))
         for lat in sg.laterals_of(sel):
@@ -549,6 +555,8 @@ def detect_inner_flatten_row_drop(
             if not _is_flatten_like(lat.this):
                 continue
             if _flatten_preserves_rows(lat):
+                continue
+            if _flatten_arg_provably_nonempty(lat, column_is_nonempty, nullable):
                 continue
             out.append(_inner_flatten_finding(lat))
     return tuple(out)
@@ -728,23 +736,50 @@ def _has_outer_kwarg(fn: Expr) -> bool:
     return False
 
 
-def _unnest_arg_provably_nonempty(
+def _flatten_operands(kernel: Expr) -> list[Expr] | None:
+    """The array expression(s) a flatten arm unnests, across the spellings, or ``None`` when
+    the arm's array cannot be read and the caller must keep firing.
+
+    The forms differ only in where they keep the array. ``UNNEST(a, b)`` zips several arrays,
+    each in ``expressions``. Every other flatten form carries one array: the explode family
+    (spark ``explode``/``posexplode``/``inline``) in ``this``, and snowflake ``FLATTEN(input =>
+    arr)`` (which sqlglot also parses to ``exp.Explode``) on an ``input`` kwarg that need not
+    come first. A form whose array we cannot locate returns ``None`` so the detector stays sound
+    (a missed non-emptiness proof over-fires; a wrong one would silence a real row drop)."""
+    fn = kernel.this if isinstance(kernel, _FLATTEN_WRAPPER_TYPED) else kernel
+    if isinstance(fn, exp.Unnest):
+        return [a for a in fn.expressions if isinstance(a, Expr)]
+    if not isinstance(fn, _ARRAY_FLATTEN_TYPED):
+        return None
+    arg = fn.this
+    if isinstance(arg, exp.Kwarg):
+        arg = _flatten_input_arg(fn)
+    return [arg] if isinstance(arg, Expr) else None
+
+
+def _flatten_input_arg(fn: Expr) -> Expr | None:
+    """The array on a snowflake ``FLATTEN``'s ``input`` kwarg, searched across all of the
+    call's arguments since ``input`` need not come first."""
+    for kw in (fn.this, *fn.args.get("expressions", [])):
+        if (
+            isinstance(kw, exp.Kwarg)
+            and isinstance(kw.this, exp.Var)
+            and kw.this.name.lower() == "input"
+        ):
+            return kw.expression
+    return None
+
+
+def _flatten_arg_provably_nonempty(
     kernel: Expr,
     column_is_nonempty: Callable[[exp.Column], bool] | None,
     nullable_tables: set[str],
 ) -> bool:
-    """True when every array ``kernel`` unnests is provably non-empty, so no parent row drops.
-
-    Only the ``UNNEST`` spelling carries its array arguments where we can read them; the
-    ``explode``/``flatten`` function forms wrap the array in dialect-specific ways and are
-    left to the outer-form check. ``UNNEST(a, b)`` zips several arrays, every one of which
-    must be non-empty for the row to survive."""
-    if not isinstance(kernel, exp.Unnest):
+    """True when every array ``kernel`` flattens is provably non-empty, so no parent row drops."""
+    operands = _flatten_operands(kernel)
+    if not operands:
         return False
-    args = [a for a in kernel.expressions if isinstance(a, Expr)]
-    if not args:
-        return False
-    return all(_array_expr_nonempty(a, column_is_nonempty, nullable_tables) for a in args)
+    return all(_array_expr_nonempty(a, column_is_nonempty, nullable_tables) for a in operands)
 
 
 def _array_expr_nonempty(

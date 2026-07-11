@@ -43,7 +43,7 @@ def is_coalesced(col: exp.Column, *, until: Expr) -> bool:
     where any deliberate handling defuses the hazard (a ``WHERE`` comparison). Where the
     fallback's own nullability matters (a ``GROUP BY`` key), use :func:`supplies_present_value`.
     """
-    return any(isinstance(node, exp.Coalesce) for node in _path(col, until))
+    return any(isinstance(n, exp.Coalesce) for n in _path(col, until))
 
 
 def is_null_checked(col: exp.Column, *, until: Expr) -> bool:
@@ -110,6 +110,29 @@ def rescued_by_or_sibling(predicate: Expr, *, where: exp.Where, nullable: frozen
     return False
 
 
+def defaulted_true_by_coalesce(predicate: Expr, *, until: Expr) -> bool:
+    """True if ``predicate`` is the first argument of a ``COALESCE`` whose remaining arguments
+    are all the literal ``TRUE`` between it and ``until``, so an unmatched row (where the
+    predicate is NULL) is defaulted to a kept ``TRUE`` and the outer join is not inverted.
+
+    Sound rather than permissive about the default: ``coalesce(pred, false)`` and a non-literal
+    or fallback-position default keep firing, since the padding ``TRUE`` is not proven there.
+    """
+    prev: Expr | None = None
+    for node in _path(predicate, until):
+        if isinstance(node, exp.Coalesce) and prev is node.this:
+            defaults = node.expressions
+            if defaults and all(_is_true_literal(d) for d in defaults):
+                return True
+        prev = node
+    return False
+
+
+def _is_true_literal(expr: Expr) -> bool:
+    """True only for the boolean literal ``TRUE``, the default that keeps a padded row."""
+    return isinstance(expr, exp.Boolean) and expr.this is True
+
+
 def _present_when_padded(
     sel: exp.Select, *, constrained: frozenset[str], nullable: frozenset[str]
 ) -> frozenset[str]:
@@ -158,13 +181,13 @@ def _full_outer_complements(sel: exp.Select) -> dict[str, frozenset[str]]:
     return {left: frozenset({right}), right: frozenset({left})}
 
 
-def _path(col: exp.Column, until: Expr) -> Iterator[Expr]:
-    """The chain of nodes from ``col`` up to and including ``until``.
+def _path(start: Expr, until: Expr) -> Iterator[Expr]:
+    """The chain of nodes from ``start`` up to and including ``until``.
 
     Inclusive of ``until`` so a guard that *is* the boundary node (``GROUP BY
     coalesce(...)``, where the coalesce is the group expression itself) is still seen.
     """
-    node: Expr | None = col
+    node: Expr | None = start
     while node is not None:
         yield node
         if node is until:
