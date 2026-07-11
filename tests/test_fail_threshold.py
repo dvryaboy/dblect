@@ -14,10 +14,10 @@ from dblect.check.findings import CheckFinding, CheckFindingKind
 from dblect.severity import Severity, exceeds_threshold, severity_of
 from dblect.sql import Finding, FindingKind
 
-# A kind at each level so the test names levels, not kinds: JOIN_FANOUT is error,
-# UNORDERED_AGGREGATE is warn. There is no native info-level structural kind, so the
-# info boundary is exercised by the empty/at-threshold cases.
-_ERROR_KIND = FindingKind.JOIN_FANOUT
+# A kind at each level so the test names levels, not kinds: NULL_GROUP_AFTER_OUTER_JOIN
+# is error, UNORDERED_AGGREGATE is warn. There is no native info-level structural kind, so
+# the info boundary is exercised by the empty/at-threshold cases.
+_ERROR_KIND = FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
 _WARN_KIND = FindingKind.UNORDERED_AGGREGATE
 
 
@@ -96,6 +96,17 @@ def test_every_check_finding_kind_has_a_severity(kind: CheckFindingKind) -> None
     # runtime too: each resolves to a real level rather than raising.
     finding = CheckFinding(kind=kind, message="", model_unique_id="model.p.m")
     assert severity_of(finding) in set(Severity)
+
+
+def test_fanout_defaults_to_advisory() -> None:
+    # Calibration (#125, docs/current_state/calibration.md): join_fanout and
+    # cross_model_fanout fire on every intended fact-to-dimension surrogate-key join,
+    # where the dimension's key is declared on the natural key and the surrogate key is
+    # a function of it that uniqueness does not yet ground through. They ship advisory
+    # until that grounding lands (or the lenient/strict split, #116, separates them), so
+    # a textbook star schema stays visible without failing CI.
+    for kind in (FindingKind.JOIN_FANOUT, FindingKind.CROSS_MODEL_FANOUT):
+        assert severity_of(_finding(kind)) is Severity.WARN
 
 
 def test_join_key_type_mismatch_is_an_error() -> None:

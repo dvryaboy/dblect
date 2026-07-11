@@ -77,15 +77,16 @@ _RANK: dict[Severity, int] = {Severity.INFO: 0, Severity.WARN: 1, Severity.ERROR
 def _structural_severity(kind: FindingKind) -> Severity:
     """A structural finding's default severity. error: the query can return wrong rows, by
     silently dropping or duplicating or mis-grouping them. warn: each run is right on its own, but
-    the rows' order, selection, or value is not pinned, so the result drifts between runs."""
+    the rows' order, selection, or value is not pinned, so the result drifts between runs. The
+    fanout pair is the calibrated exception to that split: a row-duplication hazard that would sit
+    at error by meaning, held at warn for now because it over-fires on intended surrogate-key joins
+    (see the case at its ``match`` arm below)."""
     match kind:
         case (
             FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
             | FindingKind.COALESCE_ON_JOIN_KEY
             | FindingKind.WHERE_ON_OUTER_JOINED_NULLABLE
             | FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS
-            | FindingKind.JOIN_FANOUT
-            | FindingKind.CROSS_MODEL_FANOUT
             | FindingKind.NULL_GROUP_ON_NULLABLE_KEY
             | FindingKind.JOIN_ON_NULLABLE_KEY
             | FindingKind.NOT_IN_NULLABLE_SUBQUERY
@@ -99,6 +100,16 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
             | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
             | FindingKind.NON_DETERMINISTIC_FUNCTION
+            # Real-project calibration (#125, docs/current_state/calibration.md) found
+            # the fanout pair firing on every intended fact-to-dimension surrogate-key
+            # join: the dimension declares its key on the natural key, and the surrogate
+            # key is a function of it that uniqueness does not yet ground through. They
+            # ship advisory so a textbook star schema stays visible without failing the
+            # build. Raise them back to error once uniqueness grounds through the
+            # surrogate-key expression, or once the lenient/strict split (#116) can hold
+            # the error default in the strict profile.
+            | FindingKind.JOIN_FANOUT
+            | FindingKind.CROSS_MODEL_FANOUT
         ):
             return Severity.WARN
     assert_never(kind)
