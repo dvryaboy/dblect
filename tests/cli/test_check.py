@@ -48,6 +48,42 @@ def test_structural_finding_with_explicit_manifest(
     assert "null_group_after_outer_join" in result.output
 
 
+def test_auto_discovers_manifest_under_target(
+    jaffle_manifest_path: Path, tmp_path: Path, runner: CliRunner
+) -> None:
+    # With no --manifest, dblect resolves <project>/target/manifest.json. This is
+    # the everyday path for a user who has already run `dbt compile`.
+    target = tmp_path / "target"
+    target.mkdir()
+    shutil.copy(jaffle_manifest_path, target / "manifest.json")
+    result = runner.invoke(app, ["check", str(tmp_path), "--no-fail"])
+    assert result.exit_code == 0, result.output
+    assert "null_group_after_outer_join" in result.output
+
+
+def test_missing_project_and_manifest_is_actionable(tmp_path: Path, runner: CliRunner) -> None:
+    # No manifest and nothing that looks like a dbt project: the error names both
+    # ways forward rather than surfacing a resolution stack trace.
+    result = runner.invoke(app, ["check", str(tmp_path)])
+    assert result.exit_code != 0
+    plain = _plain(result.output)
+    assert "dbt_project.yml" in plain
+    assert "--manifest" in plain
+
+
+def test_dbt_missing_on_path_points_at_the_extra(tmp_path: Path, runner: CliRunner) -> None:
+    # A dbt project with no compiled manifest and no dbt on PATH is the cold-start
+    # trap the [dbt-core] extra exists for; the error names the extra instead of
+    # failing deep inside a compile that never starts. A bogus --dbt-executable
+    # forces the not-on-PATH branch without depending on the host's PATH.
+    (tmp_path / "dbt_project.yml").write_text("name: t\n")
+    result = runner.invoke(
+        app, ["check", str(tmp_path), "--dbt-executable", "dblect-no-such-dbt-binary"]
+    )
+    assert result.exit_code != 0
+    assert "dblect[dbt-core]" in _plain(result.output)
+
+
 _CLEAN_MANIFEST = (
     Path(__file__).parent.parent
     / "fixtures"

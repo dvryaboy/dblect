@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-A static analyzer for dbt projects that reads a compiled manifest, propagates
-column-level facts through the DAG, and reports structural and
-declaration-level findings the user can navigate to and act on. Nothing is
-tagged yet; this section accumulates the work that a first release will carry.
+## [0.1.0] - 2026-07-11
+
+The first published release: the base-world static analyzer, packaged for
+`pip install dblect`. It reads a compiled dbt manifest, propagates column-level
+facts through the DAG, and reports structural and declaration-level findings the
+user can navigate to and act on. No execution and no LLM are required. The
+runtime half (property-based execution, replay-determinism) and the
+flag/var-world analysis are deferred to later releases.
 
 ### Added
 
@@ -126,4 +130,5 @@ tagged yet; this section accumulates the work that a first release will carry.
   `stddev`, `variance`, `kurtosis`, `skewness`, `median`, `mode`, and the
   quantile/percentile family now correctly flag a mixed-currency reduction (#115).
 
-[Unreleased]: https://github.com/dvryaboy/dblect/commits/main
+[Unreleased]: https://github.com/dvryaboy/dblect/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/dvryaboy/dblect/releases/tag/v0.1.0

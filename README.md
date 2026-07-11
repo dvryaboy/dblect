@@ -143,6 +143,8 @@ dblect needs the compiled SQL dbt produces. Either run `dbt compile` yourself an
 uv add --dev "dblect[dbt-core]"
 ```
 
+dblect runs on Python 3.11 and newer. It reads manifests written by dbt 1.8 through 1.11.7; the `[dbt-core]` extra pins that range. A manifest from a newer dbt is not yet modeled by the parser dblect uses (tracked in #106), so point dblect at a manifest within the range or pass one explicitly with `--manifest`.
+
 Finding line numbers refer to the compiled SQL the analyzer parsed, not to the on-disk `.sql` template. Every finding also carries the model's source file path, so you can open the source and locate the construct from there.
 
 ## Quick start
