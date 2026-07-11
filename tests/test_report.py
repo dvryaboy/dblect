@@ -91,8 +91,8 @@ def test_text_shows_both_families_under_one_report() -> None:
     assert "coverage:" in text
     # structural family: located block with the snippet
     assert "structural findings:" in text
-    # join_fanout is an error-level correctness hazard; the level rides the head line.
-    assert "L9  error  join_fanout" in text
+    # join_fanout ships advisory (warn) after the #125 calibration; the level rides the head line.
+    assert "L9  warn  join_fanout" in text
     assert "snippet: JOIN state ON e.id = s.id" in text
     # declaration family: model.column block
     assert "declaration findings:" in text
@@ -180,7 +180,8 @@ def test_json_tags_each_finding_with_its_family() -> None:
         "unbuilt": 0,
     }
     families = {f["family"]: f for f in payload["findings"]}
-    assert families["structural"]["severity"] == "error"
+    # join_fanout ships advisory (warn) after the #125 calibration.
+    assert families["structural"]["severity"] == "warn"
     assert families["declaration"]["severity"] in {"info", "warn", "error"}
     assert families["structural"]["line_start"] == 9
     assert families["structural"]["sql_snippet"] == "JOIN state ON e.id = s.id"
@@ -196,7 +197,7 @@ def test_structural_finding_carries_back_mapped_source_span() -> None:
     # A back-mapped finding reports its compiled span unchanged and a source span the
     # text renderer shows without a marker; the JSON records the basis as source.
     text = render_text(_report(structural=(_structural(),)))
-    assert "L9  error  join_fanout" in text
+    assert "L9  warn  join_fanout" in text
     assert "(compiled)" not in text
     payload = json.loads(render_json(_report(structural=(_structural(),))))
     [f] = [f for f in payload["findings"] if f["family"] == "structural"]
@@ -225,7 +226,7 @@ def test_compiled_relative_finding_is_marked_and_keeps_compiled_line() -> None:
         )
 
     text = render_text(_report(structural=(_at(12),)))
-    assert "L12 (compiled)  error  join_fanout" in text
+    assert "L12 (compiled)  warn  join_fanout" in text
     payload = json.loads(render_json(_report(structural=(_at(12),))))
     [f] = [f for f in payload["findings"] if f["family"] == "structural"]
     # compiled line preserved; source span mirrors it; basis flags the fallback.
@@ -238,7 +239,7 @@ def test_macro_call_finding_renders_via_macro_and_keeps_compiled_line() -> None:
     # The compiled line the parser saw stays on `line_start` for anyone who needs it.
     finding = _structural(source_span=SourceSpan(3, 3, SpanBasis.MACRO_CALL))
     text = render_text(_report(structural=(finding,)))
-    assert "L3 (via macro)  error  join_fanout" in text
+    assert "L3 (via macro)  warn  join_fanout" in text
     payload = json.loads(render_json(_report(structural=(finding,))))
     [f] = [f for f in payload["findings"] if f["family"] == "structural"]
     assert (f["line_start"], f["source_line_start"], f["line_basis"]) == (9, 3, "macro_call")
