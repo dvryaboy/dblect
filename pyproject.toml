@@ -27,7 +27,7 @@ dependencies = [
     "sqlglot>=25.0",
     "jinja2>=3.1",
     "typer>=0.12",
-    "hypothesis>=6.100",
+    "pyyaml>=6.0",
     "duckdb>=1.0",
     "dbt-artifacts-parser>=0.8",
 ]
@@ -53,10 +53,18 @@ Issues = "https://github.com/dvryaboy/dblect/issues"
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    # Drives the property-based suites. Not a runtime dependency: no shipped code
+    # path imports it. The runtime PBT layer that will (type-driven generators,
+    # structural PBT) is not built yet; hypothesis returns to the runtime set,
+    # or an extra, when that layer lands.
+    "hypothesis>=6.100",
     "ruff>=0.6",
     "pyright>=1.1.380",
     # Validates the SARIF reporter output against the vendored SARIF 2.1.0 schema.
     "jsonschema>=4.0",
+    # Requirement parsing and name canonicalization for the install-boundary audit
+    # in tests/test_packaging.py.
+    "packaging>=23.0",
     # See the cap rationale under [project.optional-dependencies] (parser #219).
     "dbt-core>=1.8,<1.11.8",
     "dbt-duckdb>=1.8",

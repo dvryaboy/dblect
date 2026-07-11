@@ -463,8 +463,8 @@ source = { editable = "." }
 dependencies = [
     { name = "dbt-artifacts-parser" },
     { name = "duckdb" },
-    { name = "hypothesis" },
     { name = "jinja2" },
+    { name = "pyyaml" },
     { name = "sqlglot" },
     { name = "typer" },
 ]
@@ -478,7 +478,9 @@ dbt-core = [
 dev = [
     { name = "dbt-core" },
     { name = "dbt-duckdb" },
+    { name = "hypothesis" },
     { name = "jsonschema" },
+    { name = "packaging" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -494,8 +496,8 @@ requires-dist = [
     { name = "dbt-artifacts-parser", specifier = ">=0.8" },
     { name = "dbt-core", marker = "extra == 'dbt-core'", specifier = ">=1.8,<1.11.8" },
     { name = "duckdb", specifier = ">=1.0" },
-    { name = "hypothesis", specifier = ">=6.100" },
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "sqlglot", specifier = ">=25.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
@@ -505,7 +507,9 @@ provides-extras = ["dbt-core"]
 dev = [
     { name = "dbt-core", specifier = ">=1.8,<1.11.8" },
     { name = "dbt-duckdb", specifier = ">=1.8" },
+    { name = "hypothesis", specifier = ">=6.100" },
     { name = "jsonschema", specifier = ">=4.0" },
+    { name = "packaging", specifier = ">=23.0" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
