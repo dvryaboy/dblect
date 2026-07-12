@@ -388,6 +388,7 @@ def _walk_model(
     if original is not None:
         originals = _tag_references(original)
     expression: Expr = original.copy() if original is not None else parse_sql(sql, dialect=dialect)
+    _expand_inline_struct_generators(expression)
     expression = qualify(
         expression,
         dialect=dialect,
@@ -423,6 +424,87 @@ def _tag_references(tree: Expr) -> dict[int, exp.Column]:
         col.meta[_REFERENCE_ID_META_KEY] = i
         originals[i] = col
     return originals
+
+
+_INLINE_GENERATOR_NAMES = frozenset({"inline", "inline_outer"})
+
+
+def _expand_inline_struct_generators(expression: Expr) -> None:
+    """Rewrite a Spark ``SELECT INLINE(ARRAY(STRUCT(v AS name, ...), ...))`` projection in place
+    into the named column projections the generator produces, so qualify exposes the struct
+    fields as output columns instead of collapsing the whole generator to one ``_col_0``.
+
+    ``INLINE`` over a literal array of structs is the wide category-grid idiom (a dimension of
+    constant rows, one column per struct field named by its alias). sqlglot's qualify does not
+    expand it, so every downstream reference to a field (``platform``) fails to resolve and the
+    model falls blind, or raises ``Unknown column`` when a qualified reference forces resolution.
+
+    Scoped to the provably safe shape: a literal ``ARRAY`` of ``STRUCT``s whose every field is a
+    column-free named binding. The names and their constant values come from the first struct,
+    which fixes the output-column names with no lineage to lose (the grid holds only literals).
+    Any other shape (a generator over a column, an unnamed or column-bearing field) is left as
+    sqlglot renders it and stays blind, so the rewrite never invents lineage it cannot prove.
+    """
+    for sel in expression.find_all(exp.Select):
+        rewritten: list[Expr] = []
+        changed = False
+        for proj in sel.expressions:
+            fields = _inline_struct_field_projections(proj)
+            if fields is None:
+                rewritten.append(proj)
+            else:
+                rewritten.extend(fields)
+                changed = True
+        if changed:
+            sel.set("expressions", rewritten)
+
+
+def _inline_struct_field_projections(projection: Expr) -> list[Expr] | None:
+    """The ``value AS name`` projections a literal ``INLINE(ARRAY(STRUCT(...)))`` produces, or
+    ``None`` when ``projection`` is not that shape. Every field of every struct must be a
+    column-free named binding; the field names and values are read off the first struct."""
+    gen = projection.this if isinstance(projection, exp.Alias) else projection
+    array = _inline_array_arg(gen)
+    if not (isinstance(array, exp.Array) and array.expressions):
+        return None
+    if not all(isinstance(s, exp.Struct) for s in array.expressions):
+        return None
+    fields: list[Expr] = []
+    for i, struct in enumerate(array.expressions):
+        for member in struct.expressions:
+            name, value = _named_binding(member)
+            if name is None or value is None or value.find(exp.Column) is not None:
+                return None
+            if i == 0:
+                fields.append(exp.alias_(value.copy(), name))
+    return fields or None
+
+
+def _inline_array_arg(node: Expr) -> Expr | None:
+    """The array argument of an ``INLINE`` generator, whether it parsed to the dedicated
+    ``exp.Inline`` (array on ``this``) or an anonymous ``inline``/``inline_outer`` call (array
+    as the first argument). A non-``INLINE`` node yields ``None``."""
+    if isinstance(node, exp.Inline):
+        return node.this if isinstance(node.this, Expr) else None
+    if (
+        isinstance(node, exp.Anonymous)
+        and isinstance(node.this, str)
+        and node.this.lower() in _INLINE_GENERATOR_NAMES
+    ):
+        args = node.expressions
+        return args[0] if args and isinstance(args[0], Expr) else None
+    return None
+
+
+def _named_binding(member: Expr) -> tuple[str | None, Expr | None]:
+    """``(name, value)`` for a struct member written as ``value AS name`` (``STRUCT(v AS name)``
+    parses to ``PropertyEQ``; an aliased expression to ``Alias``), or ``(None, None)`` for an
+    unnamed member the rewrite cannot name a column after."""
+    if isinstance(member, exp.PropertyEQ) and isinstance(member.this, exp.Identifier):
+        return member.this.name, member.expression
+    if isinstance(member, exp.Alias):
+        return member.alias, member.this
+    return None, None
 
 
 @dataclass(frozen=True, slots=True)
