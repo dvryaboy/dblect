@@ -169,6 +169,52 @@ def test_null_group_is_not_null_key_not_detected() -> None:
     assert detect_null_group_after_outer_join(_parse(sql)) == ()
 
 
+# --- GROUP BY on outer-joined nullable: one finding per clause, not per column (#125) ---
+
+
+def test_null_group_multiple_nullable_targets_collapse_to_one_finding() -> None:
+    # The GROUP BY clause is one decision site. Several nullable-side grouped targets are the
+    # same mistake seen N ways, so the detector emits one finding naming every offending
+    # target, rather than one per column (which inflated the corpus false-positive count).
+    sql = """
+    select b.x, b.y, b.z, count(*) as n
+    from a left join b on a.k = b.k
+    group by b.x, b.y, b.z
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    # Every offending target is named, so the single finding loses no information.
+    for target in ("b.x", "b.y", "b.z"):
+        assert target in findings[0].message
+
+
+def test_null_group_mixed_targets_reports_only_the_nullable_ones() -> None:
+    # A GROUP BY mixing a preserved-side key (a.k) with a nullable-side one (b.y) still fires
+    # once, and names only the target that actually collapses. The preserved key is not a
+    # hazard and must not appear as one.
+    sql = """
+    select a.k, b.y, count(*) as n
+    from a left join b on a.k = b.k
+    group by a.k, b.y
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert "b.y" in findings[0].message
+    assert "a.k" not in findings[0].message
+
+
+def test_null_group_collapsed_finding_spans_the_group_by_clause() -> None:
+    sql = (
+        "select b.x, b.y, count(*) as n\n"  # line 1
+        "from a\n"  # line 2
+        "left join b on a.k = b.k\n"  # line 3
+        "group by b.x, b.y\n"  # line 4
+    )
+    [finding] = detect_null_group_after_outer_join(_parse(sql))
+    assert (finding.line_start, finding.line_end) == (4, 4)
+
+
 # --- WHERE on outer-joined nullable: top-level OR-sibling rescue (#168) ---
 
 
@@ -610,6 +656,18 @@ def test_inner_unnest_duckdb_flagged(sql: str) -> None:
 def test_left_join_unnest_duckdb_not_flagged() -> None:
     sql = "select t.id, u.x from t left join unnest(t.arr) as u(x) on true"
     assert detect_inner_flatten_row_drop(_parse_d(sql, "duckdb")) == ()
+
+
+def test_inner_flatten_reports_one_finding_per_arm() -> None:
+    # Unlike GROUP BY (one decision site per clause), each flatten arm is its own location
+    # with its own inner-vs-outer fix, so two risky arms in one SELECT stay two findings.
+    # Each points at its own arm; collapsing them would lose the location and conflate two
+    # independent row-drop hazards.
+    sql = "select t.id, x, y from t, unnest(t.a) as x, unnest(t.b) as y"
+    findings = detect_inner_flatten_row_drop(_parse_d(sql, "duckdb"))
+    assert len(findings) == 2
+    # Each finding points at its own arm (the exact snippet rendering is incidental).
+    assert [any(arm in f.sql_snippet for f in findings) for arm in ("t.a", "t.b")] == [True, True]
 
 
 @pytest.mark.parametrize(
