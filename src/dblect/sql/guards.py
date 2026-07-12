@@ -111,21 +111,41 @@ def rescued_by_or_sibling(predicate: Expr, *, where: exp.Where, nullable: frozen
 
 
 def defaulted_true_by_coalesce(predicate: Expr, *, until: Expr) -> bool:
-    """True if ``predicate`` is the first argument of a ``COALESCE`` whose remaining arguments
-    are all the literal ``TRUE`` between it and ``until``, so an unmatched row (where the
-    predicate is NULL) is defaulted to a kept ``TRUE`` and the outer join is not inverted.
+    """True if ``predicate`` is the first argument of a ``COALESCE`` defaulting to the literal
+    ``TRUE``, and that ``COALESCE`` reaches ``until`` through boolean connectives only, so an
+    unmatched row (where the predicate is NULL) is defaulted to a kept ``TRUE`` and the outer
+    join is not inverted.
 
-    Sound rather than permissive about the default: ``coalesce(pred, false)`` and a non-literal
-    or fallback-position default keep firing, since the padding ``TRUE`` is not proven there.
+    Sound rather than permissive about the default *and* its context. ``coalesce(pred, false)``
+    and a non-literal or fallback-position default keep firing, since the padding ``TRUE`` is not
+    proven there. A proven ``TRUE`` that a ``NOT`` or a re-comparison of the value
+    (``coalesce(pred, true) = false``) flips back into a drop keeps firing too: the ``COALESCE``
+    no longer proves the row survives once its value passes through a non-truthy context.
     """
     prev: Expr | None = None
     for node in _path(predicate, until):
-        if isinstance(node, exp.Coalesce) and prev is node.this:
-            defaults = node.expressions
-            if defaults and all(_is_true_literal(d) for d in defaults):
-                return True
+        if (
+            isinstance(node, exp.Coalesce)
+            and prev is node.this
+            and node.expressions
+            and all(_is_true_literal(d) for d in node.expressions)
+        ):
+            return _reaches_root_truthy(node, until)
         prev = node
     return False
+
+
+def _reaches_root_truthy(node: Expr, until: Expr) -> bool:
+    """True if a subexpression evaluating to ``TRUE`` keeps its row: every node strictly between
+    ``node`` and the WHERE root ``until`` is a boolean AND/OR connective (optionally
+    parenthesised). Under a ``NOT`` or a comparison of the value a ``TRUE`` can still drop the
+    row, so a defaulted ``TRUE`` there does not prove the join is preserved."""
+    for anc in _path(node, until):
+        if anc is node or anc is until:
+            continue
+        if not isinstance(anc, (exp.And, exp.Or, exp.Paren)):
+            return False
+    return True
 
 
 def _is_true_literal(expr: Expr) -> bool:

@@ -18,14 +18,16 @@ Three properties with teeth for the precision fixes these detectors carry:
 
 * **Soundness of the where-inversion clear** (duckdb execution oracle): for
   ``a LEFT JOIN b ... WHERE <predicate>`` where the predicate is a null-intolerant comparison
-  over the optional side, optionally wrapped in ``COALESCE(cmp, default)``, if the detector
-  clears the predicate then materialized data keeps every unmatched row. The oracle is the
-  data, so a clear that actually drops unmatched rows (the ``COALESCE(cmp, false)`` case the
-  guard must not clear) fails here against ground truth rather than against a re-derivation.
+  over the optional side under one of a closed set of wrappers, if the detector clears the
+  predicate then materialized data keeps every unmatched row. The oracle is the data, so a
+  clear that actually drops unmatched rows fails here against ground truth rather than against a
+  re-derivation. The wrapper axis (``_WHERE_WRAPS``) is enumerated, not sampled, and includes
+  the traps a defaulted ``TRUE`` still drops on: ``coalesce(cmp, false)``, ``not coalesce(cmp,
+  true)``, and ``coalesce(cmp, true) = false``. The data around each wrapper is sampled.
 
-  The generator stays inside the comparison-plus-``COALESCE`` grammar the ``defaulted_true_by_
-  coalesce`` guard reasons about, where a clear is meant to imply preservation. It does not
-  generate the column-level ``COALESCE(b.col, 0) = x`` idiom, whose permissive clear is a
+  The wrappers stay inside the comparison-plus-``COALESCE`` grammar the ``defaulted_true_by_
+  coalesce`` guard reasons about, where a clear is meant to imply preservation. They do not
+  include the column-level ``COALESCE(b.col, 0) = x`` idiom, whose permissive clear is a
   deliberate "the analyst handled the null" call rather than a preservation claim (see
   ``guards.is_coalesced``); that idiom's contract is not "the join is preserved".
 """
@@ -172,30 +174,41 @@ def test_inner_flatten_clear_implies_no_parent_row_dropped(
 # --- soundness of the where-inversion clear ----------------------------------------------
 
 
+# The closed set of predicate shapes wrapping a null-intolerant comparison ``cmp`` on the
+# optional side. Each fixes how an unmatched-row NULL is treated, and thus whether the LEFT
+# JOIN's unmatched rows survive. The wrap axis is enumerated, not sampled: it is closed and the
+# guard must decide every member. `bare` and `coalesce(cmp, false)` drop the padded rows;
+# `coalesce(cmp, true)` (bare, or under a top-level AND) keeps them; `coalesce(cmp, a.v > 0)`
+# defers to the preserved side. The last two are the soundness traps -- a defaulted TRUE that a
+# NOT or a re-comparison flips back into a drop -- which a clear must not silence.
+_WHERE_WRAPS: tuple[str, ...] = (
+    "{cmp}",
+    "coalesce({cmp}, true)",
+    "coalesce({cmp}, false)",
+    "coalesce({cmp}, a.v > 0)",
+    "coalesce({cmp}, true) and a.k >= 0",
+    "not coalesce({cmp}, true)",
+    "coalesce({cmp}, true) = false",
+)
+
+
 @dataclass(frozen=True, slots=True)
-class WhereScenario:
+class WhereData:
     a_rows: tuple[tuple[int, int], ...]
     b_rows: tuple[tuple[int, int], ...]
-    predicate: str
+    threshold: int
 
 
 @st.composite
-def _where_scenario(draw: st.DrawFn) -> WhereScenario:
+def _where_data(draw: st.DrawFn) -> WhereData:
     n = draw(st.integers(min_value=2, max_value=5))
     a_rows = tuple((k, draw(st.integers(min_value=-2, max_value=3))) for k in range(n))
     # A strict subset of a's keys match, so at least one a row is unmatched and the WHERE's
     # effect on padded rows is observable.
     matched = draw(st.lists(st.integers(min_value=0, max_value=n - 1), unique=True, max_size=n - 1))
     b_rows = tuple((k, draw(st.integers(min_value=-2, max_value=3))) for k in matched)
-    cmp = f"b.v > {draw(st.integers(min_value=-2, max_value=3))}"
-    wrap = draw(st.sampled_from(["bare", "coalesce_true", "coalesce_false", "coalesce_expr"]))
-    predicate = {
-        "bare": cmp,
-        "coalesce_true": f"coalesce({cmp}, true)",
-        "coalesce_false": f"coalesce({cmp}, false)",
-        "coalesce_expr": f"coalesce({cmp}, a.v > 0)",
-    }[wrap]
-    return WhereScenario(a_rows, b_rows, predicate)
+    threshold = draw(st.integers(min_value=-2, max_value=3))
+    return WhereData(a_rows, b_rows, threshold)
 
 
 @pytest.fixture(scope="session")
@@ -207,22 +220,25 @@ def con() -> Iterator[duckdb.DuckDBPyConnection]:
         connection.close()
 
 
-@given(s=_where_scenario())
-@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@pytest.mark.parametrize("wrap", _WHERE_WRAPS, ids=lambda w: w.replace("{cmp}", "cmp"))
+@given(d=_where_data())
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_where_clear_implies_unmatched_rows_survive(
-    con: duckdb.DuckDBPyConnection, s: WhereScenario
+    con: duckdb.DuckDBPyConnection, wrap: str, d: WhereData
 ) -> None:
     """If the detector clears the predicate, the LEFT JOIN keeps every unmatched row when the
     query actually runs. The data is the judge, so clearing a predicate that silently drops
-    unmatched rows fails here."""
+    unmatched rows -- including a ``coalesce(cmp, true)`` a ``NOT`` or a ``= false`` turns back
+    into a drop -- fails here against ground truth rather than against a re-derivation."""
+    predicate = wrap.replace("{cmp}", f"b.v > {d.threshold}")
     model_sql = (
         "select a.k as ak, a.v as av, b.k as bk, b.v as bv "
-        f"from a left join b on a.k = b.k where {s.predicate}"
+        f"from a left join b on a.k = b.k where {predicate}"
     )
     cleared = (
         len(detect_where_on_outer_joined_nullable(sqlglot.parse_one(model_sql, read="duckdb"))) == 0
     )
-    tables = [("a", ("k", "v"), s.a_rows), ("b", ("k", "v"), s.b_rows)]
+    tables = [("a", ("k", "v"), d.a_rows), ("b", ("k", "v"), d.b_rows)]
     with materialized(con, tables, model_sql) as c:
         dropped_unmatched = scalar(
             c,
@@ -232,5 +248,5 @@ def test_where_clear_implies_unmatched_rows_survive(
     if cleared:
         assert dropped_unmatched == 0, (
             f"detector cleared but {dropped_unmatched} unmatched rows were dropped by "
-            f"where {s.predicate!r} (a={s.a_rows}, b={s.b_rows})"
+            f"where {predicate!r} (a={d.a_rows}, b={d.b_rows})"
         )
