@@ -100,8 +100,8 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
             | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
             | FindingKind.NON_DETERMINISTIC_FUNCTION
-            # Real-project calibration (#125, docs/current_state/calibration.md) found
-            # the fanout pair firing on every intended fact-to-dimension surrogate-key
+            # Real-project calibration (#125) found the fanout pair firing on every
+            # intended fact-to-dimension surrogate-key
             # join: the dimension declares its key on the natural key, and the surrogate
             # key is a function of it that uniqueness does not yet ground through. They
             # ship advisory so a textbook star schema stays visible without failing the
