@@ -18,7 +18,7 @@ from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_model_graph, build_relation_graph
-from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
@@ -90,6 +90,55 @@ def test_struct_field_access_through_a_cte_connects_to_the_registered_output() -
     assert upstream  # connected, not blind
     assert upstream <= subjects  # every upstream ref is a registered node, none dangling
     assert {(u.source.unique_id, u.column) for u in upstream} == {("cte.model.m.c", "payload")}
+
+
+# --- INLINE(ARRAY(STRUCT(...))) generator columns (builder) ----------------------
+#
+# Spark's `SELECT INLINE(ARRAY(STRUCT('m' AS platform), ...))` is the wide category-grid
+# idiom (Wikimedia's platform / project_family dimensions): the generator yields one column
+# per struct field, named by the field alias. sqlglot's qualify does not expand it, collapsing
+# the whole generator to one `_col_0`, so every downstream reference to a field falls blind or
+# raises `Unknown column`. Expanding the generator to its named field projections before
+# qualify exposes the fields as real output columns.
+
+
+def _spark_model_graph(sql: str) -> ColumnLineageGraph:
+    return build_model_graph(
+        model_uid="model.m", sql=sql, name_to_source={}, schema={}, dialect="spark"
+    )
+
+
+def test_inline_struct_generator_exposes_the_struct_field_as_an_output_column() -> None:
+    graph = _spark_model_graph(
+        "SELECT INLINE(ARRAY(STRUCT('mobile app' AS platform), STRUCT('other' AS platform)))"
+    )
+    model = SourceRef(SourceKind.MODEL, "model.m")
+    output = {ref.column for ref in graph.subjects() if ref.source == model}
+    # The field name, not sqlglot's `_col_0` placeholder, is the output column.
+    assert output == {"platform"}
+
+
+def test_inline_struct_generator_in_a_cte_resolves_a_qualified_field_reference() -> None:
+    # dbt inlines the ephemeral as a CTE; a qualified reference to its field (`pf.project_family`)
+    # forces qualify to resolve the column, which raised `Unknown column` before the expansion.
+    graph = _spark_model_graph(
+        "WITH pf AS (SELECT INLINE(ARRAY(STRUCT('abstract' AS project_family), "
+        "STRUCT('commons' AS project_family)))) "
+        "SELECT d.id, pf.project_family FROM dim d CROSS JOIN pf"
+    )
+    model = SourceRef(SourceKind.MODEL, "model.m")
+    output = {ref.column for ref in graph.subjects() if ref.source == model}
+    assert "project_family" in output
+
+
+def test_inline_generator_over_a_non_literal_field_is_left_untouched() -> None:
+    # The expansion is scoped to a literal category grid. A struct field that reads a column
+    # carries lineage the rewrite would drop, so that shape is not expanded (it stays as sqlglot
+    # renders it) rather than silently inventing a lineage-free column.
+    graph = _spark_model_graph("SELECT INLINE(ARRAY(STRUCT(d.name AS platform))) FROM dim d")
+    model = SourceRef(SourceKind.MODEL, "model.m")
+    output = {ref.column for ref in graph.subjects() if ref.source == model}
+    assert output != {"platform"}
 
 
 # --- UNNEST grain (uniqueness propagation) --------------------------------------
