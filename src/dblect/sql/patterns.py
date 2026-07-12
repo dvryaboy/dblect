@@ -223,6 +223,10 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
     buckets are the two booleans), or a ``COALESCE`` whose fallback the join keeps
     present (``coalesce(meta.key, base.key)`` recovers the preserved-side key). A
     ``COALESCE`` of two nullable sides still fires: the merged key can be NULL.
+
+    The GROUP BY clause is one decision site, so several offending targets in it yield
+    one finding naming every offending target, not one per column. Per-column emission
+    inflated a single grouping mistake into a burst of findings.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -233,8 +237,10 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
         if g is None:
             continue
         nullable_fs = frozenset(nullable)
+        risky_tables: set[str] = set()
+        risky_targets: list[str] = []
         for grp_expr in g.expressions:
-            risky: set[str] = set()
+            hit: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
                 if table is None or table not in nullable:
@@ -243,19 +249,23 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
                     c, until=grp_expr, nullable=nullable_fs
                 ):
                     continue
-                risky.add(table)
-            if risky:
-                tables = ", ".join(sorted(risky))
-                out.append(
-                    finding_at(
-                        FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
-                        message=(
-                            f"GROUP BY {sg.render_sql(grp_expr)} references column(s) from "
-                            f"nullable join side ({tables}); unmatched rows collapse into a NULL group"
-                        ),
-                        node=grp_expr,
-                    )
+                hit.add(table)
+            if hit:
+                risky_tables |= hit
+                risky_targets.append(sg.render_sql(grp_expr))
+        if risky_tables:
+            tables = ", ".join(sorted(risky_tables))
+            targets = ", ".join(risky_targets)
+            out.append(
+                finding_at(
+                    FindingKind.NULL_GROUP_AFTER_OUTER_JOIN,
+                    message=(
+                        f"GROUP BY {targets} references column(s) from nullable join side "
+                        f"({tables}); unmatched rows collapse into a NULL group"
+                    ),
+                    node=g,
                 )
+            )
     return tuple(out)
 
 
