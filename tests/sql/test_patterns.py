@@ -692,6 +692,16 @@ def test_inner_unnest_of_empty_literal_array_still_flagged() -> None:
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
 
 
+@pytest.mark.parametrize("sql", ["unnest([1, NULL])", "unnest([NULL])"])
+def test_inner_unnest_of_array_with_null_elements_not_flagged(sql: str) -> None:
+    # A NULL *element* still contributes a row: unnest([NULL]) yields one (null) row, so the
+    # parent survives, unlike scalar unnest(NULL) which drops it. The array is non-empty, so a
+    # NULL element must not be read as absent. The clear-implies-no-drop PBT cannot pin this: a
+    # regression here makes the detector fire, not clear, which its `if cleared` guard skips.
+    stmt = f"select t.id, x from t, {sql} as x"
+    assert detect_inner_flatten_row_drop(_parse_d(stmt, "duckdb")) == ()
+
+
 def test_inner_unnest_of_array_subquery_still_flagged() -> None:
     # ARRAY(SELECT ...) also parses to exp.Array, but the subquery may return zero rows, so
     # the array can be empty and the parent row can still drop.

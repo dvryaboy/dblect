@@ -134,18 +134,13 @@ def flatten_con(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection:
 def _executable_array(draw: st.DrawFn) -> str:
     """A duckdb-executable array expression, reaching both non-empty and empty arrays so the
     oracle can catch an unsound clear."""
-    kind = draw(
-        st.sampled_from(["literal", "literal_with_null", "empty_cast", "series", "subquery"])
-    )
+    kind = draw(st.sampled_from(["literal", "empty_cast", "series", "subquery"]))
     if kind == "literal":
         return (
             "["
             + ", ".join(str(draw(st.integers(0, 9))) for _ in range(draw(st.integers(1, 4))))
             + "]"
         )
-    if kind == "literal_with_null":
-        parts = draw(st.lists(st.sampled_from(["1", "2", "NULL"]), min_size=1, max_size=4))
-        return "[" + ", ".join(parts) + "]"
     if kind == "empty_cast":
         return "CAST([] AS INTEGER[])"
     if kind == "series":
