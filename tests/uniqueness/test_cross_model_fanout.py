@@ -213,3 +213,72 @@ def test_unrelated_nested_cte_does_not_shadow_a_real_read() -> None:
     )
     manifest = _shop(items_unique_on=None, mart_sql=mart_sql)
     assert [f.kind for f in _findings(manifest, _MART)] == [FindingKind.CROSS_MODEL_FANOUT]
+
+
+# --- the COUNT fold: COUNT(*), COUNT(1), COUNT(col), COUNT_IF stay silent (#179) ----------
+#
+# A COUNT-behavior fold yields a cardinality, not a magnitude: it counts rows (modulo nulls),
+# and the row grain is what the relation preserves. ``COUNT(*) GROUP BY g`` reads distinct
+# rows, not a replicated magnitude, so a single-level fan-out does not make it double count.
+# Every COUNT is the ``SUM(qty)`` analog (a fold at the genuine line grain), not the
+# ``SUM(amount)`` analog: counting a column reads how many rows have it, never sums its
+# (replicated) value, so even ``COUNT(amount)`` over the broken order grain stays silent.
+
+_COUNT_STAR = "SELECT order_id, COUNT(*) AS num_items FROM stg_order_items GROUP BY order_id"
+_COUNT_ONE = "SELECT order_id, COUNT(1) AS num_items FROM stg_order_items GROUP BY order_id"
+_COUNT_AMOUNT = "SELECT order_id, COUNT(amount) AS n FROM stg_order_items GROUP BY order_id"
+_COUNT_ORDER_ID = "SELECT order_id, COUNT(order_id) AS n FROM stg_order_items GROUP BY order_id"
+
+
+def test_count_folds_over_fanned_staging_are_silent() -> None:
+    """Over the fanned-out staging, every COUNT shape counts distinct rows (line items), so the
+    count is exact and none fire: the star/literal folds, and a count of the replicated
+    order-grain column ``amount`` or the group key ``order_id`` alike, whether the staging is
+    keyless or keyed at the line grain."""
+    for items_key in (None, "item_id"):
+        for sql in (_COUNT_STAR, _COUNT_ONE, _COUNT_AMOUNT, _COUNT_ORDER_ID):
+            assert _findings(_shop(items_unique_on=items_key, mart_sql=sql), _MART) == (), (
+                items_key,
+                sql,
+            )
+
+
+def test_count_amount_is_silent_where_sum_amount_fires() -> None:
+    """The contrast that pins the discriminator over identical data and the same column:
+    ``SUM(amount)`` folds the replicated order-grain magnitude and fires, while ``COUNT(amount)``
+    counts the rows carrying a non-null amount and stays silent. The two folds are not
+    interchangeable, even though both read ``amount``."""
+    fired = _findings(_shop(items_unique_on="item_id", mart_sql=_SUM_AMOUNT), _MART)
+    silent = _findings(_shop(items_unique_on="item_id", mart_sql=_COUNT_AMOUNT), _MART)
+    assert [f.kind for f in fired] == [FindingKind.CROSS_MODEL_FANOUT]
+    assert silent == ()
+
+
+def test_count_if_over_fanned_staging_is_silent() -> None:
+    """``COUNT_IF`` is a COUNT-behavior fold too (it counts rows matching a predicate), so it is
+    a cardinality, not a magnitude, and stays silent over the fan-out like the others."""
+    mart_sql = "SELECT order_id, COUNT_IF(amount > 0) AS n FROM stg_order_items GROUP BY order_id"
+    assert _findings(_shop(items_unique_on=None, mart_sql=mart_sql), _MART) == ()
+
+
+def test_ungrouped_count_star_is_silent() -> None:
+    """An ungrouped ``COUNT(*)`` folds the whole relation's row grain, with no magnitude column
+    to trace, so there is no replicated origin to fire on."""
+    manifest = _shop(items_unique_on=None, mart_sql="SELECT COUNT(*) AS n FROM stg_order_items")
+    assert _findings(manifest, _MART) == ()
+
+
+# --- the grain-collapse guard (fixes a magnitude-path false positive) ---------------------
+
+
+def test_sum_grouped_to_unique_bucket_is_silent() -> None:
+    """The grain-collapse guard: grouping by ``(order_id, item_id)`` makes each bucket the line
+    grain staging is keyed on, so every bucket is a provable singleton. ``SUM(amount)`` folds one
+    row and returns that row's amount once, so it cannot double count even though the order
+    amount is replicated across the staging's lines."""
+    mart_sql = (
+        "SELECT order_id, item_id, SUM(amount) AS total FROM stg_order_items "
+        "GROUP BY order_id, item_id"
+    )
+    manifest = _shop(items_unique_on="item_id", mart_sql=mart_sql)
+    assert _findings(manifest, _MART) == ()
