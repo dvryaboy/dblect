@@ -43,7 +43,7 @@ def is_coalesced(col: exp.Column, *, until: Expr) -> bool:
     where any deliberate handling defuses the hazard (a ``WHERE`` comparison). Where the
     fallback's own nullability matters (a ``GROUP BY`` key), use :func:`supplies_present_value`.
     """
-    return any(isinstance(node, exp.Coalesce) for node in _path(col, until))
+    return any(isinstance(n, exp.Coalesce) for n in _path(col, until))
 
 
 def is_null_checked(col: exp.Column, *, until: Expr) -> bool:
@@ -110,6 +110,49 @@ def rescued_by_or_sibling(predicate: Expr, *, where: exp.Where, nullable: frozen
     return False
 
 
+def defaulted_true_by_coalesce(predicate: Expr, *, until: Expr) -> bool:
+    """True if ``predicate`` is the first argument of a ``COALESCE`` defaulting to the literal
+    ``TRUE``, and that ``COALESCE`` reaches ``until`` through boolean connectives only, so an
+    unmatched row (where the predicate is NULL) is defaulted to a kept ``TRUE`` and the outer
+    join is not inverted.
+
+    Sound rather than permissive about the default *and* its context. ``coalesce(pred, false)``
+    and a non-literal or fallback-position default keep firing, since the padding ``TRUE`` is not
+    proven there. A proven ``TRUE`` that a ``NOT`` or a re-comparison of the value
+    (``coalesce(pred, true) = false``) flips back into a drop keeps firing too: the ``COALESCE``
+    no longer proves the row survives once its value passes through a non-truthy context.
+    """
+    prev: Expr | None = None
+    for node in _path(predicate, until):
+        if (
+            isinstance(node, exp.Coalesce)
+            and prev is node.this
+            and node.expressions
+            and all(_is_true_literal(d) for d in node.expressions)
+        ):
+            return _reaches_root_truthy(node, until)
+        prev = node
+    return False
+
+
+def _reaches_root_truthy(node: Expr, until: Expr) -> bool:
+    """True if a subexpression evaluating to ``TRUE`` keeps its row: every node strictly between
+    ``node`` and the WHERE root ``until`` is a boolean AND/OR connective (optionally
+    parenthesised). Under a ``NOT`` or a comparison of the value a ``TRUE`` can still drop the
+    row, so a defaulted ``TRUE`` there does not prove the join is preserved."""
+    for anc in _path(node, until):
+        if anc is node or anc is until:
+            continue
+        if not isinstance(anc, (exp.And, exp.Or, exp.Paren)):
+            return False
+    return True
+
+
+def _is_true_literal(expr: Expr) -> bool:
+    """True only for the boolean literal ``TRUE``, the default that keeps a padded row."""
+    return isinstance(expr, exp.Boolean) and expr.this is True
+
+
 def _present_when_padded(
     sel: exp.Select, *, constrained: frozenset[str], nullable: frozenset[str]
 ) -> frozenset[str]:
@@ -158,13 +201,13 @@ def _full_outer_complements(sel: exp.Select) -> dict[str, frozenset[str]]:
     return {left: frozenset({right}), right: frozenset({left})}
 
 
-def _path(col: exp.Column, until: Expr) -> Iterator[Expr]:
-    """The chain of nodes from ``col`` up to and including ``until``.
+def _path(start: Expr, until: Expr) -> Iterator[Expr]:
+    """The chain of nodes from ``start`` up to and including ``until``.
 
     Inclusive of ``until`` so a guard that *is* the boundary node (``GROUP BY
     coalesce(...)``, where the coalesce is the group expression itself) is still seen.
     """
-    node: Expr | None = col
+    node: Expr | None = start
     while node is not None:
         yield node
         if node is until:

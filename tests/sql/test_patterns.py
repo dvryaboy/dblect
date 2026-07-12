@@ -555,6 +555,23 @@ def test_where_coalesced_nullable_not_detected() -> None:
     assert detect_where_on_outer_joined_nullable(_parse(sql)) == ()
 
 
+def test_where_comparison_coalesced_to_false_still_detected() -> None:
+    # The soundness boundary: COALESCE(pred, FALSE) defaults the unmatched-row NULL to FALSE,
+    # so those rows are dropped and the outer join IS silently inverted. Only a literal-TRUE
+    # default keeps the rows, so this must still fire. The TRUE-clears direction is the
+    # execution-oracle PBT in test_pbt_structural_hazards.py.
+    sql = "select * from a left join b on a.k = b.k where coalesce(b.status <> a.status, false)"
+    assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
+
+
+def test_where_comparison_in_coalesce_fallback_position_still_detected() -> None:
+    # The comparison sits in a fallback position, not the first argument, so the COALESCE does
+    # not default *it* to a kept value: `coalesce(a.flag, b.status <> a.status)` returns the
+    # comparison only when a.flag is NULL, and an unmatched row can still be dropped. Fires.
+    sql = "select * from a left join b on a.k = b.k where coalesce(a.flag, b.status <> a.status)"
+    assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
+
+
 def test_where_in_predicate_on_nullable_detected() -> None:
     sql = "select * from a left join b on a.k = b.k where b.status in ('x', 'y')"
     assert len(detect_where_on_outer_joined_nullable(_parse(sql))) == 1
@@ -641,6 +658,19 @@ def test_spark_explode_outer_variants(sql: str, expected: int) -> None:
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "spark"))) == expected
 
 
+# The cross-dialect verdict (a provably non-empty explode/flatten clears the same as UNNEST,
+# a column still fires) is pinned by the metamorphic PBT in test_pbt_structural_hazards.py,
+# against the absolute UNNEST verdicts above.
+
+
+def test_lateral_unnest_of_nonempty_literal_array_not_flagged() -> None:
+    # `LATERAL UNNEST(<literal array>)` wraps the UNNEST in a lateral, but the array still
+    # rides `expressions` and is provably non-empty, so it clears exactly as the bare
+    # `UNNEST([...])` arm does. The array must be read off the wrapped UNNEST, not its `this`.
+    sql = "select t.id, x from t cross join lateral unnest([1, 2]) as x"
+    assert detect_inner_flatten_row_drop(_parse_d(sql, "duckdb")) == ()
+
+
 @pytest.mark.parametrize(
     "sql",
     [
@@ -660,6 +690,16 @@ def test_inner_unnest_of_empty_literal_array_still_flagged() -> None:
     # An empty constructor carries no non-emptiness guarantee (degenerate, but pinned).
     sql = "select t.id, x from t cross join unnest(array[]) as x"
     assert len(detect_inner_flatten_row_drop(_parse_d(sql, "bigquery"))) == 1
+
+
+@pytest.mark.parametrize("sql", ["unnest([1, NULL])", "unnest([NULL])"])
+def test_inner_unnest_of_array_with_null_elements_not_flagged(sql: str) -> None:
+    # A NULL *element* still contributes a row: unnest([NULL]) yields one (null) row, so the
+    # parent survives, unlike scalar unnest(NULL) which drops it. The array is non-empty, so a
+    # NULL element must not be read as absent. The clear-implies-no-drop PBT cannot pin this: a
+    # regression here makes the detector fire, not clear, which its `if cleared` guard skips.
+    stmt = f"select t.id, x from t, {sql} as x"
+    assert detect_inner_flatten_row_drop(_parse_d(stmt, "duckdb")) == ()
 
 
 def test_inner_unnest_of_array_subquery_still_flagged() -> None:
