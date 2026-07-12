@@ -7,6 +7,12 @@ fail a build by default, which should ship advisory, and which carry a precision
 detectors are developed against are small and constructed; this pass reports what the same detectors do on SQL nobody
 wrote for them, across three warehouse dialects.
 
+The precision follow-ups this pass first opened have since landed, and the numbers below are the tool as it stands after
+them: the flatten and `WHERE` idiom fixes ([#210](https://github.com/dvryaboy/dblect/pull/210)), the per-site finding
+collapse ([#211](https://github.com/dvryaboy/dblect/pull/211)), and the Spark struct-field lineage fix
+([#212](https://github.com/dvryaboy/dblect/pull/212)), all against the first published release
+([#209](https://github.com/dvryaboy/dblect/pull/209), dblect 0.1.0).
+
 ## The corpus
 
 Six public dbt projects, 172 analysed models, across DuckDB, Snowflake, and Spark.
@@ -39,93 +45,73 @@ time and needs a real warehouse, so it is excluded from that project's run, and 
 
 ## Results
 
+Four of the six projects were re-run after the precision fixes (the two DuckDB projects that were checked out,
+`snowflake_spend`, and `wikimedia`). `nba-monte-carlo` and `dutch_railway`, both DuckDB and neither exercising the
+Spark and per-site paths the fixes touch, carry the prior pass's figures and are marked accordingly.
+
 | Project | Dialect | Models | Findings | Unbuilt | Resolution |
 | --- | --- | ---: | ---: | ---: | ---: |
 | `jaffle_shop` | duckdb | 5 | 1 | 0 | 100% |
 | `retail_analytics` | duckdb | 9 | 1 | 0 | 100% |
-| `nba-monte-carlo` | duckdb | 63 | 3 | 4 | 95% |
-| `dutch_railway` | duckdb | 11 | 5 | 0 | 71% |
+| `nba-monte-carlo` † | duckdb | 63 | 3 | 4 | 95% |
+| `dutch_railway` † | duckdb | 11 | 5 | 0 | 71% |
 | `snowflake_spend` | snowflake | 4 | 0 | 1 | 84% |
-| `wikimedia/dbt-jobs` | spark | 80 | 37 | 11 | 73% |
-| **Total** | | **172** | **47** | **16** | |
+| `wikimedia/dbt-jobs` | spark | 80 | 20 | 0 | 76% |
 
-Only the structural family fired: none of these projects declares dblect contracts, so the declaration family
-(`domain_type_contradiction`, `aggregation_not_well_typed`, `join_key_type_mismatch`, `contract_issue`) had nothing to
-resolve. This pass calibrates the structural detectors; the declaration family needs a contract-carrying corpus, which
-the scenario fixtures supply and a real adopter project will supply later.
+† prior-pass figures, not re-run in this update.
+
+Wikimedia is where every fix bites, and the movement is all there: **37 findings to 20, 11 unbuilt models to 0,
+resolution 73% to 76%.** The other five projects are unchanged. Only the structural family fired anywhere: none of these
+projects declares dblect contracts, so the declaration family (`domain_type_contradiction`, `aggregation_not_well_typed`,
+`join_key_type_mismatch`, `contract_issue`) had nothing to resolve. This pass calibrates the structural detectors; the
+declaration family needs a contract-carrying corpus, which the scenario fixtures supply and a real adopter project will
+supply later.
 
 ## Classification
 
-Every finding was read against its model and labelled:
+Every finding was read against its model and labelled a **true positive** (a real hazard the author most likely did not
+intend), **intended** (the detector is correct about the SQL and the author wants the pattern, quieted through `-- noqa`
+or a declared contract), or a **false positive** (the condition the detector claims does not actually hold).
 
-- **True positive**: a real hazard the author most likely did not intend.
-- **Intended**: the detector is correct about the SQL, and the author wants the pattern (an intentional outer join whose
-  null group is meaningful or impossible, a fan-out that is safe through a functional dependency dblect cannot see). The
-  `-- noqa` path or a declared contract is the intended quieting mechanism.
-- **False positive**: the condition the detector claims does not actually hold, so the finding is wrong.
+Wikimedia carries the only non-trivial finding set, so it is the one worth reading in full. Its 20 findings:
 
-| Detector | Total | True positive | Intended | False positive | Default severity |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `null_group_after_outer_join` | 18 | 2 | 7 | 9 | error |
-| `join_fanout` | 13 | 1 | 12 | 0 | warn (this pass) |
-| `inner_flatten_row_drop` | 9 | 4 | 0 | 5 | error |
-| `where_on_outer_joined_nullable` | 3 | 0 | 2 | 1 | error |
-| `non_deterministic_function` | 2 | 0 | 2 | 0 | warn |
-| `non_unique_window_order_keys` | 1 | 1 | 0 | 0 | error |
-| `unordered_aggregate` | 1 | 1 | 0 | 0 | warn |
-| **Total** | **47** | **9** | **23** | **15** |
+| Detector | Findings (was) | Read | Default severity |
+| --- | ---: | --- | --- |
+| `null_group_after_outer_join` | 5 (18) | one clean true positive; the rest sit in the open guarded-grouping / derived-side gap | error |
+| `join_fanout` | 8 (13) | intended surrogate-key joins plus the one real fan-out; ships advisory | warn (this pass) |
+| `inner_flatten_row_drop` | 5 (9) | all correct fires now; the literal-grid false positives cleared | error |
+| `where_on_outer_joined_nullable` | 1 (3) | a genuine LEFT JOIN inverted by a nullable-side `WHERE`; the `COALESCE(pred, TRUE)` false positive cleared | error |
+| `unordered_aggregate` | 1 (1) | correct (`ARRAY_AGG` with no `ORDER BY`) | warn |
 
-The 15 false positives are not spread evenly. They concentrate in three specific, fixable places, and finding
-multiplicity makes them look larger than the number of underlying mistakes.
+The other five projects add one finding each of note: `jaffle_shop`'s single `null_group`, and `retail_analytics`'s
+single `non_unique_window_order_keys`, both true positives at `error`; `snowflake_spend` fires nothing. The DuckDB
+corpus that was re-run carries no false positives.
 
-### Finding multiplicity inflates the count
+The false-positive idioms the first pass measured are gone. `inner_flatten_row_drop` is now all correct fires: the four
+column-array explodes in `signal_driven_handling_bad_faith_accounts` (`EXPLODE(r.users_in_case)`, which can genuinely be
+empty) and one `GENERATE_SERIES` spine with non-literal bounds in `active_moderators_monthly` that the detector rightly
+cannot prove non-empty. The literal category-grid explodes that used to fire now clear. `where_on_outer_joined_nullable`
+no longer flags the `COALESCE(pred, TRUE)` self-revert guard. And `null_group_after_outer_join` emits one finding per
+`GROUP BY` clause rather than one per column, so the `base_moderator_actions_logging` grouping over nine columns reads as
+a single finding instead of a burst.
 
-`null_group_after_outer_join` emits one finding per grouped column, and `inner_flatten_row_drop` one per flatten arm. So
-a single grouping decision or a single cross-tab model produces a burst of findings. The 9 `null_group` false positives
-are all **one** `GROUP BY` site (`base_moderator_actions_logging`), and the 5 `inner_flatten` false positives are **one**
-model (`active_moderators_monthly`). Measured by distinct decision site rather than by column, the false-positive picture
-is five underlying mistakes, not fifteen. Collapsing `null_group` to one finding per `GROUP BY` (and `inner_flatten` per
-lateral) would report the same hazards with far less apparent noise, and is the first calibration recommendation.
+### The one remaining precision gap
 
-### The three precision gaps
-
-**1. `inner_flatten_row_drop` does not clear a provably non-empty array in the `explode`/`flatten` spellings.**
-`active_moderators_monthly` builds a dense category grid with the standard idiom
-`LATERAL VIEW EXPLODE(ARRAY('mobile', 'other'))` and `LATERAL VIEW EXPLODE(SEQUENCE(...))`. A literal array with constant
-elements, and a bounded sequence, cannot be empty or NULL, so the flatten drops no row. dblect already knows this: it has
-`array_literal_nonempty` and `generator_provably_nonempty` in `sql/vocab.py`, and they silence the equivalent
-`UNNEST(ARRAY[...])`. The guard is not reached for Spark `explode` or Snowflake `flatten`: `_unnest_arg_provably_nonempty`
-in `sql/patterns.py` returns early for anything that is not `exp.Unnest`, and the Spark `LATERAL VIEW` branch runs no
-non-emptiness check at all (only the outer-form check). So the same provably-safe array reads as safe under `UNNEST` and
-as a hazard under `explode`. The four true positives in `signal_driven_handling_bad_faith_accounts`
-(`EXPLODE(r.users_in_case)`) are genuine, because a column array can be empty; the fix is to run the existing
-non-emptiness vocabulary on the `explode`/`flatten` argument, not to weaken the detector.
-
-**2. `where_on_outer_joined_nullable` does not recognise a `COALESCE(<predicate>, TRUE)` null-guard.**
-`base_moderator_actions_reverts` excludes self-reverts with `COALESCE(reverted.event_user_text != r.event_user_text,
-TRUE)`. When the outer join misses, the inner comparison is NULL and the `COALESCE` returns TRUE, so the unmatched row is
-kept, which is exactly the inversion the detector warns about being avoided. The detector reads the bare inner comparison
-and misses the enclosing `COALESCE` default. Recognising `COALESCE(pred, TRUE)` as a guard (the dual of the
-`COALESCE(pred, FALSE)` and `IS NULL` guards the nullability work already catalogs) clears it.
-
-**3. `null_group_after_outer_join` over-fires on a FULL JOIN whose sides share lineage, and on guarded groupings.**
-The nine false positives are one `FULL JOIN` where the right relation is built entirely from the left
-(`user_status_monthly` derives from `get_actor_names`), so the flagged `a.*` columns are the effectively-preserved
-identity side and never collapse for a real actor. The intended cases nearby carry a visible guard the detector could
-read: a co-grouped identity key (`base_moderator_actions_checkuser` groups by `cul_user_text` alongside the nullable
-`event_user_id`, so the NULL bucket cannot mix unrelated users) or a `COALESCE(ua.compliance_level, 'not_applicable')`
-that turns the unmatched rows into a meaningful bucket. The clean separation is the one true positive,
-`base_moderator_actions_logging:170`, which groups by the nullable `event_user_id` with no co-grouped identity key. This
-gap is deeper than the first two: distinguishing a derived-side FULL JOIN needs lineage, and the co-grouped-key heuristic
-needs care, so the near-term win here is the multiplicity fix above, which drops the nine to one.
+`null_group_after_outer_join` is where the residual noise concentrates, and it is the deeper gap the first pass already
+named. Of Wikimedia's five, one is the clean true positive (`base_moderator_actions_logging`, grouping by the nullable
+`event_user_id` with no co-grouped identity key). The rest are over-fires a lineage-aware guard would clear: a co-grouped
+identity key that pins the bucket (`base_moderator_actions_checkuser` groups by `cul_user_text` alongside the nullable
+`event_user_id`), an effectively-preserved identity side of a derived-side join, and groupings on boolean flags whose
+unmatched bucket is meaningful. Distinguishing these needs the grouped key's lineage and functional dependencies, not a
+structural read alone, so it is the substantive follow-up this detector still carries.
 
 ## Determination
 
-**1. The detectors are sound in their core judgement, and the noise is bounded and diagnosable.** On the DuckDB corpus
-(88 models) there were no false positives at all. Scaling to Spark surfaced fifteen, and every one traces to a specific,
-fixable cause: three precision gaps and per-column finding multiplicity, not a detector reasoning about SQL incorrectly
-at its core. The broad-net, false-positive-tolerant posture the structural layer documents holds, and the `-- noqa` and
-contract quieting paths carry the intended cases.
+**1. The detectors are sound in their core judgement, and the residual noise is bounded and diagnosable.** The
+re-run DuckDB corpus carries no false positives, and Spark's earlier noise traced to specific, fixable causes rather than
+a detector reasoning about SQL incorrectly. The idiom-level and multiplicity causes are now fixed; what remains is the
+one `null_group` guarded-grouping gap above. The broad-net, false-positive-tolerant posture the structural layer
+documents holds, and the `-- noqa` and contract quieting paths carry the intended cases.
 
 **2. `join_fanout` (and `cross_model_fanout`) default to `warn` (done in this pass).** It is the highest-volume detector
 after `null_group` and its findings are dominated by two safe idioms: fact-to-dimension joins on a surrogate key that is
@@ -134,17 +120,17 @@ column is functionally determined by the join columns through a canonical primar
 fails CI on the most common join in dimensional modelling. It stays valuable at `warn`: it caught the one real fan-out in
 the corpus, `retained_newcomers` joining on an unstable `user_name` that does not determine `reg_ts`. **This is a
 temporary demotion.** The real fix is to ground uniqueness through the surrogate-key expression and through the canonical
-FD; when the lenient/strict split (#116) lands it must raise the fan-out pair back to `error` in the strict profile, so
-the interim `warn` does not become the permanent default.
+FD; when the lenient/strict split ([#116](https://github.com/dvryaboy/dblect/issues/116)) lands it must raise the
+fan-out pair back to `error` in the strict profile, so the interim `warn` does not become the permanent default.
 
-**3. Two precision fixes are worth doing before relying on the `error` defaults of these detectors.** The
-`inner_flatten_row_drop` explode/flatten non-emptiness gap (five false positives, `error` severity, the fix reuses
-existing vocabulary) and the `where_on_outer_joined_nullable` `COALESCE(pred, TRUE)` guard (one false positive) are both
-bounded and low-risk. Until they land, both detectors carry a known false-positive idiom at `error`.
+**3. The idiom precision fixes landed.** `inner_flatten_row_drop` now clears a provably non-empty array in every flatten
+spelling, and `where_on_outer_joined_nullable` recognises the `COALESCE(pred, TRUE)` guard
+([#210](https://github.com/dvryaboy/dblect/pull/210)), so both detectors can be relied on at `error` without a known
+false-positive idiom.
 
-**4. Collapse per-column emission to per-site.** `null_group_after_outer_join` and `inner_flatten_row_drop` should report
-one finding per `GROUP BY` / per lateral. This alone turns the corpus's 15 false positives into 5 and makes the
-false-positive rate legible.
+**4. Per-site emission landed.** `null_group_after_outer_join` reports one finding per `GROUP BY` clause
+([#211](https://github.com/dvryaboy/dblect/pull/211)), so a single grouping decision is one finding. `inner_flatten`
+stays one finding per lateral, since each arm is a distinct location with its own inner-vs-outer fix.
 
 **5. The already-advisory detectors are confirmed.** `non_deterministic_function` at `warn` is confirmed by the
 `nba-monte-carlo` `RAND()`-in-a-simulation case; `unordered_aggregate` at `warn` by Wikimedia's `ARRAY_AGG` with no
@@ -153,35 +139,38 @@ retail) stay at `error`.
 
 ## Coverage and robustness
 
-Resolution coverage is full on the small DuckDB projects and holds up at scale (95% on 63 models). The places it drops
-are informative, and none is a parse defect on a SQL model:
+Resolution coverage is full on the small DuckDB projects and holds up at scale (95% on 63 models). The Spark
+struct-field lineage gap is closed, and the remaining drops are informative source-column blindness, none a parse defect
+on a SQL model:
 
-- **`wikimedia` at 73%, with 11 unbuilt models.** All eleven fail column-lineage qualification with `Unknown column:
-  platform` / `Unknown column: project_family`, and all use the Spark `EXPLODE(ARRAY(STRUCT('mobile app' AS platform),
-  ...))` idiom: the qualifier does not resolve a struct field introduced by an `explode` of an array of structs. The
-  structural detectors still run on these models' ASTs (several of the findings above come from unbuilt models); it is
-  the column lineage that goes blind. This is a concrete Spark lineage-robustness gap.
+- **`wikimedia` at 76%, with 0 unbuilt models (was 73% and 11).** Every one of the eleven previously-unbuilt models used
+  the Spark `INLINE(ARRAY(STRUCT('mobile app' AS platform), ...))` category-grid idiom, whose struct fields sqlglot's
+  qualify collapses to a single `_col_0`, so downstream references to `platform` / `project_family` fell blind or raised
+  `Unknown column`. Expanding the generator to its named field columns before qualify
+  ([#212](https://github.com/dvryaboy/dblect/pull/212)) resolves them, and the eleven now build.
 - **`dutch_railway` at 71%** is source-column blindness: the project reads external DuckDB sources and no `catalog.json`
   was generated for the run, so undocumented source leaves do not resolve. `dbt docs generate` (or `--catalog`) lifts it.
   Zero models were unbuilt.
 - **`snowflake_spend` at 84%** is `SELECT *` off sources with no catalog, the same source-leaf blindness.
 - **`nba-monte-carlo`'s 4 unbuilt models** are dbt **Python** models (`.py`), reported as `model has no parsed SQL`, which
   reads the same as a genuine parse failure. Distinguishing "Python model, out of the SQL analyser's scope" from "SQL
-  that failed to parse" is tracked in #138.
+  that failed to parse" is tracked in [#138](https://github.com/dvryaboy/dblect/issues/138).
 
 No SQL model failed to parse anywhere in the corpus, across all three dialects. Snowflake (`DATE_TRUNC`, `DATEDIFF`,
-`::` casts) and Spark (`LATERAL VIEW`, `EXPLODE`, `SEQUENCE`) SQL parsed under the forced `--dialect`.
+`::` casts) and Spark (`LATERAL VIEW`, `EXPLODE`, `SEQUENCE`, `INLINE`) SQL parsed under the forced `--dialect`.
 
-## Follow-ups this pass opens
+## Follow-ups still open
 
-- Fix `inner_flatten_row_drop` to clear a provably non-empty array in the `explode`/`flatten` spellings, reusing
-  `array_literal_nonempty` / `generator_provably_nonempty` (5 false positives).
-- Fix `where_on_outer_joined_nullable` to recognise `COALESCE(pred, TRUE)` as a null-guard (1 false positive).
-- Collapse `null_group_after_outer_join` and `inner_flatten_row_drop` to one finding per decision site.
+- Ground `null_group_after_outer_join` through the grouped key's lineage and functional dependencies, so a co-grouped
+  identity key, a derived-side join, and a meaningful-bucket grouping clear rather than over-fire (the residual gap above).
 - Ground `join_fanout` uniqueness through the surrogate-key expression and the canonical functional dependency; extends
-  #197.
-- The lenient/strict split (#116) must raise the fan-out pair back to `error` in the strict profile, undoing the interim
-  `warn` this pass applied.
-- Spark column-lineage for `EXPLODE(ARRAY(STRUCT(...)))` struct fields (11 Wikimedia models go lineage-blind).
-- Distinguish Python models from parse failures in the unbuilt report (#138).
+  [#197](https://github.com/dvryaboy/dblect/pull/197). The lenient/strict split
+  ([#116](https://github.com/dvryaboy/dblect/issues/116)) then raises the fan-out pair back to `error` in the strict
+  profile, undoing the interim `warn` this pass applied.
+- Distinguish Python models from parse failures in the unbuilt report ([#138](https://github.com/dvryaboy/dblect/issues/138)).
 - A Snowflake corpus entry with real scale (GitLab `analytics` or similar) once credentials are available.
+
+Landed since this pass opened: the flatten and `WHERE` idiom fixes
+([#210](https://github.com/dvryaboy/dblect/pull/210)), the per-site finding collapse
+([#211](https://github.com/dvryaboy/dblect/pull/211)), and the Spark struct-field lineage fix
+([#212](https://github.com/dvryaboy/dblect/pull/212)).
