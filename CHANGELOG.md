@@ -13,17 +13,23 @@ The first published release: the base-world static analyzer, packaged for
 `pip install dblect`. It reads a compiled dbt manifest, propagates column-level
 facts through the DAG, and reports structural and declaration-level findings the
 user can navigate to and act on. No execution and no LLM are required. The
-runtime half (property-based execution, replay-determinism) and the
-flag/var-world analysis are deferred to later releases.
+default severities ship calibrated against a corpus of real projects across
+DuckDB, Snowflake, and Spark. The runtime half (property-based execution,
+replay-determinism) and the flag/var-world analysis are deferred to later
+releases.
 
 ### Added
 
 **Manifest and SQL ingestion**
 
 - Typed dbt manifest ingestion: `Manifest`, `Node`, and a `Dag` with topology,
-  parsed from `manifest.json`.
+  parsed from `manifest.json`. Reads manifests written by dbt 1.8 through
+  1.11.7.
 - Analysis over each model's compiled SQL (not the raw Jinja), parsed once per
-  run and shared across detectors via a sqlglot wrapper.
+  run and shared across detectors via a sqlglot wrapper. Multi-statement models
+  parse into their component statements, and a compiled artifact that has gone
+  stale against its source is surfaced as a coverage miss rather than analyzed
+  silently.
 - `catalog.json` ingestion for seed and source columns, so undocumented DAG
   leaves resolve.
 - Source-Jinja front end that discovers `var` and `env_var` references, and a
@@ -41,7 +47,7 @@ flag/var-world analysis are deferred to later releases.
   across relations and at intra-model scopes.
 - Nested-field (STRUCT) lineage with explicit `UNNEST` grain.
 
-**Uniqueness analysis**
+**Uniqueness and determinism analysis**
 
 - Uniqueness facts from dbt declarations and from structural proof, an
   ordering-key detector and a join-fan-out detector over substrate keys, and
@@ -49,6 +55,9 @@ flag/var-world analysis are deferred to later releases.
   dependencies.
 - Candidate keys derived through surrogate-hash columns; seeds and snapshots
   spanned as test targets.
+- Determinism detectors for a materialized model whose row set depends on an
+  arbitrary slice: a non-deterministic top-level `LIMIT`, and an `ORDER BY` that
+  does not fully order the rows it feeds a top-n cut.
 
 **Domain-type contracts (the declaration DSL)**
 
@@ -62,6 +71,16 @@ flag/var-world analysis are deferred to later releases.
   signals).
 - A config discoverer that grounds an incremental model's `unique_key`, and
   fact-level flag-world plumbing.
+- Aggregate behavior as a first-class combine/select/count classification
+  (`dblect.sql.aggregates`), keyed on the sqlglot node type so it covers every
+  dialect at once. It is the single source of truth for both arming the
+  coherence guard and phrasing the `aggregation_not_well_typed` finding, which
+  names the aggregate, the column it reduced, the per-row companion left
+  varying, and the grouping that failed to hold it. `count`, `count_if`, and
+  `approx_count_distinct` over a typed magnitude are row counts and stay quiet;
+  `stddev`, `variance`, `kurtosis`, `skewness`, `median`, `mode`, and the
+  quantile/percentile family flag a mixed-currency reduction; `min`/`max` widen
+  their result tag on a varying companion under the lenient default (#115).
 - Wider scalar field types in the classifier: `float` / `Float` as a magnitude,
   `Timestamp` / `datetime` as inert siblings of `Date`, and a bare integer
   (`int` / `Integer` / `BigInt`) accepted as opaque (inert) under the lenient
@@ -69,17 +88,13 @@ flag/var-world analysis are deferred to later releases.
 
 **Structural hazard detectors**
 
-- Structural detectors over every model: outer-join `WHERE` inversion,
-  non-determinism, the NULL-group-after-outer-join family (`GROUP BY`, join
-  key, `NOT IN`), and snapshot reads missing a temporal filter.
-- Source-line provenance on every finding, and SQLFluff-compatible `-- noqa`
-  suppression. A bare `-- noqa` silences every dblect finding on its line; a
-  `-- noqa: DBLECT_<KIND>` directive silences one detector, and codes without the
-  `DBLECT_` prefix are left for `dbt lint` so one comment can address both tools.
-  This replaces the earlier bespoke `-- noqa-fixture:` syntax: dblect no longer owns
-  the suppression grammar, so it coexists with dbt Fusion's `dbt lint` rather than
-  competing with it. Every suppression is still logged in the report's `suppressed:`
-  section.
+- The outer-join cluster under one effect x consumer x guard framing: `WHERE`
+  inversion, the NULL-group-after-outer-join family (`GROUP BY`, join key,
+  `NOT IN`), and a cross-model fan-out inflation detector with a symmetric
+  join-key rule.
+- Non-determinism detection, and snapshot reads missing a temporal filter.
+- An upstream `not_null` test recommendation on `join_on_nullable_key`, naming
+  why the key is nullable so the fix is actionable at its source.
 
 **Cross-world analysis**
 
@@ -92,43 +107,62 @@ flag/var-world analysis are deferred to later releases.
 - Coverage reporting that separates resolution (lineage the propagator could
   follow) from grounding (columns a fact actually checks).
 
-**CLI and reporting**
+**CLI**
 
-- The `dblect` CLI: `check` runs both detector families over a project, `init`
-  scaffolds the declaration tree and writes model stubs, `version` prints the
+- `check` runs both detector families over a project, `init` scaffolds the
+  declaration tree and writes model stubs (from `catalog.json` columns when it
+  is present), `setup` installs the AI-assistant skill, and `version` prints the
   installed version.
-- Text and JSON reporters under one versioned schema, with a non-zero exit on
-  unsuppressed findings and a `--no-fail` override. Status messages go to
-  stderr so stdout is a clean report.
-- A validated-adapter gate, with `--dialect` as the operator's opt-in
-  acknowledgment that detector behavior is best-effort off the validated set.
-- A library of demo scenarios: developer-introduced bugs that `dblect check`
-  catches.
+- Manifest resolution that honors dbt's `target-path`, auto-discovers
+  `target/manifest.json`, and falls back to running `dbt compile`, with
+  actionable errors when neither a project nor a manifest is present and when
+  dbt is not on `PATH`.
+- `--base-manifest` reports only the findings a change introduces, by
+  differencing the run against a base revision's manifest.
+- Per-finding severity with a `--fail-on` threshold (default `warn`) driving the
+  exit code, and a `--no-fail` override. A validated-adapter gate with
+  `--dialect` as the operator's opt-in acknowledgment that detector behavior is
+  best-effort off the validated set.
+
+**Reporting and suppression**
+
+- Text and JSON reporters under one versioned schema, plus SARIF 2.1.0 output
+  for GitHub code scanning and similar surfaces. Status messages go to stderr so
+  stdout is a clean report.
+- A stable issue code on every finding, surfaced in the text and SARIF output.
+- Compiled-SQL line spans back-mapped to their source positions, and
+  macro-emitted findings anchored to the macro call site so a `-- noqa` there
+  suppresses them.
+- SQLFluff-compatible `-- noqa` suppression. A bare `-- noqa` silences every
+  dblect finding on its line; a `-- noqa: DBLECT_<KIND>` directive silences one
+  detector, and codes without the `DBLECT_` prefix are left for `dbt lint` so
+  one comment can address both tools. dblect does not own the suppression
+  grammar, so it coexists with dbt Fusion's `dbt lint`. A macro body's own
+  `-- noqa` is honored through a compiled-frame directive scan, and every
+  suppression is logged in the report's `suppressed:` section.
+
+**Adapters**
+
+- One `AdapterProfile` per warehouse behind a registry, gathering the
+  dialect-specific facets the detectors need. DuckDB and BigQuery are validated
+  end to end; profiles also ship for Postgres, Redshift, and Snowflake, reachable
+  through `--dialect`.
+
+**AI-assistant integration**
+
+- The `dblect:bootstrap` skill and `dblect setup`, which install a
+  drift-guarded, built-surface-only skill so an assistant can author
+  declarations against the real API.
 
 **Execution harness**
 
 - A DuckDB execution harness that runs dbt models via subprocess with fixture
   overrides, the substrate the runtime layers will build on.
 
-### Changed
+**Demo scenarios**
 
-- `aggregation_not_well_typed` findings now name what the coherence guard
-  reasoned about: the aggregate and the column it reduced, the per-row companion
-  that is not held constant, and the grouping that fails to hold it, instead of
-  a generic message (#109).
-- Aggregate behavior is now a first-class combine/select/count classification
-  (`dblect.sql.aggregates`), the single source of truth for both arming the
-  coherence guard and the not-well-typed finding. Keying on the sqlglot node type
-  covers every dialect at once; `min`/`max` are classified as selecting aggregates
-  and widen their result tag to top on a varying companion under the lenient
-  default (#115).
-
-### Fixed
-
-- `count` (and `count_if`, `approx_count_distinct`) over a typed magnitude no
-  longer raises a spurious `aggregation_not_well_typed` finding. Conversely,
-  `stddev`, `variance`, `kurtosis`, `skewness`, `median`, `mode`, and the
-  quantile/percentile family now correctly flag a mixed-currency reduction (#115).
+- A library of demo scenarios: developer-introduced bugs that `dblect check`
+  catches.
 
 [Unreleased]: https://github.com/dvryaboy/dblect/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/dvryaboy/dblect/releases/tag/v0.1.0
