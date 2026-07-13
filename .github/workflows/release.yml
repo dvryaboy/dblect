@@ -1,0 +1,47 @@
+name: release
+
+# Publishes to PyPI when a v* tag is pushed. The wheel and sdist are built on a
+# clean runner from the tagged commit, and upload uses PyPI Trusted Publishing
+# (OIDC): no API token is stored anywhere. The `pypi` environment matches the
+# trusted-publisher registration on PyPI and is the place to add a manual
+# approval gate if one is ever wanted.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dblect
+    permissions:
+      id-token: write # required for OIDC; this is what authorizes the upload
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Guard tag against the packaged version
+        # The tag drives the release, but the wheel's version comes from
+        # _version.py via hatchling. If they disagree the upload would ship a
+        # surprise, so require the built wheel to carry the tag's version and
+        # fail loudly before publishing a mismatch.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if [ ! -f "dist/dblect-${tag}-py3-none-any.whl" ]; then
+            echo "tag ${GITHUB_REF_NAME} has no matching wheel; built:" >&2
+            ls dist >&2
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
