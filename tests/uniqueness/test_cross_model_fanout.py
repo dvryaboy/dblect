@@ -282,3 +282,61 @@ def test_sum_grouped_to_unique_bucket_is_silent() -> None:
     )
     manifest = _shop(items_unique_on="item_id", mart_sql=mart_sql)
     assert _findings(manifest, _MART) == ()
+
+
+# --- acceptance: a window-deduped dimension key reaches the cross-model consumer -----------
+#
+# The end-to-end payoff of deriving a key from ``QUALIFY ROW_NUMBER() = 1``. A dimension is
+# deduped to one row per key by the window idiom, so a staging model joining to it on that key
+# cannot fan out and stays keyed at the order grain; the downstream ``SUM(amount)`` then reads
+# one row per order and does not double count. The derived key flows through the join
+# preservation rule into the consumer's grain check. Swapping ``ROW_NUMBER`` for ``RANK``
+# removes the key (ties break it), the join can fan out, and the same ``SUM`` fires: the
+# derived key is exactly what clears the finding.
+
+_REGIONS = "source.shop.raw.regions"
+_DIM = "model.shop.dim_region_latest"
+_STG_ORDERS = "model.shop.stg_orders"
+_REV = "model.shop.region_revenue"
+
+_STG_ORDERS_SQL = (
+    "SELECT o.order_id, o.amount, d.region "
+    "FROM orders o JOIN dim_region_latest d ON o.region_id = d.region_id"
+)
+_REV_SQL = "SELECT order_id, SUM(amount) AS total FROM stg_orders GROUP BY order_id"
+
+
+def _dim_sql(rank_fn: str) -> str:
+    return (
+        f"SELECT region_id, region FROM regions "
+        f"QUALIFY {rank_fn}() OVER (PARTITION BY region_id ORDER BY region) = 1"
+    )
+
+
+def _revenue_manifest(rank_fn: str) -> Manifest:
+    nodes = [
+        _source(_ORDERS),
+        _unique("test.shop.orders_pk", column="order_id", target=_ORDERS),
+        _source(_REGIONS),  # regions carries no declared key: only the dedup can prove one
+        _model(_DIM, _dim_sql(rank_fn)),
+        _model(_STG_ORDERS, _STG_ORDERS_SQL),
+        _model(_REV, _REV_SQL),
+    ]
+    return Manifest(
+        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+    )
+
+
+def test_row_number_deduped_dimension_clears_the_cross_model_fanout() -> None:
+    """``ROW_NUMBER() = 1`` proves ``dim_region_latest`` unique on ``region_id``, so the join is
+    one-to-one, staging stays keyed on ``order_id``, and ``SUM(amount)`` reads one row per order.
+    The finding clears only because the window dedup grounded the dimension's key."""
+    assert _findings(_revenue_manifest("ROW_NUMBER"), _REV) == ()
+
+
+def test_rank_deduped_dimension_leaves_the_cross_model_fanout() -> None:
+    """The contrast that pins it: with ``RANK`` the dimension proves no key (ties keep several
+    rows per ``region_id``), the join can fan out, staging loses the order grain, and the same
+    ``SUM(amount)`` double counts. Same shape, no derived key, the finding stands."""
+    findings = _revenue_manifest("RANK")
+    assert [f.kind for f in _findings(findings, _REV)] == [FindingKind.CROSS_MODEL_FANOUT]

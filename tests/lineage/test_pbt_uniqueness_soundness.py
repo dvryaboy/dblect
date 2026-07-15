@@ -159,13 +159,14 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    shape: str  # filter | inner_join | left_join | group_by | distinct
+    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify
     select_cols: tuple[str, ...]
     left_join_col: str | None = None
     right_join_col: str | None = None
     filter_col: str | None = None
     filter_threshold: int | None = None
     group_cols: tuple[str, ...] | None = None
+    partition_cols: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -202,11 +203,21 @@ def _rows(draw: st.DrawFn, source: SourceSpec) -> tuple[tuple[int, ...], ...]:
 
 @st.composite
 def _scenario(draw: st.DrawFn) -> Scenario:
-    shape = draw(st.sampled_from(("filter", "inner_join", "left_join", "group_by", "distinct")))
+    shape = draw(
+        st.sampled_from(("filter", "inner_join", "left_join", "group_by", "distinct", "qualify"))
+    )
     is_join = shape in ("inner_join", "left_join")
     sources = (_S0, _S1) if is_join else (_S0,)
 
-    if is_join:
+    if shape == "qualify":
+        # Dedup s0 to one row per partition subset; the derived key is that subset.
+        part = tuple(
+            sorted(
+                draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True))
+            )
+        )
+        model = ModelSpec(shape=shape, select_cols=_S0.columns, partition_cols=part)
+    elif is_join:
         model = ModelSpec(
             shape=shape,
             select_cols=("k0", "a1"),
@@ -242,6 +253,13 @@ def _scenario_sql(m: ModelSpec) -> str:
         )
     if m.shape == "filter":
         return f"SELECT k0, a0 FROM s0 WHERE {m.filter_col} >= {m.filter_threshold}"
+    if m.shape == "qualify":
+        assert m.partition_cols is not None
+        cols = ", ".join(m.select_cols)
+        part = ", ".join(m.partition_cols)
+        return (
+            f"SELECT {cols} FROM s0 QUALIFY ROW_NUMBER() OVER (PARTITION BY {part} ORDER BY k0) = 1"
+        )
     assert m.group_cols is not None
     cols = ", ".join(m.group_cols)
     if m.shape == "group_by":
