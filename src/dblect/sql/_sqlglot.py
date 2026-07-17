@@ -130,6 +130,36 @@ def fn_of(w: exp.Window) -> Expr | None:
     return cast("Expr | None", w.this)
 
 
+def row_number_window(node: Expr) -> exp.Window | None:
+    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` grounds
+    a dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row, whereas
+    ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.RowNumber):
+        return node
+    return None
+
+
+def _is_literal_one(node: Expr) -> bool:
+    return isinstance(node, exp.Literal) and not node.args.get("is_string") and node.this == "1"
+
+
+def rank_one_guard_operand(leaf: Expr) -> Expr | None:
+    """The operand a ``= 1`` / ``<= 1`` dedup guard constrains to the top rank, or ``None``.
+    Recognises ``X = 1``, ``1 = X``, ``X <= 1`` and ``1 >= X`` with a literal integer ``1`` (a
+    row number is ``>= 1``, so ``<= 1`` coincides with ``= 1``). Any other comparison keeps more
+    than the top row and grounds no key. ``X`` is returned unevaluated for the caller to test."""
+    if isinstance(leaf, exp.EQ):
+        if _is_literal_one(leaf.expression):
+            return leaf.this
+        if _is_literal_one(leaf.this):
+            return leaf.expression
+    elif isinstance(leaf, exp.LTE) and _is_literal_one(leaf.expression):
+        return leaf.this  # X <= 1
+    elif isinstance(leaf, exp.GTE) and _is_literal_one(leaf.this):
+        return leaf.expression  # 1 >= X
+    return None
+
+
 def window_output_alias(w: exp.Window) -> str | None:
     """The SELECT-list alias a window is projected under (``rn`` in ``row_number() ... as rn``).
 
@@ -322,7 +352,7 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
     "can't simplify to a clean join-key" and conservatively skip.
     """
     cols: set[str] = set()
-    for leaf in _conjunctive_leaves(predicate):
+    for leaf in conjunctive_leaves(predicate):
         if not isinstance(leaf, exp.EQ):
             return None
         left = leaf.this
@@ -350,7 +380,7 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
     An alias maps to its columns only when it appears exactly once in every conjunct, the rule
     :func:`equality_cols_on_alias` enforces; aliases that fail it are simply absent.
     """
-    leaves = _conjunctive_leaves(predicate)
+    leaves = conjunctive_leaves(predicate)
     sides: list[tuple[tuple[str | None, str], tuple[str | None, str]]] = []
     for leaf in leaves:
         if not isinstance(leaf, exp.EQ):
@@ -381,7 +411,7 @@ def equality_literal_columns(predicate: Expr) -> tuple[exp.Column, ...]:
     conjunct does not poison the rest: each pin stands on its own conjunct).
     """
     out: list[exp.Column] = []
-    for leaf in _conjunctive_leaves(predicate):
+    for leaf in conjunctive_leaves(predicate):
         if not isinstance(leaf, exp.EQ):
             continue
         sides = (leaf.this, leaf.expression)
@@ -405,7 +435,7 @@ def equality_column_pairs(predicate: Expr) -> tuple[tuple[exp.Column, exp.Column
     for the literal-pin case. Non-equality and non-column leaves are skipped, each pair
     standing on its own conjunct."""
     out: list[tuple[exp.Column, exp.Column]] = []
-    for leaf in _conjunctive_leaves(predicate):
+    for leaf in conjunctive_leaves(predicate):
         if not isinstance(leaf, exp.EQ):
             continue
         left, right = leaf.this, leaf.expression
@@ -419,10 +449,10 @@ def equality_column_pairs(predicate: Expr) -> tuple[tuple[exp.Column, exp.Column
     return tuple(out)
 
 
-def _conjunctive_leaves(predicate: Expr) -> list[Expr]:
+def conjunctive_leaves(predicate: Expr) -> list[Expr]:
     """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
     if isinstance(predicate, exp.And):
-        return [*_conjunctive_leaves(predicate.this), *_conjunctive_leaves(predicate.expression)]
+        return [*conjunctive_leaves(predicate.this), *conjunctive_leaves(predicate.expression)]
     return [predicate]
 
 
