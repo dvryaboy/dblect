@@ -56,7 +56,7 @@ from dblect.lineage.facts.property import (
 )
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
-from dblect.lineage.properties.nullability import OuterJoinNull
+from dblect.lineage.properties.nullability import OUTER_JOIN_NULL_META
 from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
 
@@ -495,7 +495,6 @@ def _outer_join_null_rule(
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
     exp.Dot: _dot_rule,
-    OuterJoinNull: _outer_join_null_rule,
     exp.Add: _additive_rule,
     exp.Sub: _additive_rule,
     exp.Mul: _multiplicative_rule(_multiply_tags),
@@ -704,6 +703,7 @@ def domain_type_property(
         operators=DOMAIN_TYPE_OPERATORS,
         aggregates=_aggregate_rules(guard=guard),
         ground=ground,
+        column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
         display=domain_type_display,
         depends_on=() if fd is None else (fd,),
     )

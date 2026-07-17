@@ -30,11 +30,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from functools import reduce
-from typing import Any, ClassVar, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
-from sqlglot.expressions.core import Expression
 
 from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
@@ -55,8 +54,10 @@ from dblect.lineage.graph import (
     AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
+    Derivation,
     LineageView,
     SourceRef,
+    UnionConfluence,
     aggregation_site_meta,
 )
 
@@ -66,22 +67,6 @@ S = TypeVar("S", ColumnRef, SourceRef)
 # Key on ``Expr.meta`` where the builder records the single ``ColumnRef`` an
 # ``exp.Column`` resolves to. Centralised so builder and propagator stay in sync.
 COLUMNREF_META_KEY = "dblect_columnref"
-
-
-class UnionConfluence(Expression):
-    """Synthetic confluence node for a ``UNION ALL`` combined output column.
-
-    Carries the per-arm ``ColumnRef``s on the instance so the propagator can fold
-    them directly. Distinct from ``exp.Union`` (and not an ``exp.Column``), so
-    qualifier passes and column resolution can never misread it as a real
-    reference.
-    """
-
-    arg_types: ClassVar[dict[str, bool]] = {}
-
-    def __init__(self, arm_refs: tuple[ColumnRef, ...] = ()) -> None:
-        super().__init__()
-        self.arm_refs: tuple[ColumnRef, ...] = arm_refs
 
 
 class _NullDepContext:
@@ -234,7 +219,7 @@ def _reconcile(
 
 
 def _column_reduce(
-    expr: Expr,
+    expr: Derivation,
     prop: Property[K, Any],
     annotate: Callable[[ColumnRef], Annotation[K]],
     dep_context: DepContext,
@@ -265,7 +250,14 @@ def _column_reduce(
 
     if isinstance(expr, exp.Column):
         ref = _column_ref_meta(expr)
-        return annotate(ref) if ref is not None else default_ann
+        base = annotate(ref) if ref is not None else default_ann
+        # A column may carry a ``.meta`` taint flag (the outer-join-null marker) that
+        # adjusts its annotation in place, standing in for a wrapper node the compiled
+        # sqlglot build could not instantiate. Each matching transfer folds over the base.
+        for meta_key, transfer in prop.column_meta.items():
+            if expr.meta.get(meta_key):
+                base = transfer(expr, (base,), dep_context)
+        return base
 
     if isinstance(expr, UnionConfluence):
         if not expr.arm_refs:

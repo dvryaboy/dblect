@@ -9,8 +9,10 @@ and the guard.
 
 from __future__ import annotations
 
+import pytest
 import sqlglot
 import sqlglot.expressions as exp
+import sqlglot.parser
 
 from dblect.sql import (
     AggregateBehavior,
@@ -18,6 +20,11 @@ from dblect.sql import (
     duplicate_sensitive,
     strips_duplicates,
 )
+
+# sqlglot's compiled build (sqlglotc) forbids instantiating an interpreted subclass of a
+# compiled class, so the one test that defines a throwaway aggregate subclass is skipped
+# there. The MRO-walk logic it exercises is pure-Python dblect code, identical either way.
+_COMPILED_SQLGLOT = sqlglot.parser.__file__.endswith((".so", ".pyd"))
 
 
 def _agg(call: str) -> exp.AggFunc:
@@ -69,6 +76,11 @@ def test_no_magnitude_obligation_families_are_unclassified() -> None:
         assert aggregate_behavior(_agg(call)) is None, call
 
 
+@pytest.mark.skipif(
+    _COMPILED_SQLGLOT,
+    reason="defines an interpreted subclass of a compiled sqlglot class; the MRO-walk "
+    "logic under test is build-independent and covered on pure sqlglot",
+)
 def test_lookup_walks_the_mro() -> None:
     # A subclass of a classified aggregate inherits its behavior, matching the
     # propagator's own MRO-based aggregate dispatch.

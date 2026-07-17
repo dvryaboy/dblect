@@ -78,6 +78,12 @@ class DepContext(Protocol):
 OperatorTransfer = Callable[[Expr, tuple[Annotation[K], ...], DepContext], Annotation[K]]
 
 
+def _empty_column_meta() -> dict[str, OperatorTransfer[Any]]:
+    """Typed default factory for ``Property.column_meta`` (a bare ``dict`` default is
+    disallowed on a dataclass field, and an untyped factory leaves its type unknown)."""
+    return {}
+
+
 F = TypeVar("F")
 
 
@@ -200,6 +206,15 @@ class Property(Generic[K, S]):
     operators: Mapping[type[Expr], OperatorTransfer[K]]
     aggregates: Mapping[type[exp.AggFunc], AggregateRule[K]]
     ground: Callable[[S], Annotation[K]]
+    column_meta: Mapping[str, OperatorTransfer[K]] = field(default_factory=_empty_column_meta)
+    """Transfers keyed by a ``.meta`` flag on an ``exp.Column`` rather than by node type.
+
+    When the column reducer meets a column carrying the flag, it applies the transfer to
+    that column's annotation (passed as the sole child). This is how the outer-join-null
+    taint rides the graph: the taint stamps optional-side columns rather than wrapping
+    them in a marker node, since a marker node would be an ``Expression`` subclass, which
+    sqlglot's compiled build cannot instantiate."""
+
     semiring: Semiring[K] | None = None
     display: Callable[[K], AxisDisplay] | None = None
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
@@ -267,7 +282,10 @@ class Property(Generic[K, S]):
 # typed.
 Reducer = Callable[
     [
-        Expr,
+        # A derivation: a sqlglot ``Expr`` for most nodes, or a synthetic
+        # ``UnionConfluence`` for a UNION ALL combined output. Erased to ``Any``
+        # here because the propagator dispatches the reducer dynamically per scope.
+        Any,
         Property[Any, Any],
         Callable[[Any], Annotation[Any]],
         DepContext,
@@ -285,6 +303,7 @@ def column_property(
     operators: Mapping[type[Expr], OperatorTransfer[K]],
     aggregates: Mapping[type[exp.AggFunc], AggregateRule[K]],
     ground: Callable[[ColumnRef], Annotation[K]],
+    column_meta: Mapping[str, OperatorTransfer[K]] | None = None,
     semiring: Semiring[K] | None = None,
     display: Callable[[K], AxisDisplay] | None = None,
     depends_on: tuple[PropertyRef[Any, Any], ...] = (),
@@ -298,6 +317,7 @@ def column_property(
         operators=operators,
         aggregates=aggregates,
         ground=ground,
+        column_meta=column_meta or {},
         semiring=semiring,
         display=display,
         depends_on=depends_on,

@@ -52,7 +52,7 @@ class LineageView(Protocol[S]):
 
     def subjects(self) -> Iterable[S]: ...
 
-    def derivation(self, subject: S) -> Expr | None: ...
+    def derivation(self, subject: S) -> Derivation | None: ...
 
 
 class SourceKind(StrEnum):
@@ -113,6 +113,26 @@ class ColumnRef:
 
 
 @dataclass(frozen=True, slots=True)
+class UnionConfluence:
+    """A ``UNION ALL`` combined-output column's derivation: the per-arm ``ColumnRef``s
+    the propagator plus-folds.
+
+    It lives only as a value in :attr:`ColumnLineageGraph.expressions`, never inside a
+    sqlglot tree, and is read by an ``isinstance`` branch in the propagator. So it is a
+    plain dataclass rather than an ``exp.Expression`` subclass: the latter cannot be
+    instantiated under sqlglot's compiled build (mypyc rejects interpreted subclasses of
+    compiled classes).
+    """
+
+    arm_refs: tuple[ColumnRef, ...] = ()
+
+
+# A column's derivation is either the sqlglot projection expression that built it or,
+# for a UNION ALL combined output, the synthetic confluence of its arms.
+Derivation = Expr | UnionConfluence
+
+
+@dataclass(frozen=True, slots=True)
 class ColumnLineageGraph:
     """Per-audit column lineage assembled across the manifest DAG.
 
@@ -125,7 +145,7 @@ class ColumnLineageGraph:
     """
 
     edges: Mapping[ColumnRef, frozenset[ColumnRef]]
-    expressions: Mapping[ColumnRef, Expr]
+    expressions: Mapping[ColumnRef, Derivation]
 
     @staticmethod
     def empty() -> ColumnLineageGraph:
@@ -140,14 +160,14 @@ class ColumnLineageGraph:
             seen.setdefault(col, None)
         return tuple(seen)
 
-    def derivation(self, subject: ColumnRef) -> Expr | None:
+    def derivation(self, subject: ColumnRef) -> Derivation | None:
         """The projection expression that built ``subject``; ``None`` for a leaf."""
         return self.expressions.get(subject)
 
     @staticmethod
     def fold_into(
         edges: dict[ColumnRef, frozenset[ColumnRef]],
-        expressions: dict[ColumnRef, Expr],
+        expressions: dict[ColumnRef, Derivation],
         other: ColumnLineageGraph,
     ) -> None:
         """Fold ``other`` into the mutable ``edges``/``expressions`` accumulators in place: edges
@@ -168,7 +188,7 @@ class ColumnLineageGraph:
         exactly one model) but the rule keeps merge total.
         """
         merged_edges: dict[ColumnRef, frozenset[ColumnRef]] = dict(self.edges)
-        merged_exprs: dict[ColumnRef, Expr] = dict(self.expressions)
+        merged_exprs: dict[ColumnRef, Derivation] = dict(self.expressions)
         ColumnLineageGraph.fold_into(merged_edges, merged_exprs, other)
         return ColumnLineageGraph(edges=merged_edges, expressions=merged_exprs)
 

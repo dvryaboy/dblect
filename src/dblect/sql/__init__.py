@@ -7,11 +7,6 @@ from dblect.sql.aggregates import (
     duplicate_sensitive,
     strips_duplicates,
 )
-from dblect.sql.compat import (
-    SqlglotCompatibilityError,
-    ensure_pure_sqlglot,
-    sqlglot_supports_subclassing,
-)
 from dblect.sql.findings import (
     Finding,
     FindingKind,
@@ -77,7 +72,6 @@ __all__ = [
     "ResultStatement",
     "SQLParseError",
     "SingleResult",
-    "SqlglotCompatibilityError",
     "WindowSummary",
     "aggregate_behavior",
     "all_findings",
@@ -89,7 +83,6 @@ __all__ = [
     "detect_unordered_window",
     "detect_where_on_outer_joined_nullable",
     "duplicate_sensitive",
-    "ensure_pure_sqlglot",
     "expr_trees",
     "finding_at",
     "list_aggregations",
@@ -102,7 +95,6 @@ __all__ = [
     "parse_result_statement",
     "parse_sql",
     "scan_all",
-    "sqlglot_supports_subclassing",
     "strips_duplicates",
     "suppression_code",
     "suppression_hint",
