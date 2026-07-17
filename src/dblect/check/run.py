@@ -49,6 +49,7 @@ from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
+    Derivation,
     SourceKind,
     SourceRef,
 )
@@ -538,7 +539,8 @@ def _aggregate_owners(column_graph: ColumnLineageGraph) -> dict[int, ColumnRef]:
     owners: dict[int, ColumnRef] = {}
     for ref in column_graph.subjects():
         derivation = column_graph.derivation(ref)
-        if derivation is None:
+        # A UnionConfluence (UNION ALL combined output) carries no aggregate subtree.
+        if not isinstance(derivation, Expr):
             continue
         for agg in derivation.find_all(exp.AggFunc):
             owners.setdefault(id(agg), ref)
@@ -695,7 +697,7 @@ def _source_span(
     return line_map.map_span(line_start, line_end)
 
 
-def _span_of(*nodes: Expr | None) -> tuple[int, int]:
+def _span_of(*nodes: Derivation | None) -> tuple[int, int]:
     """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
     a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
     convention a finding with no locatable line uses (never line-suppressible).
@@ -703,9 +705,10 @@ def _span_of(*nodes: Expr | None) -> tuple[int, int]:
     The span is in the compiled SQL's line space. The located finding kinds carry it
     on ``line_start``/``line_end`` and additionally back-map it onto ``raw_code`` via
     :func:`_source_span`, so the report can point at the source line the developer
-    wrote when the construct passes through verbatim."""
+    wrote when the construct passes through verbatim. A non-``Expr`` derivation (a
+    ``UnionConfluence``) carries no line and is skipped like ``None``."""
     for node in nodes:
-        if node is None:
+        if not isinstance(node, Expr):
             continue
         span = sg.line_range(node)
         if span is not None:

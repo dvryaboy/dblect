@@ -63,3 +63,30 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: error
+
+  compiled-sqlglot:
+    # Guards that dblect keeps running against sqlglot's compiled build (sqlglotc, from
+    # the sqlglot[c] extra). The mypyc-compiled build cannot instantiate an interpreted
+    # subclass of a sqlglot class, so this job fails if a synthetic node or schema helper
+    # reintroduces such a subclass. Tests only: lint and type-check are build-independent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --frozen --python 3.13
+
+      - name: Install sqlglot's compiled build
+        run: uv pip install "sqlglot[c]"
+
+      - name: Tests (pytest, compiled sqlglot)
+        run: uv run --no-sync pytest -n auto --dist loadscope

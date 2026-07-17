@@ -50,7 +50,13 @@ from dblect.lineage.facts.property import (
     column_property,
     relation_property,
 )
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
+from dblect.lineage.graph import (
+    ColumnLineageGraph,
+    ColumnRef,
+    Derivation,
+    SourceKind,
+    SourceRef,
+)
 from dblect.lineage.predicate import atoms_of, parse_predicate
 from dblect.lineage.properties.predicate_flow import predicate_flow_property
 from dblect.lineage.properties.uniqueness import (
@@ -162,14 +168,12 @@ def _null_literal_rule(
     return Annotation(Nullability.NULLABLE)
 
 
-class OuterJoinNull(exp.Expression):  # pyright: ignore[reportPrivateImportUsage]
-    """A synthetic marker wrapping a column reference drawn from an outer join's optional
-    side. The taint rewrite (:func:`taint_outer_joins`) inserts it into the nullability
-    graph only; the rule below reads it to taint the value NULLABLE. Other properties
-    never see it, since they run over the untainted graph. It subclasses ``Expression``
-    (the concrete base) rather than ``Func`` so the standard node constructor works."""
-
-    arg_types = {"this": True}  # noqa: RUF012 (sqlglot's arg-schema contract)
+# ``exp.Column.meta`` flag the outer-join taint stamps on a column drawn from an outer
+# join's optional side. The nullability and domain-type properties read it through their
+# ``column_meta`` catalog and taint the value. A ``.meta`` flag rather than a wrapper node
+# so the taint works under sqlglot's compiled build, which cannot instantiate an
+# interpreted ``Expression`` subclass.
+OUTER_JOIN_NULL_META = "dblect_outer_join_null"
 
 
 def _outer_join_null_rule(
@@ -196,7 +200,6 @@ NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Is: _is_not_null_rule,
     exp.Nullif: _nullif_rule,
     exp.Null: _null_literal_rule,
-    OuterJoinNull: _outer_join_null_rule,
 }
 NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
     exp.Count: AggregateRule(core=_count_core),
@@ -337,6 +340,7 @@ def nullability_property(
         operators=NULLABILITY_OPERATORS,
         aggregates=NULLABILITY_AGGREGATES,
         ground=grounding(facts, opaque=set(), lat=NULLABILITY_LATTICE),
+        column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
         semiring=NullabilitySemiring(),
     )
 
@@ -419,8 +423,8 @@ def _conditional_columns_by_relation(
 # taint is a fact about the join, not the column expression, so it cannot be grounded
 # (a more precise NON_NULL inference would win the reconcile) and has to enter
 # inference. We do that by rewriting the nullability graph: each optional-side column
-# reference is wrapped in an :class:`OuterJoinNull` marker whose rule taints NULLABLE.
-# Because the marker sits in the expression the propagator walks, the taint rides
+# reference is stamped with the :data:`OUTER_JOIN_NULL_META` taint flag whose rule taints
+# NULLABLE. Because the flag rides on the column the propagator walks, the taint carries
 # downstream through every consumer and a guard (COALESCE, IS NOT NULL) still clears it.
 
 
@@ -447,14 +451,18 @@ def _optional_join_aliases(select: exp.Select) -> set[str]:
     return set(_optional_alias_sides(select))
 
 
-def _wrap_optional_columns(expr: Expr, optional: set[str]) -> Expr:
-    """A copy of ``expr`` with every column qualified by an optional-side alias wrapped in
-    :class:`OuterJoinNull`. Unqualified columns are left alone (the side is unknown), the
-    silent-when-unsure posture that keeps the taint from over-firing."""
-    rewritten = expr.copy()
+def _taint_optional_columns(deriv: Derivation, optional: set[str]) -> Derivation:
+    """A copy of ``deriv`` with every column qualified by an optional-side alias stamped
+    with the :data:`OUTER_JOIN_NULL_META` taint flag. Unqualified columns are left alone
+    (the side is unknown), the silent-when-unsure posture that keeps the taint from
+    over-firing. A non-``Expr`` derivation (a ``UnionConfluence`` combined output) carries
+    no columns to taint and passes through unchanged."""
+    if not isinstance(deriv, Expr):
+        return deriv
+    rewritten = deriv.copy()
     targets = [c for c in rewritten.find_all(exp.Column) if c.table and c.table.lower() in optional]
     for col in targets:
-        col.replace(OuterJoinNull(this=col.copy()))
+        col.meta[OUTER_JOIN_NULL_META] = True
     return rewritten
 
 
@@ -493,7 +501,7 @@ def taint_outer_joins(
             continue
         model_ref = SourceRef(SourceKind.MODEL, node.unique_id)
         for ref in refs_by_source.get(model_ref, ()):
-            new_expressions[ref] = _wrap_optional_columns(graph.expressions[ref], optional)
+            new_expressions[ref] = _taint_optional_columns(graph.expressions[ref], optional)
     return ColumnLineageGraph(edges=graph.edges, expressions=new_expressions)
 
 

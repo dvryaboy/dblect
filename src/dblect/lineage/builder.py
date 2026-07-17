@@ -27,14 +27,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar, cast
-
-if TYPE_CHECKING:
-    from sqlglot.schema import ColumnMapping
+from typing import TypeVar, cast
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
-from sqlglot.dialects.dialect import DialectType
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
@@ -44,13 +40,15 @@ from dblect.lineage.graph import (
     AggregationSite,
     ColumnLineageGraph,
     ColumnRef,
+    Derivation,
     RelationLineageGraph,
     SourceKind,
     SourceRef,
+    UnionConfluence,
     attach_aggregation_site,
     attach_source_ref,
 )
-from dblect.lineage.property import UnionConfluence, attach_column_ref
+from dblect.lineage.property import attach_column_ref
 from dblect.manifest import Manifest, ResourceType, compilation_miss_reason
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
@@ -170,65 +168,6 @@ def _stamp_tables(tree: Expr, name_to_source: Mapping[str, SourceRef]) -> None:
             attach_source_ref(table, ref)
 
 
-def _identity_key(node: exp.Column | exp.Table | str) -> object:
-    """A hashable identity keyed on the same inputs sqlglot's normalization consumes: each
-    identifier's text and its ``quoted`` flag. Keeping the quoted flag stops a quoted and an
-    unquoted spelling of the same text from colliding under a dialect that distinguishes them."""
-    if isinstance(node, str):
-        return node
-    parts = node.parts if isinstance(node, exp.Table) else [node.this]
-    return tuple(
-        (p.name, p.quoted) if isinstance(p, exp.Identifier) else (p.name, False) for p in parts
-    )
-
-
-class _CachingMappingSchema(MappingSchema):
-    """A ``MappingSchema`` that memoizes ``get_column_type``.
-
-    Resolving an ``UNNEST`` of a nested STRUCT calls ``get_column_type`` ~2M times over ~11k
-    distinct keys in a single build, re-normalizing each time. The schema only changes via
-    ``add_table`` (between models), so the result is a pure function of (table, column, dialect,
-    normalize); ``add_table`` clears the cache. Returning a stored ``DataType`` repeatedly is the
-    read-only contract sqlglot's own ``DataType``-valued schemas already rely on.
-    """
-
-    def __init__(
-        self,
-        schema: dict[str, object] | None = None,
-        *,
-        dialect: DialectType = None,
-        normalize: bool = True,
-    ) -> None:
-        super().__init__(schema, dialect=dialect, normalize=normalize)
-        self._gct_cache: dict[object, exp.DataType] = {}
-
-    def get_column_type(
-        self,
-        table: exp.Table | str,
-        column: exp.Column | str,
-        dialect: DialectType = None,
-        normalize: bool | None = None,
-    ) -> exp.DataType:
-        key = (_identity_key(table), _identity_key(column), dialect, normalize)
-        hit = self._gct_cache.get(key)
-        if hit is not None:
-            return hit
-        value = super().get_column_type(table, column, dialect=dialect, normalize=normalize)
-        self._gct_cache[key] = value
-        return value
-
-    def add_table(
-        self,
-        table: exp.Table | str,
-        column_mapping: ColumnMapping | None = None,
-        dialect: DialectType = None,
-        normalize: bool | None = None,
-        match_depth: bool = True,
-    ) -> None:
-        self._gct_cache.clear()
-        super().add_table(table, column_mapping, dialect, normalize, match_depth)
-
-
 def build_manifest_graph(
     manifest: Manifest,
     *,
@@ -251,7 +190,7 @@ def build_manifest_graph(
     # One persistent Schema, `add_table`-ing only the touched table per model, rather than a raw
     # dict `qualify` re-normalizes whole every call. `schema` stays the merge accumulator (the
     # documented-wins/UNKNOWN-for-new fold); the Schema mirrors it table by table.
-    mapping_schema: Schema = _CachingMappingSchema(
+    mapping_schema: Schema = MappingSchema(
         cast("dict[str, object]", schema), dialect=dialect, normalize=True
     )
     issues: list[BuildIssue] = []
@@ -260,7 +199,7 @@ def build_manifest_graph(
     # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
     # last-wins on expressions the same final map; each output column is built by one model anyway.
     acc_edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
-    acc_exprs: dict[ColumnRef, Expr] = {}
+    acc_exprs: dict[ColumnRef, Derivation] = {}
     for uid in manifest.dag.topological_order():
         if uid not in manifest.models:
             continue
@@ -533,7 +472,7 @@ class _Walker:
         self._self_ref = self_ref
         self._name_to_source = name_to_source
         self.edges: dict[ColumnRef, frozenset[ColumnRef]] = {}
-        self.expressions: dict[ColumnRef, Expr] = {}
+        self.expressions: dict[ColumnRef, Derivation] = {}
         # Indices the resolver needs when stamping a Column whose qualifier
         # names a child scope: which SourceRef each child scope was assigned,
         # and which synthetic UNION combined-output SourceRef stands in for
