@@ -496,6 +496,47 @@ def test_fanout_silent_on_cross_join() -> None:
     assert findings == ()
 
 
+# --- anti-joins cannot fan out ----------------------------------------------------
+#
+# An anti-join (native ANTI, and the LEFT JOIN ... IS NULL idiom) and a SEMI join filter the
+# probe rows and never multiply them, so a join key that does not cover the matched side's key
+# is not a fan-out here. The plain LEFT join on the same uncovered key still fires
+# (``test_fanout_flagged_when_keys_dont_cover_join_key``), so these silences are the filtering
+# semantics rather than a blanket exemption.
+
+
+def test_fanout_silent_on_native_anti_join() -> None:
+    parsed = _parse("select * from facts f anti join dim d on f.segment = d.segment")
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_silent_on_semi_join() -> None:
+    parsed = _parse("select * from facts f semi join dim d on f.segment = d.segment")
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_silent_on_left_join_is_null_anti_idiom() -> None:
+    parsed = _parse(
+        "select * from facts f left join dim d on f.segment = d.segment where d.segment is null"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_still_fires_on_left_join_is_null_on_a_non_key_column() -> None:
+    """The ``IS NULL`` on a non-join-key column is not the anti-join idiom (matched rows can leak),
+    so the LEFT join can still fan out and the finding stands: the skip is the recognised idiom,
+    not any LEFT join carrying an IS NULL."""
+    parsed = _parse(
+        "select * from facts f left join dim d on f.segment = d.segment where d.attr is null"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.JOIN_FANOUT
+
+
 def test_fanout_silent_when_join_target_shadowed_by_cte() -> None:
     # A local CTE named `dim` shadows the model: resolution lands on the CTE,
     # whose body has no known keys, so the detector stays silent.

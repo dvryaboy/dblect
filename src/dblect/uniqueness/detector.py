@@ -70,6 +70,7 @@ from dblect.sql import (
     Finding,
     FindingKind,
     aggregate_behavior,
+    anti_join,
     duplicate_sensitive,
     suppression_hint,
 )
@@ -239,7 +240,9 @@ def detect_join_fanout(
 
     Silent when the joined-in side has no known keys, when the ON predicate is not
     a conjunction of equalities between bare columns with exactly one side on the
-    joined-in alias, or on a ``CROSS`` join (an explicit cartesian product).
+    joined-in alias, on a ``CROSS`` join (an explicit cartesian product), or on a join
+    that filters rather than multiplies the probe rows (a SEMI or ANTI join, and the
+    ``LEFT JOIN ... IS NULL`` anti-join idiom).
     """
     scopes = _scope_index_for(tree, model_keys, scope_index)
     cte_bodies: Mapping[str, Expr] = {
@@ -247,8 +250,14 @@ def detect_join_fanout(
     }
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
+        # A SEMI/ANTI join, and the LEFT JOIN ... IS NULL anti-join idiom, filter the probe
+        # rows rather than multiply them, so they can no more fan out than a CROSS join can be
+        # covered; skip them the same way.
+        anti_arms = {id(a.join) for a in anti_join.anti_joins_of(sel) if a.join is not None}
         for j in sg.joins_of(sel):
-            if sg.join_side_of(j) is JoinSide.CROSS:
+            if sg.join_side_of(j) in (JoinSide.CROSS, JoinSide.SEMI, JoinSide.ANTI):
+                continue
+            if id(j) in anti_arms:
                 continue
             target = j.this
             if not isinstance(target, exp.Table):

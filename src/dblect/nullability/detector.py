@@ -35,7 +35,7 @@ from dblect.lineage.properties.nullability import (
     outer_join_nullable_columns,
 )
 from dblect.manifest import Manifest
-from dblect.sql import Finding, FindingKind, finding_at
+from dblect.sql import Finding, FindingKind, anti_join, finding_at
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
 
@@ -133,9 +133,11 @@ def detect_join_on_nullable_key(
     join's own dropped side. A FULL join drops nothing (both sides survive NULL-padded), so
     it flags both. A semi join filters its left rows, so a NULL key on either side silently
     drops the row exactly as an inner join does, and it is flagged with the same row-loss
-    framing. An anti join inverts the hazard (a NULL key is kept as a spurious non-match), so
-    it is left alone. Gating per join keeps an outer join elsewhere in the same SELECT from
-    silencing an inner join's genuine row loss.
+    framing. An anti join inverts the hazard: a NULL probe key matches nothing, so the row is
+    kept as a spurious non-match rather than dropped, and only the probe side is flagged (a
+    NULL on the matched side is null-safe, simply failing to match, unlike NOT IN). Gating per
+    join keeps an outer join elsewhere in the same SELECT from silencing an inner join's
+    genuine row loss.
 
     Nullability is read from the upstream relation, so this fires on an inherited-nullable
     key the local SQL gives no hint about. One join is one decision to look at, so a
@@ -157,14 +159,33 @@ def detect_join_on_nullable_key(
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         alias_to_rel = _alias_to_relation(sel)
+        # An anti-join reverses the hazard, so it is decided by the shared classifier and the
+        # probe side alone; the classifier keys each anti-join arm by its Join node.
+        anti_by_join = {id(a.join): a for a in anti_join.anti_joins_of(sel) if a.join is not None}
         for join, side, dropped in sg.joins_with_outer_dropped_aliases(sel):
             on = sg.on_of(join)
             if on is None:
                 continue
             if side is JoinSide.ANTI:
-                # Anti join inverts the hazard: a NULL key matches nothing, so the row is kept
-                # as a spurious non-match rather than dropped. That is the opposite framing
-                # from every other join here, so leave it to a dedicated future case.
+                # A native anti join keeps a NULL-PROBE-key row as a spurious non-match (it
+                # matches nothing), the inverse of a dropped row. Only the probe side is a
+                # hazard; a NULL on the matched side simply fails to match, which is the
+                # anti-join's null-safe semantics (unlike NOT IN, whose empty-result footgun
+                # ``detect_not_in_nullable_subquery`` covers). The matched side of ``LEFT JOIN
+                # ... IS NULL`` reaches this detector as an ordinary LEFT join instead.
+                anti = anti_by_join.get(id(join))
+                if anti is None:  # ON is not a clean conjunction of column equalities
+                    continue
+                keys, determined = _nullable_keys_for_alias(
+                    anti.probe_alias,
+                    anti.probe_cols,
+                    alias_to_rel=alias_to_rel,
+                    nullable_by_name=nullable_by_name,
+                    causes_by_relation=causes_by_relation,
+                    fd_by_name=fd_by_name,
+                )
+                if keys:
+                    out.append(_join_finding(join, keys, determined=determined, side=side))
                 continue
             cols_by_alias = sg.equality_cols_by_alias(on)
             if cols_by_alias is None:  # not a clean conjunction of column equalities
@@ -174,32 +195,56 @@ def detect_join_on_nullable_key(
             for alias, cols in sorted(cols_by_alias.items()):
                 if alias in dropped:  # this outer join drops the no-match here: its intent
                     continue
-                relation = alias_to_rel.get(alias)
-                if relation is None:  # a subquery or CTE source, not a bare table
-                    continue
-                nullable = nullable_by_name.get(relation)
-                if not nullable:
-                    continue
-                causes = causes_by_relation.get(relation, {})
-                nullable_here = frozenset(cols & nullable)
-                # ``or nullable_here`` keeps the reduction from ever emptying the reported key:
-                # a constant dependency (``{} -> c``) could fold the last column away, which
-                # would silence a genuine nullable-key hazard. Silence is only ever a non-null
-                # key's job, so fall back to the unreduced columns there.
-                cover = (
-                    minimal_cover(fd_by_name.get(relation, NO_FDS), nullable_here) or nullable_here
+                k, d = _nullable_keys_for_alias(
+                    alias,
+                    cols,
+                    alias_to_rel=alias_to_rel,
+                    nullable_by_name=nullable_by_name,
+                    causes_by_relation=causes_by_relation,
+                    fd_by_name=fd_by_name,
                 )
-                keys.extend(
-                    _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
-                    for column in sorted(cover)
-                )
-                determined.extend(
-                    _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
-                    for column in sorted(nullable_here - cover)
-                )
+                keys.extend(k)
+                determined.extend(d)
             if keys:
                 out.append(_join_finding(join, keys, determined=determined, side=side))
     return tuple(out)
+
+
+def _nullable_keys_for_alias(
+    alias: str,
+    cols: frozenset[str],
+    *,
+    alias_to_rel: Mapping[str, str],
+    nullable_by_name: NullableByName,
+    causes_by_relation: CauseByName,
+    fd_by_name: Mapping[str, FDSet],
+) -> tuple[list[_NullableKey], list[_NullableKey]]:
+    """The nullable key columns an equality on ``alias`` contributes, split into the reported
+    cover and the columns a declared ``determines`` folds into it.
+
+    Empty lists when ``alias`` resolves to no bare relation (a subquery or CTE source) or the
+    relation has no nullable column among ``cols``. The cover is the :func:`minimal_cover` of the
+    nullable columns under the relation's FDs, falling back to the unreduced columns so a constant
+    dependency (``{} -> c``) can never fold the last column away and silence the hazard; silence is
+    only ever a non-null key's job."""
+    relation = alias_to_rel.get(alias)
+    if relation is None:
+        return [], []
+    nullable = nullable_by_name.get(relation)
+    if not nullable:
+        return [], []
+    causes = causes_by_relation.get(relation, {})
+    nullable_here = frozenset(cols & nullable)
+    cover = minimal_cover(fd_by_name.get(relation, NO_FDS), nullable_here) or nullable_here
+    keys = [
+        _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
+        for column in sorted(cover)
+    ]
+    determined = [
+        _NullableKey(relation, column, causes.get(column, NullableCause.UNKNOWN))
+        for column in sorted(nullable_here - cover)
+    ]
+    return keys, determined
 
 
 def detect_not_in_nullable_subquery(
@@ -217,13 +262,52 @@ def detect_not_in_nullable_subquery(
         query = in_node.args.get("query")
         if query is None or not isinstance(in_node.parent, exp.Not):
             continue
-        resolved = _single_projected_column(query)
+        resolved = anti_join.single_projected_column(query)
         if resolved is None:
             continue
         relation, column = resolved
         nullable = nullable_by_name.get(relation)
         if nullable and column in nullable:
             out.append(_not_in_finding(in_node, source=relation, column=column))
+    return tuple(out)
+
+
+def detect_not_exists_on_nullable_key(
+    tree: Expr,
+    *,
+    nullable_by_name: NullableByName,
+    cause_by_name: CauseByName | None = None,
+    fd_by_name: Mapping[str, FDSet] = {},
+) -> tuple[Finding, ...]:
+    """Flag ``NOT EXISTS (SELECT ... FROM R WHERE P)`` whose probe correlation key is nullable.
+
+    NOT EXISTS is the anti-join operator written as a correlated subquery, so it carries the same
+    probe-side hazard as a native anti join: a NULL probe key makes the correlation predicate NULL
+    for every inner row, so NOT EXISTS is true and the row is kept as a spurious non-match. The
+    matched (inner) side is null-safe, which is exactly why NOT EXISTS is the recommended
+    replacement for NOT IN, so only the probe side is flagged. The shared classifier decodes the
+    correlation; the reduction and framing are the native anti join's."""
+    causes_by_relation = cause_by_name or {}
+    out: list[Finding] = []
+    for sel in sg.find_all_selects(tree):
+        alias_to_rel = _alias_to_relation(sel)
+        for a in anti_join.anti_joins_of(sel):
+            if a.form is not anti_join.AntiJoinForm.NOT_EXISTS:
+                continue
+            keys, determined = _nullable_keys_for_alias(
+                a.probe_alias,
+                a.probe_cols,
+                alias_to_rel=alias_to_rel,
+                nullable_by_name=nullable_by_name,
+                causes_by_relation=causes_by_relation,
+                fd_by_name=fd_by_name,
+            )
+            if keys:
+                out.append(
+                    _nullable_finding(
+                        a.node, keys, determined=determined, prefix="NOT EXISTS", framing="anti"
+                    )
+                )
     return tuple(out)
 
 
@@ -239,25 +323,6 @@ def _alias_to_relation(sel: exp.Select) -> dict[str, str]:
         if isinstance(target, exp.Table):
             out[target.alias_or_name] = target.name
     return out
-
-
-def _single_projected_column(query: Expr) -> tuple[str, str] | None:
-    """The ``(relation, column)`` a subquery projects, when it is a single bare column
-    over a single bare-table FROM with no joins; else ``None``."""
-    select = query.this if isinstance(query, exp.Subquery) else query
-    if not isinstance(select, exp.Select) or sg.joins_of(select):
-        return None
-    projections = select.selects
-    if len(projections) != 1:
-        return None
-    proj = projections[0]
-    column = proj.this if isinstance(proj, exp.Alias) else proj
-    if not isinstance(column, exp.Column):
-        return None
-    from_ = sg.from_of(select)
-    if from_ is None or not isinstance(from_.this, exp.Table):
-        return None
-    return (from_.this.name, sg.column_name(column).lower())
 
 
 def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
@@ -289,12 +354,14 @@ def _cause_clause(cause: NullableCause) -> str:
 
 # The kind word prefixed onto "JOIN" in a finding. An inner join is absent and reads as the
 # bare "JOIN". LEFT/RIGHT/FULL take the kept-row outer framing; SEMI takes the row-loss
-# framing (it filters the left rows, so a NULL key drops the row exactly as an inner join).
+# framing (it filters the left rows, so a NULL key drops the row exactly as an inner join);
+# ANTI takes the inverted kept-as-spurious-non-match framing.
 _JOIN_KIND_WORD: Mapping[JoinSide, str] = {
     JoinSide.LEFT: "LEFT",
     JoinSide.RIGHT: "RIGHT",
     JoinSide.FULL: "FULL OUTER",
     JoinSide.SEMI: "SEMI",
+    JoinSide.ANTI: "ANTI",
 }
 _OUTER_SIDES = frozenset({JoinSide.LEFT, JoinSide.RIGHT, JoinSide.FULL})
 
@@ -348,33 +415,57 @@ def _join_finding(
     present, the message names them as functionally redundant and recommends dropping their
     equality conditions, which removes their null-non-match risk outright, ahead of a not_null
     test on the key that remains."""
+    kind_word = _JOIN_KIND_WORD.get(side)
+    prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
+    framing = "anti" if side is JoinSide.ANTI else "outer" if side in _OUTER_SIDES else "row_loss"
+    return _nullable_finding(join, keys, determined=determined, prefix=prefix, framing=framing)
+
+
+def _nullable_finding(
+    node: Expr,
+    keys: Sequence[_NullableKey],
+    *,
+    determined: Sequence[_NullableKey],
+    prefix: str,
+    framing: str,
+) -> Finding:
+    """Assemble a nullable-key finding for a join or an anti-join predicate.
+
+    ``framing`` selects the hazard wording: ``anti`` (a NULL key matches nothing so the row is
+    kept as a spurious non-match), ``outer`` (a preserved row survives NULL-padded), or
+    ``row_loss`` (the row is silently dropped). ``prefix`` names the construct (``LEFT JOIN``,
+    ``ANTI JOIN``, ``NOT EXISTS``). The cause attribution, ``determines`` redundancy clause, and
+    not_null guard are shared across every framing."""
     distinct_columns = sorted({k.column for k in keys})
     plain_columns = ", ".join(distinct_columns)
     listing, cause = _columns_and_cause(keys)
     sources = ", ".join(repr(r) for r in sorted({k.relation for k in keys}))
     is_are = "are" if len(distinct_columns) > 1 else "is"
-    kind_word = _JOIN_KIND_WORD.get(side)
-    prefix = f"{kind_word} JOIN" if kind_word is not None else "JOIN"
     redundancy = _redundancy_clause(keys, determined)
     guard = (
         f"The durable guard is a not_null test on {plain_columns} in {sources}, which turns "
         f"this silent {{loss}} into a loud test failure on the producing model; or, locally, "
         f"filter the nulls or COALESCE to a sentinel if the match was intended."
     )
-    if side in _OUTER_SIDES:
-        message = (
-            f"{prefix} keys on {listing}, which {is_are} nullable upstream in "
-            f"{sources}{cause}; the outer join keeps these rows, but NULL never equals NULL, "
-            f"so a NULL key silently never matches and the row survives with the join target "
+    head = f"{prefix} keys on {listing}, which {is_are} nullable upstream in {sources}{cause}; "
+    if framing == "anti":
+        body = (
+            f"NULL never equals NULL, so a row with a NULL key matches nothing and is kept as a "
+            f"spurious non-match, the anti-join including it rather than excluding "
+            f"it.{redundancy} {guard.format(loss='spurious inclusion')}"
+        )
+    elif framing == "outer":
+        body = (
+            f"the outer join keeps these rows, but NULL never equals NULL, so a NULL key silently "
+            f"never matches and the row survives with the join target "
             f"NULL-padded.{redundancy} {guard.format(loss='non-match')}"
         )
     else:
-        message = (
-            f"{prefix} keys on {listing}, which {is_are} nullable upstream in {sources}{cause}; "
+        body = (
             f"NULL never equals NULL, so rows with a NULL key never match and are silently "
             f"dropped.{redundancy} {guard.format(loss='row loss')}"
         )
-    return finding_at(FindingKind.JOIN_ON_NULLABLE_KEY, message=message, node=join)
+    return finding_at(FindingKind.JOIN_ON_NULLABLE_KEY, message=head + body, node=node)
 
 
 def _redundancy_clause(keys: Sequence[_NullableKey], determined: Sequence[_NullableKey]) -> str:
@@ -499,4 +590,12 @@ def make_nullability_detectors(
     def not_in_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_not_in_nullable_subquery(tree, nullable_by_name=nullable_by_name)
 
-    return (group_by_nullable, join_on_nullable, not_in_nullable)
+    def not_exists_on_nullable(tree: Expr) -> tuple[Finding, ...]:
+        return detect_not_exists_on_nullable_key(
+            tree,
+            nullable_by_name=nullable_by_name,
+            cause_by_name=cause_by_name,
+            fd_by_name=fd_by_name,
+        )
+
+    return (group_by_nullable, join_on_nullable, not_in_nullable, not_exists_on_nullable)
