@@ -8,6 +8,10 @@ top = the universe, bottom = the empty set), a bona-fide bounded lattice whose
 bottom is reachable, so every arm of the validation table is exercisable.
 """
 
+# Reaches for the propagator's private ``_lookup_subclass`` to pin its MRO-walk contract
+# directly (the dispatch every operator/aggregate rule rides on).
+# pyright: reportPrivateUsage=false
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -28,7 +32,7 @@ from dblect.lineage.facts.property import (
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnRef, RelationLineageGraph, SourceKind, SourceRef
-from dblect.lineage.property import propagate, run
+from dblect.lineage.property import _lookup_subclass, propagate, run
 from dblect.lineage.semiring import UnionSemiring
 
 _UNIVERSE = frozenset({0, 1, 2, 3})
@@ -346,3 +350,21 @@ def test_run_fills_store_for_every_property() -> None:
     store = run(graph, PropertyRegistry((p1, p2)))
     assert store.get("p1", out) == Annotation(frozenset({0}), Opacity.CONCRETE)
     assert store.get("p2", out) == Annotation(frozenset({1}), Opacity.CONCRETE)
+
+
+def test_lookup_subclass_walks_the_mro() -> None:
+    # The propagator dispatches operator and aggregate rules through this helper, so a
+    # subclass of a registered type inherits its rule (a dialect aggregate subclassing
+    # a classified one still classifies). Exercised on plain classes so it runs under
+    # every sqlglot build, including the compiled one that forbids instantiating an
+    # interpreted subclass of a sqlglot class.
+    class A: ...
+
+    class B(A): ...
+
+    class C(B): ...
+
+    assert _lookup_subclass({A: "a"}, A) == "a"  # exact match
+    assert _lookup_subclass({A: "a"}, C) == "a"  # walks the MRO to an ancestor
+    assert _lookup_subclass({A: "a", B: "b"}, C) == "b"  # nearest ancestor wins
+    assert _lookup_subclass({A: "a"}, object) is None  # nothing registered
