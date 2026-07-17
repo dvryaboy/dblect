@@ -100,6 +100,14 @@ def anti_joins_of(sel: exp.Select) -> tuple[AntiJoin, ...]:
     return tuple(out)
 
 
+def anti_arm_ids(sel: exp.Select) -> set[int]:
+    """The ``id()`` of each anti-join *arm* in ``sel``: a native ``ANTI`` join or the
+    ``LEFT JOIN ... IS NULL`` idiom. A per-join reducer intersects this with its own join nodes
+    to tell an anti-join arm from an ordinary join. The predicate forms (``NOT EXISTS`` /
+    ``NOT IN``) have no arm and are absent."""
+    return {id(a.join) for a in anti_joins_of(sel) if a.join is not None}
+
+
 def _sides_of(on: Expr | None) -> dict[str, frozenset[str]]:
     """Per-alias equality columns of a join/correlation predicate, lower-cased, empty when the
     predicate is not a clean conjunction of column equalities."""
@@ -141,10 +149,8 @@ def _left_is_null_anti_join(j: exp.Join, *, leaves: list[Expr], from_alias: str)
     equality match proves the column non-NULL, so the recognition needs no nullability oracle. An
     ``IS NULL`` on a non-key column can leak matched rows and is left for a substrate-backed
     consumer to decide."""
-    target = j.this
-    matched_alias = target.alias_or_name
-    sides = _sides_of(sg.on_of(j))
-    matched_cols = sides.get(matched_alias, frozenset())
+    matched_alias = j.this.alias_or_name
+    matched_cols = _sides_of(sg.on_of(j)).get(matched_alias, frozenset())
     if not matched_cols:
         return None
     for leaf in leaves:
@@ -154,19 +160,8 @@ def _left_is_null_anti_join(j: exp.Join, *, leaves: list[Expr], from_alias: str)
         if not isinstance(col, exp.Column):
             continue
         if sg.column_table(col) == matched_alias and sg.column_name(col).lower() in matched_cols:
-            probe_alias, probe_cols, _ = _probe_split(
-                sides, matched_alias=matched_alias, from_alias=from_alias
-            )
-            matched_name = target.name if isinstance(target, exp.Table) else None
-            return AntiJoin(
-                AntiJoinForm.LEFT_IS_NULL,
-                probe_alias,
-                probe_cols,
-                matched_name,
-                matched_cols,
-                node=j,
-                join=j,
-            )
+            # Verified an anti-join: it decodes exactly as the native arm, only the form differs.
+            return _join_anti(j, AntiJoinForm.LEFT_IS_NULL, from_alias=from_alias)
     return None
 
 

@@ -832,9 +832,9 @@ class _RelationWalk:
         # preserved across it; the WHERE is the predicate flow's concern, not ours.
         joins = sg.joins_of(sel)
         # An anti-join (native ANTI, or the LEFT JOIN ... IS NULL idiom) filters the probe side,
-        # so it preserves the probe's keys unconditionally; the classifier marks which join arms
-        # are anti-joins so ``_join_preserves`` can tell one from an ordinary LEFT join.
-        anti_arms = {id(a.join) for a in anti_join.anti_joins_of(sel) if a.join is not None}
+        # so it preserves the probe's keys unconditionally; ``_join_preserves`` reads these arm
+        # ids to tell an anti-join arm from an ordinary LEFT join.
+        anti_arms = anti_join.anti_arm_ids(sel)
         joins_preserve = True
         for j in joins:
             resolved = (

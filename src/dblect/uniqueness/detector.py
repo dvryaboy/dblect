@@ -253,7 +253,7 @@ def detect_join_fanout(
         # A SEMI/ANTI join, and the LEFT JOIN ... IS NULL anti-join idiom, filter the probe
         # rows rather than multiply them, so they can no more fan out than a CROSS join can be
         # covered; skip them the same way.
-        anti_arms = {id(a.join) for a in anti_join.anti_joins_of(sel) if a.join is not None}
+        anti_arms = anti_join.anti_arm_ids(sel)
         for j in sg.joins_of(sel):
             if sg.join_side_of(j) in (JoinSide.CROSS, JoinSide.SEMI, JoinSide.ANTI):
                 continue
