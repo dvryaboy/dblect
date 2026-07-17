@@ -131,13 +131,9 @@ def fn_of(w: exp.Window) -> Expr | None:
 
 
 def row_number_window(node: Expr) -> exp.Window | None:
-    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``.
-
-    ``ROW_NUMBER`` assigns a distinct rank within each partition, so ``= 1`` keeps
-    exactly one row per partition; ``RANK`` / ``DENSE_RANK`` share a rank across ties,
-    so several rows can carry rank 1 and the partition is not a key. Only ``RowNumber``
-    grounds the dedup key, so the match is on that node type alone.
-    """
+    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` grounds
+    a dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row, whereas
+    ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
     if isinstance(node, exp.Window) and isinstance(node.this, exp.RowNumber):
         return node
     return None
@@ -149,13 +145,9 @@ def _is_literal_one(node: Expr) -> bool:
 
 def rank_one_guard_operand(leaf: Expr) -> Expr | None:
     """The operand a ``= 1`` / ``<= 1`` dedup guard constrains to the top rank, or ``None``.
-
-    Recognises ``X = 1``, ``1 = X``, ``X <= 1`` and ``1 >= X`` with a literal integer ``1``.
-    These are exactly the guards that select the first row per partition (a row number is
-    ``>= 1``, so ``<= 1`` coincides with ``= 1``). Every other comparison (``= 2``, ``< 3``,
-    ``> 1``, ``>= 1``, ``BETWEEN``) keeps more than the single top row, so it returns ``None``
-    and grounds no key. ``X`` is returned unevaluated for the caller to test as a window.
-    """
+    Recognises ``X = 1``, ``1 = X``, ``X <= 1`` and ``1 >= X`` with a literal integer ``1`` (a
+    row number is ``>= 1``, so ``<= 1`` coincides with ``= 1``). Any other comparison keeps more
+    than the top row and grounds no key. ``X`` is returned unevaluated for the caller to test."""
     if isinstance(leaf, exp.EQ):
         if _is_literal_one(leaf.expression):
             return leaf.this

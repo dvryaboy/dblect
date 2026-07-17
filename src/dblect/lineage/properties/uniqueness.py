@@ -816,6 +816,15 @@ class _RelationWalk:
         from_alias, from_carried = resolved
         combined = _qualify(from_alias, from_carried.keys)
 
+        # A ``ROW_NUMBER() ... = 1`` dedup keys the output on its partition columns. Where the
+        # window is evaluated decides when the key holds: one computed inside the FROM subquery
+        # (filtered by an outer guard) is a key of the from relation, so it joins the from-side
+        # keys and must survive join preservation; one this SELECT computes (inline in the guard
+        # or a projected alias) is evaluated over the post-join, post-group rows, so it unions in
+        # after those steps.
+        rn_postjoin, rn_fromside = _rownumber_keys(sel, from_node=from_.this, from_alias=from_alias)
+        combined |= rn_fromside
+
         # WHERE filters cannot add duplicates, so keys (and conditional keys) are
         # preserved across it; the WHERE is the predicate flow's concern, not ours.
         joins = sg.joins_of(sel)
@@ -840,10 +849,7 @@ class _RelationWalk:
             gk = _group_key(group, from_alias=from_alias)
             combined = gk if gk is not None else frozenset[_QKey]()
 
-        # A ``ROW_NUMBER() ... = 1`` dedup makes its partition columns a key of the
-        # post-filter relation, independent of what came before, so it unions in. QUALIFY
-        # runs after GROUP BY, so it applies over whatever ``combined`` now holds.
-        combined = combined | _rownumber_keys(sel, from_node=from_.this, from_alias=from_alias)
+        combined |= rn_postjoin
 
         projection = _Projection.build(sel, from_alias=from_alias)
         keys = _project(sel, combined, projection)
@@ -991,19 +997,21 @@ def _group_key(group: exp.Group, *, from_alias: str) -> frozenset[_QKey] | None:
     return None if key is None else frozenset({key})
 
 
-def _rownumber_keys(sel: exp.Select, *, from_node: Expr, from_alias: str) -> frozenset[_QKey]:
-    """Candidate keys the ``ROW_NUMBER() ... = 1`` dedup idiom introduces.
+def _rownumber_keys(
+    sel: exp.Select, *, from_node: Expr, from_alias: str
+) -> tuple[frozenset[_QKey], frozenset[_QKey]]:
+    """Keys the ``ROW_NUMBER() ... = 1`` dedup idiom introduces, split by where the window is
+    evaluated: ``(post_join, from_side)``.
 
     A relation filtered to the first row per ``PARTITION BY c1..cn`` keeps one row per
-    partition, so ``{c1..cn}`` is a candidate key of the output. The dedup guard lives in a
-    ``QUALIFY`` clause or an outer ``WHERE``; the window itself is inline in that guard
-    (``QUALIFY ROW_NUMBER() OVER (...) = 1``), named by a projection of this SELECT
-    (``QUALIFY rn = 1``), or named by a projection of the FROM subquery the guard filters
-    (``... FROM (SELECT ..., ROW_NUMBER() OVER (...) AS rn FROM t) WHERE rn = 1``). Each
-    recognised guard contributes the partition columns as a key qualified to the FROM
-    relation, which the projection then maps onto output names. A window that is projected
-    but never filtered grounds nothing (no dedup happened), and a partition-less window
-    (the empty key, whole-relation uniqueness) is skipped rather than modelled here.
+    partition, so ``{c1..cn}`` is a candidate key. The dedup guard lives in ``QUALIFY`` or an
+    outer ``WHERE``; the window is inline in that guard (``QUALIFY ROW_NUMBER() OVER (...) = 1``),
+    named by a projection of this SELECT (``QUALIFY rn = 1``), or named by a projection of the
+    FROM subquery the guard filters (``FROM (SELECT ..., ROW_NUMBER() ... AS rn FROM t) WHERE rn
+    = 1``). The first two see the post-join rows and land in ``post_join``; the subquery window
+    is computed before the outer join, so its key is only a key of the from relation and lands
+    in ``from_side`` for the caller to carry through join preservation. A window projected but
+    never filtered, and a partition-less window (the empty key), ground nothing.
     """
     guards: list[Expr] = []
     qualify = sg.qualify_of(sel)
@@ -1013,7 +1021,8 @@ def _rownumber_keys(sel: exp.Select, *, from_node: Expr, from_alias: str) -> fro
     if where is not None and isinstance(where.this, Expr):
         guards.extend(sg.conjunctive_leaves(where.this))
 
-    out: set[_QKey] = set()
+    post_join: set[_QKey] = set()
+    from_side: set[_QKey] = set()
     for leaf in guards:
         operand = sg.rank_one_guard_operand(leaf)
         if operand is None:
@@ -1021,58 +1030,58 @@ def _rownumber_keys(sel: exp.Select, *, from_node: Expr, from_alias: str) -> fro
         inline = sg.row_number_window(operand)
         if inline is not None:
             key = _bare_column_key(sg.partition_of(inline), from_alias=from_alias)
+            if key is not None:
+                post_join.add(key)
         elif isinstance(operand, exp.Column):
-            key = _named_rownumber_key(operand, sel=sel, from_node=from_node, from_alias=from_alias)
-        else:
-            key = None
-        if key is not None:
-            out.add(key)
-    return frozenset(out)
+            own = _same_select_rownumber_key(operand, sel=sel, from_alias=from_alias)
+            if own is not None:
+                post_join.add(own)
+            else:
+                sub = _subquery_rownumber_key(operand, from_node=from_node, from_alias=from_alias)
+                if sub is not None:
+                    from_side.add(sub)
+    return frozenset(post_join), frozenset(from_side)
 
 
-def _named_rownumber_key(
-    ref: exp.Column, *, sel: exp.Select, from_node: Expr, from_alias: str
+def _same_select_rownumber_key(
+    ref: exp.Column, *, sel: exp.Select, from_alias: str
 ) -> _QKey | None:
-    """The partition key of a ``ROW_NUMBER()`` window named by ``ref`` (an ``rn`` the guard
-    filters on), resolved against the projection that defines the name.
-
-    The window is either a projection of this SELECT (``QUALIFY rn = 1`` naming a select
-    alias) or a projection of the FROM subquery the guard filters. A same-select alias
-    partitions over this scope's own columns, so its key qualifies to ``from_alias``
-    directly. A subquery alias partitions over the subquery's inner columns, so each
-    partition column maps through the subquery's projection onto the output name the outer
-    scope references (``from_alias`` is that subquery's alias). ``None`` if ``ref`` names no
-    row-number window, or a partition column the relevant projection does not expose.
-    """
+    """Partition key of a ``ROW_NUMBER()`` window this SELECT projects as ``ref`` (``QUALIFY rn =
+    1`` naming a select alias). The window is evaluated over this scope's own (post-join) rows, so
+    its partition qualifies to ``from_alias``. ``None`` if ``ref`` is qualified or names no such
+    window."""
+    if sg.column_table(ref) is not None:
+        return None
+    own = _output_projections(sel)
     name = sg.column_name(ref).lower()
+    window = sg.row_number_window(own[name]) if own is not None and name in own else None
+    return _bare_column_key(sg.partition_of(window), from_alias=from_alias) if window else None
+
+
+def _subquery_rownumber_key(ref: exp.Column, *, from_node: Expr, from_alias: str) -> _QKey | None:
+    """Partition key of a ``ROW_NUMBER()`` window the FROM subquery projects as ``ref``, filtered
+    by an outer guard. The window runs inside the subquery, so the key is only a key of the from
+    relation. ``None`` if ``from_node`` is not that subquery, ``ref`` names no such window, or a
+    partition column it does not expose."""
     qualifier = sg.column_table(ref)
-    if qualifier is None:
-        own = _output_projections(sel)
-        window = sg.row_number_window(own[name]) if own is not None and name in own else None
-        if window is not None:
-            return _bare_column_key(sg.partition_of(window), from_alias=from_alias)
-    if isinstance(from_node, exp.Subquery) and qualifier in (None, from_alias):
-        inner = from_node.this
-        if isinstance(inner, exp.Select):
-            projs = _output_projections(inner)
-            window = (
-                sg.row_number_window(projs[name]) if projs is not None and name in projs else None
-            )
-            if window is not None:
-                return _subquery_partition_key(window, inner=inner, sub_alias=from_alias)
-    return None
+    if not isinstance(from_node, exp.Subquery) or qualifier not in (None, from_alias):
+        return None
+    inner = from_node.this
+    if not isinstance(inner, exp.Select):
+        return None
+    projs = _output_projections(inner)
+    name = sg.column_name(ref).lower()
+    window = sg.row_number_window(projs[name]) if projs is not None and name in projs else None
+    return _subquery_partition_key(window, inner=inner, sub_alias=from_alias) if window else None
 
 
 def _subquery_partition_key(
     window: exp.Window, *, inner: exp.Select, sub_alias: str
 ) -> _QKey | None:
-    """A subquery-aliased window's partition columns, lifted to the outer scope.
-
-    The partition columns name columns of ``inner``; the outer scope sees them only under
-    the output names ``inner`` projects them as, qualified by the subquery alias. Each
-    partition column maps through ``inner``'s projection onto an output name; ``None`` if a
-    partition column is not a bare column or ``inner`` does not project it (so the outer
-    scope cannot name it, and no key holds on the output)."""
+    """A subquery-aliased window's partition columns, lifted to the outer scope by mapping each
+    through ``inner``'s projection onto the output name (qualified by the subquery alias) the
+    outer scope references. ``None`` if a partition column is not a bare column or ``inner`` does
+    not project it, so the outer scope cannot name it and no key holds."""
     inner_from = sg.from_of(inner)
     if inner_from is None or not isinstance(inner_from.this, exp.Table | exp.Subquery):
         return None
