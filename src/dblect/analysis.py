@@ -32,7 +32,7 @@ from dblect.audit import AuditReport, LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding, CheckReport
 from dblect.check.run import build_check_graphs, run_check
 from dblect.manifest import Manifest
-from dblect.sql import parse_manifest_models
+from dblect.sql import ensure_pure_sqlglot, parse_manifest_models
 from dblect.types import ContractRegistry
 
 # The sealed set of findings any analysis surfaces: one member per detector family.
@@ -107,6 +107,11 @@ def analyze(
     The declaration family already reads these off the shared build; this hands the same facts
     to the structural one.
     """
+    # Fail fast on sqlglot's compiled build: dblect subclasses sqlglot's Expression
+    # and MappingSchema, which the mypyc-compiled `sqlglotc` cannot instantiate. This
+    # is the single door both the CLI and programmatic callers pass through, so one
+    # clear error here replaces a cryptic TypeError deep in the build.
+    ensure_pure_sqlglot()
     parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
     graphs = build_check_graphs(manifest, profile, registry=registry, trees=trees)
     check = run_check(manifest, profile, resolution_floor=resolution_floor, graphs=graphs)
