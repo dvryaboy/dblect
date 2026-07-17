@@ -28,6 +28,7 @@ from dblect.nullability.detector import (
     NullableCause,
     detect_join_on_nullable_key,
     detect_not_exists_on_nullable_key,
+    detect_not_in_nullable_subquery,
     make_nullability_detectors,
 )
 from dblect.sql import Finding, FindingKind, parse_sql
@@ -354,6 +355,43 @@ def test_not_exists_matched_side_null_is_silent() -> None:
         parse_sql(sql, dialect="duckdb"), nullable_by_name=_STG_NULLABLE
     )
     assert findings == ()
+
+
+# The NOT IN "result silently empty" hazard is sound only where NOT IN is a top-level WHERE
+# conjunct. The detector shares the anti-join classifier's scope for exactly that reason: a NULL
+# in the subquery makes the predicate never true, which empties the result only when nothing else
+# in the WHERE can admit a row. Under an OR the other disjunct still admits rows, so the NOT IN is
+# a dead disjunct rather than an emptied result, a different hazard the detector does not claim.
+def _not_in_keys(sql: str) -> tuple[Finding, ...]:
+    return detect_not_in_nullable_subquery(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=_STG_NULLABLE
+    )
+
+
+def test_not_in_as_top_level_conjunct_fires() -> None:
+    findings = _not_in_keys("SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)")
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NOT_IN_NULLABLE_SUBQUERY
+
+
+def test_not_in_conjoined_with_another_predicate_still_fires() -> None:
+    # AND keeps NOT IN a top-level conjunct: a NULL in the subquery still empties the result.
+    sql = "SELECT id FROM stg WHERE id > 0 AND id NOT IN (SELECT tag FROM stg)"
+    assert len(_not_in_keys(sql)) == 1
+
+
+def test_not_in_under_or_is_silent() -> None:
+    # Under OR the other disjunct still admits rows on a subquery NULL, so the result is not
+    # silently empty and the finding must not claim it is.
+    sql = "SELECT id FROM stg WHERE id > 0 OR id NOT IN (SELECT tag FROM stg)"
+    assert _not_in_keys(sql) == ()
+
+
+def test_not_in_with_expression_left_side_still_fires() -> None:
+    # The empty-result footgun lives on the subquery (matched) side, so the left side need not be
+    # a bare column: a NULL in the projected subquery column empties the result all the same.
+    sql = "SELECT id FROM stg WHERE coalesce(id, 0) NOT IN (SELECT tag FROM stg)"
+    assert len(_not_in_keys(sql)) == 1
 
 
 # A FULL join drops no rows: both sides survive NULL-padded, so a NULL key is the silent

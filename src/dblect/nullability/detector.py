@@ -252,23 +252,29 @@ def detect_not_in_nullable_subquery(
 ) -> tuple[Finding, ...]:
     """Flag ``x NOT IN (SELECT col FROM rel)`` where ``col`` is nullable in ``rel``.
 
-    A single NULL among the subquery's values makes ``x NOT IN (...)`` evaluate to NULL
-    for every ``x``, so the predicate is never true and the result is silently empty:
-    the canonical three-valued-logic footgun. Only the single-bare-column, single-source
-    subquery shape is reasoned about; anything else is left alone.
+    A single NULL among the subquery's values makes ``x NOT IN (...)`` evaluate to NULL for every
+    ``x``, so the predicate is never true and the result is silently empty: the canonical
+    three-valued-logic footgun. The hazard is on the subquery (matched) side, so the shared
+    classifier decodes ``(rel, col)`` and only its ``NOT_IN`` form is consumed here; the probe
+    side is irrelevant, so an expression left side is read the same as a bare column.
+
+    The classifier reads each SELECT's top-level WHERE conjuncts, which is exactly the scope where
+    "silently empty" is a sound claim: a subquery NULL empties the result only when nothing else in
+    the WHERE can admit a row. Under an ``OR`` the other disjunct still admits rows, so the NOT IN
+    there is a dead disjunct rather than an emptied result, a distinct hazard left to a later case.
     """
     out: list[Finding] = []
-    for in_node in tree.find_all(exp.In):
-        query = in_node.args.get("query")
-        if query is None or not isinstance(in_node.parent, exp.Not):
-            continue
-        resolved = anti_join.single_projected_column(query)
-        if resolved is None:
-            continue
-        relation, column = resolved
-        nullable = nullable_by_name.get(relation)
-        if nullable and column in nullable:
-            out.append(_not_in_finding(in_node, source=relation, column=column))
+    for sel in sg.find_all_selects(tree):
+        for a in anti_join.anti_joins_of(sel):
+            if a.form is not anti_join.AntiJoinForm.NOT_IN or a.matched_name is None:
+                continue
+            nullable = nullable_by_name.get(a.matched_name)
+            if not nullable:
+                continue
+            out.extend(
+                _not_in_finding(a.node, source=a.matched_name, column=column)
+                for column in sorted(a.matched_cols & nullable)
+            )
     return tuple(out)
 
 
@@ -494,7 +500,7 @@ def _redundancy_clause(keys: Sequence[_NullableKey], determined: Sequence[_Nulla
     )
 
 
-def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
+def _not_in_finding(node: Expr, *, source: str, column: str) -> Finding:
     return finding_at(
         FindingKind.NOT_IN_NULLABLE_SUBQUERY,
         message=(
@@ -502,7 +508,7 @@ def _not_in_finding(in_node: exp.In, *, source: str, column: str) -> Finding:
             f"{source!r}; one NULL makes the whole predicate never true, so the result is "
             f"silently empty. Use NOT EXISTS, or filter the NULLs from the subquery."
         ),
-        node=in_node,
+        node=node,
     )
 
 

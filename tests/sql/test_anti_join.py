@@ -115,3 +115,23 @@ def test_in_without_not_is_not_an_anti_join() -> None:
     """A bare ``IN`` is a semi-join; only ``NOT IN`` is the anti-join."""
     sel = sqlglot.parse_one("SELECT l.a FROM l WHERE l.k IN (SELECT k FROM r)")
     assert anti_joins_of(sel) == ()  # type: ignore[arg-type]
+
+
+def test_not_in_under_or_is_not_a_scope_conjunct() -> None:
+    """``anti_joins_of`` reads only a SELECT's top-level WHERE conjuncts, so a NOT IN buried in
+    an OR is not returned: under OR the other disjunct still admits rows, so it is not the
+    "rows of L absent from R" the top-level anti-join denotes."""
+    sel = sqlglot.parse_one("SELECT l.a FROM l WHERE l.j > 0 OR l.k NOT IN (SELECT k FROM r)")
+    assert anti_joins_of(sel) == ()  # type: ignore[arg-type]
+
+
+def test_not_in_with_non_column_left_side_decodes_the_matched_side_without_a_probe() -> None:
+    """A NOT IN whose left side is an expression is still the anti-join operator (rows of L whose
+    value is absent from R); the probe columns just do not decode, exactly as a native anti-join
+    with a non-equality predicate. The matched side still decodes, which is what the NOT IN
+    empty-result hazard reads."""
+    a = _only("SELECT l.a FROM l WHERE coalesce(l.k, 0) NOT IN (SELECT k FROM r)")
+    assert a.form is AntiJoinForm.NOT_IN
+    assert a.probe_cols == frozenset()
+    assert a.matched_name == "r"
+    assert a.matched_cols == frozenset({"k"})

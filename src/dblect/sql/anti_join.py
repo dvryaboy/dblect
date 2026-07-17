@@ -193,24 +193,28 @@ def _not_exists_anti_join(exists: exp.Exists, *, from_alias: str, node: Expr) ->
 
 
 def _not_in_anti_join(in_node: exp.In, *, from_alias: str, node: Expr) -> AntiJoin | None:
-    """``l.k NOT IN (SELECT r FROM R)`` over a single bare projected column of a single bare
-    table. The probe column is the ``NOT IN`` left side; the matched column is the subquery's one
-    projection."""
+    """``x NOT IN (SELECT r FROM R)`` over a single bare projected column of a single bare table.
+    The matched column is the subquery's one projection. The probe column is the ``NOT IN`` left
+    side when it is a bare column; an expression left side still denotes the anti-join operator
+    (rows of L whose value is absent from R), so the form is recognised with no clean probe key,
+    exactly as a native anti-join with a non-equality predicate carries empty ``probe_cols``."""
     query = in_node.args.get("query")
     if query is None:
-        return None
-    probe_col = in_node.this
-    if not isinstance(probe_col, exp.Column):
         return None
     resolved = single_projected_column(query)
     if resolved is None:
         return None
     matched_name, matched_col = resolved
-    probe_alias = sg.column_table(probe_col) or from_alias
+    probe_col = in_node.this
+    if isinstance(probe_col, exp.Column):
+        probe_alias = sg.column_table(probe_col) or from_alias
+        probe_cols = frozenset({sg.column_name(probe_col).lower()})
+    else:
+        probe_alias, probe_cols = from_alias, frozenset[str]()
     return AntiJoin(
         AntiJoinForm.NOT_IN,
         probe_alias,
-        frozenset({sg.column_name(probe_col).lower()}),
+        probe_cols,
         matched_name,
         frozenset({matched_col}),
         node=node,
