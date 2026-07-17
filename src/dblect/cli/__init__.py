@@ -182,6 +182,7 @@ def check(
     from dblect.report import render_json, render_text
     from dblect.sarif import render_sarif
     from dblect.severity import exceeds_threshold
+    from dblect.sql import SqlglotCompatibilityError
 
     if base_catalog is not None and base_manifest is None:
         raise typer.BadParameter("--base-catalog has no effect without --base-manifest")
@@ -193,23 +194,29 @@ def check(
     profile = _resolve_profile(loaded.adapter_type, dialect_override, command="check")
 
     load_result = load_declarations(project_dir)
-    report = analyze(
-        loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
-    )
-    report = replace(report, check=replace(report.check, load_issues=load_result.issues))
-    if base_manifest is not None:
-        base = _analyze_base(
-            base_manifest=base_manifest,
-            base_catalog=base_catalog,
-            dialect_override=dialect_override,
-            registry=load_result.registry,
-            resolution_floor=resolution_floor,
+    try:
+        report = analyze(
+            loaded, profile, registry=load_result.registry, resolution_floor=resolution_floor
         )
-        # Narrow only the merged ``findings`` view: that is what every renderer and the
-        # exit code read. The family sub-reports keep their project-wide coverage
-        # metadata (models scanned, contracts resolved), which describes the whole run,
-        # not the introduced subset.
-        report = replace(report, findings=introduced_findings(report.findings, base.findings))
+        report = replace(report, check=replace(report.check, load_issues=load_result.issues))
+        if base_manifest is not None:
+            base = _analyze_base(
+                base_manifest=base_manifest,
+                base_catalog=base_catalog,
+                dialect_override=dialect_override,
+                registry=load_result.registry,
+                resolution_floor=resolution_floor,
+            )
+            # Narrow only the merged ``findings`` view: that is what every renderer and the
+            # exit code read. The family sub-reports keep their project-wide coverage
+            # metadata (models scanned, contracts resolved), which describes the whole run,
+            # not the introduced subset.
+            report = replace(report, findings=introduced_findings(report.findings, base.findings))
+    except SqlglotCompatibilityError as e:
+        # An unsupported sqlglot build is an environment problem, not a finding; report it
+        # as a clean run failure rather than a traceback.
+        typer.echo(f"check: {e}", err=True)
+        raise typer.Exit(code=1) from e
     match output_format:
         case OutputFormat.JSON:
             rendered = render_json(report)
