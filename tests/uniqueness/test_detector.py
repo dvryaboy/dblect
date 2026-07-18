@@ -243,6 +243,17 @@ _LIMIT_CASES = [
         True,
         True,
     ),
+    (
+        # An ordinal resolves to the named projection's own source column, which is already a
+        # source name. Translating it through the projection's aliases a second time would
+        # re-map it whenever another projection is aliased to that name: here `other as id`
+        # would turn the resolved `id` into `other` and lose the key that covers the order.
+        "order_ordinal_of_key_aliased_over_by_a_later_projection",
+        "select id as x, other as id from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
 ]
 
 

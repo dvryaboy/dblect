@@ -333,9 +333,10 @@ def detect_limit_without_deterministic_order(
     equivalence check we do not model). When an ``ORDER BY`` is present but no source key is
     known, it stays silent rather than guess the ordering is non-unique. A top scope that
     yields a single row (an ungrouped aggregate) is exempt: SQL's implicit grouping collapses
-    it to one row, so a ``LIMIT`` cannot drop a row. Order keys are resolved through the
-    projection's aliases before being matched, so an ``order by <alias>`` of a key counts as
-    covering (and a renamed non-key column does not pass as the key).
+    it to one row, so a ``LIMIT`` cannot drop a row. Order keys named as output names are
+    resolved through the projection's aliases before being matched, so an ``order by <alias>``
+    of a key counts as covering (and a renamed non-key column does not pass as the key); a
+    positional key arrives already in the source namespace and is matched as-is.
     """
     if not is_materialized or not isinstance(tree, exp.Select):
         return ()
@@ -354,11 +355,15 @@ def detect_limit_without_deterministic_order(
     )
     if source_keys is None:
         return ()
-    order_cols = _bare_column_names(list(sg.statement_order_targets(tree)))
+    targets = sg.statement_order_targets(tree)
+    order_cols = _bare_column_names([t.expression for t in targets])
     if order_cols is None:
         return ()
     projection = _projection_aliases(tree)
-    covered = frozenset(projection.get(c, c) for c in order_cols)
+    covered = frozenset(
+        name if t.in_source_namespace else projection.get(name, name)
+        for t, name in zip(targets, order_cols, strict=True)
+    )
     if any(k <= covered for k in source_keys):
         return ()
     return (_limit_finding(limit, ordered=True, order_cols=order_cols),)
