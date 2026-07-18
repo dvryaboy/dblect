@@ -87,6 +87,11 @@ def detect_null_group_on_nullable_key(
     local case belongs to ``null_group_after_outer_join``). Only bare-column group keys
     are reasoned about; a computed key like ``date_trunc(col)`` needs an equivalence we
     do not model and is skipped.
+
+    A key named positionally or by output name is read through :func:`sg.group_targets` to the
+    projection it names, so ``group by 1`` over a nullable column carries the same hazard as
+    spelling the column out. The finding then lands on that projection, which is where the
+    grouped expression is actually written.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -99,10 +104,7 @@ def detect_null_group_on_nullable_key(
         nullable = nullable_by_name.get(target.name)
         if not nullable:
             continue
-        group = sg.group_of(sel)
-        if group is None:
-            continue
-        for grp_expr in group.expressions:
+        for grp_expr in sg.group_targets(sel):
             if not isinstance(grp_expr, exp.Column):
                 continue
             qualifier = sg.column_table(grp_expr)

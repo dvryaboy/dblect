@@ -147,6 +147,9 @@ def _kinds(mart_sql: str) -> list[FindingKind]:
 # this layer reasons only about single-source, join-free scopes.
 _CASES: list[tuple[str, str, bool]] = [
     ("group-by/nullable", "SELECT tag, count(*) AS n FROM stg GROUP BY tag", True),
+    # An ordinal names the projection, so the inherited-nullable key is grouped on just the
+    # same and the detector has to read through the position rather than past it.
+    ("group-by/nullable-ordinal", "SELECT tag, count(*) AS n FROM stg GROUP BY 1", True),
     ("group-by/non-null", "SELECT id, count(*) AS n FROM stg GROUP BY id", False),
     (
         "group-by/local-join",

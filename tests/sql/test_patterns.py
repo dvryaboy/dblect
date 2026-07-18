@@ -127,25 +127,19 @@ def test_list_aggregations_excludes_windowed_functions() -> None:
     assert aggs[0].argument_sql == "x"
 
 
-def test_unordered_window_constant_order_by_detected() -> None:
-    # `over (order by 1)` is not a positional reference: inside a window the literal is a
-    # constant, so every row sorts equal and the ranking is as arbitrary as with no ORDER BY.
-    findings = detect_unordered_window(_parse("select row_number() over (order by 1) from t"))
-    assert len(findings) == 1
-    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
-
-
+# The clear direction and the full clause enumeration belong to the duckdb permutation oracle
+# in ``test_pbt_structural_hazards.py``, which decides "really orders" from the data rather
+# than from a re-derivation of the rule. These keep a parse-only guard on the detect direction,
+# which is where reading a window's ORDER BY structurally went wrong.
 @pytest.mark.parametrize("order", ["1", "'x'", "null", "1 + 2"])
 def test_unordered_window_column_free_order_by_detected(order: str) -> None:
-    # Nothing that fails to reference a column can order rows.
+    # Nothing that fails to reference a column can order rows. `over (order by 1)` in
+    # particular is not a positional reference: inside a window the literal is a constant, so
+    # every row sorts equal and the ranking is as arbitrary as with no ORDER BY.
     sql = f"select row_number() over (order by {order}) from t"
-    assert len(detect_unordered_window(_parse(sql))) == 1
-
-
-def test_unordered_window_partly_constant_order_by_not_detected() -> None:
-    # One real key is an ordering; the constant alongside it is merely inert.
-    sql = "select row_number() over (order by 1, n) from t"
-    assert detect_unordered_window(_parse(sql)) == ()
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
 
 
 def test_unordered_aggregate_constant_order_by_detected() -> None:
@@ -154,26 +148,11 @@ def test_unordered_aggregate_constant_order_by_detected() -> None:
     assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
 
 
-def test_unordered_aggregate_real_order_by_not_detected() -> None:
-    assert detect_unordered_aggregate(_parse("select array_agg(s order by n) from t")) == ()
-
-
 def test_null_group_after_left_join_detected() -> None:
     sql = """
     select b.k, sum(amount) as total
     from a left join b on a.k = b.k
     group by b.k
-    """
-    findings = detect_null_group_after_outer_join(_parse(sql))
-    assert len(findings) == 1
-    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
-
-
-def test_null_group_after_left_join_positional_target_detected() -> None:
-    sql = """
-    select b.k, sum(amount) as total
-    from a left join b on a.k = b.k
-    group by 1
     """
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
@@ -229,18 +208,33 @@ def test_null_group_alias_shadowing_an_input_column_not_resolved() -> None:
     assert detect_null_group_after_outer_join(_parse(sql)) == ()
 
 
+def test_null_group_alias_under_a_star_projection_not_resolved() -> None:
+    # `select a.*` carries input columns the query never names, so `amt` may bind to an `a.amt`
+    # the shadow guard cannot see. A star makes every name potentially taken, so resolution
+    # declines rather than resolving to `b.k * 2` and reporting a hazard the query may not have.
+    sql = """
+    select a.*, b.k * 2 as amt, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by a.id, amt
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
 def test_list_group_bys_resolves_alias_target() -> None:
     groups = list_group_bys(_parse("select b.k as grp, count(*) from t group by grp"))
     assert groups[0].targets == ("b.k",)
     assert groups[0].target_columns == (("b", "k"),)
 
 
-def test_null_group_positional_target_reports_the_group_by_line() -> None:
-    # The finding has to land on the GROUP BY the analyst wrote, not at line 0. A positional
-    # target holds no identifier, so the line has to come off the ordinal literal itself.
+def test_null_group_positional_target_detected_and_located() -> None:
+    # `group by 1` names the nullable-side projection, so the hazard is the same one the
+    # spelled-out `group by b.k` carries. The finding also has to land on the GROUP BY the
+    # analyst wrote, not at line 0: a positional target holds no identifier, so the line has to
+    # come off the ordinal literal itself.
     sql = "select b.k, sum(amount) as total\nfrom a left join b on a.k = b.k\ngroup by 1"
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
     assert findings[0].line_start == 3
     assert findings[0].line_end == 3
 

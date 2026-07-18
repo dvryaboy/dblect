@@ -14,6 +14,7 @@ documents its key and what shape it returns.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
@@ -77,10 +78,8 @@ def group_targets(sel: exp.Select) -> tuple[Expr, ...]:
     no dialect gate.
 
     A target we cannot resolve is returned unchanged, leaving callers to treat it as the opaque
-    target it is. For an ordinal that means one past the end of the projection list, or into a
-    prefix holding a ``SELECT *`` that expands to an unknown number of columns, so position N is
-    not the Nth listed projection. For a name it means no projection carries it as an output
-    name, or :func:`_shadows_an_input_column` cannot rule out an input column of that name.
+    target it is. :func:`_resolve_ordinal` and :func:`_resolve_name` each document when they
+    decline.
     """
     group = group_of(sel)
     if group is None:
@@ -96,7 +95,7 @@ def _resolve_group_target(
     target: Expr, sel: exp.Select, projections: Sequence[Expr], projected: Mapping[str, Expr]
 ) -> Expr:
     resolved = _resolve_ordinal(target, projections)
-    return resolved if resolved is not target else _resolve_name(target, sel, projected)
+    return resolved if resolved is not None else _resolve_name(target, sel, projected)
 
 
 def _resolve_name(target: Expr, sel: exp.Select, projected: Mapping[str, Expr]) -> Expr:
@@ -159,7 +158,15 @@ def _shadows_an_input_column(name: str, sel: exp.Select) -> bool:
 
     ``GROUP BY`` and ``ORDER BY`` are excluded from the sweep because both resolve names against
     output aliases themselves, so a reference there is not evidence of an input column.
+
+    A projection that expands to unknown width settles the question the other way: ``select
+    a.*`` carries every column of ``a`` without naming one, so any name may be among them and
+    the sweep has nothing to find. Treating that as "no input column" would resolve the alias
+    and report against an expression the engine never grouped by, turning the permissive edge
+    above into a false positive, so an unexpanded star declines every name in the query.
     """
+    if any(_expands_to_unknown_width(p) for p in sel.expressions):
+        return True
     for key, arg in sel.args.items():
         if key in ("group", "order"):
             continue
@@ -170,7 +177,25 @@ def _shadows_an_input_column(name: str, sel: exp.Select) -> bool:
     return False
 
 
-def statement_order_targets(sel: exp.Select) -> tuple[Expr, ...]:
+@dataclass(frozen=True)
+class OrderTarget:
+    """One statement-level ``ORDER BY`` target, and which namespace its expression is in.
+
+    A positional target resolves to the named projection's own expression, so it arrives in the
+    query's *source* namespace, already past the ``AS`` binding. A target spelled as a name is
+    in the *output* namespace, where a caller matching against source columns still has to
+    translate it through the projection's aliases.
+
+    Conflating the two re-translates a resolved source column whenever some *other* projection
+    is aliased to that name: in ``select id as x, other as id ... order by 1`` the ordinal
+    resolves to ``id``, which a second pass through the alias map would turn into ``other``.
+    """
+
+    expression: Expr
+    in_source_namespace: bool
+
+
+def statement_order_targets(sel: exp.Select) -> tuple[OrderTarget, ...]:
     """The statement-level ``ORDER BY`` targets of ``sel``, with ordinals resolved and each
     target's ``exp.Ordered`` wrapper removed.
 
@@ -183,7 +208,14 @@ def statement_order_targets(sel: exp.Select) -> tuple[Expr, ...]:
         return ()
     projections = cast("list[Expr]", sel.expressions)
     targets = (t.this if isinstance(t, exp.Ordered) else t for t in order.expressions)
-    return tuple(_resolve_ordinal(t, projections) for t in targets)
+    return tuple(_order_target(t, projections) for t in targets)
+
+
+def _order_target(target: Expr, projections: Sequence[Expr]) -> OrderTarget:
+    resolved = _resolve_ordinal(target, projections)
+    if resolved is None:
+        return OrderTarget(target, in_source_namespace=False)
+    return OrderTarget(resolved, in_source_namespace=True)
 
 
 def imposes_row_order(order: exp.Order | None) -> bool:
@@ -204,21 +236,23 @@ def imposes_row_order(order: exp.Order | None) -> bool:
     return any(find_columns(e) for e in order.expressions)
 
 
-def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr:
-    """``target`` resolved through the projection list if it is a positional reference.
+def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr | None:
+    """The projection ``target`` names positionally, or ``None`` when it names none.
 
     Only a bare positive integer literal is positional. A string (``GROUP BY 'x'``), a float,
     and a negation (which parses as ``Neg`` over the literal, not a literal) are grouped
-    values, so they pass through untouched.
+    values, so they name no position. Nor does an index past the end of the projection list,
+    or one reaching over a ``SELECT *`` that expands to an unknown number of columns, so
+    position N is not the Nth listed projection.
     """
     if not (isinstance(target, exp.Literal) and target.is_int):
-        return target
+        return None
     index = int(target.this)
     if not 1 <= index <= len(projections):
-        return target
+        return None
     prefix = projections[:index]
     if any(_expands_to_unknown_width(p) for p in prefix):
-        return target
+        return None
     return prefix[-1].unalias()
 
 
