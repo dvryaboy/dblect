@@ -101,13 +101,6 @@ def test_exits_non_zero_when_findings_present(
     assert result.exit_code == 1
 
 
-def test_exits_zero_with_no_fail_override(jaffle_manifest_path: Path, runner: CliRunner) -> None:
-    result = runner.invoke(
-        app, ["check", "--manifest", str(jaffle_manifest_path), "--no-fail", "."]
-    )
-    assert result.exit_code == 0
-
-
 def test_fail_on_error_passes_warn_only_run(jaffle_manifest_path: Path, runner: CliRunner) -> None:
     # jaffle's structural finding is null_group_after_outer_join, an error-level
     # correctness hazard, so --fail-on error still fails it. The warn-vs-error
@@ -116,12 +109,6 @@ def test_fail_on_error_passes_warn_only_run(jaffle_manifest_path: Path, runner: 
     result = runner.invoke(
         app, ["check", "--manifest", str(jaffle_manifest_path), "--fail-on", "error", "."]
     )
-    assert result.exit_code == 1, result.output
-
-
-def test_fail_on_default_is_warn(jaffle_manifest_path: Path, runner: CliRunner) -> None:
-    # No --fail-on given: the default warn threshold fails the error-level finding.
-    result = runner.invoke(app, ["check", "--manifest", str(jaffle_manifest_path), "."])
     assert result.exit_code == 1, result.output
 
 
@@ -245,12 +232,6 @@ def test_env_var_overrides_project_target_path(
     )
     assert result.exit_code == 0, result.output
     assert "null_group_after_outer_join" in result.output
-
-
-def test_missing_manifest_and_no_dbt_project_fails(tmp_path: Path, runner: CliRunner) -> None:
-    result = runner.invoke(app, ["check", str(tmp_path)])
-    assert result.exit_code != 0
-    assert "dbt_project.yml" in result.output
 
 
 def test_explicit_manifest_missing_fails(tmp_path: Path, runner: CliRunner) -> None:

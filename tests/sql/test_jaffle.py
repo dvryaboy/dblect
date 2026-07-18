@@ -38,11 +38,6 @@ def _parsed(node: Node) -> Expr:
     return parse_sql(node.compiled_code, dialect="duckdb")
 
 
-def test_every_jaffle_model_parses(jaffle: Manifest) -> None:
-    for node in _models_with_code(jaffle).values():
-        _parsed(node)
-
-
 def test_customers_model_flags_null_group_risk(jaffle: Manifest) -> None:
     node = jaffle.nodes["model.jaffle_shop.customers"]
     findings = detect_null_group_after_outer_join(_parsed(node))

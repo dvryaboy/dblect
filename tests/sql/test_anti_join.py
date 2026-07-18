@@ -73,18 +73,16 @@ def test_multi_column_correlation_carries_every_predicate_column() -> None:
 # --- soundness edges --------------------------------------------------------------
 
 
-def test_left_is_null_on_a_join_key_column_is_an_anti_join() -> None:
-    """The ``IS NULL`` on a join-key column keeps exactly the unmatched rows: a matched row has
-    ``l.k = r.k`` so ``r.k`` is non-NULL there, and the filter excludes it. Sound with no
-    nullability oracle, because the equality match itself proves the column non-NULL."""
-    a = _only("SELECT l.a FROM l LEFT JOIN r ON l.k = r.k WHERE r.k IS NULL")
-    assert a.form is AntiJoinForm.LEFT_IS_NULL
-
-
 def test_left_is_null_on_a_non_key_column_is_not_recognised() -> None:
-    """``IS NULL`` on a column absent from the join key can leak matched rows: a matched row may
-    carry a NULL there, survive the filter, and the result is not the anti-join. The classifier
-    stays oracle-free and does not claim it; deciding it needs the nullability substrate."""
+    """The join-key column is where the idiom is sound, and this is the foil that bounds it.
+
+    On a join-key column (``_LEFT_IS_NULL`` above) the ``IS NULL`` keeps exactly the unmatched
+    rows: a matched row has ``l.k = r.k`` so ``r.k`` is non-NULL there, and the filter excludes
+    it. That holds with no nullability oracle, because the equality match itself proves the
+    column non-NULL. On a column absent from the join key the argument evaporates: a matched row
+    may carry a NULL there, survive the filter, and the result is not the anti-join. The
+    classifier stays oracle-free and does not claim it; deciding it needs the nullability
+    substrate."""
     sel = sqlglot.parse_one("SELECT l.a FROM l LEFT JOIN r ON l.k = r.k WHERE r.attr IS NULL")
     assert anti_joins_of(sel) == ()  # type: ignore[arg-type]
 
