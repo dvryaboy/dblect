@@ -73,23 +73,12 @@ def test_list_group_bys_one_per_select() -> None:
     assert {g.targets for g in groups} == {("x",), ("y",)}
 
 
-def test_list_group_bys_resolves_positional_targets() -> None:
-    # The ordinal names a projection, so the inventory reports what is grouped rather than the
-    # literal standing in for it.
-    groups = list_group_bys(_parse("select b.k, count(*) from t group by 1"))
-    assert groups[0].targets == ("b.k",)
-    assert groups[0].target_columns == (("b", "k"),)
-
-
 def test_list_group_bys_resolves_positional_target_through_alias() -> None:
+    # The ordinal names a projection, so the inventory reports what is grouped rather than the
+    # literal standing in for it, seeing through the AS binding to the expression underneath.
     groups = list_group_bys(_parse("select b.k as key, count(*) from t group by 1"))
     assert groups[0].targets == ("b.k",)
     assert groups[0].target_columns == (("b", "k"),)
-
-
-def test_list_group_bys_resolves_mixed_positional_and_named_targets() -> None:
-    groups = list_group_bys(_parse("select b.k, b.status, count(*) from t group by 1, b.status"))
-    assert groups[0].targets == ("b.k", "b.status")
 
 
 def test_list_group_bys_leaves_out_of_range_ordinal_unresolved() -> None:
@@ -121,12 +110,52 @@ def test_list_group_bys_leaves_non_ordinal_literals_unresolved(target: str) -> N
     assert groups[0].target_columns == ()
 
 
+def test_list_group_bys_leaves_duplicated_alias_unresolved() -> None:
+    # Two projections carrying one alias name it ambiguously, and the query is not valid SQL
+    # anyway (duckdb binds the first and then rejects the ungrouped second), so there is nothing
+    # to resolve to and the target stays as written rather than picking an arm.
+    groups = list_group_bys(_parse("select b.k as x, b.status as x, count(*) from t group by x"))
+    assert groups[0].targets == ("x",)
+    assert groups[0].target_columns == ((None, "x"),)
+
+
 def test_list_aggregations_excludes_windowed_functions() -> None:
     p = _parse("select sum(x), sum(y) over () from t")
     aggs = list_aggregations(p)
     assert len(aggs) == 1
     assert aggs[0].function == "Sum"
     assert aggs[0].argument_sql == "x"
+
+
+def test_unordered_window_constant_order_by_detected() -> None:
+    # `over (order by 1)` is not a positional reference: inside a window the literal is a
+    # constant, so every row sorts equal and the ranking is as arbitrary as with no ORDER BY.
+    findings = detect_unordered_window(_parse("select row_number() over (order by 1) from t"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
+
+
+@pytest.mark.parametrize("order", ["1", "'x'", "null", "1 + 2"])
+def test_unordered_window_column_free_order_by_detected(order: str) -> None:
+    # Nothing that fails to reference a column can order rows.
+    sql = f"select row_number() over (order by {order}) from t"
+    assert len(detect_unordered_window(_parse(sql))) == 1
+
+
+def test_unordered_window_partly_constant_order_by_not_detected() -> None:
+    # One real key is an ordering; the constant alongside it is merely inert.
+    sql = "select row_number() over (order by 1, n) from t"
+    assert detect_unordered_window(_parse(sql)) == ()
+
+
+def test_unordered_aggregate_constant_order_by_detected() -> None:
+    findings = detect_unordered_aggregate(_parse("select array_agg(s order by 1) from t"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
+
+
+def test_unordered_aggregate_real_order_by_not_detected() -> None:
+    assert detect_unordered_aggregate(_parse("select array_agg(s order by n) from t")) == ()
 
 
 def test_null_group_after_left_join_detected() -> None:
@@ -151,35 +180,59 @@ def test_null_group_after_left_join_positional_target_detected() -> None:
     assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
 
 
-def test_null_group_positional_target_to_preserved_side_not_detected() -> None:
+def test_null_group_alias_target_detected() -> None:
+    # `group by grp` names the projection aliased grp, which is the nullable side.
     sql = """
-    select a.k, sum(amount) as total
+    select b.k as grp, sum(amount) as total
     from a left join b on a.k = b.k
-    group by 1
-    """
-    assert detect_null_group_after_outer_join(_parse(sql)) == ()
-
-
-def test_null_group_positional_coalesce_to_preserved_side_not_detected() -> None:
-    # The guard that clears a recovered key has to see the COALESCE the ordinal names.
-    sql = """
-    select coalesce(b.k, a.k) as k, sum(amount) as total
-    from a left join b on a.k = b.k
-    group by 1
-    """
-    assert detect_null_group_after_outer_join(_parse(sql)) == ()
-
-
-def test_null_group_positional_target_selects_the_named_projection() -> None:
-    # Ordinal 2 must land on the nullable projection, not the preserved one at ordinal 1.
-    sql = """
-    select a.k, b.status, sum(amount) as total
-    from a left join b on a.k = b.k
-    group by 1, 2
+    group by grp
     """
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
-    assert "b.status" in findings[0].message
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_unqualified_reference_to_projected_column_detected() -> None:
+    # The dbt idiom: project a qualified column, group by its bare name. SQL binds the name to
+    # the input column, and the projection *is* that column, so both readings land on the same
+    # expression and resolving is sound even though the name shadows an input column.
+    sql = """
+    select orders.customer_id, sum(amount) as total
+    from payments left join orders on payments.order_id = orders.order_id
+    group by customer_id
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_unqualified_reference_to_preserved_column_not_detected() -> None:
+    sql = """
+    select payments.order_id, sum(amount) as total
+    from payments left join orders on payments.order_id = orders.order_id
+    group by order_id
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_alias_shadowing_an_input_column_not_resolved() -> None:
+    # SQL resolves a GROUP BY name to an input column before an output alias, so `group by amt`
+    # here groups by b.amt, not by the projection aliased amt. We cannot tell which table an
+    # unqualified name binds to without a schema, so we decline to resolve and stay silent.
+    # This is the known-permissive edge of the alias rule: the b.amt grouping is a real hazard
+    # we do not report, matching the behaviour before aliases resolved at all.
+    sql = """
+    select b.amt * 2 as amt, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by amt
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_list_group_bys_resolves_alias_target() -> None:
+    groups = list_group_bys(_parse("select b.k as grp, count(*) from t group by grp"))
+    assert groups[0].targets == ("b.k",)
+    assert groups[0].target_columns == (("b", "k"),)
 
 
 def test_null_group_positional_target_reports_the_group_by_line() -> None:

@@ -414,6 +414,10 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
     runs unless an ORDER BY pins the order. ``LAG``/``LEAD``/``FIRST_VALUE``/
     ``LAST_VALUE`` are similarly meaningless without an ordering.
 
+    An ORDER BY whose targets reference no column is no ordering at all: inside a window a
+    literal is a constant rather than the positional reference the same literal denotes at
+    statement level, so every row sorts equal and the ranking stays arbitrary.
+
     The exception is the dedup where a ``row_number() = 1`` keeps one row per partition and
     the partition key covers every column the ranked scope carries forward: the surviving
     rows are then identical on all surfaced columns, so the missing ORDER BY does not change
@@ -424,8 +428,7 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
         fn = sg.fn_of(w)
         if fn is None or type(fn) not in _RANKING_FUNCTIONS:
             continue
-        order = sg.order_of(w)
-        if order is not None and order.expressions:
+        if sg.imposes_row_order(sg.order_of(w)):
             continue
         if _row_number_dedup_is_order_insensitive(w):
             continue
@@ -443,12 +446,16 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
 
 
 def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
-    """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY."""
+    """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY.
+
+    An aggregate's ORDER BY takes expressions, so ``array_agg(x order by 1)`` orders by a
+    constant and leaves the element order as undefined as no ORDER BY would.
+    """
     out: list[Finding] = []
     for node in sg.find_all_ordered_aggregates(tree):
         if isinstance(node.parent, exp.WithinGroup):
             continue
-        if sg.aggregate_order_of(node) is not None:
+        if sg.imposes_row_order(sg.aggregate_order_of(node)):
             continue
         out.append(
             finding_at(
