@@ -22,6 +22,8 @@ from typer.testing import CliRunner
 
 from dblect.cli import app
 
+from ._output import plain
+
 _CASES = Path(__file__).parent.parent / "fixtures" / "scenarios" / "cases"
 _CURRENCY_CREEP = _CASES / "currency_creep"
 _HEAD_MANIFEST = _CURRENCY_CREEP / "manifest.json"
@@ -94,4 +96,4 @@ def test_an_introduced_finding_fails_the_run(runner: CliRunner, base_without_mar
 def test_missing_base_manifest_is_an_error(runner: CliRunner, tmp_path: Path) -> None:
     result = _run(runner, "--base-manifest", str(tmp_path / "nope.json"))
     assert result.exit_code != 0
-    assert "--base-manifest" in result.output
+    assert "--base-manifest" in plain(result.output)
