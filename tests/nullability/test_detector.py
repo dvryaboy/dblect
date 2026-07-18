@@ -368,16 +368,13 @@ def _not_in_keys(sql: str) -> tuple[Finding, ...]:
     )
 
 
-def test_not_in_as_top_level_conjunct_fires() -> None:
-    findings = _not_in_keys("SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)")
-    assert len(findings) == 1
-    assert findings[0].kind is FindingKind.NOT_IN_NULLABLE_SUBQUERY
-
-
 def test_not_in_conjoined_with_another_predicate_still_fires() -> None:
-    # AND keeps NOT IN a top-level conjunct: a NULL in the subquery still empties the result.
+    # AND keeps NOT IN a top-level conjunct: a NULL in the subquery still empties the result. The
+    # bare top-level-conjunct case is the parametrized ``not-in/nullable`` scenario above; this
+    # adds the AND scope that the shared classifier newly threads through.
     sql = "SELECT id FROM stg WHERE id > 0 AND id NOT IN (SELECT tag FROM stg)"
     assert len(_not_in_keys(sql)) == 1
+    assert _not_in_keys(sql)[0].kind is FindingKind.NOT_IN_NULLABLE_SUBQUERY
 
 
 def test_not_in_under_or_is_silent() -> None:
