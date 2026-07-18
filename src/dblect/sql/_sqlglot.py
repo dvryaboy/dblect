@@ -13,6 +13,7 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import cast
 
@@ -59,6 +60,60 @@ def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
 
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
+
+
+def group_targets(sel: exp.Select) -> tuple[Expr, ...]:
+    """The expressions ``sel`` groups by, with positional ordinals resolved to the projections
+    they name.
+
+    ``GROUP BY 1`` names the first projection, so a reader walking the ``Group`` node's
+    arguments finds an ``exp.Literal`` where the semantics are the projected expression. Every
+    structural check over grouping keys wants the expression, so the resolution belongs here
+    rather than in each caller. We resolve by lookup instead of rewriting the tree, so the
+    caller's nodes keep the source positions that findings report line numbers from.
+
+    Every adapter dblect targets reads a bare integer in GROUP BY as a position, so this needs
+    no dialect gate.
+
+    An ordinal we cannot resolve is returned unchanged, leaving callers to treat it as the
+    opaque target it is: one past the end of the projection list, or into a prefix holding a
+    ``SELECT *`` that expands to an unknown number of columns, so position N is not the Nth
+    listed projection.
+    """
+    group = group_of(sel)
+    if group is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    return tuple(_resolve_ordinal(target, projections) for target in group.expressions)
+
+
+def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr:
+    """``target`` resolved through the projection list if it is a positional reference.
+
+    Only a bare positive integer literal is positional. A string (``GROUP BY 'x'``), a float,
+    and a negation (which parses as ``Neg`` over the literal, not a literal) are grouped
+    values, so they pass through untouched.
+    """
+    if not (isinstance(target, exp.Literal) and target.is_int):
+        return target
+    index = int(target.this)
+    if not 1 <= index <= len(projections):
+        return target
+    prefix = projections[:index]
+    if any(_expands_to_unknown_width(p) for p in prefix):
+        return target
+    return prefix[-1].unalias()
+
+
+def _expands_to_unknown_width(projection: Expr) -> bool:
+    """Whether ``projection`` stands for an unknown number of output columns.
+
+    A bare ``*`` or a qualified ``t.*`` does; ``count(*)`` does not, so this looks at the
+    projection itself rather than searching it for a ``Star``.
+    """
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+    )
 
 
 def on_of(j: exp.Join) -> Expr | None:
@@ -459,17 +514,17 @@ def conjunctive_leaves(predicate: Expr) -> list[Expr]:
 def line_range(e: Expr) -> tuple[int, int] | None:
     """The 1-indexed (start, end) source-line span covered by `e`.
 
-    sqlglot only stamps token-position metadata onto ``Identifier`` nodes, so
-    we walk descendants and take min/max over their `meta["line"]`. Returns
-    `None` if no identifier carries a usable line number (rare; some literal-
-    only expressions like ``select 1`` have no identifier children).
+    sqlglot stamps token-position metadata onto the leaves it builds from a single token,
+    which is mostly ``Identifier`` but also ``Literal``, so we walk every descendant and take
+    min/max over the ``meta["line"]`` values we find. Reading identifiers alone left the
+    literal-only expressions with no span at all, which is how ``GROUP BY 1`` reported a
+    finding against line 0. Returns ``None`` when no descendant carries a usable line number.
 
-    Line numbers refer to the SQL the parser saw (the model's
-    ``compiled_code``).
+    Line numbers refer to the SQL the parser saw (the model's ``compiled_code``).
     """
     lines: list[int] = []
-    for ident in e.find_all(exp.Identifier):
-        line = ident.meta.get("line") if ident.meta else None
+    for node in e.walk():
+        line = node.meta.get("line") if node.meta else None
         if isinstance(line, int):
             lines.append(line)
     if not lines:

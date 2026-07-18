@@ -73,6 +73,54 @@ def test_list_group_bys_one_per_select() -> None:
     assert {g.targets for g in groups} == {("x",), ("y",)}
 
 
+def test_list_group_bys_resolves_positional_targets() -> None:
+    # The ordinal names a projection, so the inventory reports what is grouped rather than the
+    # literal standing in for it.
+    groups = list_group_bys(_parse("select b.k, count(*) from t group by 1"))
+    assert groups[0].targets == ("b.k",)
+    assert groups[0].target_columns == (("b", "k"),)
+
+
+def test_list_group_bys_resolves_positional_target_through_alias() -> None:
+    groups = list_group_bys(_parse("select b.k as key, count(*) from t group by 1"))
+    assert groups[0].targets == ("b.k",)
+    assert groups[0].target_columns == (("b", "k"),)
+
+
+def test_list_group_bys_resolves_mixed_positional_and_named_targets() -> None:
+    groups = list_group_bys(_parse("select b.k, b.status, count(*) from t group by 1, b.status"))
+    assert groups[0].targets == ("b.k", "b.status")
+
+
+def test_list_group_bys_leaves_out_of_range_ordinal_unresolved() -> None:
+    # Nothing to resolve against; the target stays the opaque literal it is rather than
+    # indexing off the end of the projection list.
+    groups = list_group_bys(_parse("select b.k, count(*) from t group by 7"))
+    assert groups[0].targets == ("7",)
+    assert groups[0].target_columns == ()
+
+
+def test_list_group_bys_leaves_ordinal_unresolved_under_unexpanded_star() -> None:
+    # A star expands to an unknown number of columns, so position 2 is not the second listed
+    # projection and the ordinal cannot be resolved soundly.
+    groups = list_group_bys(_parse("select *, b.k from t group by 2"))
+    assert groups[0].targets == ("2",)
+
+
+def test_list_group_bys_resolves_ordinal_when_star_follows_it() -> None:
+    # A star *after* the ordinal's position does not shift the prefix it indexes into.
+    groups = list_group_bys(_parse("select b.k, * from t group by 1"))
+    assert groups[0].targets == ("b.k",)
+
+
+@pytest.mark.parametrize("target", ["'1'", "1.5", "-1", "0"])
+def test_list_group_bys_leaves_non_ordinal_literals_unresolved(target: str) -> None:
+    # Only a bare positive integer literal is a positional reference. A string, a float, a
+    # negation, and the out-of-range 0 are grouped values, not positions.
+    groups = list_group_bys(_parse(f"select b.k, count(*) from t group by {target}"))
+    assert groups[0].target_columns == ()
+
+
 def test_list_aggregations_excludes_windowed_functions() -> None:
     p = _parse("select sum(x), sum(y) over () from t")
     aggs = list_aggregations(p)
@@ -90,6 +138,58 @@ def test_null_group_after_left_join_detected() -> None:
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_after_left_join_positional_target_detected() -> None:
+    sql = """
+    select b.k, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by 1
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_positional_target_to_preserved_side_not_detected() -> None:
+    sql = """
+    select a.k, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by 1
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_positional_coalesce_to_preserved_side_not_detected() -> None:
+    # The guard that clears a recovered key has to see the COALESCE the ordinal names.
+    sql = """
+    select coalesce(b.k, a.k) as k, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by 1
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_positional_target_selects_the_named_projection() -> None:
+    # Ordinal 2 must land on the nullable projection, not the preserved one at ordinal 1.
+    sql = """
+    select a.k, b.status, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by 1, 2
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert "b.status" in findings[0].message
+
+
+def test_null_group_positional_target_reports_the_group_by_line() -> None:
+    # The finding has to land on the GROUP BY the analyst wrote, not at line 0. A positional
+    # target holds no identifier, so the line has to come off the ordinal literal itself.
+    sql = "select b.k, sum(amount) as total\nfrom a left join b on a.k = b.k\ngroup by 1"
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].line_start == 3
+    assert findings[0].line_end == 3
 
 
 def test_null_group_after_inner_join_not_detected() -> None:
@@ -884,13 +984,13 @@ def test_now_in_join_on_detected() -> None:
     assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
-def test_now_in_group_by_detected() -> None:
+def test_now_in_positional_group_by_detected() -> None:
+    # `group by 1` names the first projection, so the grouped expression is the one holding
+    # now() even though the GROUP BY target in the AST is the literal 1.
     sql = "select date_diff('day', ts, now()) as days_ago, count(*) from t group by 1"
-    # `group by 1` is a positional reference; the GROUP BY *target* in the AST
-    # is the literal 1, not the expression. So this won't fire. The pattern
-    # we care about is `group by <expression containing now()>` directly.
-    # (Documented because someone will inevitably wonder why it didn't trigger.)
-    assert _non_determinism(sql) == ()
+    findings = _non_determinism(sql)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
 def test_now_in_explicit_group_by_expression_detected() -> None:
