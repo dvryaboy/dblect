@@ -23,10 +23,6 @@ def _keys(*key_sets: set[str]) -> CandidateKeySet:
     return CandidateKeySet(frozenset(frozenset(k) for k in key_sets))
 
 
-def test_grain_preserved_when_the_origin_key_is_a_key() -> None:
-    assert grain_preserved(_keys({"order_id"}), frozenset({"order_id"}))
-
-
 def test_grain_preserved_when_a_finer_key_survives() -> None:
     """A relation keyed on a subset of the origin is even finer, so each origin row still
     appears once."""
@@ -45,5 +41,7 @@ def test_grain_not_preserved_when_no_key_is_known() -> None:
 
 
 def test_any_surviving_subset_key_preserves_the_grain() -> None:
-    """Several candidate keys: one that refines the origin is enough."""
+    """Several candidate keys: one that refines the origin is enough. The matching key here is
+    the origin key itself, so this also pins the equality boundary, that a key equal to the
+    origin refines it."""
     assert grain_preserved(_keys({"x"}, {"order_id"}), frozenset({"order_id"}))

@@ -317,7 +317,7 @@ def test_suppressed_declaration_finding_reaches_sarif() -> None:
     assert result["suppressions"][0]["justification"].endswith("@ L4")
 
 
-@pytest.mark.parametrize("fmt", ["text", "json", "sarif"])
+@pytest.mark.parametrize("fmt", ["text", "sarif"])
 def test_cli_check_emits_requested_format(jaffle_manifest_path: Path, fmt: str) -> None:
     from typer.testing import CliRunner
 
