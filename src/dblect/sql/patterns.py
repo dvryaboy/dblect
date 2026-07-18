@@ -182,12 +182,12 @@ def list_group_bys(tree: Expr) -> tuple[GroupBySummary, ...]:
     """Return every GROUP BY clause's targets, one summary per containing SELECT."""
     out: list[GroupBySummary] = []
     for sel in sg.find_all_selects(tree):
-        g = sg.group_of(sel)
-        if g is None:
+        if sg.group_of(sel) is None:
             continue
-        targets = tuple(sg.render_sql(e) for e in g.expressions)
+        grouped = sg.group_targets(sel)
+        targets = tuple(sg.render_sql(e) for e in grouped)
         cols: list[tuple[str | None, str]] = []
-        for e in g.expressions:
+        for e in grouped:
             cols.extend(sg.column_key(c) for c in sg.find_columns(e))
         out.append(GroupBySummary(targets=targets, target_columns=tuple(cols)))
     return tuple(out)
@@ -239,7 +239,7 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
         nullable_fs = frozenset(nullable)
         risky_tables: set[str] = set()
         risky_targets: list[str] = []
-        for grp_expr in g.expressions:
+        for grp_expr in sg.group_targets(sel):
             hit: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
@@ -863,9 +863,7 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
         on = sg.on_of(j)
         if on is not None:
             scopes.append(("a JOIN ON clause", on))
-    group = sg.group_of(sel)
-    if group is not None:
-        scopes.extend(("a GROUP BY target", g) for g in group.expressions)
+    scopes.extend(("a GROUP BY target", g) for g in sg.group_targets(sel))
     for w in sg.find_all_windows(sel):
         scopes.extend(("a window PARTITION BY", part) for part in sg.partition_of(w))
         order = sg.order_of(w)
