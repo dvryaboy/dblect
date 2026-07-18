@@ -10,7 +10,6 @@ codes, and the JSON schema. The declaration side and init are pinned in
 from __future__ import annotations
 
 import json
-import re
 import shutil
 from pathlib import Path
 
@@ -19,15 +18,7 @@ from typer.testing import CliRunner
 
 from dblect.cli import app
 
-# Typer/Rich renders BadParameter inside a Panel and highlights CLI flags like
-# ``--dialect`` with colour escapes when a colour-capable terminal is detected
-# (which CI runners report). That highlighting splits the literal substring
-# ``--dialect`` across ANSI sequences, so substring checks must strip first.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-
-
-def _plain(text: str) -> str:
-    return _ANSI_RE.sub("", text)
+from ._output import plain as _plain
 
 
 @pytest.fixture
