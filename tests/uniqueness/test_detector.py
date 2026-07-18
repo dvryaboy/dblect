@@ -227,6 +227,22 @@ _LIMIT_CASES = [
         True,
         True,
     ),
+    (
+        # A statement-level ORDER BY *is* positional, unlike the same literal inside a window,
+        # so ordinal 1 names the key column and the slice is deterministic.
+        "order_ordinal_of_key",
+        "select id from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
+    (
+        "order_ordinal_of_non_key",
+        "select other from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        True,
+    ),
 ]
 
 

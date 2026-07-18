@@ -354,7 +354,7 @@ def detect_limit_without_deterministic_order(
     )
     if source_keys is None:
         return ()
-    order_cols = _bare_column_names(order.expressions)
+    order_cols = _bare_column_names(list(sg.statement_order_targets(tree)))
     if order_cols is None:
         return ()
     projection = _projection_aliases(tree)

@@ -13,7 +13,7 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import cast
 
@@ -63,28 +63,145 @@ def group_of(sel: exp.Select) -> exp.Group | None:
 
 
 def group_targets(sel: exp.Select) -> tuple[Expr, ...]:
-    """The expressions ``sel`` groups by, with positional ordinals resolved to the projections
-    they name.
+    """The expressions ``sel`` groups by, with positional ordinals and output-alias references
+    resolved to the projections they name.
 
-    ``GROUP BY 1`` names the first projection, so a reader walking the ``Group`` node's
-    arguments finds an ``exp.Literal`` where the semantics are the projected expression. Every
-    structural check over grouping keys wants the expression, so the resolution belongs here
-    rather than in each caller. We resolve by lookup instead of rewriting the tree, so the
-    caller's nodes keep the source positions that findings report line numbers from.
+    ``GROUP BY 1`` and ``GROUP BY revenue_day`` both name a projection, so a reader walking the
+    ``Group`` node's arguments finds an ``exp.Literal`` or a table-less ``exp.Column`` where the
+    semantics are the projected expression. Every structural check over grouping keys wants that
+    expression, so the resolution belongs here rather than in each caller. We resolve by lookup
+    instead of rewriting the tree, so the caller's nodes keep the source positions that findings
+    report line numbers from.
 
     Every adapter dblect targets reads a bare integer in GROUP BY as a position, so this needs
     no dialect gate.
 
-    An ordinal we cannot resolve is returned unchanged, leaving callers to treat it as the
-    opaque target it is: one past the end of the projection list, or into a prefix holding a
-    ``SELECT *`` that expands to an unknown number of columns, so position N is not the Nth
-    listed projection.
+    A target we cannot resolve is returned unchanged, leaving callers to treat it as the opaque
+    target it is. For an ordinal that means one past the end of the projection list, or into a
+    prefix holding a ``SELECT *`` that expands to an unknown number of columns, so position N is
+    not the Nth listed projection. For a name it means no projection carries it as an output
+    name, or :func:`_shadows_an_input_column` cannot rule out an input column of that name.
     """
     group = group_of(sel)
     if group is None:
         return ()
     projections = cast("list[Expr]", sel.expressions)
-    return tuple(_resolve_ordinal(target, projections) for target in group.expressions)
+    projected = _projection_expressions_by_output_name(sel)
+    return tuple(
+        _resolve_group_target(target, sel, projections, projected) for target in group.expressions
+    )
+
+
+def _resolve_group_target(
+    target: Expr, sel: exp.Select, projections: Sequence[Expr], projected: Mapping[str, Expr]
+) -> Expr:
+    resolved = _resolve_ordinal(target, projections)
+    return resolved if resolved is not target else _resolve_name(target, sel, projected)
+
+
+def _resolve_name(target: Expr, sel: exp.Select, projected: Mapping[str, Expr]) -> Expr:
+    """``target`` resolved to the projection it names, if it is an output-name reference.
+
+    Only an unqualified column name can name a projection; ``t.k`` binds to the table.
+
+    A name matching a projection that is *itself* the bare column of that name resolves
+    unconditionally: SQL would bind the name to that input column, and the projection is that
+    same column, so the two readings agree and the shadowing question does not arise. This is
+    the ``select orders.customer_id ... group by customer_id`` idiom. Any other projection is
+    a renaming, where an input column of the same name would win over the output name, so it
+    resolves only when :func:`_shadows_an_input_column` finds no such column.
+    """
+    if not isinstance(target, exp.Column) or target.args.get("table") is not None:
+        return target
+    if not isinstance(target.this, exp.Identifier):
+        return target
+    name = column_name(target)
+    projection = projected.get(name)
+    if projection is None:
+        return target
+    if isinstance(projection, exp.Column) and column_name(projection) == name:
+        return projection
+    return target if _shadows_an_input_column(name, sel) else projection
+
+
+def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+    """Each output name in ``sel``'s projection mapped to the expression behind it.
+
+    An output name carried by two projections names neither unambiguously, so it is dropped
+    rather than resolved to whichever came last. Such a query does not run anyway: an engine
+    binds the first and then rejects the second as ungrouped.
+    """
+    out: dict[str, Expr] = {}
+    duplicated: set[str] = set()
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Alias):
+            name, expression = proj.alias_or_name, cast("Expr", proj.this)
+        elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Identifier):
+            name, expression = column_name(proj), proj
+        else:
+            continue
+        if name in out:
+            duplicated.add(name)
+        out[name] = expression
+    return {name: e for name, e in out.items() if name not in duplicated}
+
+
+def _shadows_an_input_column(name: str, sel: exp.Select) -> bool:
+    """Whether ``name`` may bind to an input column of ``sel`` rather than to its output alias.
+
+    SQL resolves a GROUP BY name against the input columns first and only then against the
+    output aliases, so ``select b.amt * 2 as amt ... group by amt`` groups by ``b.amt``. Naming
+    the input columns exactly needs a schema, which the AST layer does not have, so we treat any
+    column of that name referenced elsewhere in the query as evidence the name is taken and
+    decline to resolve. That is conservative in the direction of the behaviour before aliases
+    resolved at all: an input column the query never mentions still slips through, which is the
+    known-permissive edge of this rule.
+
+    ``GROUP BY`` and ``ORDER BY`` are excluded from the sweep because both resolve names against
+    output aliases themselves, so a reference there is not evidence of an input column.
+    """
+    for key, arg in sel.args.items():
+        if key in ("group", "order"):
+            continue
+        nodes = cast("list[object]", arg) if isinstance(arg, list) else [cast("object", arg)]
+        for node in nodes:
+            if isinstance(node, Expr) and any(column_name(c) == name for c in find_columns(node)):
+                return True
+    return False
+
+
+def statement_order_targets(sel: exp.Select) -> tuple[Expr, ...]:
+    """The statement-level ``ORDER BY`` targets of ``sel``, with ordinals resolved and each
+    target's ``exp.Ordered`` wrapper removed.
+
+    Unlike the ORDER BY inside a window or an aggregate, where a literal is a constant that
+    orders nothing (see :func:`imposes_row_order`), a statement-level ``ORDER BY 1`` is a
+    positional reference to the first projection.
+    """
+    order = cast("exp.Order | None", sel.args.get("order"))
+    if order is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    targets = (t.this if isinstance(t, exp.Ordered) else t for t in order.expressions)
+    return tuple(_resolve_ordinal(t, projections) for t in targets)
+
+
+def imposes_row_order(order: exp.Order | None) -> bool:
+    """Whether ``order`` actually pins the order of the rows it governs.
+
+    An ORDER BY inside a window or an aggregate takes expressions, never the positional
+    references a statement-level ORDER BY accepts, so a literal there is a constant: every row
+    sorts equal and the ranking falls back to whatever physical order the engine happened to
+    have. An ordering whose targets reference no column therefore pins nothing, and the caller's
+    "no ORDER BY" hazard applies to it unchanged.
+
+    A target referencing a column counts even when the column sits inside a subquery, where the
+    value is constant per row and so orders nothing either. That keeps the answer conservative:
+    the caller stays silent rather than reporting a hazard this rule cannot yet prove.
+    """
+    if order is None or not order.expressions:
+        return False
+    return any(find_columns(e) for e in order.expressions)
 
 
 def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr:
