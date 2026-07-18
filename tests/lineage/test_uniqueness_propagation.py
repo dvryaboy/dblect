@@ -262,6 +262,64 @@ def test_join_drops_keys_when_joined_side_is_not_unique_on_the_key() -> None:
     assert keys["model.shop.joined"] == CandidateKeySet.of()  # no key proven
 
 
+# An anti-join keeps a probe row only when it has no match, and a semi-join only when it does;
+# either way each is row-removing and never multiplies the probe, so the probe's keys carry
+# through unconditionally, whether or not the matched side has a key of its own. The three tests
+# below reuse the exact setup of ``test_join_drops_keys_when_joined_side_is_not_unique_on_the_key``
+# (probe ``orders`` unique on ``id``, keyless matched ``events``): the ordinary LEFT join there
+# fans out and drops the key, so the only difference here is the row-removing join, which is what
+# rescues the key.
+
+
+def test_anti_join_preserves_probe_keys_against_a_keyless_matched_side() -> None:
+    orders = _source("source.shop.raw.orders")
+    events = _source("source.shop.raw.events")
+    keys = _keys(
+        orders,
+        events,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _model(
+            "model.shop.anti",
+            "SELECT o.id FROM orders o ANTI JOIN events e ON o.id = e.order_id",
+        ),
+    )
+    assert keys["model.shop.anti"] == CandidateKeySet.of(_key("id"))
+
+
+def test_semi_join_preserves_probe_keys_against_a_keyless_matched_side() -> None:
+    orders = _source("source.shop.raw.orders")
+    events = _source("source.shop.raw.events")
+    keys = _keys(
+        orders,
+        events,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _model(
+            "model.shop.semi",
+            "SELECT o.id FROM orders o SEMI JOIN events e ON o.id = e.order_id",
+        ),
+    )
+    assert keys["model.shop.semi"] == CandidateKeySet.of(_key("id"))
+
+
+def test_left_join_is_null_anti_idiom_preserves_probe_keys() -> None:
+    """The ``LEFT JOIN ... WHERE <matched join key> IS NULL`` idiom keeps only the unmatched
+    probe rows, one per probe row, so the probe key survives though the bare LEFT join to the
+    same keyless side (the foil above) fans out and loses it."""
+    orders = _source("source.shop.raw.orders")
+    events = _source("source.shop.raw.events")
+    keys = _keys(
+        orders,
+        events,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _model(
+            "model.shop.antinull",
+            "SELECT o.id FROM orders o LEFT JOIN events e ON o.id = e.order_id "
+            "WHERE e.order_id IS NULL",
+        ),
+    )
+    assert keys["model.shop.antinull"] == CandidateKeySet.of(_key("id"))
+
+
 def test_inner_join_carries_joined_in_key_when_probe_is_unique_on_the_join_cols() -> None:
     """The symmetric rule. ``orders`` is unique on the join column, so each ``order_items`` row
     matches at most one order and the result is keyed at the line grain. The probe key

@@ -159,7 +159,7 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify
+    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify | anti/semi shapes
     select_cols: tuple[str, ...]
     left_join_col: str | None = None
     right_join_col: str | None = None
@@ -204,12 +204,34 @@ def _rows(draw: st.DrawFn, source: SourceSpec) -> tuple[tuple[int, ...], ...]:
 @st.composite
 def _scenario(draw: st.DrawFn) -> Scenario:
     shape = draw(
-        st.sampled_from(("filter", "inner_join", "left_join", "group_by", "distinct", "qualify"))
+        st.sampled_from(
+            (
+                "filter",
+                "inner_join",
+                "left_join",
+                "group_by",
+                "distinct",
+                "qualify",
+                "anti_join",
+                "semi_join",
+                "left_is_null",
+            )
+        )
     )
+    # The anti/semi shapes filter s0 by s1, so they project s0 alone but still need s1's data.
+    anti_shapes = ("anti_join", "semi_join", "left_is_null")
     is_join = shape in ("inner_join", "left_join")
-    sources = (_S0, _S1) if is_join else (_S0,)
+    sources = (_S0, _S1) if is_join or shape in anti_shapes else (_S0,)
 
-    if shape == "qualify":
+    if shape in anti_shapes:
+        # An anti/semi filter preserves s0's declared key {k0}; the oracle proves it over rows.
+        model = ModelSpec(
+            shape=shape,
+            select_cols=("k0", "a0"),
+            left_join_col=draw(st.sampled_from(_S0.columns)),
+            right_join_col=draw(st.sampled_from(_S1.columns)),
+        )
+    elif shape == "qualify":
         # Dedup s0 to one row per partition subset; the derived key is that subset.
         part = tuple(
             sorted(
@@ -251,6 +273,15 @@ def _scenario_sql(m: ModelSpec) -> str:
             f"SELECT s0.k0 AS k0, s1.a1 AS a1 "
             f"FROM s0 {join} s1 ON s0.{m.left_join_col} = s1.{m.right_join_col}"
         )
+    if m.shape in ("anti_join", "semi_join", "left_is_null"):
+        base = "SELECT s0.k0 AS k0, s0.a0 AS a0 FROM s0"
+        on = f"ON s0.{m.left_join_col} = s1.{m.right_join_col}"
+        if m.shape == "anti_join":
+            return f"{base} ANTI JOIN s1 {on}"
+        if m.shape == "semi_join":
+            return f"{base} SEMI JOIN s1 {on}"
+        # left_is_null: the IS NULL sits on s1's join-key column, the recognised anti-join idiom.
+        return f"{base} LEFT JOIN s1 {on} WHERE s1.{m.right_join_col} IS NULL"
     if m.shape == "filter":
         return f"SELECT k0, a0 FROM s0 WHERE {m.filter_col} >= {m.filter_threshold}"
     if m.shape == "qualify":

@@ -5,11 +5,13 @@ NON_NULL activation) lives on the lineage.facts substrate as
 ``dblect.lineage.properties.nullability``. This package is the audit-facing consumer:
 detectors that read the proven nullability and flag NULL-sensitive constructs where the
 null silently changes the result: a GROUP BY on an inherited-nullable key, a join keyed
-on one, and a ``NOT IN`` over a subquery that projects one.
+on one, a ``NOT IN`` over a subquery that projects one, and a ``NOT EXISTS`` whose probe
+correlation key is one.
 """
 
 from dblect.nullability.detector import (
     detect_join_on_nullable_key,
+    detect_not_exists_on_nullable_key,
     detect_not_in_nullable_subquery,
     detect_null_group_on_nullable_key,
     make_nullability_detectors,
@@ -17,6 +19,7 @@ from dblect.nullability.detector import (
 
 __all__ = [
     "detect_join_on_nullable_key",
+    "detect_not_exists_on_nullable_key",
     "detect_not_in_nullable_subquery",
     "detect_null_group_on_nullable_key",
     "make_nullability_detectors",

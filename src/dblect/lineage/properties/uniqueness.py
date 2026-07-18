@@ -74,6 +74,7 @@ from dblect.sql import (
     SURROGATE_HASH_PASSTHROUGH,
     SURROGATE_HASH_STRUCTURAL,
     SQLParseError,
+    anti_join,
     parse_sql,
 )
 from dblect.sql import _sqlglot as sg
@@ -630,12 +631,14 @@ def surrogate_key_discoverer(
 #
 # The relation-algebra walk for candidate keys. It mirrors the column reducer's
 # job (turn a derivation into an inferred annotation, recursing into referenced
-# nodes) but over relation algebra: a FROM carries the source's keys; a JOIN that
-# neither multiplies nor NULL-pads the probe side (INNER and LEFT, and the SEMI/ANTI
-# filters, but not RIGHT/FULL) keeps the probe side's keys when the joined-in side is
-# unique on the join columns, and an INNER JOIN additionally carries the joined-in
-# side's keys when the probe is unique on them (each side surviving when the other
-# cannot multiply it); GROUP BY / DISTINCT introduce a key, UNION ALL keeps none, and
+# nodes) but over relation algebra: a FROM carries the source's keys; an INNER or LEFT
+# JOIN keeps the probe side's keys when the joined-in side is unique on the join columns
+# (so it cannot multiply them), while RIGHT/FULL (which NULL-pad the probe) and CROSS
+# (which multiplies) drop them; a SEMI or ANTI join, and the LEFT JOIN ... IS NULL
+# anti-join idiom, filter the probe side and so preserve its keys unconditionally. An
+# INNER JOIN additionally carries the joined-in side's keys when the probe is unique on
+# them (each side surviving when the other cannot multiply it); GROUP BY / DISTINCT
+# introduce a key, UNION ALL keeps none, and
 # the projection remaps keys onto output names. Posture is silent-when-unproven: a
 # shape the walk does not model drops keys rather than over-claiming.
 
@@ -828,6 +831,10 @@ class _RelationWalk:
         # WHERE filters cannot add duplicates, so keys (and conditional keys) are
         # preserved across it; the WHERE is the predicate flow's concern, not ours.
         joins = sg.joins_of(sel)
+        # An anti-join (native ANTI, or the LEFT JOIN ... IS NULL idiom) filters the probe side,
+        # so it preserves the probe's keys unconditionally; ``_join_preserves`` reads these arm
+        # ids to tell an anti-join arm from an ordinary LEFT join.
+        anti_arms = anti_join.anti_arm_ids(sel)
         joins_preserve = True
         for j in joins:
             resolved = (
@@ -836,7 +843,9 @@ class _RelationWalk:
             # One walk of the ON predicate's equalities serves both join-key rules below.
             on = sg.on_of(j)
             by_alias = sg.equality_cols_by_alias(on) if on is not None else None
-            preserved = self._join_preserves(j, resolved=resolved, by_alias=by_alias)
+            preserved = self._join_preserves(
+                j, resolved=resolved, by_alias=by_alias, anti_arm=id(j) in anti_arms
+            )
             survivors = self._joined_in_survivors(
                 j, left_keys=combined, resolved=resolved, by_alias=by_alias
             )
@@ -909,17 +918,23 @@ class _RelationWalk:
         *,
         resolved: tuple[str, _Carried] | None,
         by_alias: dict[str, frozenset[str]] | None,
+        anti_arm: bool,
     ) -> bool:
         """Whether ``j`` neither multiplies nor NULL-pads the probe side's rows, so the
         probe side's keys (and any conditional keys riding with them) carry through unchanged.
 
-        The joined-in side cannot multiply probe rows exactly when its join columns cover one
-        of its keys. A CROSS join always multiplies, and a RIGHT or FULL join NULL-pads the
-        probe columns on unmatched rows (so a probe key no longer identifies them); all three
-        drop the probe keys. An unresolved target, a keyless joined-in side, or a missing /
-        non-covering ON also leave fanout possible. ``by_alias`` is the ON predicate's
+        A SEMI or ANTI join, and the ``LEFT JOIN ... IS NULL`` anti-join idiom (``anti_arm``),
+        filter the probe side and project nothing from the matched side, so they keep each probe
+        row at most once and preserve the probe's keys unconditionally, whether or not the matched
+        side has a key. For an ordinary join the joined-in side cannot multiply probe rows exactly
+        when its join columns cover one of its keys. A CROSS join always multiplies, and a RIGHT or
+        FULL join NULL-pads the probe columns on unmatched rows (so a probe key no longer identifies
+        them); all three drop the probe keys. An unresolved target, a keyless joined-in side, or a
+        missing / non-covering ON also leave fanout possible. ``by_alias`` is the ON predicate's
         per-alias equality columns, parsed once by the caller.
         """
+        if anti_arm or sg.join_side_of(j) in (JoinSide.SEMI, JoinSide.ANTI):
+            return True  # a filter over the probe side: row-removing, never multiplying
         if sg.join_side_of(j) in (JoinSide.CROSS, JoinSide.RIGHT, JoinSide.FULL):
             return False  # multiplies (CROSS) or NULL-pads the probe side (RIGHT/FULL)
         if resolved is None:

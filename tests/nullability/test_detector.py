@@ -27,6 +27,8 @@ from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.nullability.detector import (
     NullableCause,
     detect_join_on_nullable_key,
+    detect_not_exists_on_nullable_key,
+    detect_not_in_nullable_subquery,
     make_nullability_detectors,
 )
 from dblect.sql import Finding, FindingKind, parse_sql
@@ -307,14 +309,86 @@ def test_semi_join_flags_either_side_with_row_loss_framing() -> None:
         assert "drop" in lowered  # the left row is silently dropped on a NULL key
 
 
-# An anti join inverts the hazard: a NULL key matches nothing, so the row is kept as a
-# spurious non-match rather than dropped. That framing is the opposite of every other join
-# here, so the detector leaves it alone rather than emit a mislabelled finding.
-def test_anti_join_is_left_alone() -> None:
+# An anti join inverts the hazard, and the two sides split. A NULL on the MATCHED side simply
+# fails to match, which is the native anti-join's null-safe semantics (unlike NOT IN), so a
+# nullable matched key is benign here and stays silent.
+def test_anti_join_matched_side_null_is_silent() -> None:
+    # probe is ``other`` (no nullable key); the matched ``stg.tag`` is the nullable one.
     right_nullable = "SELECT a.x FROM other a LEFT ANTI JOIN stg s ON a.k = s.tag"
-    left_nullable = "SELECT a.x FROM stg a LEFT ANTI JOIN other o ON a.tag = o.k"
     assert _join_keys(right_nullable, _STG_NULLABLE) == ()
-    assert _join_keys(left_nullable, _STG_NULLABLE) == ()
+
+
+# A NULL on the PROBE side is the hazard: it matches nothing, so the anti-join keeps the row as
+# a spurious non-match rather than excluding it. The finding takes the inverted framing (kept,
+# not dropped) and names the anti-join.
+def test_anti_join_probe_side_null_fires_with_kept_framing() -> None:
+    # probe is ``stg`` (nullable ``tag``); the matched ``other`` has no nullable key.
+    left_nullable = "SELECT a.x FROM stg a LEFT ANTI JOIN other o ON a.tag = o.k"
+    findings = _join_keys(left_nullable, _STG_NULLABLE)
+    assert len(findings) == 1
+    lowered = findings[0].message.lower()
+    assert "anti join" in lowered
+    assert "kept" in lowered  # the row survives as a spurious non-match
+    assert "drop" not in lowered  # it is not row loss
+
+
+# NOT EXISTS is the same anti-join operator written as a correlated subquery, and carries the
+# same probe-side hazard: a NULL correlation key on the probe matches nothing, so NOT EXISTS is
+# true and the row is kept as a spurious non-match. The dedicated detector names it "NOT EXISTS".
+def test_not_exists_probe_side_null_fires_with_kept_framing() -> None:
+    sql = "SELECT s.id FROM stg s WHERE NOT EXISTS (SELECT 1 FROM other o WHERE o.k = s.tag)"
+    findings = detect_not_exists_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=_STG_NULLABLE
+    )
+    assert len(findings) == 1
+    lowered = findings[0].message.lower()
+    assert "not exists" in lowered
+    assert "kept" in lowered
+    assert "drop" not in lowered
+
+
+def test_not_exists_matched_side_null_is_silent() -> None:
+    """A NULL on the matched (inner subquery) side simply fails to match, the null-safe
+    semantics that make NOT EXISTS the recommended replacement for NOT IN; so it stays silent."""
+    sql = "SELECT o.x FROM other o WHERE NOT EXISTS (SELECT 1 FROM stg s WHERE s.tag = o.k)"
+    findings = detect_not_exists_on_nullable_key(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=_STG_NULLABLE
+    )
+    assert findings == ()
+
+
+# The NOT IN "result silently empty" hazard is sound only where NOT IN is a top-level WHERE
+# conjunct. The detector shares the anti-join classifier's scope for exactly that reason: a NULL
+# in the subquery makes the predicate never true, which empties the result only when nothing else
+# in the WHERE can admit a row. Under an OR the other disjunct still admits rows, so the NOT IN is
+# a dead disjunct rather than an emptied result, a different hazard the detector does not claim.
+def _not_in_keys(sql: str) -> tuple[Finding, ...]:
+    return detect_not_in_nullable_subquery(
+        parse_sql(sql, dialect="duckdb"), nullable_by_name=_STG_NULLABLE
+    )
+
+
+def test_not_in_conjoined_with_another_predicate_still_fires() -> None:
+    # AND keeps NOT IN a top-level conjunct: a NULL in the subquery still empties the result. The
+    # bare top-level-conjunct case is the parametrized ``not-in/nullable`` scenario above; this
+    # adds the AND scope that the shared classifier newly threads through.
+    sql = "SELECT id FROM stg WHERE id > 0 AND id NOT IN (SELECT tag FROM stg)"
+    assert len(_not_in_keys(sql)) == 1
+    assert _not_in_keys(sql)[0].kind is FindingKind.NOT_IN_NULLABLE_SUBQUERY
+
+
+def test_not_in_under_or_is_silent() -> None:
+    # Under OR the other disjunct still admits rows on a subquery NULL, so the result is not
+    # silently empty and the finding must not claim it is.
+    sql = "SELECT id FROM stg WHERE id > 0 OR id NOT IN (SELECT tag FROM stg)"
+    assert _not_in_keys(sql) == ()
+
+
+def test_not_in_with_expression_left_side_still_fires() -> None:
+    # The empty-result footgun lives on the subquery (matched) side, so the left side need not be
+    # a bare column: a NULL in the projected subquery column empties the result all the same.
+    sql = "SELECT id FROM stg WHERE coalesce(id, 0) NOT IN (SELECT tag FROM stg)"
+    assert len(_not_in_keys(sql)) == 1
 
 
 # A FULL join drops no rows: both sides survive NULL-padded, so a NULL key is the silent
