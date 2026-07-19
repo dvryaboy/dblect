@@ -13,6 +13,8 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import cast
 
@@ -59,6 +61,344 @@ def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
 
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
+
+
+def group_targets(sel: exp.Select) -> tuple[Expr, ...]:
+    """The expressions ``sel`` groups by, with positional ordinals and output-alias references
+    resolved to the projections they name.
+
+    ``GROUP BY 1`` and ``GROUP BY revenue_day`` both name a projection, so a reader walking the
+    ``Group`` node's arguments finds an ``exp.Literal`` or a table-less ``exp.Column`` where the
+    semantics are the projected expression. Every structural check over grouping keys wants that
+    expression, so the resolution belongs here rather than in each caller. We resolve by lookup
+    instead of rewriting the tree, so the caller's nodes keep the source positions that findings
+    report line numbers from.
+
+    Every adapter dblect targets reads a bare integer in GROUP BY as a position, so this needs
+    no dialect gate.
+
+    A target we cannot resolve is returned unchanged, leaving callers to treat it as the opaque
+    target it is. :func:`_resolve_ordinal` and :func:`_resolve_name` each document when they
+    decline.
+    """
+    group = group_of(sel)
+    if group is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    projected = _projection_expressions_by_output_name(sel)
+    return tuple(
+        _resolve_group_target(target, sel, projections, projected) for target in group.expressions
+    )
+
+
+def _resolve_group_target(
+    target: Expr, sel: exp.Select, projections: Sequence[Expr], projected: Mapping[str, Expr]
+) -> Expr:
+    resolved = _resolve_ordinal(target, projections)
+    return resolved if resolved is not None else _resolve_name(target, sel, projected)
+
+
+def _resolve_name(target: Expr, sel: exp.Select, projected: Mapping[str, Expr]) -> Expr:
+    """``target`` resolved to the projection it names, if it is an output-name reference.
+
+    Only an unqualified column name can name a projection; ``t.k`` binds to the table.
+
+    A name matching a projection that is *itself* the bare column of that name resolves
+    unconditionally: SQL would bind the name to that input column, and the projection is that
+    same column, so the two readings agree and the shadowing question does not arise. This is
+    the ``select orders.customer_id ... group by customer_id`` idiom. Any other projection is
+    a renaming, where an input column of the same name would win over the output name, so it
+    resolves only when :func:`_shadows_an_input_column` finds no such column.
+    """
+    if not isinstance(target, exp.Column) or target.args.get("table") is not None:
+        return target
+    if not isinstance(target.this, exp.Identifier):
+        return target
+    name = column_name(target)
+    projection = projected.get(name)
+    if projection is None:
+        return target
+    if isinstance(projection, exp.Column) and column_name(projection) == name:
+        return projection
+    return target if _shadows_an_input_column(name, sel) else projection
+
+
+def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+    """Each output name in ``sel``'s projection mapped to the expression behind it.
+
+    An output name carried by two projections names neither unambiguously, so it is dropped
+    rather than resolved to whichever came last. Such a query does not run anyway: an engine
+    binds the first and then rejects the second as ungrouped.
+    """
+    out: dict[str, Expr] = {}
+    duplicated: set[str] = set()
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Alias):
+            name, expression = proj.alias_or_name, cast("Expr", proj.this)
+        elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Identifier):
+            name, expression = column_name(proj), proj
+        else:
+            continue
+        if name in out:
+            duplicated.add(name)
+        out[name] = expression
+    return {name: e for name, e in out.items() if name not in duplicated}
+
+
+@dataclass(frozen=True)
+class _InputColumns:
+    """What a scope's sources contribute to its input columns.
+
+    ``names`` are the input columns the AST names outright. ``has_unknown_width`` records that
+    some source (or the scope's own projection) carries a star, so columns beyond ``names`` are
+    present but unnamed.
+    """
+
+    names: frozenset[str]
+    has_unknown_width: bool
+
+
+def _shadows_an_input_column(name: str, sel: exp.Select) -> bool:
+    """Whether ``name`` may bind to an input column of ``sel`` rather than to its output alias.
+
+    SQL resolves a GROUP BY name against the input columns first and only then against the
+    output aliases, so ``select b.amt * 2 as amt ... group by amt`` groups by ``b.amt``.
+
+    The name shadows when it is one of the enumerated input columns, and either way one thing
+    short-circuits to "declines": a star of unknown width, whether the scope's own projection
+    (``select a.*``) or one it reads from (``(select * from raw) p``), carries columns any of
+    which may be the queried name. A source that aliases the name into existence
+    (``(select v as amt from raw) p``) is caught by the first test, since that name is among the
+    enumerated columns.
+
+    Otherwise we fall back to evidence: a column of that name referenced somewhere that could
+    bind to one of this scope's own sources. This is the case a base table forces, its columns
+    being unknowable without a schema, and it leaves the **known-permissive edge** of this rule,
+    an input column of a base table the query never mentions, which still slips through. Where
+    every source enumerates its columns and the name is not among them, no valid reference to it
+    can exist, so this path resolves the alias just the same.
+
+    Not evidence: a reference from a scope that cannot bind to this one. An unused CTE's body
+    and an uncorrelated subquery both describe other scopes' columns, so they say nothing about
+    what this scope's sources carry. A correlated reference does reach back out, so a column
+    qualified with one of this scope's source aliases counts wherever it is written. ``GROUP BY``
+    and ``ORDER BY`` are skipped because both resolve names against output aliases themselves,
+    so a reference there is not evidence of an input column.
+    """
+    inputs = _input_columns(sel)
+    if name in inputs.names or inputs.has_unknown_width:
+        return True
+    return _name_bound_against_scope(name, sel)
+
+
+def _input_columns(sel: exp.Select) -> _InputColumns:
+    """What ``sel``'s sources contribute to its input columns, as far as the AST names them."""
+    names: set[str] = set()
+    has_unknown_width = any(_expands_to_unknown_width(p) for p in sel.expressions)
+    ctes = _visible_ctes(sel)
+    for source in _sources_of(sel):
+        body = _relation_body(source, ctes)
+        if body is None:  # a base table: unknowable, evidence fallback
+            continue
+        outputs = _output_names(body)
+        names |= outputs.names
+        has_unknown_width = has_unknown_width or outputs.has_unknown_width
+    return _InputColumns(frozenset(names), has_unknown_width)
+
+
+def _relation_body(source: Expr, ctes: Mapping[str, exp.Select]) -> exp.Select | None:
+    """The SELECT behind ``source`` when it is one we can read: a derived table, or a table
+    reference naming a CTE in scope. A base table (or anything else in FROM position, such as a
+    table function or an UNNEST) has no body here and its columns stay unknown."""
+    if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Select):
+        return source.this
+    if isinstance(source, exp.Table):
+        return ctes.get(source.name.lower())
+    return None
+
+
+@dataclass(frozen=True)
+class _OutputNames:
+    """The names a SELECT projects, and whether a star leaves some of them unnamed."""
+
+    names: frozenset[str]
+    has_unknown_width: bool
+
+
+def _output_names(sel: exp.Select) -> _OutputNames:
+    """Every name ``sel`` projects. A star sets ``has_unknown_width``, since it stands for
+    columns we cannot name. A bare expression contributes no name (the engine picks one that no
+    clean identifier a GROUP BY writes will match), but it does not widen the output the way a
+    star does, so it is simply skipped."""
+    names: set[str] = set()
+    has_unknown_width = False
+    for proj in sel.expressions:
+        if _expands_to_unknown_width(proj):
+            has_unknown_width = True
+        elif isinstance(proj, exp.Alias):
+            names.add(proj.alias_or_name)
+        elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Identifier):
+            names.add(column_name(proj))
+    return _OutputNames(frozenset(names), has_unknown_width)
+
+
+def _visible_ctes(sel: exp.Select) -> dict[str, exp.Select]:
+    """Every CTE ``sel`` can reference, by lower-cased name, walking out through the enclosing
+    statements. An inner definition shadows an outer one of the same name, so the first binding
+    found walking outward wins."""
+    out: dict[str, exp.Select] = {}
+    node: Expr | None = sel
+    while node is not None:
+        if isinstance(node, exp.Select):
+            for cte in node.ctes:
+                if isinstance(cte.this, exp.Select):
+                    out.setdefault(cte.alias_or_name.lower(), cte.this)
+        node = node.parent
+    return out
+
+
+def _sources_of(sel: exp.Select) -> list[Expr]:
+    """The relations ``sel`` reads from: its FROM, its JOINs, and its laterals."""
+    from_ = from_of(sel)
+    sources: list[Expr] = [] if from_ is None else [cast("Expr", from_.this)]
+    sources.extend(cast("Expr", j.this) for j in joins_of(sel))
+    sources.extend(laterals_of(sel))
+    return sources
+
+
+# Clauses whose column references are not evidence that a name binds to an input column.
+# GROUP BY and ORDER BY resolve names against output aliases themselves, so a reference there
+# is the very thing being resolved. A CTE list describes other scopes; where a CTE is actually
+# read, :func:`_input_columns` takes its output names instead. Both spellings of the WITH key
+# are listed for the same reason :func:`from_of` accepts two: sqlglot's compiled build suffixes
+# keys that collide with Python keywords.
+_NOT_INPUT_EVIDENCE = frozenset({"group", "order", "with", "with_"})
+
+
+def _name_bound_against_scope(name: str, sel: exp.Select) -> bool:
+    """Whether a column named ``name`` is referenced anywhere that could bind to ``sel``'s own
+    sources: written directly in ``sel``'s scope, or qualified with one of its source aliases
+    from inside a correlated subquery."""
+    aliases = {a.lower() for a in (name_of(s) for s in _sources_of(sel)) if a}
+    for key, arg in sel.args.items():
+        if key in _NOT_INPUT_EVIDENCE:
+            continue
+        nodes = cast("list[object]", arg) if isinstance(arg, list) else [cast("object", arg)]
+        for node in nodes:
+            if not isinstance(node, Expr):
+                continue
+            for c in find_columns(node):
+                if column_name(c) != name:
+                    continue
+                table = column_table(c)
+                if node_in_scope(c, sel) or (table is not None and table.lower() in aliases):
+                    return True
+    return False
+
+
+def node_in_scope(node: Expr, sel: exp.Select) -> bool:
+    """True when ``node``'s nearest enclosing SELECT is ``sel`` (not a nested sub-SELECT).
+
+    A node's scope decides which relations' columns it can refer to, so any check that reads a
+    node against ``sel``'s sources, keys, or grouping has to exclude nodes that actually belong
+    to a nested SELECT, where those are a different scope's.
+    """
+    cur: Expr | None = node.parent
+    while cur is not None:
+        if isinstance(cur, exp.Select):
+            return cur is sel
+        cur = cur.parent
+    return False
+
+
+@dataclass(frozen=True)
+class OrderTarget:
+    """One statement-level ``ORDER BY`` target, and which namespace its expression is in.
+
+    A positional target resolves to the named projection's own expression, so it arrives in the
+    query's *source* namespace, already past the ``AS`` binding. A target spelled as a name is
+    in the *output* namespace, where a caller matching against source columns still has to
+    translate it through the projection's aliases.
+
+    Conflating the two re-translates a resolved source column whenever some *other* projection
+    is aliased to that name: in ``select id as x, other as id ... order by 1`` the ordinal
+    resolves to ``id``, which a second pass through the alias map would turn into ``other``.
+    """
+
+    expression: Expr
+    in_source_namespace: bool
+
+
+def statement_order_targets(sel: exp.Select) -> tuple[OrderTarget, ...]:
+    """The statement-level ``ORDER BY`` targets of ``sel``, with ordinals resolved and each
+    target's ``exp.Ordered`` wrapper removed.
+
+    Unlike the ORDER BY inside a window or an aggregate, where a literal is a constant that
+    orders nothing (see :func:`imposes_row_order`), a statement-level ``ORDER BY 1`` is a
+    positional reference to the first projection.
+    """
+    order = cast("exp.Order | None", sel.args.get("order"))
+    if order is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    targets = (t.this if isinstance(t, exp.Ordered) else t for t in order.expressions)
+    return tuple(_order_target(t, projections) for t in targets)
+
+
+def _order_target(target: Expr, projections: Sequence[Expr]) -> OrderTarget:
+    resolved = _resolve_ordinal(target, projections)
+    if resolved is None:
+        return OrderTarget(target, in_source_namespace=False)
+    return OrderTarget(resolved, in_source_namespace=True)
+
+
+def imposes_row_order(order: exp.Order | None) -> bool:
+    """Whether ``order`` actually pins the order of the rows it governs.
+
+    An ORDER BY inside a window or an aggregate takes expressions, never the positional
+    references a statement-level ORDER BY accepts, so a literal there is a constant: every row
+    sorts equal and the ranking falls back to whatever physical order the engine happened to
+    have. An ordering whose targets reference no column therefore pins nothing, and the caller's
+    "no ORDER BY" hazard applies to it unchanged.
+
+    A target referencing a column counts even when the column sits inside a subquery, where the
+    value is constant per row and so orders nothing either. That keeps the answer conservative:
+    the caller stays silent rather than reporting a hazard this rule cannot yet prove.
+    """
+    if order is None or not order.expressions:
+        return False
+    return any(find_columns(e) for e in order.expressions)
+
+
+def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr | None:
+    """The projection ``target`` names positionally, or ``None`` when it names none.
+
+    Only a bare positive integer literal is positional. A string (``GROUP BY 'x'``), a float,
+    and a negation (which parses as ``Neg`` over the literal, not a literal) are grouped
+    values, so they name no position. Nor does an index past the end of the projection list,
+    or one reaching over a ``SELECT *`` that expands to an unknown number of columns, so
+    position N is not the Nth listed projection.
+    """
+    if not (isinstance(target, exp.Literal) and target.is_int):
+        return None
+    index = int(target.this)
+    if not 1 <= index <= len(projections):
+        return None
+    prefix = projections[:index]
+    if any(_expands_to_unknown_width(p) for p in prefix):
+        return None
+    return prefix[-1].unalias()
+
+
+def _expands_to_unknown_width(projection: Expr) -> bool:
+    """Whether ``projection`` stands for an unknown number of output columns.
+
+    A bare ``*`` or a qualified ``t.*`` does; ``count(*)`` does not, so this looks at the
+    projection itself rather than searching it for a ``Star``.
+    """
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+    )
 
 
 def on_of(j: exp.Join) -> Expr | None:
@@ -459,17 +799,17 @@ def conjunctive_leaves(predicate: Expr) -> list[Expr]:
 def line_range(e: Expr) -> tuple[int, int] | None:
     """The 1-indexed (start, end) source-line span covered by `e`.
 
-    sqlglot only stamps token-position metadata onto ``Identifier`` nodes, so
-    we walk descendants and take min/max over their `meta["line"]`. Returns
-    `None` if no identifier carries a usable line number (rare; some literal-
-    only expressions like ``select 1`` have no identifier children).
+    sqlglot stamps token-position metadata onto the leaves it builds from a single token,
+    which is mostly ``Identifier`` but also ``Literal``, so we walk every descendant and take
+    min/max over the ``meta["line"]`` values we find. Reading identifiers alone left the
+    literal-only expressions with no span at all, which is how ``GROUP BY 1`` reported a
+    finding against line 0. Returns ``None`` when no descendant carries a usable line number.
 
-    Line numbers refer to the SQL the parser saw (the model's
-    ``compiled_code``).
+    Line numbers refer to the SQL the parser saw (the model's ``compiled_code``).
     """
     lines: list[int] = []
-    for ident in e.find_all(exp.Identifier):
-        line = ident.meta.get("line") if ident.meta else None
+    for node in e.walk():
+        line = node.meta.get("line") if node.meta else None
         if isinstance(line, int):
             lines.append(line)
     if not lines:

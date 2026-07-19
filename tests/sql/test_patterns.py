@@ -73,12 +73,79 @@ def test_list_group_bys_one_per_select() -> None:
     assert {g.targets for g in groups} == {("x",), ("y",)}
 
 
+def test_list_group_bys_resolves_positional_target_through_alias() -> None:
+    # The ordinal names a projection, so the inventory reports what is grouped rather than the
+    # literal standing in for it, seeing through the AS binding to the expression underneath.
+    groups = list_group_bys(_parse("select b.k as key, count(*) from t group by 1"))
+    assert groups[0].targets == ("b.k",)
+    assert groups[0].target_columns == (("b", "k"),)
+
+
+def test_list_group_bys_leaves_out_of_range_ordinal_unresolved() -> None:
+    # Nothing to resolve against; the target stays the opaque literal it is rather than
+    # indexing off the end of the projection list.
+    groups = list_group_bys(_parse("select b.k, count(*) from t group by 7"))
+    assert groups[0].targets == ("7",)
+    assert groups[0].target_columns == ()
+
+
+def test_list_group_bys_leaves_ordinal_unresolved_under_unexpanded_star() -> None:
+    # A star expands to an unknown number of columns, so position 2 is not the second listed
+    # projection and the ordinal cannot be resolved soundly.
+    groups = list_group_bys(_parse("select *, b.k from t group by 2"))
+    assert groups[0].targets == ("2",)
+
+
+def test_list_group_bys_resolves_ordinal_when_star_follows_it() -> None:
+    # A star *after* the ordinal's position does not shift the prefix it indexes into.
+    groups = list_group_bys(_parse("select b.k, * from t group by 1"))
+    assert groups[0].targets == ("b.k",)
+
+
+@pytest.mark.parametrize("target", ["'1'", "1.5", "-1", "0"])
+def test_list_group_bys_leaves_non_ordinal_literals_unresolved(target: str) -> None:
+    # Only a bare positive integer literal is a positional reference. A string, a float, a
+    # negation, and the out-of-range 0 are grouped values, not positions.
+    groups = list_group_bys(_parse(f"select b.k, count(*) from t group by {target}"))
+    assert groups[0].target_columns == ()
+
+
+def test_list_group_bys_leaves_duplicated_alias_unresolved() -> None:
+    # Two projections carrying one alias name it ambiguously, and the query is not valid SQL
+    # anyway (duckdb binds the first and then rejects the ungrouped second), so there is nothing
+    # to resolve to and the target stays as written rather than picking an arm.
+    groups = list_group_bys(_parse("select b.k as x, b.status as x, count(*) from t group by x"))
+    assert groups[0].targets == ("x",)
+    assert groups[0].target_columns == ((None, "x"),)
+
+
 def test_list_aggregations_excludes_windowed_functions() -> None:
     p = _parse("select sum(x), sum(y) over () from t")
     aggs = list_aggregations(p)
     assert len(aggs) == 1
     assert aggs[0].function == "Sum"
     assert aggs[0].argument_sql == "x"
+
+
+# The clear direction and the full clause enumeration belong to the duckdb permutation oracle
+# in ``test_pbt_structural_hazards.py``, which decides "really orders" from the data rather
+# than from a re-derivation of the rule. These keep a parse-only guard on the detect direction,
+# which is where reading a window's ORDER BY structurally went wrong.
+@pytest.mark.parametrize("order", ["1", "'x'", "null", "1 + 2"])
+def test_unordered_window_column_free_order_by_detected(order: str) -> None:
+    # Nothing that fails to reference a column can order rows. `over (order by 1)` in
+    # particular is not a positional reference: inside a window the literal is a constant, so
+    # every row sorts equal and the ranking is as arbitrary as with no ORDER BY.
+    sql = f"select row_number() over (order by {order}) from t"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
+
+
+def test_unordered_aggregate_constant_order_by_detected() -> None:
+    findings = detect_unordered_aggregate(_parse("select array_agg(s order by 1) from t"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
 
 
 def test_null_group_after_left_join_detected() -> None:
@@ -90,6 +157,170 @@ def test_null_group_after_left_join_detected() -> None:
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_alias_target_detected() -> None:
+    # `group by grp` names the projection aliased grp, which is the nullable side.
+    sql = """
+    select b.k as grp, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by grp
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_unqualified_reference_to_projected_column_detected() -> None:
+    # The dbt idiom: project a qualified column, group by its bare name. SQL binds the name to
+    # the input column, and the projection *is* that column, so both readings land on the same
+    # expression and resolving is sound even though the name shadows an input column.
+    sql = """
+    select orders.customer_id, sum(amount) as total
+    from payments left join orders on payments.order_id = orders.order_id
+    group by customer_id
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_unqualified_reference_to_preserved_column_not_detected() -> None:
+    sql = """
+    select payments.order_id, sum(amount) as total
+    from payments left join orders on payments.order_id = orders.order_id
+    group by order_id
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_alias_shadowing_an_input_column_not_resolved() -> None:
+    # SQL resolves a GROUP BY name to an input column before an output alias, so `group by amt`
+    # here groups by b.amt, not by the projection aliased amt. We cannot tell which table an
+    # unqualified name binds to without a schema, so we decline to resolve and stay silent.
+    # This is the known-permissive edge of the alias rule: the b.amt grouping is a real hazard
+    # we do not report, matching the behaviour before aliases resolved at all.
+    sql = """
+    select b.amt * 2 as amt, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by amt
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_alias_under_a_star_projection_not_resolved() -> None:
+    # `select a.*` carries input columns the query never names, so `amt` may bind to an `a.amt`
+    # the shadow guard cannot see. A star makes every name potentially taken, so resolution
+    # declines rather than resolving to `b.k * 2` and reporting a hazard the query may not have.
+    sql = """
+    select a.*, b.k * 2 as amt, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by a.id, amt
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+# Which scope a column belongs to decides whether it is evidence that a GROUP BY name is
+# taken. The guard asks two questions in order: can this scope's input columns be enumerated
+# (a derived table or a CTE names its own output, a base table does not), and failing that,
+# is a column of the name referenced somewhere that could bind to one of this scope's sources.
+# Each case below is a distinct answer to that pair, and `amt` is always the projected alias.
+_SHADOW_CASES: list[tuple[str, str, bool]] = [
+    (
+        # `c` is never a source here, so its body says nothing about what `a` and `b` carry.
+        "unused-cte/not-evidence",
+        """with c as (select amt from raw)
+        select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k group by amt""",
+        True,
+    ),
+    (
+        # Nor does a subquery that only correlates to itself; `z.amt` is a column of `z`.
+        "unrelated-subquery/not-evidence",
+        """select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k
+        where exists (select 1 from z where z.amt > 0) group by amt""",
+        True,
+    ),
+    (
+        # A correlated reference reaches back out to this scope, so `a.amt` is a real input
+        # column even though it is written inside the subquery.
+        "correlated-outer-reference/evidence",
+        """select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k
+        where exists (select 1 from z where z.q = a.amt) group by amt""",
+        False,
+    ),
+    (
+        # A CTE that IS a source names its own output columns, so `amt` is taken. The name
+        # appears nowhere as a column, only as an output alias, which is why sweeping for
+        # referenced columns cannot see it.
+        "cte-source-aliases-the-name/evidence",
+        """with c as (select v as amt, k from raw)
+        select b.k * 2 as amt, sum(amount) as total
+        from c left join b on c.k = b.k group by amt""",
+        False,
+    ),
+    (
+        # Same for a derived table, and here every source is enumerable, so this is decided
+        # rather than guessed.
+        "derived-table-aliases-the-name/evidence",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select v as amt, k from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        False,
+    ),
+    (
+        # Every source enumerable and no `amt` among them: the name is decidably free, so the
+        # alias resolves without falling back to the reference sweep at all.
+        "derived-tables-without-the-name/not-evidence",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select v, k from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        True,
+    ),
+    (
+        # A star inside a derived-table source carries unknown columns just as an outer `*`
+        # does, so `amt` may be among them: the same decline, whether the star is the scope's
+        # own projection or one it reads from.
+        "derived-source-star/unknown-columns",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select * from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "resolves"),
+    [(sql, resolves) for _name, sql, resolves in _SHADOW_CASES],
+    ids=[name for name, _sql, _resolves in _SHADOW_CASES],
+)
+def test_null_group_alias_resolves_only_when_the_name_is_free(sql: str, resolves: bool) -> None:
+    # Resolving the alias reaches `b.k * 2` / `q.k * 2` on the nullable side, so the finding
+    # firing is the observable signal that resolution happened.
+    fired = detect_null_group_after_outer_join(_parse(sql)) != ()
+    assert fired is resolves
+
+
+def test_list_group_bys_resolves_alias_target() -> None:
+    groups = list_group_bys(_parse("select b.k as grp, count(*) from t group by grp"))
+    assert groups[0].targets == ("b.k",)
+    assert groups[0].target_columns == (("b", "k"),)
+
+
+def test_null_group_positional_target_detected_and_located() -> None:
+    # `group by 1` names the nullable-side projection, so the hazard is the same one the
+    # spelled-out `group by b.k` carries. The finding also has to land on the GROUP BY the
+    # analyst wrote, not at line 0: a positional target holds no identifier, so the line has to
+    # come off the ordinal literal itself.
+    sql = "select b.k, sum(amount) as total\nfrom a left join b on a.k = b.k\ngroup by 1"
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    assert findings[0].line_start == 3
+    assert findings[0].line_end == 3
 
 
 def test_null_group_after_inner_join_not_detected() -> None:
@@ -884,13 +1115,13 @@ def test_now_in_join_on_detected() -> None:
     assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
-def test_now_in_group_by_detected() -> None:
+def test_now_in_positional_group_by_detected() -> None:
+    # `group by 1` names the first projection, so the grouped expression is the one holding
+    # now() even though the GROUP BY target in the AST is the literal 1.
     sql = "select date_diff('day', ts, now()) as days_ago, count(*) from t group by 1"
-    # `group by 1` is a positional reference; the GROUP BY *target* in the AST
-    # is the literal 1, not the expression. So this won't fire. The pattern
-    # we care about is `group by <expression containing now()>` directly.
-    # (Documented because someone will inevitably wonder why it didn't trigger.)
-    assert _non_determinism(sql) == ()
+    findings = _non_determinism(sql)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
 def test_now_in_explicit_group_by_expression_detected() -> None:

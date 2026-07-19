@@ -1,7 +1,7 @@
 """Property-based tests for two structural detectors, complementing the example tests
 in ``test_patterns.py``.
 
-Three properties with teeth for the precision fixes these detectors carry:
+Properties with teeth for the precision fixes these detectors carry:
 
 * **Dialect invariance of the inner-flatten detector** (parse-only, metamorphic): the same
   logical array flatten written under ``UNNEST`` (duckdb/bigquery), ``LATERAL VIEW EXPLODE``
@@ -30,12 +30,24 @@ Three properties with teeth for the precision fixes these detectors carry:
   include the column-level ``COALESCE(b.col, 0) = x`` idiom, whose permissive clear is a
   deliberate "the analyst handled the null" call rather than a preservation claim (see
   ``guards.is_coalesced``); that idiom's contract is not "the join is preserved".
+
+* **Spelling invariance of GROUP BY targets** (parse-only, metamorphic): a query grouped by
+  expression and the same query grouped by ordinal or by output alias must draw the same
+  findings. The detectors read grouping keys off the ``Group`` node, where both indirect
+  spellings arrive as something other than the projected expression, so this pins every
+  GROUP BY reader to the semantics rather than to the surface form.
+
+* **The unordered-window verdict against permutation stability** (duckdb execution oracle): the
+  detector clears a ranking window exactly when its ORDER BY survives feeding the same rows in a
+  different insertion order. A literal inside a window is a constant rather than a positional
+  reference, so ``over (order by 1)`` pins nothing, and the engine is the judge of that.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import cast
 
 import duckdb
 import pytest
@@ -45,7 +57,9 @@ from hypothesis import strategies as st
 
 from dblect.sql.patterns import (
     detect_inner_flatten_row_drop,
+    detect_unordered_window,
     detect_where_on_outer_joined_nullable,
+    scan_all,
 )
 from tests.lineage._duckdb_oracle import materialized, scalar
 
@@ -245,3 +259,147 @@ def test_where_clear_implies_unmatched_rows_survive(
             f"detector cleared but {dropped_unmatched} unmatched rows were dropped by "
             f"where {predicate!r} (a={d.a_rows}, b={d.b_rows})"
         )
+
+
+# --- spelling invariance of GROUP BY targets ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class _GroupTarget:
+    """One projection that a GROUP BY can name, either by expression or by ordinal."""
+
+    sql: str
+    alias: str | None
+
+    def projection(self) -> str:
+        return self.sql if self.alias is None else f"{self.sql} as {self.alias}"
+
+
+# Projections chosen so the grouped set reaches every clause the GROUP BY readers branch on:
+# the nullable side of the join (the null-group hazard), the preserved side and a
+# preserved-side COALESCE fallback (its guards), a two-nullable-side COALESCE (which the
+# guards must *not* clear), an IS NOT NULL test (the boolean-bucket clear), and a
+# non-deterministic call (the load-bearing-position hazard).
+_GROUP_TARGET_SQL = (
+    "a.k",
+    "b.k",
+    "b.status",
+    "coalesce(b.k, a.k)",
+    "coalesce(b.k, b.status)",
+    "b.k is not null",
+    "date_diff('day', a.ts, now())",
+)
+
+
+@st.composite
+def _group_by_query(draw: st.DrawFn) -> tuple[str, str]:
+    """One logical query rendered twice: grouping wholly by expression, and grouping with at
+    least one target named indirectly, by its ordinal or by its output alias.
+
+    All three spellings denote the same grouping, so every detector must return the same verdict
+    for them. Aliases are drawn independently of the grouping, so an ordinal has to resolve
+    through an ``AS`` binding as often as not, and the spelling is drawn per target rather than
+    all-or-nothing, so a clause mixing spellings is an ordinary example rather than a special
+    case. The alias pool (``p0``..``p3``) deliberately avoids the source column names, since a
+    name that could bind to an input column is one this resolution declines to touch.
+    """
+    chosen = draw(st.lists(st.sampled_from(_GROUP_TARGET_SQL), min_size=1, max_size=4, unique=True))
+    targets = [
+        _GroupTarget(sql, f"p{i}" if draw(st.booleans()) else None) for i, sql in enumerate(chosen)
+    ]
+    grouped = draw(
+        st.lists(st.integers(min_value=0, max_value=len(targets) - 1), min_size=1, unique=True)
+    )
+    spellings = [draw(st.sampled_from(_spellings_for(targets[i]))) for i in grouped]
+    # At least one target has to be written indirectly, or the two renderings are the same query.
+    forced = draw(st.integers(min_value=0, max_value=len(grouped) - 1))
+    indirect = [s for s in _spellings_for(targets[grouped[forced]]) if s != "expression"]
+    spellings[forced] = draw(st.sampled_from(indirect))
+    # The aggregate trails the grouped projections so ordinals index a stable prefix.
+    projections = ", ".join([t.projection() for t in targets] + ["sum(a.amt) as total"])
+    body = f"select {projections} from a left join b on a.k = b.k group by "
+    return (
+        body + ", ".join(targets[i].sql for i in grouped),
+        body
+        + ", ".join(_render(targets[i], i, s) for i, s in zip(grouped, spellings, strict=True)),
+    )
+
+
+def _spellings_for(target: _GroupTarget) -> list[str]:
+    """How this target can be named in a GROUP BY: always by its expression or its ordinal, and
+    by its output alias when it carries one."""
+    return ["expression", "ordinal"] + (["alias"] if target.alias is not None else [])
+
+
+def _render(target: _GroupTarget, index: int, spelling: str) -> str:
+    if spelling == "ordinal":
+        return str(index + 1)
+    if spelling == "alias":
+        assert target.alias is not None
+        return target.alias
+    return target.sql
+
+
+@given(q=_group_by_query())
+@settings(max_examples=200, deadline=None)
+def test_group_by_ordinal_matches_named_spelling(q: tuple[str, str]) -> None:
+    """``GROUP BY 1`` is the same query as ``GROUP BY <first projection>``, so it must draw the
+    same findings. A detector that reads the ``Group`` node structurally sees an ``exp.Literal``
+    where the semantics are the projected expression, which silently disarms it; this property
+    is what pins the two spellings together across every detector at once, including the
+    off-by-one an ordinal resolved against the wrong projection would introduce."""
+    named, positional = q
+    assert _scan_kinds(named) == _scan_kinds(positional), (
+        f"named {named!r} and positional {positional!r} disagree"
+    )
+
+
+def _scan_kinds(sql: str) -> list[str]:
+    return sorted(f.kind.value for f in scan_all(sqlglot.parse_one(sql, read="duckdb")))
+
+
+# --- a constant ORDER BY is not an ordering (duckdb execution oracle) ---------------------
+
+
+_WINDOW_ORDERINGS = [
+    "order by n",
+    "order by 1",
+    "order by 'x'",
+    "order by null",
+    "order by 1 + 2",
+    "order by 1, n",
+    "order by n + 1",
+    "order by -n",
+]
+
+
+@pytest.mark.parametrize("clause", _WINDOW_ORDERINGS)
+def test_unordered_window_verdict_matches_permutation_stability(
+    con: duckdb.DuckDBPyConnection, clause: str
+) -> None:
+    """The detector clears a ranking window exactly when its ORDER BY really orders the rows.
+
+    A literal in a *window* ORDER BY is a constant, not the positional reference the same
+    literal denotes in a statement-level ORDER BY, so every row sorts equal and the ranking
+    falls back to whatever physical order the engine had. The oracle for "really orders" is
+    therefore permutation stability: feed the same rows in two different insertion orders and
+    see whether the row-number assignment survives. The data is the judge, so a clause we clear
+    that does not actually pin an order fails here rather than against a re-derivation.
+    """
+    ranked: list[list[tuple[int, int]]] = []
+    for rows in ("(3), (1), (2)", "(2), (1), (3)"):
+        con.execute("create or replace table w(n integer)")
+        con.execute(f"insert into w values {rows}")
+        assigned = cast(
+            "list[tuple[int, int]]",
+            con.execute(f"select n, row_number() over ({clause}) rn from w").fetchall(),
+        )
+        ranked.append(sorted(assigned))
+    stable = ranked[0] == ranked[1]
+    cleared = not detect_unordered_window(
+        sqlglot.parse_one(f"select row_number() over ({clause}) from w", read="duckdb")
+    )
+    assert cleared == stable, (
+        f"detector {'cleared' if cleared else 'flagged'} `{clause}` but the ranking is "
+        f"{'stable' if stable else 'unstable'} under input permutation: {ranked}"
+    )

@@ -182,12 +182,12 @@ def list_group_bys(tree: Expr) -> tuple[GroupBySummary, ...]:
     """Return every GROUP BY clause's targets, one summary per containing SELECT."""
     out: list[GroupBySummary] = []
     for sel in sg.find_all_selects(tree):
-        g = sg.group_of(sel)
-        if g is None:
+        if sg.group_of(sel) is None:
             continue
-        targets = tuple(sg.render_sql(e) for e in g.expressions)
+        grouped = sg.group_targets(sel)
+        targets = tuple(sg.render_sql(e) for e in grouped)
         cols: list[tuple[str | None, str]] = []
-        for e in g.expressions:
+        for e in grouped:
             cols.extend(sg.column_key(c) for c in sg.find_columns(e))
         out.append(GroupBySummary(targets=targets, target_columns=tuple(cols)))
     return tuple(out)
@@ -239,7 +239,7 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
         nullable_fs = frozenset(nullable)
         risky_tables: set[str] = set()
         risky_targets: list[str] = []
-        for grp_expr in g.expressions:
+        for grp_expr in sg.group_targets(sel):
             hit: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
@@ -414,6 +414,10 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
     runs unless an ORDER BY pins the order. ``LAG``/``LEAD``/``FIRST_VALUE``/
     ``LAST_VALUE`` are similarly meaningless without an ordering.
 
+    An ORDER BY whose targets reference no column is no ordering at all: inside a window a
+    literal is a constant rather than the positional reference the same literal denotes at
+    statement level, so every row sorts equal and the ranking stays arbitrary.
+
     The exception is the dedup where a ``row_number() = 1`` keeps one row per partition and
     the partition key covers every column the ranked scope carries forward: the surviving
     rows are then identical on all surfaced columns, so the missing ORDER BY does not change
@@ -424,8 +428,7 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
         fn = sg.fn_of(w)
         if fn is None or type(fn) not in _RANKING_FUNCTIONS:
             continue
-        order = sg.order_of(w)
-        if order is not None and order.expressions:
+        if sg.imposes_row_order(sg.order_of(w)):
             continue
         if _row_number_dedup_is_order_insensitive(w):
             continue
@@ -443,12 +446,16 @@ def detect_unordered_window(tree: Expr) -> tuple[Finding, ...]:
 
 
 def detect_unordered_aggregate(tree: Expr) -> tuple[Finding, ...]:
-    """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY."""
+    """Flag order-sensitive aggregates (ARRAY_AGG, STRING_AGG) with no ORDER BY.
+
+    An aggregate's ORDER BY takes expressions, so ``array_agg(x order by 1)`` orders by a
+    constant and leaves the element order as undefined as no ORDER BY would.
+    """
     out: list[Finding] = []
     for node in sg.find_all_ordered_aggregates(tree):
         if isinstance(node.parent, exp.WithinGroup):
             continue
-        if sg.aggregate_order_of(node) is not None:
+        if sg.imposes_row_order(sg.aggregate_order_of(node)):
             continue
         out.append(
             finding_at(
@@ -863,9 +870,7 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
         on = sg.on_of(j)
         if on is not None:
             scopes.append(("a JOIN ON clause", on))
-    group = sg.group_of(sel)
-    if group is not None:
-        scopes.extend(("a GROUP BY target", g) for g in group.expressions)
+    scopes.extend(("a GROUP BY target", g) for g in sg.group_targets(sel))
     for w in sg.find_all_windows(sel):
         scopes.extend(("a window PARTITION BY", part) for part in sg.partition_of(w))
         order = sg.order_of(w)

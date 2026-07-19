@@ -105,7 +105,7 @@ def detect_non_unique_window_order_keys(
         if source_keys is None:
             continue
         for w in sg.find_all_windows(sel):
-            if not _node_in_scope(w, sel):
+            if not sg.node_in_scope(w, sel):
                 continue
             order = sg.order_of(w)
             if order is None:
@@ -177,7 +177,7 @@ def detect_non_unique_aggregate_order_keys(
         group = sg.group_of(sel)
         grouping = group.expressions if group is not None else []
         for agg in sg.find_all_ordered_aggregates(sel):
-            if not _node_in_scope(agg, sel):
+            if not sg.node_in_scope(agg, sel):
                 continue
             order = sg.aggregate_order_of(agg)
             agg_limit = sg.aggregate_limit_of(agg)
@@ -333,9 +333,10 @@ def detect_limit_without_deterministic_order(
     equivalence check we do not model). When an ``ORDER BY`` is present but no source key is
     known, it stays silent rather than guess the ordering is non-unique. A top scope that
     yields a single row (an ungrouped aggregate) is exempt: SQL's implicit grouping collapses
-    it to one row, so a ``LIMIT`` cannot drop a row. Order keys are resolved through the
-    projection's aliases before being matched, so an ``order by <alias>`` of a key counts as
-    covering (and a renamed non-key column does not pass as the key).
+    it to one row, so a ``LIMIT`` cannot drop a row. Order keys named as output names are
+    resolved through the projection's aliases before being matched, so an ``order by <alias>``
+    of a key counts as covering (and a renamed non-key column does not pass as the key); a
+    positional key arrives already in the source namespace and is matched as-is.
     """
     if not is_materialized or not isinstance(tree, exp.Select):
         return ()
@@ -354,11 +355,15 @@ def detect_limit_without_deterministic_order(
     )
     if source_keys is None:
         return ()
-    order_cols = _bare_column_names(order.expressions)
+    targets = sg.statement_order_targets(tree)
+    order_cols = _bare_column_names([t.expression for t in targets])
     if order_cols is None:
         return ()
     projection = _projection_aliases(tree)
-    covered = frozenset(projection.get(c, c) for c in order_cols)
+    covered = frozenset(
+        name if t.in_source_namespace else projection.get(name, name)
+        for t, name in zip(targets, order_cols, strict=True)
+    )
     if any(k <= covered for k in source_keys):
         return ()
     return (_limit_finding(limit, ordered=True, order_cols=order_cols),)
@@ -1016,20 +1021,6 @@ def _reads_outside_grouping(node: Expr, group_keys: frozenset[tuple[str | None, 
     return any(
         (sg.column_table(c), sg.column_name(c)) not in group_keys for c in sg.find_columns(node)
     )
-
-
-def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
-    """True when ``node``'s nearest enclosing SELECT is ``sel`` (not a nested sub-SELECT).
-
-    Both the window and top-n-aggregate order-key checks read a node against ``sel``'s source
-    keys and grouping, so a window or aggregate that actually belongs to a nested SELECT must be
-    excluded: its keys and grouping are a different scope's."""
-    cur: Expr | None = node.parent
-    while cur is not None:
-        if isinstance(cur, exp.Select):
-            return cur is sel
-        cur = cur.parent
-    return False
 
 
 def _uncovered_order_keys(
