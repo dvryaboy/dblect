@@ -105,7 +105,7 @@ def detect_non_unique_window_order_keys(
         if source_keys is None:
             continue
         for w in sg.find_all_windows(sel):
-            if not _node_in_scope(w, sel):
+            if not sg.node_in_scope(w, sel):
                 continue
             order = sg.order_of(w)
             if order is None:
@@ -177,7 +177,7 @@ def detect_non_unique_aggregate_order_keys(
         group = sg.group_of(sel)
         grouping = group.expressions if group is not None else []
         for agg in sg.find_all_ordered_aggregates(sel):
-            if not _node_in_scope(agg, sel):
+            if not sg.node_in_scope(agg, sel):
                 continue
             order = sg.aggregate_order_of(agg)
             agg_limit = sg.aggregate_limit_of(agg)
@@ -1021,20 +1021,6 @@ def _reads_outside_grouping(node: Expr, group_keys: frozenset[tuple[str | None, 
     return any(
         (sg.column_table(c), sg.column_name(c)) not in group_keys for c in sg.find_columns(node)
     )
-
-
-def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
-    """True when ``node``'s nearest enclosing SELECT is ``sel`` (not a nested sub-SELECT).
-
-    Both the window and top-n-aggregate order-key checks read a node against ``sel``'s source
-    keys and grouping, so a window or aggregate that actually belongs to a nested SELECT must be
-    excluded: its keys and grouping are a different scope's."""
-    cur: Expr | None = node.parent
-    while cur is not None:
-        if isinstance(cur, exp.Select):
-            return cur is sel
-        cur = cur.parent
-    return False
 
 
 def _uncovered_order_keys(

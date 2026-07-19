@@ -145,35 +145,169 @@ def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
     return {name: e for name, e in out.items() if name not in duplicated}
 
 
+@dataclass(frozen=True)
+class _InputColumns:
+    """What a scope's sources contribute to its input columns.
+
+    ``names`` are the input columns the AST names outright. ``has_unknown_width`` records that
+    some source (or the scope's own projection) carries a star, so columns beyond ``names`` are
+    present but unnamed.
+    """
+
+    names: frozenset[str]
+    has_unknown_width: bool
+
+
 def _shadows_an_input_column(name: str, sel: exp.Select) -> bool:
     """Whether ``name`` may bind to an input column of ``sel`` rather than to its output alias.
 
     SQL resolves a GROUP BY name against the input columns first and only then against the
-    output aliases, so ``select b.amt * 2 as amt ... group by amt`` groups by ``b.amt``. Naming
-    the input columns exactly needs a schema, which the AST layer does not have, so we treat any
-    column of that name referenced elsewhere in the query as evidence the name is taken and
-    decline to resolve. That is conservative in the direction of the behaviour before aliases
-    resolved at all: an input column the query never mentions still slips through, which is the
-    known-permissive edge of this rule.
+    output aliases, so ``select b.amt * 2 as amt ... group by amt`` groups by ``b.amt``.
 
-    ``GROUP BY`` and ``ORDER BY`` are excluded from the sweep because both resolve names against
-    output aliases themselves, so a reference there is not evidence of an input column.
+    The name shadows when it is one of the enumerated input columns, and either way one thing
+    short-circuits to "declines": a star of unknown width, whether the scope's own projection
+    (``select a.*``) or one it reads from (``(select * from raw) p``), carries columns any of
+    which may be the queried name. A source that aliases the name into existence
+    (``(select v as amt from raw) p``) is caught by the first test, since that name is among the
+    enumerated columns.
 
-    A projection that expands to unknown width settles the question the other way: ``select
-    a.*`` carries every column of ``a`` without naming one, so any name may be among them and
-    the sweep has nothing to find. Treating that as "no input column" would resolve the alias
-    and report against an expression the engine never grouped by, turning the permissive edge
-    above into a false positive, so an unexpanded star declines every name in the query.
+    Otherwise we fall back to evidence: a column of that name referenced somewhere that could
+    bind to one of this scope's own sources. This is the case a base table forces, its columns
+    being unknowable without a schema, and it leaves the **known-permissive edge** of this rule,
+    an input column of a base table the query never mentions, which still slips through. Where
+    every source enumerates its columns and the name is not among them, no valid reference to it
+    can exist, so this path resolves the alias just the same.
+
+    Not evidence: a reference from a scope that cannot bind to this one. An unused CTE's body
+    and an uncorrelated subquery both describe other scopes' columns, so they say nothing about
+    what this scope's sources carry. A correlated reference does reach back out, so a column
+    qualified with one of this scope's source aliases counts wherever it is written. ``GROUP BY``
+    and ``ORDER BY`` are skipped because both resolve names against output aliases themselves,
+    so a reference there is not evidence of an input column.
     """
-    if any(_expands_to_unknown_width(p) for p in sel.expressions):
+    inputs = _input_columns(sel)
+    if name in inputs.names or inputs.has_unknown_width:
         return True
+    return _name_bound_against_scope(name, sel)
+
+
+def _input_columns(sel: exp.Select) -> _InputColumns:
+    """What ``sel``'s sources contribute to its input columns, as far as the AST names them."""
+    names: set[str] = set()
+    has_unknown_width = any(_expands_to_unknown_width(p) for p in sel.expressions)
+    ctes = _visible_ctes(sel)
+    for source in _sources_of(sel):
+        body = _relation_body(source, ctes)
+        if body is None:  # a base table: unknowable, evidence fallback
+            continue
+        outputs = _output_names(body)
+        names |= outputs.names
+        has_unknown_width = has_unknown_width or outputs.has_unknown_width
+    return _InputColumns(frozenset(names), has_unknown_width)
+
+
+def _relation_body(source: Expr, ctes: Mapping[str, exp.Select]) -> exp.Select | None:
+    """The SELECT behind ``source`` when it is one we can read: a derived table, or a table
+    reference naming a CTE in scope. A base table (or anything else in FROM position, such as a
+    table function or an UNNEST) has no body here and its columns stay unknown."""
+    if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Select):
+        return source.this
+    if isinstance(source, exp.Table):
+        return ctes.get(source.name.lower())
+    return None
+
+
+@dataclass(frozen=True)
+class _OutputNames:
+    """The names a SELECT projects, and whether a star leaves some of them unnamed."""
+
+    names: frozenset[str]
+    has_unknown_width: bool
+
+
+def _output_names(sel: exp.Select) -> _OutputNames:
+    """Every name ``sel`` projects. A star sets ``has_unknown_width``, since it stands for
+    columns we cannot name. A bare expression contributes no name (the engine picks one that no
+    clean identifier a GROUP BY writes will match), but it does not widen the output the way a
+    star does, so it is simply skipped."""
+    names: set[str] = set()
+    has_unknown_width = False
+    for proj in sel.expressions:
+        if _expands_to_unknown_width(proj):
+            has_unknown_width = True
+        elif isinstance(proj, exp.Alias):
+            names.add(proj.alias_or_name)
+        elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Identifier):
+            names.add(column_name(proj))
+    return _OutputNames(frozenset(names), has_unknown_width)
+
+
+def _visible_ctes(sel: exp.Select) -> dict[str, exp.Select]:
+    """Every CTE ``sel`` can reference, by lower-cased name, walking out through the enclosing
+    statements. An inner definition shadows an outer one of the same name, so the first binding
+    found walking outward wins."""
+    out: dict[str, exp.Select] = {}
+    node: Expr | None = sel
+    while node is not None:
+        if isinstance(node, exp.Select):
+            for cte in node.ctes:
+                if isinstance(cte.this, exp.Select):
+                    out.setdefault(cte.alias_or_name.lower(), cte.this)
+        node = node.parent
+    return out
+
+
+def _sources_of(sel: exp.Select) -> list[Expr]:
+    """The relations ``sel`` reads from: its FROM, its JOINs, and its laterals."""
+    from_ = from_of(sel)
+    sources: list[Expr] = [] if from_ is None else [cast("Expr", from_.this)]
+    sources.extend(cast("Expr", j.this) for j in joins_of(sel))
+    sources.extend(laterals_of(sel))
+    return sources
+
+
+# Clauses whose column references are not evidence that a name binds to an input column.
+# GROUP BY and ORDER BY resolve names against output aliases themselves, so a reference there
+# is the very thing being resolved. A CTE list describes other scopes; where a CTE is actually
+# read, :func:`_input_columns` takes its output names instead. Both spellings of the WITH key
+# are listed for the same reason :func:`from_of` accepts two: sqlglot's compiled build suffixes
+# keys that collide with Python keywords.
+_NOT_INPUT_EVIDENCE = frozenset({"group", "order", "with", "with_"})
+
+
+def _name_bound_against_scope(name: str, sel: exp.Select) -> bool:
+    """Whether a column named ``name`` is referenced anywhere that could bind to ``sel``'s own
+    sources: written directly in ``sel``'s scope, or qualified with one of its source aliases
+    from inside a correlated subquery."""
+    aliases = {a.lower() for a in (name_of(s) for s in _sources_of(sel)) if a}
     for key, arg in sel.args.items():
-        if key in ("group", "order"):
+        if key in _NOT_INPUT_EVIDENCE:
             continue
         nodes = cast("list[object]", arg) if isinstance(arg, list) else [cast("object", arg)]
         for node in nodes:
-            if isinstance(node, Expr) and any(column_name(c) == name for c in find_columns(node)):
-                return True
+            if not isinstance(node, Expr):
+                continue
+            for c in find_columns(node):
+                if column_name(c) != name:
+                    continue
+                table = column_table(c)
+                if node_in_scope(c, sel) or (table is not None and table.lower() in aliases):
+                    return True
+    return False
+
+
+def node_in_scope(node: Expr, sel: exp.Select) -> bool:
+    """True when ``node``'s nearest enclosing SELECT is ``sel`` (not a nested sub-SELECT).
+
+    A node's scope decides which relations' columns it can refer to, so any check that reads a
+    node against ``sel``'s sources, keys, or grouping has to exclude nodes that actually belong
+    to a nested SELECT, where those are a different scope's.
+    """
+    cur: Expr | None = node.parent
+    while cur is not None:
+        if isinstance(cur, exp.Select):
+            return cur is sel
+        cur = cur.parent
     return False
 
 

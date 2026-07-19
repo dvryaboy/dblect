@@ -220,6 +220,90 @@ def test_null_group_alias_under_a_star_projection_not_resolved() -> None:
     assert detect_null_group_after_outer_join(_parse(sql)) == ()
 
 
+# Which scope a column belongs to decides whether it is evidence that a GROUP BY name is
+# taken. The guard asks two questions in order: can this scope's input columns be enumerated
+# (a derived table or a CTE names its own output, a base table does not), and failing that,
+# is a column of the name referenced somewhere that could bind to one of this scope's sources.
+# Each case below is a distinct answer to that pair, and `amt` is always the projected alias.
+_SHADOW_CASES: list[tuple[str, str, bool]] = [
+    (
+        # `c` is never a source here, so its body says nothing about what `a` and `b` carry.
+        "unused-cte/not-evidence",
+        """with c as (select amt from raw)
+        select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k group by amt""",
+        True,
+    ),
+    (
+        # Nor does a subquery that only correlates to itself; `z.amt` is a column of `z`.
+        "unrelated-subquery/not-evidence",
+        """select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k
+        where exists (select 1 from z where z.amt > 0) group by amt""",
+        True,
+    ),
+    (
+        # A correlated reference reaches back out to this scope, so `a.amt` is a real input
+        # column even though it is written inside the subquery.
+        "correlated-outer-reference/evidence",
+        """select b.k * 2 as amt, sum(amount) as total
+        from a left join b on a.k = b.k
+        where exists (select 1 from z where z.q = a.amt) group by amt""",
+        False,
+    ),
+    (
+        # A CTE that IS a source names its own output columns, so `amt` is taken. The name
+        # appears nowhere as a column, only as an output alias, which is why sweeping for
+        # referenced columns cannot see it.
+        "cte-source-aliases-the-name/evidence",
+        """with c as (select v as amt, k from raw)
+        select b.k * 2 as amt, sum(amount) as total
+        from c left join b on c.k = b.k group by amt""",
+        False,
+    ),
+    (
+        # Same for a derived table, and here every source is enumerable, so this is decided
+        # rather than guessed.
+        "derived-table-aliases-the-name/evidence",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select v as amt, k from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        False,
+    ),
+    (
+        # Every source enumerable and no `amt` among them: the name is decidably free, so the
+        # alias resolves without falling back to the reference sweep at all.
+        "derived-tables-without-the-name/not-evidence",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select v, k from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        True,
+    ),
+    (
+        # A star inside a derived-table source carries unknown columns just as an outer `*`
+        # does, so `amt` may be among them: the same decline, whether the star is the scope's
+        # own projection or one it reads from.
+        "derived-source-star/unknown-columns",
+        """select q.k * 2 as amt, sum(q.amount) as total
+        from (select * from raw) p left join (select k, amount from other) q
+        on p.k = q.k group by amt""",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "resolves"),
+    [(sql, resolves) for _name, sql, resolves in _SHADOW_CASES],
+    ids=[name for name, _sql, _resolves in _SHADOW_CASES],
+)
+def test_null_group_alias_resolves_only_when_the_name_is_free(sql: str, resolves: bool) -> None:
+    # Resolving the alias reaches `b.k * 2` / `q.k * 2` on the nullable side, so the finding
+    # firing is the observable signal that resolution happened.
+    fired = detect_null_group_after_outer_join(_parse(sql)) != ()
+    assert fired is resolves
+
+
 def test_list_group_bys_resolves_alias_target() -> None:
     groups = list_group_bys(_parse("select b.k as grp, count(*) from t group by grp"))
     assert groups[0].targets == ("b.k",)
