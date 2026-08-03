@@ -17,7 +17,9 @@ Two generators feed one soundness checker:
 
 * **Unconditional shapes** (``_scenario``): one model over one or two sources with
   ``unique`` declarations, in the filter / inner-join / left-join / group-by /
-  distinct forms.
+  distinct forms. The group-by form draws how it names its targets (see
+  ``GroupSpelling``), so the ordinals a dbt project actually writes are judged by the
+  same oracle as the spelled-out form.
 * **Conditional activation** (``_cond_scenario``): a ``where``-filtered ``unique``
   on a source whose downstream model applies a filter that may or may not imply the
   predicate. Source data honors the conditional declaration (``id`` is distinct only
@@ -55,6 +57,7 @@ from dblect.lineage.properties.uniqueness import (
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
+from tests.lineage._group_spelling import GroupSpelling
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -166,6 +169,7 @@ class ModelSpec:
     filter_col: str | None = None
     filter_threshold: int | None = None
     group_cols: tuple[str, ...] | None = None
+    group_spelling: GroupSpelling | None = None
     partition_cols: tuple[str, ...] | None = None
 
 
@@ -199,6 +203,13 @@ def _rows(draw: st.DrawFn, source: SourceSpec) -> tuple[tuple[int, ...], ...]:
         )
         rows.append((key, *plain))
     return tuple(rows)
+
+
+def _column_subset(draw: st.DrawFn) -> tuple[str, ...]:
+    """A sorted distinct subset of ``s0``'s columns, the shape GROUP BY and DISTINCT share."""
+    return tuple(
+        sorted(draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True)))
+    )
 
 
 @st.composite
@@ -253,14 +264,29 @@ def _scenario(draw: st.DrawFn) -> Scenario:
             filter_col=draw(st.sampled_from(_S0.columns)),
             filter_threshold=draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN)),
         )
-    else:  # group_by | distinct
-        cols = tuple(
-            sorted(
-                draw(st.lists(st.sampled_from(_S0.columns), min_size=1, max_size=3, unique=True))
+    elif shape == "group_by":
+        spelling = draw(st.sampled_from(tuple(GroupSpelling)))
+        if spelling is GroupSpelling.SHADOWING_ALIAS:
+            # ``SELECT source AS name ... GROUP BY name, source``: the group key is
+            # (input ``name``, ``source``) while the output carries only ``source`` under
+            # ``name``'s spelling, so two groups can share an output value.
+            name_col, source_col = draw(
+                st.lists(st.sampled_from(_S0.columns), min_size=2, max_size=2, unique=True)
             )
-        )
-        select = (*cols, "n") if shape == "group_by" else cols
-        model = ModelSpec(shape=shape, select_cols=select, group_cols=cols)
+            model = ModelSpec(
+                shape=shape,
+                select_cols=(name_col, "n"),
+                group_cols=(name_col, source_col),
+                group_spelling=spelling,
+            )
+        else:
+            cols = _column_subset(draw)
+            model = ModelSpec(
+                shape=shape, select_cols=(*cols, "n"), group_cols=cols, group_spelling=spelling
+            )
+    else:  # distinct
+        cols = _column_subset(draw)
+        model = ModelSpec(shape=shape, select_cols=cols, group_cols=cols)
 
     data = tuple((s.name, draw(_rows(s))) for s in sources)
     return Scenario(sources=sources, model=model, data=data)
@@ -293,9 +319,20 @@ def _scenario_sql(m: ModelSpec) -> str:
         )
     assert m.group_cols is not None
     cols = ", ".join(m.group_cols)
-    if m.shape == "group_by":
-        return f"SELECT {cols}, COUNT(*) AS n FROM s0 GROUP BY {cols}"
-    return f"SELECT DISTINCT {cols} FROM s0"
+    if m.shape != "group_by":
+        return f"SELECT DISTINCT {cols} FROM s0"
+    if m.group_spelling is GroupSpelling.SHADOWING_ALIAS:
+        name_col, source_col = m.group_cols
+        return (
+            f"SELECT {source_col} AS {name_col}, COUNT(*) AS n "
+            f"FROM s0 GROUP BY {name_col}, {source_col}"
+        )
+    targets = (
+        ", ".join(str(i + 1) for i in range(len(m.group_cols)))
+        if m.group_spelling is GroupSpelling.ORDINAL
+        else cols
+    )
+    return f"SELECT {cols}, COUNT(*) AS n FROM s0 GROUP BY {targets}"
 
 
 def _scenario_manifest(s: Scenario) -> Manifest:

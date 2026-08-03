@@ -36,6 +36,7 @@ from dblect.lineage.properties.functional_dependency import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Node, ResourceType
+from tests.lineage._group_spelling import GroupSpelling
 
 _SRC = SourceRef(SourceKind.SOURCE, "source.test.raw.t")
 _MODEL = SourceRef(SourceKind.MODEL, "model.test.m")
@@ -48,6 +49,7 @@ class Scenario:
     declared: bool  # ``g -> x`` declared, and the data honours it
     where: tuple[str, int] | None  # equality filter ``col = literal``
     group_cols: tuple[str, ...]  # non-empty means GROUP BY these input columns
+    group_spelling: GroupSpelling  # how that GROUP BY names them
     renames: Mapping[str, str]  # projected input column -> output name
 
 
@@ -78,8 +80,16 @@ def _scenario(draw: st.DrawFn) -> Scenario:
         projected = tuple(sorted(draw(st.sets(st.sampled_from(_COLS), min_size=1, max_size=3))))
     names = draw(st.permutations(("a", "b", "c")))
     renames = {col: names[i] for i, col in enumerate(projected)}
+    # Every projection here renames, so an ordinal has to see through the AS binding to the
+    # input column and then let the projection rename it back.
+    spelling = draw(st.sampled_from((GroupSpelling.EXPRESSION, GroupSpelling.ORDINAL)))
     return Scenario(
-        rows=tuple(rows), declared=declared, where=where, group_cols=group_cols, renames=renames
+        rows=tuple(rows),
+        declared=declared,
+        where=where,
+        group_cols=group_cols,
+        group_spelling=spelling,
+        renames=renames,
     )
 
 
@@ -91,7 +101,13 @@ def _model_sql(s: Scenario) -> str:
     if s.where is not None:
         sql += f" WHERE {s.where[0]} = {s.where[1]}"
     if s.group_cols:
-        sql += f" GROUP BY {', '.join(s.group_cols)}"
+        # The group columns lead the projection list, so ordinal i names group column i.
+        targets = (
+            ", ".join(str(i + 1) for i in range(len(s.group_cols)))
+            if s.group_spelling is GroupSpelling.ORDINAL
+            else ", ".join(s.group_cols)
+        )
+        sql += f" GROUP BY {targets}"
     return sql
 
 

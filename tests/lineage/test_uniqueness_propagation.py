@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
 import sqlglot.expressions as exp
 
 # The relation-graph builder lives next to the column builder.
@@ -169,16 +170,53 @@ def test_projection_rename_remaps_the_key() -> None:
     assert keys["model.shop.stg"] == CandidateKeySet.of(_key("order_id"))
 
 
-def test_group_by_introduces_a_key_on_the_group_columns() -> None:
+# A GROUP BY names its targets in several ways, and the key it introduces is the same for
+# all of them. `GROUP BY 1` is the dbt house style, so the ordinal spellings carry most of
+# the aggregate models a project has.
+_SAME_KEY_SPELLINGS: list[tuple[str, str]] = [
+    ("expression", "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id"),
+    ("ordinal", "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY 1"),
+    # The ordinal names the projection, so resolving it has to see through the AS binding to
+    # the source column and then let the projection rename it back.
+    (
+        "ordinal-through-alias",
+        "SELECT orders.customer_id AS customer_id, SUM(amount) AS total FROM orders GROUP BY 1",
+    ),
+    (
+        "name-of-the-projected-column",
+        "SELECT orders.customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [sql for _name, sql in _SAME_KEY_SPELLINGS],
+    ids=[name for name, _sql in _SAME_KEY_SPELLINGS],
+)
+def test_group_by_introduces_a_key_on_the_group_columns(sql: str) -> None:
+    src = _source("source.shop.raw.orders")
+    keys = _keys(src, _model("model.shop.by_customer", sql))
+    assert keys["model.shop.by_customer"] == CandidateKeySet.of(_key("customer_id"))
+
+
+def test_group_by_name_shadowed_by_an_input_column_introduces_no_key() -> None:
+    # `GROUP BY customer_id` binds to the input column, which the projection aliases over,
+    # so the grouping is by (customer_id, region) while the output carries only the renamed
+    # region. Two groups sharing a region then produce the same output value, so no key
+    # holds. Reading the name as the projection instead would collapse the two targets onto
+    # `region` and claim one, which is the edge the resolution declines to cross: an input
+    # column of a base table is not something the AST can rule out.
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
         _model(
             "model.shop.by_customer",
-            "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id",
+            "SELECT o.region AS customer_id, COUNT(*) AS n "
+            "FROM orders o GROUP BY customer_id, o.region",
         ),
     )
-    assert keys["model.shop.by_customer"] == CandidateKeySet.of(_key("customer_id"))
+    assert keys["model.shop.by_customer"] == CandidateKeySet.of()
 
 
 def test_distinct_introduces_a_full_tuple_key() -> None:

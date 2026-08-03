@@ -855,7 +855,7 @@ class _RelationWalk:
         group = sg.group_of(sel)
         grouped = group is not None and bool(group.expressions)
         if group is not None and grouped:
-            gk = _group_key(group, from_alias=from_alias)
+            gk = _group_key(sel, from_alias=from_alias)
             combined = gk if gk is not None else frozenset[_QKey]()
 
         combined |= rn_postjoin
@@ -1005,10 +1005,18 @@ def _bare_column_key(exprs: Collection[Expr], *, from_alias: str) -> _QKey | Non
     return frozenset(cols)
 
 
-def _group_key(group: exp.Group, *, from_alias: str) -> frozenset[_QKey] | None:
-    """The key a GROUP BY introduces, or ``None`` for a shape we cannot size
-    (positional or expression group keys), which drops tracked keys."""
-    key = _bare_column_key(group.expressions, from_alias=from_alias)
+def _group_key(sel: exp.Select, *, from_alias: str) -> frozenset[_QKey] | None:
+    """The key ``sel``'s GROUP BY introduces, or ``None`` for a shape we cannot size
+    (an expression group key), which drops tracked keys.
+
+    Targets are read through :attr:`sg.GroupTarget.grounded_expression`, so ``GROUP BY 1``
+    grounds the key its spelled-out form would. That fallback matters here rather than in a
+    detector: this key is read downstream to clear hazards, so resolving a target the AST
+    cannot decide would silence findings rather than add one.
+    """
+    key = _bare_column_key(
+        [t.grounded_expression for t in sg.group_targets(sel)], from_alias=from_alias
+    )
     return None if key is None else frozenset({key})
 
 
