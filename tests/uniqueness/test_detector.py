@@ -254,6 +254,26 @@ _LIMIT_CASES = [
         True,
         False,
     ),
+    (
+        # A qualified name binds to the relation's column, never to the output alias that
+        # shares its name, so it is in the source namespace for the same reason an ordinal is.
+        # duckdb agrees: `order by orders.id` sorts by the key while `order by id` sorts by
+        # `other`, so the three spellings of the key here must all clear.
+        "order_qualified_key_aliased_over_by_a_later_projection",
+        "select id as x, other as id from orders order by orders.id limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
+    (
+        # The other direction of the same rule: a bare name does bind to the output alias, so
+        # `order by id` here orders by `other` and the key no longer covers the slice.
+        "order_bare_name_captured_by_a_later_projection_alias",
+        "select id as x, other as id from orders order by id limit 10",
+        _ORDERS_ON_ID,
+        True,
+        True,
+    ),
 ]
 
 

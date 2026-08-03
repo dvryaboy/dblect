@@ -333,10 +333,11 @@ def detect_limit_without_deterministic_order(
     equivalence check we do not model). When an ``ORDER BY`` is present but no source key is
     known, it stays silent rather than guess the ordering is non-unique. A top scope that
     yields a single row (an ungrouped aggregate) is exempt: SQL's implicit grouping collapses
-    it to one row, so a ``LIMIT`` cannot drop a row. Order keys named as output names are
+    it to one row, so a ``LIMIT`` cannot drop a row. An order key spelled as a bare name is
     resolved through the projection's aliases before being matched, so an ``order by <alias>``
-    of a key counts as covering (and a renamed non-key column does not pass as the key); a
-    positional key arrives already in the source namespace and is matched as-is.
+    of a key counts as covering (and a renamed non-key column does not pass as the key). A
+    positional or qualified key already names a source column (``sg.OrderTarget``) and is
+    matched as-is, so all three spellings of one key agree.
     """
     if not is_materialized or not isinstance(tree, exp.Select):
         return ()

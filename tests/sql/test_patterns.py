@@ -280,6 +280,15 @@ _SHADOW_CASES: list[tuple[str, str, bool]] = [
         True,
     ),
     (
+        # A schema-qualified name binds to the real table, so a CTE that happens to share its
+        # bare name describes a different relation and its `amt` is not this source's column.
+        "schema-qualified-source-is-not-the-cte/not-evidence",
+        """with c as (select v as amt, k from raw)
+        select b.k * 2 as amt, sum(amount) as total
+        from db.c as t left join b on t.k = b.k group by amt""",
+        True,
+    ),
+    (
         # A star inside a derived-table source carries unknown columns just as an outer `*`
         # does, so `amt` may be among them: the same decline, whether the star is the scope's
         # own projection or one it reads from.

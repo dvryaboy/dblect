@@ -134,11 +134,15 @@ def _join_finding(mart_sql: str) -> Finding:
     return findings[0]
 
 
-def _kinds(mart_sql: str) -> list[FindingKind]:
+def _findings(mart_sql: str) -> list[Finding]:
     """Every nullability finding the detectors raise on ``mart``."""
     detectors = make_nullability_detectors(_manifest(mart_sql), _DUCKDB)
     tree = parse_sql(mart_sql, dialect="duckdb")
-    return [f.kind for detector in detectors for f in detector(tree)]
+    return [f for detector in detectors for f in detector(tree)]
+
+
+def _kinds(mart_sql: str) -> list[FindingKind]:
+    return [f.kind for f in _findings(mart_sql)]
 
 
 # ``stg.tag`` is nullable upstream (the optional side of stg's LEFT JOIN); ``stg.id`` and
@@ -177,6 +181,19 @@ def test_detector_fires_only_on_an_inherited_nullable_key(
     sql: str, kind: FindingKind, fires: bool
 ) -> None:
     assert (kind in _kinds(sql)) is fires
+
+
+@pytest.mark.parametrize("target", ["tag", "1"])
+def test_group_finding_lands_on_the_group_by_the_analyst_wrote(target: str) -> None:
+    # Grouping is the decision this finding is about, so its line points at the GROUP BY
+    # rather than at the projection a bare name or an ordinal resolves through. The message
+    # still names the resolved column, which is what makes a positional key readable.
+    mart_sql = f"SELECT\n  tag,\n  count(*) AS n\nFROM stg\nGROUP BY\n  {target}"
+    (finding,) = [
+        f for f in _findings(mart_sql) if f.kind is FindingKind.NULL_GROUP_ON_NULLABLE_KEY
+    ]
+    assert (finding.line_start, finding.line_end) == (6, 6)
+    assert "GROUP BY tag " in finding.message
 
 
 def test_flagged_group_key_really_carries_a_null_bucket() -> None:

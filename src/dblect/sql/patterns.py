@@ -184,7 +184,7 @@ def list_group_bys(tree: Expr) -> tuple[GroupBySummary, ...]:
     for sel in sg.find_all_selects(tree):
         if sg.group_of(sel) is None:
             continue
-        grouped = sg.group_targets(sel)
+        grouped = [t.expression for t in sg.group_targets(sel)]
         targets = tuple(sg.render_sql(e) for e in grouped)
         cols: list[tuple[str | None, str]] = []
         for e in grouped:
@@ -239,7 +239,7 @@ def detect_null_group_after_outer_join(tree: Expr) -> tuple[Finding, ...]:
         nullable_fs = frozenset(nullable)
         risky_tables: set[str] = set()
         risky_targets: list[str] = []
-        for grp_expr in sg.group_targets(sel):
+        for grp_expr in (t.expression for t in sg.group_targets(sel)):
             hit: set[str] = set()
             for c in sg.find_columns(grp_expr):
                 table = sg.column_table(c)
@@ -857,7 +857,8 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
     Returns ``(label, scope)`` pairs:
 
     * Each JOIN's ON clause.
-    * Each GROUP BY target expression.
+    * Each GROUP BY target expression. A target named positionally or by output name
+      contributes the projection it resolves to, which is where the call would be written.
     * Each window function's PARTITION BY expression list (rolled up as the
       window node itself for snippet purposes) and ORDER BY expression list.
 
@@ -870,7 +871,7 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
         on = sg.on_of(j)
         if on is not None:
             scopes.append(("a JOIN ON clause", on))
-    scopes.extend(("a GROUP BY target", g) for g in sg.group_targets(sel))
+    scopes.extend(("a GROUP BY target", t.expression) for t in sg.group_targets(sel))
     for w in sg.find_all_windows(sel):
         scopes.extend(("a window PARTITION BY", part) for part in sg.partition_of(w))
         order = sg.order_of(w)
