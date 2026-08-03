@@ -200,6 +200,25 @@ def test_group_by_introduces_a_key_on_the_group_columns(sql: str) -> None:
     assert keys["model.shop.by_customer"] == CandidateKeySet.of(_key("customer_id"))
 
 
+def test_group_by_bare_name_binds_to_the_joined_in_side_it_projects() -> None:
+    # The dbt idiom `select orders.customer_id ... group by customer_id`, in a scope where
+    # the name belongs to the joined-in side rather than the FROM. Reading the written node
+    # would qualify it with the FROM's alias and lose the key; the projection is that same
+    # column, so SQL's own binding decides it and the key survives.
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _model(
+            "model.shop.by_customer",
+            "SELECT c.region, SUM(o.amount) AS total "
+            "FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY region",
+        ),
+    )
+    assert keys["model.shop.by_customer"] == CandidateKeySet.of(_key("region"))
+
+
 def test_group_by_name_shadowed_by_an_input_column_introduces_no_key() -> None:
     # `GROUP BY customer_id` binds to the input column, which the projection aliases over,
     # so the grouping is by (customer_id, region) while the output carries only the renamed
