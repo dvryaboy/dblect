@@ -264,17 +264,6 @@ def test_where_clear_implies_unmatched_rows_survive(
 # --- spelling invariance of GROUP BY targets ---------------------------------------------
 
 
-@dataclass(frozen=True)
-class _GroupTarget:
-    """One projection that a GROUP BY can name, either by expression or by ordinal."""
-
-    sql: str
-    alias: str | None
-
-    def projection(self) -> str:
-        return self.sql if self.alias is None else f"{self.sql} as {self.alias}"
-
-
 # Projections chosen so the grouped set reaches every clause the GROUP BY readers branch on:
 # the nullable side of the join (the null-group hazard), the preserved side and a
 # preserved-side COALESCE fallback (its guards), a two-nullable-side COALESCE (which the
@@ -296,48 +285,42 @@ def _group_by_query(draw: st.DrawFn) -> tuple[str, str]:
     """One logical query rendered twice: grouping wholly by expression, and grouping with at
     least one target named indirectly, by its ordinal or by its output alias.
 
-    All three spellings denote the same grouping, so every detector must return the same verdict
-    for them. Aliases are drawn independently of the grouping, so an ordinal has to resolve
-    through an ``AS`` binding as often as not, and the spelling is drawn per target rather than
-    all-or-nothing, so a clause mixing spellings is an ordinary example rather than a special
-    case. The alias pool (``p0``..``p3``) deliberately avoids the source column names, since a
-    name that could bind to an input column is one this resolution declines to touch.
+    Aliases are drawn independently of the grouping, so an ordinal has to resolve through an
+    ``AS`` binding as often as not, and the spelling is drawn per target, so a clause mixing
+    spellings is an ordinary example rather than a special case.
     """
     chosen = draw(st.lists(st.sampled_from(_GROUP_TARGET_SQL), min_size=1, max_size=4, unique=True))
-    targets = [
-        _GroupTarget(sql, f"p{i}" if draw(st.booleans()) else None) for i, sql in enumerate(chosen)
-    ]
+    # An alias, where drawn, is also how the target can be named. `p0`..`p3` avoid the source
+    # column names so the spelling stays an alias reference rather than an input column.
+    aliases = [f"p{i}" if draw(st.booleans()) else None for i in range(len(chosen))]
     grouped = draw(
-        st.lists(st.integers(min_value=0, max_value=len(targets) - 1), min_size=1, unique=True)
+        st.lists(st.integers(min_value=0, max_value=len(chosen) - 1), min_size=1, unique=True)
     )
-    spellings = [draw(st.sampled_from(_spellings_for(targets[i]))) for i in grouped]
-    # At least one target has to be written indirectly, or the two renderings are the same query.
-    forced = draw(st.integers(min_value=0, max_value=len(grouped) - 1))
-    indirect = [s for s in _spellings_for(targets[grouped[forced]]) if s != "expression"]
-    spellings[forced] = draw(st.sampled_from(indirect))
+
+    def spellings(i: int) -> list[str]:
+        alias = aliases[i]
+        return [str(i + 1)] + ([alias] if alias is not None else [])
+
+    indirect = [draw(st.sampled_from(spellings(i))) for i in grouped]
+    # At least one target is written indirectly, or the two renderings are the same query.
+    direct = [draw(st.booleans()) for _ in grouped]
+    direct[draw(st.integers(min_value=0, max_value=len(grouped) - 1))] = False
+
     # The aggregate trails the grouped projections so ordinals index a stable prefix.
-    projections = ", ".join([t.projection() for t in targets] + ["sum(a.amt) as total"])
-    body = f"select {projections} from a left join b on a.k = b.k group by "
+    projections = [
+        sql if alias is None else f"{sql} as {alias}"
+        for sql, alias in zip(chosen, aliases, strict=True)
+    ]
+    selected = ", ".join([*projections, "sum(a.amt) as total"])
+    body = f"select {selected} from a left join b on a.k = b.k group by "
     return (
-        body + ", ".join(targets[i].sql for i in grouped),
+        body + ", ".join(chosen[i] for i in grouped),
         body
-        + ", ".join(_render(targets[i], i, s) for i, s in zip(grouped, spellings, strict=True)),
+        + ", ".join(
+            chosen[i] if d else spelled
+            for i, d, spelled in zip(grouped, direct, indirect, strict=True)
+        ),
     )
-
-
-def _spellings_for(target: _GroupTarget) -> list[str]:
-    """How this target can be named in a GROUP BY: always by its expression or its ordinal, and
-    by its output alias when it carries one."""
-    return ["expression", "ordinal"] + (["alias"] if target.alias is not None else [])
-
-
-def _render(target: _GroupTarget, index: int, spelling: str) -> str:
-    if spelling == "ordinal":
-        return str(index + 1)
-    if spelling == "alias":
-        assert target.alias is not None
-        return target.alias
-    return target.sql
 
 
 @given(q=_group_by_query())
