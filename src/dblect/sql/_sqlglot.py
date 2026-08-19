@@ -13,8 +13,10 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import cast
+from typing import TypeGuard, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -59,6 +61,190 @@ def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
 
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
+
+
+@dataclass(frozen=True)
+class GroupTarget:
+    """One ``GROUP BY`` target: the expression it denotes, and the node the query writes.
+
+    A finding about the *grouping decision* belongs at ``written_at``, so ``GROUP BY 1`` is
+    diagnosed at the clause an analyst reads. One about something written inside the target (a
+    ``now()`` call) belongs at ``expression``, where that call is spelled out. The two nodes
+    coincide for a target written in full.
+    """
+
+    expression: Expr
+    written_at: Expr
+
+
+def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
+    """The targets ``sel`` groups by, with ordinals and output-name references resolved to the
+    projections they name.
+
+    ``GROUP BY 1`` and ``GROUP BY revenue_day`` both name a projection, so a reader walking the
+    ``Group`` node's arguments finds a literal or a table-less column where the semantics are the
+    projected expression. Every structural check over grouping keys wants that expression, so the
+    resolution belongs here rather than in each caller. Resolution is by lookup rather than by
+    rewriting the tree, so the nodes keep their source positions.
+
+    Every adapter dblect targets reads a bare integer in GROUP BY as a position, so no dialect
+    gate is needed. A target we cannot resolve carries itself as its own ``expression``.
+    """
+    group = group_of(sel)
+    if group is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    projected = _projection_expressions_by_output_name(sel)
+    return tuple(
+        GroupTarget(_resolve_group_target(target, projections, projected), target)
+        for target in group.expressions
+    )
+
+
+def _resolve_group_target(
+    target: Expr, projections: Sequence[Expr], projected: Mapping[str, Expr]
+) -> Expr:
+    resolved = _resolve_ordinal(target, projections)
+    return resolved if resolved is not None else _resolve_name(target, projected)
+
+
+def _names_an_output_column(e: Expr) -> TypeGuard[exp.Column]:
+    """Whether ``e`` is the spelling that can bind to a projection's output name.
+
+    Only an unqualified column reference can. A qualified ``t.k`` binds to that relation's column
+    and never picks up a matching output name, in a GROUP BY and a statement-level ORDER BY alike
+    (duckdb: ``select id as x, other as id ... order by orders.id`` sorts by ``id``, while
+    ``order by id`` sorts by ``other``).
+    """
+    return isinstance(e, exp.Column) and isinstance(e.this, exp.Identifier) and e.table == ""
+
+
+def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> Expr:
+    """``target`` resolved to the projection it names, if it is an output-name reference.
+
+    **Known-permissive edge**: SQL binds a GROUP BY name to an input column before an output
+    alias, so ``select b.amt * 2 as amt ... group by amt`` really groups by ``b.amt`` while this
+    resolves it to ``b.amt * 2``. Ruling that out needs a schema the AST layer does not have. A
+    reader reasoning structurally lands on the same join side either way, which is why the
+    detectors accept it: their error direction is to over-report. A consumer that *grounds* a
+    fact from the group key needs more, and takes it from the target it was written as.
+    """
+    if not _names_an_output_column(target):
+        return target
+    projection = projected.get(column_name(target))
+    return target if projection is None else projection
+
+
+def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+    """Each output name in ``sel``'s projection mapped to the expression behind it.
+
+    A name carried by two projections names neither unambiguously, so it is dropped rather than
+    resolved to whichever came last. Such a query does not run anyway: an engine binds the first
+    and rejects the second as ungrouped.
+    """
+    out: dict[str, Expr] = {}
+    duplicated: set[str] = set()
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Alias):
+            name, expression = proj.alias_or_name, cast("Expr", proj.this)
+        elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Identifier):
+            name, expression = column_name(proj), proj
+        else:
+            continue
+        if name in out:
+            duplicated.add(name)
+        out[name] = expression
+    return {name: e for name, e in out.items() if name not in duplicated}
+
+
+@dataclass(frozen=True)
+class OrderTarget:
+    """One statement-level ``ORDER BY`` target, and which namespace its expression is in.
+
+    A resolved ordinal and a qualified ``t.k`` both name a source column outright, already past
+    the ``AS`` binding. Only a bare name is in the *output* namespace, where a caller matching
+    against source columns has to translate it through the projection's aliases first.
+
+    Conflating the two re-translates a source column whenever some *other* projection is aliased
+    to that name: in ``select id as x, other as id ... order by 1`` the target is ``id``, which a
+    second pass through the alias map would turn into ``other``. A target naming no single column
+    (``order by lower(k)``) carries the source reading by default, which nothing acts on: the one
+    consumer declines a non-bare-column target first.
+    """
+
+    expression: Expr
+    in_source_namespace: bool
+
+
+def statement_order_targets(sel: exp.Select) -> tuple[OrderTarget, ...]:
+    """The statement-level ``ORDER BY`` targets of ``sel``, with ordinals resolved and each
+    target's ``exp.Ordered`` wrapper removed.
+
+    Unlike the ORDER BY inside a window or an aggregate, where a literal is a constant that
+    orders nothing (see :func:`imposes_row_order`), a statement-level ``ORDER BY 1`` is a
+    positional reference to the first projection.
+    """
+    order = cast("exp.Order | None", sel.args.get("order"))
+    if order is None:
+        return ()
+    projections = cast("list[Expr]", sel.expressions)
+    targets = (t.this if isinstance(t, exp.Ordered) else t for t in order.expressions)
+    return tuple(_order_target(t, projections) for t in targets)
+
+
+def _order_target(target: Expr, projections: Sequence[Expr]) -> OrderTarget:
+    resolved = _resolve_ordinal(target, projections)
+    if resolved is not None:
+        return OrderTarget(resolved, in_source_namespace=True)
+    return OrderTarget(target, in_source_namespace=not _names_an_output_column(target))
+
+
+def imposes_row_order(order: exp.Order | None) -> bool:
+    """Whether ``order`` actually pins the order of the rows it governs.
+
+    An ORDER BY inside a window or an aggregate takes expressions, never the positional
+    references a statement-level ORDER BY accepts, so a literal there is a constant: every row
+    sorts equal and the ranking follows whatever physical order the engine had. An ordering whose
+    targets reference no column therefore pins nothing.
+
+    A column inside a subquery counts even though it is constant per row and orders nothing
+    either, which keeps the answer conservative: the caller stays silent rather than report a
+    hazard this rule cannot prove.
+    """
+    if order is None or not order.expressions:
+        return False
+    return any(find_columns(e) for e in order.expressions)
+
+
+def _resolve_ordinal(target: Expr, projections: Sequence[Expr]) -> Expr | None:
+    """The projection ``target`` names positionally, or ``None`` when it names none.
+
+    Only a bare positive integer literal is positional. A string (``GROUP BY 'x'``), a float,
+    and a negation (which parses as ``Neg`` over the literal, not a literal) are grouped
+    values, so they name no position. Nor does an index past the end of the projection list,
+    or one reaching over a ``SELECT *`` that expands to an unknown number of columns, so
+    position N is not the Nth listed projection.
+    """
+    if not (isinstance(target, exp.Literal) and target.is_int):
+        return None
+    index = int(target.this)
+    if not 1 <= index <= len(projections):
+        return None
+    prefix = projections[:index]
+    if any(_expands_to_unknown_width(p) for p in prefix):
+        return None
+    return prefix[-1].unalias()
+
+
+def _expands_to_unknown_width(projection: Expr) -> bool:
+    """Whether ``projection`` stands for an unknown number of output columns.
+
+    A bare ``*`` or a qualified ``t.*`` does; ``count(*)`` does not, so this looks at the
+    projection itself rather than searching it for a ``Star``.
+    """
+    return isinstance(projection, exp.Star) or (
+        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+    )
 
 
 def on_of(j: exp.Join) -> Expr | None:
@@ -459,17 +645,17 @@ def conjunctive_leaves(predicate: Expr) -> list[Expr]:
 def line_range(e: Expr) -> tuple[int, int] | None:
     """The 1-indexed (start, end) source-line span covered by `e`.
 
-    sqlglot only stamps token-position metadata onto ``Identifier`` nodes, so
-    we walk descendants and take min/max over their `meta["line"]`. Returns
-    `None` if no identifier carries a usable line number (rare; some literal-
-    only expressions like ``select 1`` have no identifier children).
+    sqlglot stamps ``meta["line"]`` at the token a node opens on, and not only on identifiers:
+    literals, function calls, and stars carry one too. Every stamp lies inside its own node's
+    span, so walking all descendants and taking min/max only tightens the answer. Reading
+    identifiers alone left literal-only expressions with no span, which is how ``GROUP BY 1``
+    reported against line 0. Returns ``None`` when no descendant carries a line number.
 
-    Line numbers refer to the SQL the parser saw (the model's
-    ``compiled_code``).
+    Line numbers refer to the SQL the parser saw (the model's ``compiled_code``).
     """
     lines: list[int] = []
-    for ident in e.find_all(exp.Identifier):
-        line = ident.meta.get("line") if ident.meta else None
+    for node in e.walk():
+        line = node.meta.get("line")
         if isinstance(line, int):
             lines.append(line)
     if not lines:

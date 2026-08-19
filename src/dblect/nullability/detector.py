@@ -87,6 +87,11 @@ def detect_null_group_on_nullable_key(
     local case belongs to ``null_group_after_outer_join``). Only bare-column group keys
     are reasoned about; a computed key like ``date_trunc(col)`` needs an equivalence we
     do not model and is skipped.
+
+    A key named positionally or by output name is read through :func:`sg.group_targets` to the
+    projection it names, so ``group by 1`` over a nullable column carries the same hazard as
+    spelling the column out. The finding names that projection and lands on the GROUP BY, the
+    decision site an analyst following the line number is looking for.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -99,10 +104,8 @@ def detect_null_group_on_nullable_key(
         nullable = nullable_by_name.get(target.name)
         if not nullable:
             continue
-        group = sg.group_of(sel)
-        if group is None:
-            continue
-        for grp_expr in group.expressions:
+        for grouped in sg.group_targets(sel):
+            grp_expr = grouped.expression
             if not isinstance(grp_expr, exp.Column):
                 continue
             qualifier = sg.column_table(grp_expr)
@@ -110,7 +113,11 @@ def detect_null_group_on_nullable_key(
                 continue
             column = sg.column_name(grp_expr).lower()
             if column in nullable:
-                out.append(_finding(grp_expr, source=target.name, column=column))
+                out.append(
+                    _finding(
+                        grp_expr, written_at=grouped.written_at, source=target.name, column=column
+                    )
+                )
     return tuple(out)
 
 
@@ -331,7 +338,9 @@ def _alias_to_relation(sel: exp.Select) -> dict[str, str]:
     return out
 
 
-def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
+def _finding(grp_expr: exp.Column, *, written_at: Expr, source: str, column: str) -> Finding:
+    """Named after the resolved group key, located at the clause that wrote it. The two part
+    company when the key is spelled positionally or by output name."""
     return finding_at(
         FindingKind.NULL_GROUP_ON_NULLABLE_KEY,
         message=(
@@ -340,7 +349,7 @@ def _finding(grp_expr: exp.Column, *, source: str, column: str) -> Finding:
             f"that downstream code rarely accounts for. Filter the nulls before grouping, "
             f"or make the orphan-handling intent explicit."
         ),
-        node=grp_expr,
+        node=written_at,
     )
 
 

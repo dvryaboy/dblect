@@ -73,12 +73,62 @@ def test_list_group_bys_one_per_select() -> None:
     assert {g.targets for g in groups} == {("x",), ("y",)}
 
 
+# What a GROUP BY target resolves to, and the conditions under which it cannot. An
+# unresolvable target reads back as written, so the rendered target is the whole contract.
+# Only a bare positive integer is positional: a string, a float, a negation (which parses as
+# Neg over the literal), and 0 are grouped values. A star expands to an unknown number of
+# columns, so an ordinal reaching over one indexes nothing knowable, while one before it is
+# unaffected. A name carried by two projections names neither.
+_GROUP_TARGET_RESOLUTION: list[tuple[str, str, str]] = [
+    ("ordinal-through-alias", "select b.k as key, count(*) from t group by 1", "b.k"),
+    ("name-through-alias", "select b.k as grp, count(*) from t group by grp", "b.k"),
+    ("ordinal-past-the-end", "select b.k, count(*) from t group by 7", "7"),
+    ("ordinal-over-a-star", "select *, b.k from t group by 2", "2"),
+    ("ordinal-before-a-star", "select b.k, * from t group by 1", "b.k"),
+    ("string-literal", "select b.k, count(*) from t group by '1'", "'1'"),
+    ("float-literal", "select b.k, count(*) from t group by 1.5", "1.5"),
+    ("negated-literal", "select b.k, count(*) from t group by -1", "-1"),
+    ("zero", "select b.k, count(*) from t group by 0", "0"),
+    ("duplicated-output-name", "select b.k as x, b.status as x from t group by x", "x"),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "target"),
+    [(sql, target) for _name, sql, target in _GROUP_TARGET_RESOLUTION],
+    ids=[name for name, _sql, _target in _GROUP_TARGET_RESOLUTION],
+)
+def test_list_group_bys_reports_the_resolved_target(sql: str, target: str) -> None:
+    assert list_group_bys(_parse(sql))[0].targets == (target,)
+
+
 def test_list_aggregations_excludes_windowed_functions() -> None:
     p = _parse("select sum(x), sum(y) over () from t")
     aggs = list_aggregations(p)
     assert len(aggs) == 1
     assert aggs[0].function == "Sum"
     assert aggs[0].argument_sql == "x"
+
+
+# The clear direction and the full clause enumeration belong to the duckdb permutation oracle
+# in ``test_pbt_structural_hazards.py``, which decides "really orders" from the data rather
+# than from a re-derivation of the rule. These keep a parse-only guard on the detect direction,
+# which is where reading a window's ORDER BY structurally went wrong.
+@pytest.mark.parametrize("order", ["1", "'x'", "null", "1 + 2"])
+def test_unordered_window_column_free_order_by_detected(order: str) -> None:
+    # Nothing that fails to reference a column can order rows. `over (order by 1)` in
+    # particular is not a positional reference: inside a window the literal is a constant, so
+    # every row sorts equal and the ranking is as arbitrary as with no ORDER BY.
+    sql = f"select row_number() over (order by {order}) from t"
+    findings = detect_unordered_window(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_RANKING_WINDOW
+
+
+def test_unordered_aggregate_constant_order_by_detected() -> None:
+    findings = detect_unordered_aggregate(_parse("select array_agg(s order by 1) from t"))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.UNORDERED_AGGREGATE
 
 
 def test_null_group_after_left_join_detected() -> None:
@@ -90,6 +140,56 @@ def test_null_group_after_left_join_detected() -> None:
     findings = detect_null_group_after_outer_join(_parse(sql))
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_alias_target_detected() -> None:
+    # `group by grp` names the projection aliased grp, which is the nullable side. The
+    # unqualified `group by customer_id` spelling of the jaffle idiom is the same lookup, and
+    # the metamorphic property in test_pbt_structural_hazards.py holds every detector to it.
+    sql = """
+    select b.k as grp, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by grp
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+
+
+def test_null_group_alias_of_a_preserved_column_not_detected() -> None:
+    sql = """
+    select payments.order_id as grp, sum(amount) as total
+    from payments left join orders on payments.order_id = orders.order_id
+    group by grp
+    """
+    assert detect_null_group_after_outer_join(_parse(sql)) == ()
+
+
+def test_null_group_alias_shadowed_by_an_input_column_still_reports() -> None:
+    # The known-permissive edge: SQL binds `amt` to the input column `b.amt`, so the grouping
+    # is really by b.amt while we resolve to the projection `b.k * 2`. Ruling that out needs a
+    # schema the AST layer does not have. Both readings sit on the nullable side here, so the
+    # verdict stands, and over-reporting is this detector's safe direction either way.
+    sql = """
+    select b.k * 2 as amt, sum(amount) as total
+    from a left join b on a.k = b.k
+    group by amt
+    """
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+
+
+def test_null_group_positional_target_detected_and_located() -> None:
+    # `group by 1` names the nullable-side projection, so the hazard is the same one the
+    # spelled-out `group by b.k` carries. The finding also has to land on the GROUP BY the
+    # analyst wrote, not at line 0: a positional target holds no identifier, so the line has to
+    # come off the ordinal literal itself.
+    sql = "select b.k, sum(amount) as total\nfrom a left join b on a.k = b.k\ngroup by 1"
+    findings = detect_null_group_after_outer_join(_parse(sql))
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NULL_GROUP_AFTER_OUTER_JOIN
+    assert findings[0].line_start == 3
+    assert findings[0].line_end == 3
 
 
 def test_null_group_after_inner_join_not_detected() -> None:
@@ -884,13 +984,13 @@ def test_now_in_join_on_detected() -> None:
     assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
-def test_now_in_group_by_detected() -> None:
+def test_now_in_positional_group_by_detected() -> None:
+    # `group by 1` names the first projection, so the grouped expression is the one holding
+    # now() even though the GROUP BY target in the AST is the literal 1.
     sql = "select date_diff('day', ts, now()) as days_ago, count(*) from t group by 1"
-    # `group by 1` is a positional reference; the GROUP BY *target* in the AST
-    # is the literal 1, not the expression. So this won't fire. The pattern
-    # we care about is `group by <expression containing now()>` directly.
-    # (Documented because someone will inevitably wonder why it didn't trigger.)
-    assert _non_determinism(sql) == ()
+    findings = _non_determinism(sql)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
 def test_now_in_explicit_group_by_expression_detected() -> None:

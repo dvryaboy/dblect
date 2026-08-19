@@ -227,6 +227,53 @@ _LIMIT_CASES = [
         True,
         True,
     ),
+    (
+        # A statement-level ORDER BY *is* positional, unlike the same literal inside a window,
+        # so ordinal 1 names the key column and the slice is deterministic.
+        "order_ordinal_of_key",
+        "select id from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
+    (
+        "order_ordinal_of_non_key",
+        "select other from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        True,
+    ),
+    (
+        # An ordinal resolves to the named projection's own source column, which is already a
+        # source name. Translating it through the projection's aliases a second time would
+        # re-map it whenever another projection is aliased to that name: here `other as id`
+        # would turn the resolved `id` into `other` and lose the key that covers the order.
+        "order_ordinal_of_key_aliased_over_by_a_later_projection",
+        "select id as x, other as id from orders order by 1 limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
+    (
+        # A qualified name binds to the relation's column, never to the output alias that
+        # shares its name, so it is in the source namespace for the same reason an ordinal is.
+        # duckdb agrees: `order by orders.id` sorts by the key while `order by id` sorts by
+        # `other`, so the three spellings of the key here must all clear.
+        "order_qualified_key_aliased_over_by_a_later_projection",
+        "select id as x, other as id from orders order by orders.id limit 10",
+        _ORDERS_ON_ID,
+        True,
+        False,
+    ),
+    (
+        # The other direction of the same rule: a bare name does bind to the output alias, so
+        # `order by id` here orders by `other` and the key no longer covers the slice.
+        "order_bare_name_captured_by_a_later_projection_alias",
+        "select id as x, other as id from orders order by id limit 10",
+        _ORDERS_ON_ID,
+        True,
+        True,
+    ),
 ]
 
 
