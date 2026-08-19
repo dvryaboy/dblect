@@ -259,7 +259,7 @@ class _FdWalk:
         group = sg.group_of(sel)
         group_names: frozenset[str] | None = None
         if group is not None and group.expressions:
-            group_names = _group_columns(group)
+            group_names = _group_columns(sel)
             if group_names is None:
                 return frozenset()  # unmodellable group shape: prove nothing
             # Grouping aggregates everything outside the group key away, so only a
@@ -377,11 +377,18 @@ class _FdWalk:
         return _project_qualified(qfds, qrename)
 
 
-def _group_columns(group: exp.Group) -> frozenset[str] | None:
-    """The group key as case-folded input column names, or ``None`` for a shape we
-    cannot name (positional or expression group keys)."""
+def _group_columns(sel: exp.Select) -> frozenset[str] | None:
+    """The group key as case-folded input column names, or ``None`` for a shape we cannot name
+    (an expression group key).
+
+    Targets are read through :attr:`sg.GroupTarget.grounded_expression`, so ``GROUP BY 1`` names
+    the same columns its spelled-out form would. The dependencies minted below say the group key
+    determines every output, which is a key claim in FD clothing, so the same fallback applies:
+    a binding the AST cannot decide stays at the column name the query wrote.
+    """
     out: set[str] = set()
-    for g in group.expressions:
+    for target in sg.group_targets(sel):
+        g = target.grounded_expression
         if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
             return None
         out.add(sg.column_name(g).lower())

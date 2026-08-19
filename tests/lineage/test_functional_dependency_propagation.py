@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
+
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact
@@ -205,16 +207,42 @@ def test_constancy_flows_through_a_cte_and_a_downstream_model() -> None:
 # --- GROUP BY --------------------------------------------------------------------
 
 
-def test_group_by_determines_the_aggregates() -> None:
+# The group key determines the aggregates however the GROUP BY spells its targets.
+# ``GROUP BY 1`` is the dbt house style, so the ordinal carries most real aggregate models.
+_GROUP_SPELLINGS: list[tuple[str, str]] = [
+    ("expression", "SELECT country, SUM(amount) AS total FROM payments GROUP BY country"),
+    ("ordinal", "SELECT country, SUM(amount) AS total FROM payments GROUP BY 1"),
+    (
+        "ordinal-through-alias",
+        "SELECT payments.country AS country, SUM(amount) AS total FROM payments GROUP BY 1",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "sql", [sql for _name, sql in _GROUP_SPELLINGS], ids=[name for name, _sql in _GROUP_SPELLINGS]
+)
+def test_group_by_determines_the_aggregates(sql: str) -> None:
+    out = _fds(_declared(), _source(_PAYMENTS.unique_id), _model("model.shop.by_country", sql))
+    assert out["model.shop.by_country"] == FDSet.of(_fd("total", "country"))
+
+
+def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
+    # `GROUP BY country` binds to the input column, which the projection aliases over, so
+    # the grouping is by (country, currency) while the output carries only the renamed
+    # currency. Two groups sharing a currency then disagree on the total, so `country` in
+    # the output determines nothing. Reading the name as its projection would collapse the
+    # two targets onto `currency` and mint the dependency anyway.
     out = _fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
         _model(
             "model.shop.by_country",
-            "SELECT country, SUM(amount) AS total FROM payments GROUP BY country",
+            "SELECT p.currency AS country, SUM(amount) AS total FROM payments p "
+            "GROUP BY country, p.currency",
         ),
     )
-    assert out["model.shop.by_country"] == FDSet.of(_fd("total", "country"))
+    assert out["model.shop.by_country"] == FDSet.of()
 
 
 def test_group_by_keeps_fds_among_the_group_columns() -> None:

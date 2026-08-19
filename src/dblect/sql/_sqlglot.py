@@ -63,18 +63,53 @@ def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
 
 
+class GroupBinding(StrEnum):
+    """How firmly a ``GROUP BY`` target is bound to the expression it denotes.
+
+    ``WRITTEN`` is a target spelled out in full, or one we declined to resolve, so the node is
+    its own meaning. ``DECIDED`` is fixed by SQL's own rules: an ordinal, or a name whose
+    projection is that very column. ``PRESUMED`` is a renaming alias, where SQL
+    would bind an input column of that name first and the AST cannot rule one out.
+
+    A detector may read all three, since over-reporting is its safe direction. A consumer that
+    *grounds* a fact from the group key stops at ``DECIDED`` (see
+    :attr:`GroupTarget.grounded_expression`): keys and dependencies are read downstream to
+    clear hazards, so a wrong resolution there silences real findings instead of adding a
+    spurious one.
+    """
+
+    WRITTEN = "written"
+    DECIDED = "decided"
+    PRESUMED = "presumed"
+
+
 @dataclass(frozen=True)
 class GroupTarget:
-    """One ``GROUP BY`` target: the expression it denotes, and the node the query writes.
+    """One ``GROUP BY`` target: the expression it denotes, the node the query writes, and how
+    firmly the two are tied together.
 
     A finding about the *grouping decision* belongs at ``written_at``, so ``GROUP BY 1`` is
     diagnosed at the clause an analyst reads. One about something written inside the target (a
     ``now()`` call) belongs at ``expression``, where that call is spelled out. The two nodes
-    coincide for a target written in full.
+    coincide for a target written in full. ``binding`` decides whether a consumer may ground a
+    fact from ``expression``: see :attr:`grounded_expression`.
     """
 
     expression: Expr
     written_at: Expr
+    binding: GroupBinding
+
+    @property
+    def grounded_expression(self) -> Expr:
+        """The reading a consumer may ground a fact from: the resolved expression where SQL's
+        own rules decide the binding, and the written node where they do not.
+
+        Falling back to ``written_at`` on a ``PRESUMED`` binding is the conservative reading, and
+        it is the one SQL takes whenever the name really is an input column. Two targets can also
+        resolve onto one node (``SELECT x AS a ... GROUP BY a, x`` where ``a`` is an input
+        column), which would shrink the group key, and a shorter key is the stronger claim.
+        """
+        return self.written_at if self.binding is GroupBinding.PRESUMED else self.expression
 
 
 def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
@@ -96,16 +131,18 @@ def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
     projections = cast("list[Expr]", sel.expressions)
     projected = _projection_expressions_by_output_name(sel)
     return tuple(
-        GroupTarget(_resolve_group_target(target, projections, projected), target)
-        for target in group.expressions
+        _resolve_group_target(target, projections, projected) for target in group.expressions
     )
 
 
 def _resolve_group_target(
     target: Expr, projections: Sequence[Expr], projected: Mapping[str, Expr]
-) -> Expr:
+) -> GroupTarget:
     resolved = _resolve_ordinal(target, projections)
-    return resolved if resolved is not None else _resolve_name(target, projected)
+    if resolved is not None:
+        return GroupTarget(resolved, target, GroupBinding.DECIDED)
+    expression, binding = _resolve_name(target, projected)
+    return GroupTarget(expression, target, binding)
 
 
 def _names_an_output_column(e: Expr) -> TypeGuard[exp.Column]:
@@ -119,20 +156,29 @@ def _names_an_output_column(e: Expr) -> TypeGuard[exp.Column]:
     return isinstance(e, exp.Column) and isinstance(e.this, exp.Identifier) and e.table == ""
 
 
-def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> Expr:
-    """``target`` resolved to the projection it names, if it is an output-name reference.
+def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> tuple[Expr, GroupBinding]:
+    """``target`` resolved to the projection it names, if it is an output-name reference, with
+    how firmly the two are tied together.
 
-    **Known-permissive edge**: SQL binds a GROUP BY name to an input column before an output
-    alias, so ``select b.amt * 2 as amt ... group by amt`` really groups by ``b.amt`` while this
-    resolves it to ``b.amt * 2``. Ruling that out needs a schema the AST layer does not have. A
-    reader reasoning structurally lands on the same join side either way, which is why the
-    detectors accept it: their error direction is to over-report. A consumer that *grounds* a
-    fact from the group key needs more, and takes it from the target it was written as.
+    A name whose projection is *itself* the bare column of that name is ``DECIDED``: SQL binds
+    the name to that input column, the projection is that same column, so the two readings agree.
+    This is the ``select orders.customer_id ... group by customer_id`` idiom.
+
+    Any other projection is a renaming, and SQL binds a GROUP BY name to an input column before
+    an output alias, so ``select b.amt * 2 as amt ... group by amt`` really groups by ``b.amt``
+    while this resolves it to ``b.amt * 2``. Ruling that out needs a schema the AST layer does not
+    have, hence ``PRESUMED``. A reader reasoning structurally lands on the same join side either
+    way, which is why the detectors accept it: their error direction is to over-report.
     """
     if not _names_an_output_column(target):
-        return target
-    projection = projected.get(column_name(target))
-    return target if projection is None else projection
+        return target, GroupBinding.WRITTEN
+    name = column_name(target)
+    projection = projected.get(name)
+    if projection is None:
+        return target, GroupBinding.WRITTEN
+    if isinstance(projection, exp.Column) and column_name(projection) == name:
+        return projection, GroupBinding.DECIDED
+    return projection, GroupBinding.PRESUMED
 
 
 def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
