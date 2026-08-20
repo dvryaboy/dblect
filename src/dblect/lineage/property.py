@@ -28,7 +28,7 @@ property's :class:`~dblect.lineage.facts.DepContext` reads.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from functools import reduce
 from typing import Any, TypeVar, cast
 
@@ -87,6 +87,7 @@ def propagate(
     dep_context: DepContext = _NULL_DEP_CONTEXT,
     subjects: Iterable[S] | None = None,
     sink: CoherenceSink[K] | None = None,
+    inferred_sink: MutableMapping[S, Annotation[K]] | None = None,
 ) -> Mapping[S, Annotation[K]]:
     """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
@@ -117,6 +118,15 @@ def propagate(
     than re-inferring it from the output. It is per-call: the propagator never mutates
     the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
     silently (the substrate-only path).
+
+    ``inferred_sink`` is the pre-reconcile record (``refutation-and-verdicts.md``):
+    when supplied, each derived subject's inferred annotation is recorded there as
+    the reducer produced it, before reconciliation folds the grounded value in. The
+    flow value keeps its meaning (trust the declaration forward); the record is what
+    lets an emitter ask whether the derivation re-derived a declaration, which the
+    flow value cannot answer for a meet-reconciled property (the declaration unions
+    into it and would check itself). A leaf or a declared-opaque subject has no
+    derivation to judge, so neither is recorded.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
@@ -145,6 +155,8 @@ def propagate(
                     result = grounded  # a leaf anchors on its grounded value
                 else:
                     inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
+                    if inferred_sink is not None:
+                        inferred_sink[subject] = inferred
                     result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
             annotations[subject] = result
             return result
