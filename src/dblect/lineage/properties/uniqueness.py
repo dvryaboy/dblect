@@ -1289,25 +1289,20 @@ class _Projection:
 # --- the property ------------------------------------------------------------
 
 
-def uniqueness_property(
+def uniqueness_facts(
     manifest: Manifest,
     profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
-) -> Property[CandidateKeySet, SourceRef]:
-    """The manifest-backed uniqueness property: declared keys (unique tests,
-    ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, the
-    config ``unique_key`` of a deduplicating incremental model, plus any
-    ``extra``) ground each relation, and the relation reducer infers more from the
-    SQL. Declared and inferred keys both hold, so they compose by meet
-    (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
-    set is empty. The property carries its relation-algebra walk as ``reducer`` so
-    the propagator dispatches it without a global registry.
-
-    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
-    and dedup semantics, and carries any ``--dialect`` override so grammar and
-    semantics stay coherent."""
+) -> Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]:
+    """Every candidate-key grounding fact, bucketed by relation: the manifest
+    discoverers (unique tests, ``unique_combination_of_columns``, native PRIMARY
+    KEY / UNIQUE, the config ``unique_key`` of a deduplicating incremental model,
+    the surrogate-hash expansion), any ``extra`` discoverers, and any
+    ``extra_facts`` already resolved in the caller's hand (the check threads the
+    contract-declared keys this way, so contracts are resolved once per run)."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
@@ -1318,7 +1313,25 @@ def uniqueness_property(
     )
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
-    facts = collect(manifest, discoverers, name_to_source={})
+    collected = collect(manifest, discoverers, name_to_source={})
+    if not extra_facts:
+        return collected
+    merged: dict[SourceRef, list[Fact[CandidateKeySet, SourceRef]]] = {
+        scope: list(bucket) for scope, bucket in collected.items()
+    }
+    for fact in extra_facts:
+        merged.setdefault(fact.scope, []).append(fact)
+    return {scope: tuple(bucket) for scope, bucket in merged.items()}
+
+
+def uniqueness_property_from_facts(
+    facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> Property[CandidateKeySet, SourceRef]:
+    """The uniqueness property grounded from ``facts``. Declared and inferred keys
+    both hold, so they compose by meet (``reconcile_by_meet``); no opaque opt-out
+    reader is wired yet, so the opaque set is empty. The property carries its
+    relation-algebra walk as ``reducer`` so the propagator dispatches it without a
+    global registry."""
     return relation_property(
         name="uniqueness",
         lattice=UNIQUENESS_LATTICE,
@@ -1327,6 +1340,24 @@ def uniqueness_property(
         ground=_grounding_with_conditional(facts),
         reconcile_by_meet=True,
         reducer=relation_reduce,
+    )
+
+
+def uniqueness_property(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    parsed: Mapping[str, Expr] | None = None,
+) -> Property[CandidateKeySet, SourceRef]:
+    """The manifest-backed uniqueness property: :func:`uniqueness_facts` grounds
+    each relation and the relation reducer infers more from the SQL.
+
+    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
+    and dedup semantics, and carries any ``--dialect`` override so grammar and
+    semantics stay coherent."""
+    return uniqueness_property_from_facts(
+        uniqueness_facts(manifest, profile, extra=extra, parsed=parsed)
     )
 
 

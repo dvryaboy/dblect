@@ -20,7 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -62,11 +62,17 @@ from dblect.lineage.properties.domain_type import (
     domain_type_property,
     join_key_conflicts,
 )
+from dblect.check.grain import declared_grain_findings
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
     functional_dependency_grounded_scopes,
     functional_dependency_grounding,
     functional_dependency_property,
+)
+from dblect.lineage.properties.uniqueness import (
+    CandidateKeySet,
+    uniqueness_facts,
+    uniqueness_property_from_facts,
 )
 from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
@@ -104,6 +110,11 @@ class CheckGraphs:
     per world: it derives from the world-invariant declared facts, so colocating it with
     the graph build keeps it in step with the graph instead of resting on the assumption
     that successive worlds share one."""
+    uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
+    """Every candidate-key grounding fact by relation: the manifest channels plus the
+    resolved contract keys. World-invariant, and the single bucket both the uniqueness
+    propagation and the grain emitter read, so what grounds and what is judged can
+    never drift apart."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +142,16 @@ class WorldAnnotations:
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
     coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
+    functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(default_factory=dict)
+    """The FD flow per relation, kept for the readers that test coverage through the
+    closure (the grain emitter) rather than recomputed per consumer."""
+    uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
+        default_factory=dict
+    )
+    """The pre-reconcile record for uniqueness: each derived relation's candidate keys
+    as the SQL derived them, before the declared keys folded in. What the grain
+    emitter compares a declaration against; the flow value cannot serve (the
+    declaration unions into it and would check itself)."""
 
 
 def build_check_graphs(
@@ -169,6 +190,9 @@ def build_check_graphs(
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
         join_key_ground=domain_type_grounding(by_scope(resolved.tag_facts)),
+        uniqueness_facts=uniqueness_facts(
+            manifest, profile, extra_facts=resolved.key_facts, parsed=trees
+        ),
     )
 
 
@@ -187,7 +211,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         functional_dependency_grounding(by_scope(facts.fd_facts))
     )
     store = AnnotationStore()
-    for scope, ann in propagate(graphs.relation_build.graph, fd_prop).items():
+    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop))
+    for scope, ann in fd_anns.items():
         store.record(fd_prop.name, scope, ann)
 
     dt_prop = domain_type_property(
@@ -197,8 +222,16 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
     clears: list[CoherenceClear[DomainTag]] = []
     domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx, sink=clears)
+
+    uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
+    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
+    propagate(graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred)
     return WorldAnnotations(
-        world=facts.world, domain_type=domain_type, coherence_clears=tuple(clears)
+        world=facts.world,
+        domain_type=domain_type,
+        coherence_clears=tuple(clears),
+        functional_dependency=fd_anns,
+        uniqueness_inferred=uniqueness_inferred,
     )
 
 
@@ -321,6 +354,14 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             world.domain_type,
             graphs.join_key_ground,
             line_maps,
+        )
+    )
+    findings.extend(
+        declared_grain_findings(
+            graphs.manifest,
+            graphs.uniqueness_facts,
+            world.uniqueness_inferred,
+            world.functional_dependency,
         )
     )
     return findings
