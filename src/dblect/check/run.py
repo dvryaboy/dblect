@@ -36,6 +36,7 @@ from dblect.check.findings import (
     SuppressedCheckFinding,
     UnbuiltModel,
 )
+from dblect.check.grain import declared_grain_findings
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -62,7 +63,6 @@ from dblect.lineage.properties.domain_type import (
     domain_type_property,
     join_key_conflicts,
 )
-from dblect.check.grain import declared_grain_findings
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
     functional_dependency_grounded_scopes,
@@ -129,6 +129,14 @@ class WorldFacts:
     tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
 
 
+def _no_fd_annotations() -> dict[SourceRef, Annotation[FDSet]]:
+    return {}
+
+
+def _no_key_annotations() -> dict[SourceRef, Annotation[CandidateKeySet]]:
+    return {}
+
+
 @dataclass(frozen=True, slots=True)
 class WorldAnnotations:
     """One world's propagation result, keyed by the world it holds under. A bundle
@@ -142,11 +150,13 @@ class WorldAnnotations:
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
     coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
-    functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(default_factory=dict)
+    functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(
+        default_factory=_no_fd_annotations
+    )
     """The FD flow per relation, kept for the readers that test coverage through the
     closure (the grain emitter) rather than recomputed per consumer."""
     uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
-        default_factory=dict
+        default_factory=_no_key_annotations
     )
     """The pre-reconcile record for uniqueness: each derived relation's candidate keys
     as the SQL derived them, before the declared keys folded in. What the grain
