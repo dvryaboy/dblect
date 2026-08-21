@@ -31,9 +31,10 @@ from dblect.lineage.facts.model import (
     Declared,
     Fact,
     NativeConstraint,
+    Provenance,
 )
 from dblect.lineage.graph import SourceRef
-from dblect.lineage.properties.functional_dependency import FDSet, NO_FDS, determines
+from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, determines
 from dblect.lineage.properties.uniqueness import CandidateKeySet, Key
 from dblect.manifest import Manifest
 
@@ -88,21 +89,8 @@ def declared_grain_findings(
         fd_ann = fd.get(scope)
         fds = fd_ann.value if fd_ann is not None else NO_FDS
         for fact in bucket:
-            # Every provenance of the closed union is decided here. A Declared key is
-            # a claim about this SELECT's output, so it is judged. A NativeConstraint
-            # is discharged (or not) by the warehouse's write path, and the
-            # advisory-unenforced case is the unenforced-constraint finding's (#48). A
-            # CompileValue key is an incremental ``unique_key`` under a deduplicating
-            # strategy: the merge collapses on write, so the SELECT is expected to
-            # carry finer rows (the incremental-grain stream, #7, owns that write
-            # path).
-            match fact.provenance:
-                case Declared():
-                    pass
-                case NativeConstraint() | CompileValue():
-                    continue
-                case other:
-                    assert_never(other)
+            if not _judged_provenance(fact.provenance):
+                continue
             if fact.condition is not None:
                 continue  # a conditional key holds only over a row filter; activation owns it
             for authored in fact.value.keys:
@@ -117,6 +105,22 @@ def declared_grain_findings(
                     continue
                 out.append(_finding(manifest, scope, fact, authored, witness))
     return out
+
+
+def _judged_provenance(provenance: Provenance) -> bool:
+    """Whether a key of this provenance is a claim about the SELECT's own output,
+    every case of the closed union decided. A Declared key is judged. A
+    NativeConstraint is discharged (or not) by the warehouse's write path, and the
+    advisory-unenforced case belongs to the unenforced-constraint finding (#48). A
+    CompileValue key is an incremental ``unique_key`` under a deduplicating
+    strategy: the merge collapses on write, so the SELECT is expected to carry
+    finer rows (the incremental-grain stream, #7, owns that write path)."""
+    match provenance:
+        case Declared():
+            return True
+        case NativeConstraint() | CompileValue():
+            return False
+    assert_never(provenance)
 
 
 def _finding(

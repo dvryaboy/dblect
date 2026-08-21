@@ -69,9 +69,7 @@ def test_established_implies_uniqueness_on_the_declared_grain(
         else []
     )
     claimed_fds = (
-        data.draw(st.lists(st.sampled_from(true_fds), max_size=4), label="fds")
-        if true_fds
-        else []
+        data.draw(st.lists(st.sampled_from(true_fds), max_size=4), label="fds") if true_fds else []
     )
     grain = data.draw(st.sampled_from(_INDEX_SUBSETS), label="grain")
 

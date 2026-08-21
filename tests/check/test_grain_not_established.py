@@ -25,7 +25,7 @@ from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
-from dblect.contracts import contract
+from dblect.contracts import ContractSelf, contract
 from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
 from dblect.manifest.parse import Column
 from dblect.types import ModelContract
@@ -83,7 +83,7 @@ def _declare_order_lines_key() -> None:
         dbt_model = "order_lines"
 
         @contract
-        def per_line(self):
+        def per_line(self: ContractSelf) -> object:
             return self.key(self.order_id, self.line_number)
 
 
@@ -112,7 +112,7 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     fct = _node(
@@ -144,7 +144,7 @@ def test_finding_lands_at_the_declaring_model_not_the_downstream_consumer() -> N
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     fct = _node(
@@ -174,7 +174,7 @@ def test_a_collapse_to_the_declared_grain_is_established_and_silent() -> None:
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     fct = _node(
@@ -196,7 +196,7 @@ def test_a_non_minimal_declared_grain_is_covered_and_silent() -> None:
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order_and_line(self):
+        def one_row_per_order_and_line(self: ContractSelf) -> object:
             return self.grain(per=(self.order_id, self.line_number))
 
     fct = _node(
@@ -218,18 +218,18 @@ def test_coverage_runs_through_the_fd_closure() -> None:
         dbt_model = "order_regions"
 
         @contract
-        def per_order_region(self):
+        def per_order_region(self: ContractSelf) -> object:
             return self.key(self.order_id, self.region)
 
         @contract
-        def order_pins_region(self):
+        def order_pins_region(self: ContractSelf) -> object:
             return self.order_id.determines(self.region)
 
     class FctOrders(ModelContract):
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     regions = _node(
@@ -258,7 +258,7 @@ def test_absence_of_any_inferred_key_is_not_a_witness() -> None:
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     fct = _node(
@@ -278,7 +278,7 @@ def test_a_leaf_declaration_has_no_entailment_to_judge() -> None:
         dbt_model = "order_lines"
 
         @contract
-        def per_line(self):
+        def per_line(self: ContractSelf) -> object:
             return self.grain(per=(self.order_id, self.line_number))
 
     report = run_check(_manifest(_ORDER_LINES), _DUCKDB)
@@ -293,14 +293,14 @@ def test_an_unrelated_surviving_key_is_not_a_witness() -> None:
         dbt_model = "order_lines"
 
         @contract
-        def per_line(self):
+        def per_line(self: ContractSelf) -> object:
             return self.key(self.line_id)
 
     class FctOrders(ModelContract):
         dbt_model = "fct_orders"
 
         @contract
-        def one_row_per_order(self):
+        def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
     lines = _node(
