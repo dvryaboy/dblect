@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dblect.adapters import profile_for_adapter
-from dblect.check import CheckFindingKind, run_check
+from dblect.check import CheckFinding, CheckFindingKind, CheckReport, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
 from dblect.manifest.parse import Column
@@ -87,13 +87,8 @@ def _declare_order_lines_key() -> None:
             return self.key(self.order_id, self.line_number)
 
 
-def _grain_findings(report: object) -> list[object]:
-    assert hasattr(report, "findings")
-    return [
-        f
-        for f in report.findings  # type: ignore[attr-defined]
-        if f.kind is CheckFindingKind.GRAIN_NOT_ESTABLISHED
-    ]
+def _grain_findings(report: CheckReport) -> list[CheckFinding]:
+    return [f for f in report.findings if f.kind is CheckFindingKind.GRAIN_NOT_ESTABLISHED]
 
 
 # --- the witnessed defeater fires -------------------------------------------------
@@ -125,8 +120,8 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
     findings = _grain_findings(report)
     assert len(findings) == 1
     finding = findings[0]
-    assert finding.model_unique_id == "model.shop.fct_orders"  # type: ignore[attr-defined]
-    message = finding.message  # type: ignore[attr-defined]
+    assert finding.model_unique_id == "model.shop.fct_orders"
+    message = finding.message
     assert "not established" in message
     assert "order_id" in message
     assert "line_number" in message
@@ -348,7 +343,7 @@ def test_a_dbt_unique_test_declaration_is_judged_like_a_contract_grain() -> None
     report = run_check(_manifest(_ORDER_LINES, fct, unique_test), _DUCKDB)
 
     findings = _grain_findings(report)
-    assert [f.model_unique_id for f in findings] == ["model.shop.fct_orders"]  # type: ignore[attr-defined]
+    assert [f.model_unique_id for f in findings] == ["model.shop.fct_orders"]
 
 
 def test_an_incremental_unique_key_is_discharged_by_the_write_not_the_select() -> None:
