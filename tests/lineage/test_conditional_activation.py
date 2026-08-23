@@ -24,56 +24,21 @@ from dblect.lineage.properties.uniqueness import (
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from dblect.manifest import DbtTestMetadata, Node, ResourceType
 from dblect.sql import FindingKind, parse_sql
 from dblect.uniqueness.detector import make_fact_grounded_detectors
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        constraints=(),
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str, where: str | None = None) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
         attached_node=target,
@@ -87,11 +52,7 @@ def _key(*cols: str) -> Key:
 def _activated(*nodes: Node) -> Mapping[str, CandidateKeySet]:
     """Propagate uniqueness and predicate-flow, activate, and return each model's
     candidate-key set by unique_id."""
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     graph = build_relation_graph(manifest).graph
     keys = propagate(graph, uniqueness_property(manifest, _DUCKDB))
     flow = propagate(graph, predicate_flow_property())
@@ -102,7 +63,7 @@ def _activated(*nodes: Node) -> Mapping[str, CandidateKeySet]:
 def test_conditional_key_activates_when_the_model_carries_the_filter() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model("model.shop.dim", "SELECT * FROM orders WHERE active"),
+        _node("model.shop.dim", "SELECT * FROM orders WHERE active"),
         _unique("test.shop.u", column="id", target="model.shop.dim", where="active"),
     )
     assert _key("id") in res["model.shop.dim"].keys
@@ -112,7 +73,7 @@ def test_conditional_key_activates_under_a_narrower_filter() -> None:
     # The model filters ``amount > 5``, which implies the test's ``amount > 0``.
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model("model.shop.dim", "SELECT * FROM orders WHERE amount > 5"),
+        _node("model.shop.dim", "SELECT * FROM orders WHERE amount > 5"),
         _unique("test.shop.u", column="id", target="model.shop.dim", where="amount > 0"),
     )
     assert _key("id") in res["model.shop.dim"].keys
@@ -123,7 +84,7 @@ def test_conditional_key_activates_when_a_cte_carries_the_filter() -> None:
     # for free, so the model's flow still implies the predicate.
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model(
+        _node(
             "model.shop.dim",
             "WITH a AS (SELECT * FROM orders WHERE active) SELECT * FROM a",
         ),
@@ -135,7 +96,7 @@ def test_conditional_key_activates_when_a_cte_carries_the_filter() -> None:
 def test_conditional_key_activates_when_an_inline_subquery_carries_the_filter() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model(
+        _node(
             "model.shop.dim",
             "SELECT * FROM (SELECT * FROM orders WHERE active) s",
         ),
@@ -147,7 +108,7 @@ def test_conditional_key_activates_when_an_inline_subquery_carries_the_filter() 
 def test_conditional_key_stays_conditional_without_a_matching_filter() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model("model.shop.dim", "SELECT * FROM orders"),
+        _node("model.shop.dim", "SELECT * FROM orders"),
         _unique("test.shop.u", column="id", target="model.shop.dim", where="active"),
     )
     dim = res["model.shop.dim"]
@@ -159,7 +120,7 @@ def test_filter_that_does_not_imply_the_predicate_does_not_activate() -> None:
     # ``amount > 0`` does not imply ``amount > 5``: a wider filter is not enough.
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model("model.shop.dim", "SELECT * FROM orders WHERE amount > 0"),
+        _node("model.shop.dim", "SELECT * FROM orders WHERE amount > 0"),
         _unique("test.shop.u", column="id", target="model.shop.dim", where="amount > 5"),
     )
     assert _key("id") not in res["model.shop.dim"].keys
@@ -169,7 +130,7 @@ def test_unconditional_unique_still_grounds_a_key() -> None:
     # The conditional-carrying grounding must not disturb the ordinary path.
     res = _activated(
         _source("source.shop.raw.orders"),
-        _model("model.shop.dim", "SELECT * FROM orders"),
+        _node("model.shop.dim", "SELECT * FROM orders"),
         _unique("test.shop.u", column="id", target="model.shop.dim"),
     )
     assert res["model.shop.dim"].keys == frozenset({_key("id")})
@@ -184,7 +145,7 @@ def test_conditional_key_on_an_upstream_activates_at_a_filtering_consumer() -> N
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
-        _model("model.shop.dim", "SELECT * FROM orders WHERE active"),
+        _node("model.shop.dim", "SELECT * FROM orders WHERE active"),
     )
     assert _key("id") in res["model.shop.dim"].keys
 
@@ -195,7 +156,7 @@ def test_cross_model_activation_renames_predicate_columns() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
-        _model("model.shop.dim", "SELECT id, region AS r FROM orders WHERE region = 'US'"),
+        _node("model.shop.dim", "SELECT id, region AS r FROM orders WHERE region = 'US'"),
     )
     assert _key("id") in res["model.shop.dim"].keys
 
@@ -204,7 +165,7 @@ def test_cross_model_conditional_is_carried_but_not_activated_without_a_filter()
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
-        _model("model.shop.dim", "SELECT * FROM orders"),
+        _node("model.shop.dim", "SELECT * FROM orders"),
     )
     dim = res["model.shop.dim"]
     assert _key("id") not in dim.keys
@@ -217,8 +178,8 @@ def test_conditional_carries_through_a_passthrough_chain_then_activates() -> Non
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
-        _model("model.shop.stg", "SELECT * FROM orders"),
-        _model("model.shop.mart", "SELECT * FROM stg WHERE active"),
+        _node("model.shop.stg", "SELECT * FROM orders"),
+        _node("model.shop.mart", "SELECT * FROM stg WHERE active"),
     )
     assert _key("id") not in res["model.shop.stg"].keys  # staging adds no filter
     assert _key("id") in res["model.shop.mart"].keys
@@ -230,7 +191,7 @@ def test_conditional_carries_through_a_cte_consuming_an_upstream() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="active"),
-        _model(
+        _node(
             "model.shop.dim",
             "WITH c AS (SELECT * FROM orders WHERE active) SELECT * FROM c",
         ),
@@ -245,7 +206,7 @@ def test_conditional_dropped_when_a_predicate_column_is_not_projected() -> None:
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
-        _model("model.shop.dim", "SELECT id FROM orders WHERE region = 'US'"),
+        _node("model.shop.dim", "SELECT id FROM orders WHERE region = 'US'"),
     )
     dim = res["model.shop.dim"]
     assert _key("id") not in dim.keys
@@ -265,8 +226,8 @@ def _join_then_filter(join_sql: str, *, lk_unique: bool) -> Mapping[str, Candida
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
         _source("source.shop.raw.lk"),
-        _model("model.shop.j", join_sql),
-        _model("model.shop.m", "SELECT * FROM j WHERE region = 'US'"),
+        _node("model.shop.j", join_sql),
+        _node("model.shop.m", "SELECT * FROM j WHERE region = 'US'"),
     ]
     if lk_unique:
         nodes.append(_unique("test.shop.lk", column="lk_id", target="source.shop.raw.lk"))
@@ -314,11 +275,7 @@ _CONSUMER = "SELECT f.x FROM events f JOIN dim d ON f.did = d.id"
 
 
 def _fanout_kinds(*nodes: Node) -> list[FindingKind]:
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     _window, fanout, _limit, _agg = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in fanout(parse_sql(_CONSUMER, dialect="duckdb"))]
 
@@ -328,7 +285,7 @@ def test_activation_covers_a_join_and_suppresses_the_fanout_finding() -> None:
     # join on ``id`` is covered: no fanout.
     kinds = _fanout_kinds(
         _source("source.shop.raw.events"),
-        _model("model.shop.dim", "SELECT * FROM events WHERE active"),
+        _node("model.shop.dim", "SELECT * FROM events WHERE active"),
         _unique("test.shop.region", column="region", target="model.shop.dim"),
         _unique("test.shop.id", column="id", target="model.shop.dim", where="active"),
     )
@@ -340,7 +297,7 @@ def test_without_the_filter_the_join_fanout_finding_stands() -> None:
     # the only key is ``region``, which does not cover the join, and the fanout fires.
     kinds = _fanout_kinds(
         _source("source.shop.raw.events"),
-        _model("model.shop.dim", "SELECT * FROM events"),
+        _node("model.shop.dim", "SELECT * FROM events"),
         _unique("test.shop.region", column="region", target="model.shop.dim"),
         _unique("test.shop.id", column="id", target="model.shop.dim", where="active"),
     )
@@ -353,7 +310,7 @@ def test_cross_model_activation_suppresses_a_join_fanout_finding() -> None:
     kinds = _fanout_kinds(
         _source("source.shop.raw.events"),
         _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
-        _model("model.shop.dim", "SELECT * FROM events WHERE active"),
+        _node("model.shop.dim", "SELECT * FROM events WHERE active"),
         _unique("test.shop.region", column="region", target="model.shop.dim"),
     )
     assert FindingKind.JOIN_FANOUT not in kinds
@@ -365,7 +322,7 @@ def test_cross_model_without_the_filter_the_fanout_finding_stands() -> None:
     kinds = _fanout_kinds(
         _source("source.shop.raw.events"),
         _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
-        _model("model.shop.dim", "SELECT * FROM events"),
+        _node("model.shop.dim", "SELECT * FROM events"),
         _unique("test.shop.region", column="region", target="model.shop.dim"),
     )
     assert FindingKind.JOIN_FANOUT in kinds
@@ -380,11 +337,7 @@ def test_cross_model_without_the_filter_the_fanout_finding_stands() -> None:
 
 
 def _window_kinds(model_sql: str, *nodes: Node) -> list[FindingKind]:
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     window_keys, _fanout, _limit, _agg = make_fact_grounded_detectors(manifest, _DUCKDB)
     return [f.kind for f in window_keys(parse_sql(model_sql, dialect="duckdb"))]
 
@@ -402,7 +355,7 @@ def test_intra_model_cte_activation_covers_a_window() -> None:
         _source("source.shop.raw.events"),
         _unique("test.shop.region", column="region", target="source.shop.raw.events"),
         _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
-        _model("model.shop.win", sql),
+        _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
 
@@ -419,6 +372,6 @@ def test_intra_model_cte_without_filter_leaves_the_window_uncovered() -> None:
         _source("source.shop.raw.events"),
         _unique("test.shop.region", column="region", target="source.shop.raw.events"),
         _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
-        _model("model.shop.win", sql),
+        _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds

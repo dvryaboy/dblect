@@ -37,6 +37,9 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -46,59 +49,14 @@ _STG = "model.shop.stg_order_items"
 _MART = "model.shop.mart_revenue"
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
     )
 
 
@@ -119,13 +77,13 @@ def _key(*cols: str) -> Key:
 
 
 # The uncovered join: order_items carries no key, so a row per item survives.
-_UNCOLLAPSED_STG = _model(
+_UNCOLLAPSED_STG = _node(
     _STG,
     "SELECT o.order_id, o.amount, i.item_id "
     "FROM orders o JOIN order_items i ON o.order_id = i.order_id",
 )
 # The same join, collapsed back to the order grain.
-_COLLAPSED_STG = _model(
+_COLLAPSED_STG = _node(
     _STG,
     "SELECT o.order_id, SUM(o.amount) AS amount "
     "FROM orders o JOIN order_items i ON o.order_id = i.order_id GROUP BY o.order_id",
@@ -173,7 +131,7 @@ def test_downstream_sum_traces_to_the_replicated_source_column() -> None:
     GROUP BY, back to ``orders.amount`` (the replicated side), the origin column the
     discriminator needs to find the grain the magnitude was produced at."""
     orders, orders_pk = _orders_with_key()
-    mart = _model(
+    mart = _node(
         _MART, "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
     )
     prov = _provenance(_manifest(orders, orders_pk, _source(_ITEMS), _UNCOLLAPSED_STG, mart))
@@ -186,7 +144,7 @@ def test_provenance_distinguishes_joined_in_from_replicated() -> None:
     ``order_items``, so the discriminator can tell a replicated-side read (the fan trap)
     from a joined-in read (the intended set aggregation)."""
     orders, orders_pk = _orders_with_key()
-    mart = _model(_MART, "SELECT order_id, item_id FROM stg_order_items")
+    mart = _node(_MART, "SELECT order_id, item_id FROM stg_order_items")
     prov = _provenance(_manifest(orders, orders_pk, _source(_ITEMS), _UNCOLLAPSED_STG, mart))
     item = ColumnRef(SourceRef(SourceKind.MODEL, _MART), "item_id")
     assert prov[item] == frozenset({ColumnRef(SourceRef(SourceKind.SOURCE, _ITEMS), "item_id")})
@@ -201,7 +159,7 @@ def test_signals_compose_to_fire_on_the_fan_trap() -> None:
     property. Un-collapsed staging keyed on nothing, origin keyed on ``order_id`` -> not
     preserved -> fire."""
     orders, orders_pk = _orders_with_key()
-    mart = _model(
+    mart = _node(
         _MART, "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
     )
     manifest = _manifest(orders, orders_pk, _source(_ITEMS), _UNCOLLAPSED_STG, mart)
@@ -215,7 +173,7 @@ def test_signals_compose_to_stay_silent_after_collapse() -> None:
     """The benign counterpart: collapsed staging is keyed on ``order_id``, which refines the
     origin key, so the same composition stays silent."""
     orders, orders_pk = _orders_with_key()
-    mart = _model(
+    mart = _node(
         _MART, "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
     )
     manifest = _manifest(orders, orders_pk, _source(_ITEMS), _COLLAPSED_STG, mart)

@@ -25,7 +25,10 @@ from dblect.lineage.properties.uniqueness import (
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from dblect.manifest import DbtTestMetadata, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 _T = SourceRef(SourceKind.SOURCE, "source.s.t")
@@ -144,48 +147,11 @@ def test_inline_generator_over_a_non_literal_field_is_left_untouched() -> None:
 # --- UNNEST grain (uniqueness propagation) --------------------------------------
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
@@ -193,9 +159,7 @@ def _unique(uid: str, *, column: str, target: str) -> Node:
 
 
 def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
-    manifest = Manifest(
-        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes, adapter_type="bigquery")
     graph = build_relation_graph(manifest, dialect="bigquery").graph
     anns = propagate(graph, uniqueness_property(manifest, profile_for_adapter("bigquery")))
     return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
@@ -211,7 +175,7 @@ def test_unnest_explodes_grain_so_the_parent_key_does_not_survive() -> None:
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
         # one row per (order, tag): `id` is no longer unique on the output.
-        _model("model.shop.order_tags", "SELECT o.id, tag FROM orders o, UNNEST(o.tags) AS tag"),
+        _node("model.shop.order_tags", "SELECT o.id, tag FROM orders o, UNNEST(o.tags) AS tag"),
     )
     assert _key("id") not in keys["model.shop.order_tags"].keys
 
@@ -221,7 +185,7 @@ def test_left_join_unnest_also_explodes_grain() -> None:
     keys = _keys(
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
-        _model(
+        _node(
             "model.shop.order_tags",
             "SELECT o.id, tag FROM orders o LEFT JOIN UNNEST(o.tags) AS tag ON TRUE",
         ),

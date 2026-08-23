@@ -32,55 +32,21 @@ from dblect.lineage.properties.functional_dependency import (
 )
 from dblect.lineage.properties.uniqueness import uniqueness_property
 from dblect.lineage.property import propagate
-from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from dblect.manifest import DbtTestMetadata, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 _FdFacts = Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]]
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
@@ -105,11 +71,7 @@ def _fds(facts: _FdFacts, *nodes: Node, read_keys: bool = False) -> dict[str, FD
     """Build a manifest from the nodes, propagate the FD property (after uniqueness
     when ``read_keys`` is set, so the key-derived source is live), and return each
     model's FD set keyed by unique_id."""
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     graph = build_relation_graph(manifest).graph
     ground = functional_dependency_grounding(facts)
     if read_keys:
@@ -132,7 +94,7 @@ def test_passthrough_carries_the_declared_fd() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.stg", "SELECT country, currency, amount FROM payments"),
+        _node("model.shop.stg", "SELECT country, currency, amount FROM payments"),
     )
     assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
 
@@ -141,7 +103,7 @@ def test_projection_renames_both_sides() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.stg", "SELECT country AS nation, currency AS curr FROM payments"),
+        _node("model.shop.stg", "SELECT country AS nation, currency AS curr FROM payments"),
     )
     assert out["model.shop.stg"] == FDSet.of(_fd("curr", "nation"))
 
@@ -150,7 +112,7 @@ def test_dropping_a_dependency_column_drops_the_fd() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.stg", "SELECT country, amount FROM payments"),
+        _node("model.shop.stg", "SELECT country, amount FROM payments"),
     )
     assert out["model.shop.stg"] == NO_FDS
 
@@ -159,7 +121,7 @@ def test_star_carries_everything() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.stg", "SELECT * FROM payments"),
+        _node("model.shop.stg", "SELECT * FROM payments"),
     )
     assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
 
@@ -173,7 +135,7 @@ def test_where_preserves_fds() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.stg", "SELECT country, currency FROM payments WHERE amount > 0"),
+        _node("model.shop.stg", "SELECT country, currency FROM payments WHERE amount > 0"),
     )
     assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
 
@@ -184,7 +146,7 @@ def test_where_equality_pins_a_column_constant() -> None:
     out = _fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.usd", "SELECT country, currency FROM payments WHERE currency = 'usd'"),
+        _node("model.shop.usd", "SELECT country, currency FROM payments WHERE currency = 'usd'"),
     )
     assert out["model.shop.usd"] == FDSet.of(_fd("currency"))
 
@@ -193,12 +155,12 @@ def test_constancy_flows_through_a_cte_and_a_downstream_model() -> None:
     out = _fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
-        _model(
+        _node(
             "model.shop.usd",
             "WITH f AS (SELECT country, currency FROM payments WHERE currency = 'usd') "
             "SELECT country, currency FROM f",
         ),
-        _model("model.shop.downstream", "SELECT country, currency FROM usd"),
+        _node("model.shop.downstream", "SELECT country, currency FROM usd"),
     )
     assert out["model.shop.usd"] == FDSet.of(_fd("currency"))
     assert out["model.shop.downstream"] == FDSet.of(_fd("currency"))
@@ -223,7 +185,7 @@ _GROUP_SPELLINGS: list[tuple[str, str]] = [
     "sql", [sql for _name, sql in _GROUP_SPELLINGS], ids=[name for name, _sql in _GROUP_SPELLINGS]
 )
 def test_group_by_determines_the_aggregates(sql: str) -> None:
-    out = _fds(_declared(), _source(_PAYMENTS.unique_id), _model("model.shop.by_country", sql))
+    out = _fds(_declared(), _source(_PAYMENTS.unique_id), _node("model.shop.by_country", sql))
     assert out["model.shop.by_country"] == FDSet.of(_fd("total", "country"))
 
 
@@ -236,7 +198,7 @@ def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
     out = _fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
-        _model(
+        _node(
             "model.shop.by_country",
             "SELECT p.currency AS country, SUM(amount) AS total FROM payments p "
             "GROUP BY country, p.currency",
@@ -249,7 +211,7 @@ def test_group_by_keeps_fds_among_the_group_columns() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model(
+        _node(
             "model.shop.by_cc",
             "SELECT country, currency, SUM(amount) AS total FROM payments "
             "GROUP BY country, currency",
@@ -267,7 +229,7 @@ def test_group_by_drops_fds_reaching_outside_the_group_key() -> None:
     out = _fds(
         _declared(_fd("region", "country")),
         _source(_PAYMENTS.unique_id),
-        _model(
+        _node(
             "model.shop.by_country",
             "SELECT country, SUM(amount) AS total FROM payments GROUP BY country",
         ),
@@ -284,7 +246,7 @@ def test_star_over_a_group_by_keeps_only_within_group_fds() -> None:
     out = _fds(
         _declared(_fd("region", "country"), _fd("currency", "region")),
         _source(_PAYMENTS.unique_id),
-        _model("model.shop.g", "SELECT * FROM payments GROUP BY country"),
+        _node("model.shop.g", "SELECT * FROM payments GROUP BY country"),
     )
     assert out["model.shop.g"] == NO_FDS
 
@@ -298,7 +260,7 @@ def test_union_all_proves_nothing() -> None:
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
-        _model(
+        _node(
             "model.shop.u",
             "SELECT country, currency FROM payments "
             "UNION ALL SELECT country, currency FROM payments",
@@ -319,7 +281,7 @@ def test_a_key_determines_the_columns_selected_alongside_it() -> None:
         _declared(),
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
-        _model("model.shop.stg", "SELECT id, customer_id FROM orders"),
+        _node("model.shop.stg", "SELECT id, customer_id FROM orders"),
         read_keys=True,
     )
     assert out["model.shop.stg"] == FDSet.of(_fd("customer_id", "id"))
@@ -331,7 +293,7 @@ def test_without_the_uniqueness_edge_no_key_fd_is_minted() -> None:
         _declared(),
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
-        _model("model.shop.stg", "SELECT id, customer_id FROM orders"),
+        _node("model.shop.stg", "SELECT id, customer_id FROM orders"),
     )
     assert out["model.shop.stg"] == NO_FDS
 
@@ -364,7 +326,7 @@ def test_inner_join_carries_a_joined_relations_fd() -> None:
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.amount, c.country, c.currency FROM payments p "
             "JOIN customers c ON p.customer_id = c.id",
@@ -383,7 +345,7 @@ def test_inner_join_carries_both_sides_fds() -> None:
         ),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.ref, p.amount, c.country, c.currency FROM payments p "
             "JOIN customers c ON p.customer_id = c.id",
@@ -401,7 +363,7 @@ def test_inner_join_qualifies_under_a_name_collision() -> None:
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT c.country AS country, c.currency AS currency, p.country AS p_country "
             "FROM payments p JOIN customers c ON p.customer_id = c.id",
@@ -418,7 +380,7 @@ def test_left_join_drops_the_optional_sides_fds() -> None:
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.amount, c.country, c.currency FROM payments p "
             "LEFT JOIN customers c ON p.customer_id = c.id",
@@ -434,7 +396,7 @@ def test_left_join_carries_the_kept_sides_fds() -> None:
         _declared_on({_PAYMENTS: (_fd("amount", "ref"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.ref, p.amount, c.country FROM payments p "
             "LEFT JOIN customers c ON p.customer_id = c.id",
@@ -450,7 +412,7 @@ def test_left_join_does_not_mint_the_on_equality() -> None:
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.customer_id, c.id FROM payments p "
             "LEFT JOIN customers c ON p.customer_id = c.id",
@@ -471,7 +433,7 @@ def test_right_join_keeps_the_joined_in_side() -> None:
         ),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.ref, p.amount, c.country, c.currency FROM payments p "
             "RIGHT JOIN customers c ON p.customer_id = c.id",
@@ -491,7 +453,7 @@ def test_full_join_proves_nothing() -> None:
         ),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.ref, p.amount, c.country, c.currency FROM payments p "
             "FULL JOIN customers c ON p.customer_id = c.id",
@@ -508,7 +470,7 @@ def test_cross_join_carries_side_fds() -> None:
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.amount, c.country, c.currency FROM payments p CROSS JOIN customers c",
         ),
@@ -526,7 +488,7 @@ def test_a_later_outer_join_pads_an_earlier_inner_joins_equality() -> None:
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
         _source(extra.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.customer_id, c.id, e.g, e.v FROM payments p "
             "JOIN customers c ON p.customer_id = c.id "
@@ -542,7 +504,7 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT p.amount, c.currency FROM payments p "
             "JOIN customers c ON p.customer_id = c.id WHERE c.currency = 'usd'",

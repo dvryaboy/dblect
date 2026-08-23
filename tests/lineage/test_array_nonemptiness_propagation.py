@@ -18,48 +18,17 @@ from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.array_nonemptiness import ArrayNonEmpty, array_nonemptiness
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Node
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _BQ = profile_for_adapter("bigquery")
 _PG = profile_for_adapter("postgres")
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="app",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="app",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _values(*nodes: Node, profile: AdapterProfile = _BQ) -> Mapping[ColumnRef, ArrayNonEmpty]:
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type=profile.adapter_type,
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes, adapter_type=profile.adapter_type)
     graph = build_manifest_graph(manifest, dialect=profile.sqlglot_dialect).graph
     anns = propagate(graph, array_nonemptiness)
     return {ref: ann.value for ref, ann in anns.items()}
@@ -73,7 +42,7 @@ def test_array_agg_under_group_by_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(STRUCT(tag, weight)) AS tags FROM events GROUP BY event_id",
         ),
@@ -87,7 +56,7 @@ def test_array_agg_without_group_by_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model("model.app.allrows", "SELECT ARRAY_AGG(tag) AS tags FROM events"),
+        _node("model.app.allrows", "SELECT ARRAY_AGG(tag) AS tags FROM events"),
     )
     assert values[_col("model.app.allrows", "tags")] is ArrayNonEmpty.UNKNOWN
 
@@ -96,7 +65,7 @@ def test_array_literal_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.pivot",
             "SELECT event_id, ARRAY[STRUCT('clicks' AS k, clicks AS v)] AS metrics FROM events",
         ),
@@ -111,7 +80,7 @@ def test_generator_over_literal_bounds_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.spine",
             "SELECT event_id, GENERATE_ARRAY(0, 23) AS hours FROM events",
         ),
@@ -125,7 +94,7 @@ def test_date_generator_over_literal_bounds_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.calendar",
             "SELECT event_id, GENERATE_DATE_ARRAY(DATE '2020-01-01', DATE '2020-12-31') AS days "
             "FROM events",
@@ -141,7 +110,7 @@ def test_postgres_date_generate_series_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.calendar",
             "SELECT event_id, "
             "generate_series('2020-01-01'::date, '2020-12-31'::date, interval '1 day') AS days "
@@ -158,7 +127,7 @@ def test_timestamp_generator_over_literal_bounds_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.ticks",
             "SELECT event_id, "
             "GENERATE_TIMESTAMP_ARRAY(TIMESTAMP '2020-01-01', TIMESTAMP '2020-01-02', "
@@ -175,7 +144,7 @@ def test_generator_over_column_bounds_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.counted",
             "SELECT event_id, GENERATE_SERIES(1, cnt) AS ns FROM events",
         ),
@@ -191,7 +160,7 @@ def test_array_of_filtered_set_subqueries_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.filtered",
             "SELECT event_id, ARRAY_CONCAT("
             "  ARRAY((SELECT AS STRUCT name, value FROM UNNEST(raw_metrics) WHERE name IN ('a'))),"
@@ -208,7 +177,7 @@ def test_raw_source_array_stays_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model("model.app.passthrough", "SELECT event_id, tags FROM events"),
+        _node("model.app.passthrough", "SELECT event_id, tags FROM events"),
     )
     assert values[_col("model.app.passthrough", "tags")] is ArrayNonEmpty.UNKNOWN
 
@@ -218,7 +187,7 @@ def test_array_agg_ignore_nulls_of_struct_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(STRUCT(tag, weight) IGNORE NULLS) AS tags "
             "FROM events GROUP BY event_id",
@@ -232,7 +201,7 @@ def test_array_agg_ignore_nulls_of_scalar_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(tag IGNORE NULLS) AS tags FROM events GROUP BY event_id",
         ),
@@ -247,7 +216,7 @@ def test_array_agg_under_empty_grouping_set_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model("model.app.grand", "SELECT ARRAY_AGG(tag) AS tags FROM events GROUP BY ()"),
+        _node("model.app.grand", "SELECT ARRAY_AGG(tag) AS tags FROM events GROUP BY ()"),
     )
     assert values[_col("model.app.grand", "tags")] is ArrayNonEmpty.UNKNOWN
 
@@ -258,7 +227,7 @@ def test_array_agg_with_filter_is_unknown() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(tag) FILTER (WHERE weight > 0) AS tags "
             "FROM events GROUP BY event_id",
@@ -275,7 +244,7 @@ def test_array_agg_ignore_nulls_of_ordered_struct_is_non_empty() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(STRUCT(tag, weight) ORDER BY weight IGNORE NULLS) AS tags "
             "FROM events GROUP BY event_id",
@@ -289,11 +258,11 @@ def test_non_emptiness_carries_across_a_model_boundary() -> None:
     src = _source("source.app.raw.events")
     values = _values(
         src,
-        _model(
+        _node(
             "model.app.stg",
             "SELECT event_id, ARRAY_AGG(STRUCT(tag, weight)) AS tags FROM events GROUP BY event_id",
         ),
-        _model("model.app.mart", "SELECT event_id, tags FROM stg"),
+        _node("model.app.mart", "SELECT event_id, tags FROM stg"),
     )
     assert values[_col("model.app.mart", "tags")] is ArrayNonEmpty.NON_EMPTY
 
@@ -302,7 +271,7 @@ def test_union_all_is_non_empty_only_when_every_arm_is() -> None:
     src = _source("source.app.raw.events")
     mixed = _values(
         src,
-        _model(
+        _node(
             "model.app.u",
             "SELECT ARRAY[1] AS xs FROM events UNION ALL SELECT xs FROM events",
         ),
@@ -311,7 +280,7 @@ def test_union_all_is_non_empty_only_when_every_arm_is() -> None:
 
     both = _values(
         src,
-        _model(
+        _node(
             "model.app.u2",
             "SELECT ARRAY[1] AS xs FROM events UNION ALL SELECT ARRAY[2, 3] AS xs FROM events",
         ),

@@ -12,7 +12,7 @@ from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.properties.functional_dependency import FD, FDSet
-from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
+from dblect.manifest import DbtTestMetadata, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
     detect_join_fanout,
@@ -21,6 +21,8 @@ from dblect.uniqueness.detector import (
     detect_non_unique_window_order_keys,
     make_fact_grounded_detectors,
 )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -745,48 +747,14 @@ def test_fanout_collapse_ignores_aggregate_in_nested_subquery() -> None:
 
 
 def _source_with_identifier(uid: str, *, name: str, identifier: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-        identifier=identifier,
-    )
-
-
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(uid, kind=ResourceType.SOURCE, name=name, schema="raw", identifier=identifier)
 
 
 def _unique_test(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
@@ -803,12 +771,8 @@ def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
     test = _unique_test("test.shop.u", column="id", target=src.unique_id)
     # The compiled SQL references the source by its identifier, as dbt emits it.
     sql = "select row_number() over (partition by customer_id order by ts) as rn from orders_v2"
-    model = _model("model.shop.ranked", sql)
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in (src, test, model)},
-    )
+    model = _node("model.shop.ranked", sql)
+    manifest = _manifest(*(src, test, model))
     tree = _parse(sql)
     window_keys, _fanout, _limit, _agg = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}
@@ -826,12 +790,8 @@ def test_aggregate_order_resolves_keys_through_factory_boundary() -> None:
     src = _source_with_identifier("source.shop.raw.orders", name="orders", identifier="orders_v2")
     test = _unique_test("test.shop.u", column="id", target=src.unique_id)
     sql = "select array_agg(line order by created_at limit 1) as latest from orders_v2"
-    model = _model("model.shop.latest_line", sql)
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in (src, test, model)},
-    )
+    model = _node("model.shop.latest_line", sql)
+    manifest = _manifest(*(src, test, model))
     tree = _parse(sql)
     _window, _fanout, _limit, agg_order = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}
@@ -844,19 +804,7 @@ def test_aggregate_order_resolves_keys_through_factory_boundary() -> None:
 
 
 def _materialized_model(uid: str, sql: str, *, materialized: str | None) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        config=ModelConfig(materialized=materialized),
-    )
+    return _node(uid, sql, config=ModelConfig(materialized=materialized))
 
 
 @pytest.mark.parametrize(
@@ -887,11 +835,7 @@ def test_limit_detector_fires_only_for_persisted_materialization(
     materialization through the factory, keyed by ``id(tree)``)."""
     sql = "select id from orders limit 10"
     model = _materialized_model("model.shop.m", sql, materialized=materialized)
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={model.unique_id: model},
-    )
+    manifest = _manifest(model)
     tree = _parse(sql)
     _window, _fanout, limit_order, _agg = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}

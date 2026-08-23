@@ -22,6 +22,9 @@ from dblect.adapters import profile_for_adapter
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import make_cross_model_fanout_detectors
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -44,48 +47,11 @@ _STG_COLLAPSED_SQL = (
 )
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
@@ -108,15 +74,13 @@ def _shop(*extra: Node, items_unique_on: str | None, mart_sql: str, stg_sql: str
         _source(_ORDERS),
         _unique("test.shop.orders_pk", column="order_id", target=_ORDERS),
         _source(_ITEMS),
-        _model(_STG, stg_sql),
-        _model(_MART, mart_sql),
+        _node(_STG, stg_sql),
+        _node(_MART, mart_sql),
         *extra,
     ]
     if items_unique_on is not None:
         nodes.append(_unique("test.shop.items_pk", column=items_unique_on, target=_ITEMS))
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 _SUM_AMOUNT = "SELECT order_id, SUM(amount) AS total FROM stg_order_items GROUP BY order_id"
@@ -181,12 +145,10 @@ def test_no_known_origin_grain_is_silent() -> None:
         _source(_ORDERS),  # no unique test on orders
         _source(_ITEMS),
         _unique("test.shop.items_pk", column="item_id", target=_ITEMS),
-        _model(_STG, _STG_SQL),
-        _model(_MART, _SUM_AMOUNT),
+        _node(_STG, _STG_SQL),
+        _node(_MART, _SUM_AMOUNT),
     ]
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
     assert _findings(manifest, _MART) == ()
 
 
@@ -318,13 +280,11 @@ def _revenue_manifest(rank_fn: str) -> Manifest:
         _source(_ORDERS),
         _unique("test.shop.orders_pk", column="order_id", target=_ORDERS),
         _source(_REGIONS),  # regions carries no declared key: only the dedup can prove one
-        _model(_DIM, _dim_sql(rank_fn)),
-        _model(_STG_ORDERS, _STG_ORDERS_SQL),
-        _model(_REV, _REV_SQL),
+        _node(_DIM, _dim_sql(rank_fn)),
+        _node(_STG_ORDERS, _STG_ORDERS_SQL),
+        _node(_REV, _REV_SQL),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_row_number_deduped_dimension_clears_the_cross_model_fanout() -> None:

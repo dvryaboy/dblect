@@ -21,48 +21,16 @@ from dblect.lineage.graph import SourceKind
 from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
 from dblect.lineage.properties.predicate_flow import RowFilter, predicate_flow_property
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
-
-
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        constraints=(),
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+from dblect.manifest import Node
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 
 def _flow(*nodes: Node) -> Mapping[str, RowFilter]:
     """Build a manifest, propagate predicate-flow, and return each model's filter
     keyed by unique_id."""
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     result = build_relation_graph(manifest)
     anns = propagate(result.graph, predicate_flow_property())
     return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
@@ -82,13 +50,13 @@ _ORDERS = "source.shop.raw.orders"
 
 
 def test_passthrough_without_a_filter_knows_nothing() -> None:
-    flow = _flow(_source(_ORDERS), _model("model.shop.m", "SELECT * FROM orders"))
+    flow = _flow(_source(_ORDERS), _node("model.shop.m", "SELECT * FROM orders"))
     assert flow["model.shop.m"].atoms == frozenset()
 
 
 def test_where_becomes_the_filter() -> None:
     flow = _flow(
-        _source(_ORDERS), _model("model.shop.m", "SELECT * FROM orders WHERE country = 'US'")
+        _source(_ORDERS), _node("model.shop.m", "SELECT * FROM orders WHERE country = 'US'")
     )
     assert flow["model.shop.m"].atoms == _atoms("country = 'US'")
 
@@ -96,7 +64,7 @@ def test_where_becomes_the_filter() -> None:
 def test_in_filter_carries() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model("model.shop.m", "SELECT * FROM orders WHERE region IN ('US', 'CA')"),
+        _node("model.shop.m", "SELECT * FROM orders WHERE region IN ('US', 'CA')"),
     )
     assert flow["model.shop.m"].atoms == _atoms("region IN ('US', 'CA')")
 
@@ -104,7 +72,7 @@ def test_in_filter_carries() -> None:
 def test_bare_boolean_carries_under_a_star() -> None:
     # A bare boolean is opaque to interval reasoning, but under ``SELECT *`` every
     # column passes through unchanged, so the atom is carried verbatim.
-    flow = _flow(_source(_ORDERS), _model("model.shop.m", "SELECT * FROM orders WHERE active"))
+    flow = _flow(_source(_ORDERS), _node("model.shop.m", "SELECT * FROM orders WHERE active"))
     assert flow["model.shop.m"].atoms == _atoms("active")
 
 
@@ -114,8 +82,8 @@ def test_bare_boolean_carries_under_a_star() -> None:
 def test_filter_flows_downstream_through_a_passthrough() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model("model.shop.a", "SELECT * FROM orders WHERE country = 'US'"),
-        _model("model.shop.b", "SELECT * FROM a"),
+        _node("model.shop.a", "SELECT * FROM orders WHERE country = 'US'"),
+        _node("model.shop.b", "SELECT * FROM a"),
     )
     assert flow["model.shop.b"].atoms == _atoms("country = 'US'")
 
@@ -123,8 +91,8 @@ def test_filter_flows_downstream_through_a_passthrough() -> None:
 def test_consumer_conjoins_its_own_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model("model.shop.a", "SELECT * FROM orders WHERE country = 'US'"),
-        _model("model.shop.b", "SELECT * FROM a WHERE amount > 0"),
+        _node("model.shop.a", "SELECT * FROM orders WHERE country = 'US'"),
+        _node("model.shop.b", "SELECT * FROM a WHERE amount > 0"),
     )
     assert flow["model.shop.b"].atoms == _atoms("country = 'US' AND amount > 0")
 
@@ -135,7 +103,7 @@ def test_consumer_conjoins_its_own_filter() -> None:
 def test_projection_renames_the_filter_columns() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model("model.shop.m", "SELECT country AS region, amount FROM orders WHERE country = 'US'"),
+        _node("model.shop.m", "SELECT country AS region, amount FROM orders WHERE country = 'US'"),
     )
     assert flow["model.shop.m"].atoms == _atoms("region = 'US'")
 
@@ -145,7 +113,7 @@ def test_filter_on_a_dropped_column_is_lost() -> None:
     # in the output columns and drops.
     flow = _flow(
         _source(_ORDERS),
-        _model("model.shop.m", "SELECT amount FROM orders WHERE country = 'US'"),
+        _node("model.shop.m", "SELECT amount FROM orders WHERE country = 'US'"),
     )
     assert flow["model.shop.m"].atoms == frozenset()
 
@@ -157,7 +125,7 @@ def test_join_drops_the_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
         _source("source.shop.raw.customers"),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT * FROM orders o JOIN customers c ON o.cid = c.id WHERE o.country = 'US'",
         ),
@@ -168,7 +136,7 @@ def test_join_drops_the_filter() -> None:
 def test_group_by_drops_the_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT country, count(*) AS n FROM orders WHERE country = 'US' GROUP BY country",
         ),
@@ -180,7 +148,7 @@ def test_union_drops_the_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
         _source("source.shop.raw.archive"),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT * FROM orders WHERE country = 'US' "
             "UNION ALL SELECT * FROM archive WHERE country = 'US'",
@@ -195,7 +163,7 @@ def test_union_drops_the_filter() -> None:
 def test_cte_accumulates_the_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model(
+        _node(
             "model.shop.m",
             "WITH us AS (SELECT * FROM orders WHERE country = 'US') SELECT * FROM us",
         ),
@@ -206,7 +174,7 @@ def test_cte_accumulates_the_filter() -> None:
 def test_inline_subquery_accumulates_the_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model(
+        _node(
             "model.shop.m",
             "SELECT * FROM (SELECT * FROM orders WHERE country = 'US') s",
         ),
@@ -217,7 +185,7 @@ def test_inline_subquery_accumulates_the_filter() -> None:
 def test_cte_filter_conjoins_with_the_outer_filter() -> None:
     flow = _flow(
         _source(_ORDERS),
-        _model(
+        _node(
             "model.shop.m",
             "WITH us AS (SELECT * FROM orders WHERE country = 'US') "
             "SELECT * FROM us WHERE amount > 0",
@@ -246,7 +214,7 @@ def test_filter_accumulates_down_a_passthrough_chain(specs: list[tuple[str, int]
     prev = "s"
     for i, atom_sql in enumerate(atom_sqls):
         uid = f"model.shop.m{i}"
-        models.append(_model(uid, f"SELECT * FROM {prev} WHERE {atom_sql}"))
+        models.append(_node(uid, f"SELECT * FROM {prev} WHERE {atom_sql}"))
         prev = f"m{i}"
     flow = _flow(src, *models)
     expected: frozenset[Canon] = frozenset[Canon]().union(*(_atoms(s) for s in atom_sqls))
