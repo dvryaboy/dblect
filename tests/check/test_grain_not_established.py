@@ -23,10 +23,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
+
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFinding, CheckFindingKind, CheckReport, run_check
 from dblect.contracts import ContractSelf, contract
-from dblect.manifest import DbtTestMetadata, Manifest, ModelConfig, Node, ResourceType
+from dblect.manifest import (
+    ConstraintSpec,
+    ConstraintType,
+    DbtTestMetadata,
+    Manifest,
+    ModelConfig,
+    Node,
+    ResourceType,
+)
 from dblect.manifest.parse import Column
 from dblect.types import ModelContract
 
@@ -43,6 +53,7 @@ def _node(
     sql: str | None,
     columns: Mapping[str, Column],
     config: ModelConfig | None = None,
+    constraints: tuple[ConstraintSpec, ...] = (),
 ) -> Node:
     return Node(
         unique_id=uid,
@@ -56,6 +67,7 @@ def _node(
         original_file_path=f"models/{uid.split('.')[-1]}.sql",
         columns=columns,
         config=config,
+        constraints=constraints,
     )
 
 
@@ -100,39 +112,9 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
     # to its output: the witnessed defeater. This is also the pre-reconcile
     # regression: the flow value contains the declared grain (meet unions it in), so
     # an emitter reading the flow value would see the declaration satisfy itself and
-    # report nothing.
-    _declare_order_lines_key()
-
-    class FctOrders(ModelContract):
-        dbt_model = "fct_orders"
-
-        @contract
-        def one_row_per_order(self: ContractSelf) -> object:
-            return self.grain(per=self.order_id)
-
-    fct = _node(
-        "model.shop.fct_orders",
-        sql="select order_id, line_number, amount from order_lines",
-        columns=_LINE_COLS,
-    )
-    report = run_check(_manifest(_ORDER_LINES, fct), _DUCKDB)
-
-    findings = _grain_findings(report)
-    assert len(findings) == 1
-    finding = findings[0]
-    assert finding.model_unique_id == "model.shop.fct_orders"
-    message = finding.message
-    assert "not established" in message
-    assert "order_id" in message
-    assert "line_number" in message
-    # Honesty of grade: the construction fails to establish the grain; the data may
-    # still satisfy it, so the finding never claims a violation.
-    assert "violat" not in message.lower()
-
-
-def test_finding_lands_at_the_declaring_model_not_the_downstream_consumer() -> None:
-    # The point of the emitter (issue #202): raise the finding at the model whose
-    # grain is unestablished, not at the downstream sum that eventually trips.
+    # report nothing. The downstream consumer pins where the finding lands (issue
+    # #202): at the model whose grain is unestablished, not at the sum that
+    # eventually trips over it.
     _declare_order_lines_key()
 
     class FctOrders(ModelContract):
@@ -154,7 +136,15 @@ def test_finding_lands_at_the_declaring_model_not_the_downstream_consumer() -> N
     )
     report = run_check(_manifest(_ORDER_LINES, fct, consumer), _DUCKDB)
 
-    assert [f.model_unique_id for f in _grain_findings(report)] == ["model.shop.fct_orders"]
+    findings = _grain_findings(report)
+    assert [f.model_unique_id for f in findings] == ["model.shop.fct_orders"]
+    message = findings[0].message
+    assert "not established" in message
+    assert "order_id" in message
+    assert "line_number" in message
+    # Honesty of grade: the construction fails to establish the grain; the data may
+    # still satisfy it, so the finding never claims a violation.
+    assert "violat" not in message.lower()
 
 
 # --- the grain is established: silence ---------------------------------------------
@@ -312,21 +302,21 @@ def test_an_unrelated_surviving_key_is_not_a_witness() -> None:
     assert _grain_findings(report) == []
 
 
-# --- provenance channels: every case of the closed type decided ---------------------
+# --- declaration channels: every case of the closed provenance type decided ---------
+#
+# The contract channel's fire case is the drift test above; the table here covers the
+# rest. A dbt ``unique`` test is judged like a contract grain (provenance carries no
+# authority ordering), and it is the only other channel that fires. A ``where``-filtered
+# test claims uniqueness only over a row filter, so it is activation's business, not a
+# grain claim about the whole output. A native constraint is discharged (or not) by the
+# warehouse's write path; the advisory-unenforced case is the unenforced-constraint
+# finding's (#48). A deduplicating incremental's ``unique_key`` is enforced by the merge
+# on write, so the SELECT is expected to carry finer rows (the incremental-grain
+# stream, #7).
 
 
-def test_a_dbt_unique_test_declaration_is_judged_like_a_contract_grain() -> None:
-    # The same claim authored through the dbt ``unique`` test channel: provenance
-    # carries no authority ordering, so a declared key is a declared key whichever
-    # surface stated it. The drift shape that fires for a contract grain fires here.
-    _declare_order_lines_key()
-
-    fct = _node(
-        "model.shop.fct_orders",
-        sql="select order_id, line_number, amount from order_lines",
-        columns=_LINE_COLS,
-    )
-    unique_test = Node(
+def _unique_test_node(*, where: str | None) -> Node:
+    return Node(
         unique_id="test.shop.unique_fct_orders_order_id",
         name="unique_fct_orders_order_id",
         resource_type=ResourceType.OTHER,
@@ -337,32 +327,49 @@ def test_a_dbt_unique_test_declaration_is_judged_like_a_contract_grain() -> None
         compiled_code=None,
         original_file_path=None,
         columns={},
-        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": "order_id"}),
+        test_metadata=DbtTestMetadata(
+            name="unique", kwargs={"column_name": "order_id"}, where=where
+        ),
         attached_node="model.shop.fct_orders",
     )
-    report = run_check(_manifest(_ORDER_LINES, fct, unique_test), _DUCKDB)
-
-    findings = _grain_findings(report)
-    assert [f.model_unique_id for f in findings] == ["model.shop.fct_orders"]
 
 
-def test_an_incremental_unique_key_is_discharged_by_the_write_not_the_select() -> None:
-    # A deduplicating incremental materialization enforces its ``unique_key`` on
-    # write: the SELECT is expected to carry finer rows and the merge collapses
-    # them. That key is a CompileValue fact, not a declaration about the SELECT's
-    # own output, so the emitter must not judge it (the incremental-grain stream,
-    # issue #7, owns that write-path reasoning).
+@pytest.mark.parametrize(
+    ("channel", "fires"),
+    [
+        ("dbt_unique_test", True),
+        ("conditional_unique_test", False),
+        ("native_constraint", False),
+        ("incremental_unique_key", False),
+    ],
+)
+def test_declaration_channels_decide_what_is_judged(channel: str, fires: bool) -> None:
     _declare_order_lines_key()
+
+    extra_nodes: list[Node] = []
+    config: ModelConfig | None = None
+    constraints: tuple[ConstraintSpec, ...] = ()
+    if channel == "dbt_unique_test":
+        extra_nodes.append(_unique_test_node(where=None))
+    elif channel == "conditional_unique_test":
+        extra_nodes.append(_unique_test_node(where="order_id > 0"))
+    elif channel == "native_constraint":
+        constraints = (ConstraintSpec(type=ConstraintType.UNIQUE, columns=("order_id",)),)
+    elif channel == "incremental_unique_key":
+        config = ModelConfig(
+            materialized="incremental",
+            incremental_strategy="merge",
+            unique_key=("order_id",),
+        )
 
     fct = _node(
         "model.shop.fct_orders",
         sql="select order_id, line_number, amount from order_lines",
         columns=_LINE_COLS,
-        config=ModelConfig(
-            materialized="incremental",
-            incremental_strategy="merge",
-            unique_key=("order_id",),
-        ),
+        config=config,
+        constraints=constraints,
     )
-    report = run_check(_manifest(_ORDER_LINES, fct), _DUCKDB)
-    assert _grain_findings(report) == []
+    report = run_check(_manifest(_ORDER_LINES, fct, *extra_nodes), _DUCKDB)
+
+    findings = _grain_findings(report)
+    assert [f.model_unique_id for f in findings] == (["model.shop.fct_orders"] if fires else [])
