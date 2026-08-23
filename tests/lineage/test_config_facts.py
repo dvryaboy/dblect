@@ -31,30 +31,12 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
-
-
-def _manifest(*nodes: Node, adapter_type: str = "duckdb") -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type=adapter_type,
-        nodes={n.unique_id: n for n in nodes},
-    )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 
 def _model(uid: str, *, config: ModelConfig | None = None) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code="select 1",
-        original_file_path=None,
-        columns={},
-        config=config,
-    )
+    return _node(uid, "select 1", config=config)
 
 
 def _incremental(uid: str, *, strategy: str | None, unique_key: tuple[str, ...]) -> Node:
@@ -182,17 +164,11 @@ def test_unknown_adapter_default_is_conservative() -> None:
 def test_non_model_resource_grounds_nothing() -> None:
     """Incremental materialization is a model concept; a non-model node carrying a
     config-shaped value is not a relation this mapping addresses."""
-    src = Node(
-        unique_id="source.shop.raw.events",
+    src = _node(
+        "source.shop.raw.events",
+        kind=ResourceType.SOURCE,
         name="events",
-        resource_type=ResourceType.SOURCE,
-        fqn=("source.shop.raw.events",),
-        package_name="shop",
         schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         config=ModelConfig(
             materialized="incremental", incremental_strategy="merge", unique_key=("id",)
         ),

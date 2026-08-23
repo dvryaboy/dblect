@@ -15,41 +15,24 @@ from dblect.analysis import analyze
 from dblect.audit import LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding
 from dblect.check.run import run_check
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest, Node
 from dblect.sql import FindingKind
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
-def _manifest(compiled_sql: str) -> Manifest:
-    node = Node(
-        unique_id="model.pkg.m",
-        name="m",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "m"),
-        package_name="pkg",
-        schema=None,
-        raw_code=compiled_sql,
-        compiled_code=compiled_sql,
-        original_file_path="models/m.sql",
-        columns={},
+def _sql_manifest(compiled_sql: str) -> Manifest:
+    node = _node(
+        "model.pkg.m", compiled_sql, raw=compiled_sql, name="m", schema=None, path="models/m.sql"
     )
-    return Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    return _manifest(node, schema_version="x")
 
 
 def _model_node(uid: str, name: str, sql: str, *, depends_on: frozenset[str] = frozenset()) -> Node:
-    return Node(
-        unique_id=uid,
-        name=name,
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", name),
-        package_name="pkg",
-        schema=None,
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=f"models/{name}.sql",
-        columns={},
-        depends_on=depends_on,
+    return _node(
+        uid, sql, raw=sql, name=name, schema=None, path=f"models/{name}.sql", depends_on=depends_on
     )
 
 
@@ -67,9 +50,7 @@ def _multi_model_manifest() -> Manifest:
         "group by u.id, d.country",
         depends_on=frozenset({"model.pkg.up"}),
     )
-    return Manifest(
-        schema_version="x", adapter_type="duckdb", nodes={up.unique_id: up, mart.unique_id: mart}
-    )
+    return _manifest(up, mart, schema_version="x")
 
 
 def test_analyze_is_the_union_of_both_detector_families() -> None:
@@ -96,7 +77,7 @@ def test_analyze_carries_the_structural_family_a_check_only_consumer_would_miss(
 def test_analyze_exposes_each_familys_own_report() -> None:
     # Consumers that need the family-specific extras (coverage, suppressed directives)
     # still reach them; the merged ``findings`` is a convenience, not a lossy view.
-    manifest = _manifest("select 1 as x")
+    manifest = _sql_manifest("select 1 as x")
     report = analyze(manifest, _DUCKDB)
 
     assert report.check.findings == tuple(f for f in report.findings if isinstance(f, CheckFinding))

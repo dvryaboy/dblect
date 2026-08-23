@@ -24,7 +24,9 @@ from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.properties.uniqueness import Key, uniqueness_property
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -34,45 +36,18 @@ _POOL = ("c0", "c1", "c2")  # every model projects all three, so a partition sub
 
 
 def _source(unique_id: str = _RAW, name: str = "events") -> Node:
-    return Node(
-        unique_id=unique_id,
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=("test", name),
-        package_name="test",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(unique_id, kind=ResourceType.SOURCE, name=name, schema="raw")
 
 
 def _model(sql: str, *, deps: frozenset[str]) -> Node:
-    return Node(
-        unique_id=_MODEL,
-        name="deduped",
-        resource_type=ResourceType.MODEL,
-        fqn=("test", "deduped"),
-        package_name="test",
-        schema="analytics",
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        depends_on=deps,
-    )
+    return _node(_MODEL, sql, raw=sql, name="deduped", depends_on=deps)
 
 
 def _keys(sql: str, *extra_sources: Node) -> frozenset[Key]:
     """The model's inferred candidate keys. The sources declare none, so any key here is one
     the SQL proves. Extra sources model additional FROM/JOIN relations (each keyless)."""
     model = _model(sql, deps=frozenset({_RAW, *(s.unique_id for s in extra_sources)}))
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in (_source(), *extra_sources, model)},
-    )
+    manifest = _manifest(*(_source(), *extra_sources, model))
     anns = propagate(build_relation_graph(manifest).graph, uniqueness_property(manifest, _DUCKDB))
     return next(ann.value.keys for ref, ann in anns.items() if ref.unique_id == _MODEL)
 

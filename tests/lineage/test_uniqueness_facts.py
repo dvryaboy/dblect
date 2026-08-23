@@ -31,68 +31,18 @@ from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
     DbtTestMetadata,
-    Manifest,
     Node,
     ResourceType,
 )
-
-
-def _manifest(*nodes: Node, adapter_type: str = "duckdb") -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type=adapter_type,
-        nodes={n.unique_id: n for n in nodes},
-    )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 
 def _model(
     uid: str, *, columns: Mapping[str, Column] = {}, constraints: tuple[ConstraintSpec, ...] = ()
 ) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code="select 1",
-        original_file_path=None,
-        columns=columns,
-        constraints=constraints,
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _leaf(uid: str, *, kind: ResourceType) -> Node:
-    """A seed or snapshot: a leaf relation a downstream model refs by name, with no
-    SQL of its own (a seed is data; a snapshot's SQL is dbt-managed)."""
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(uid, "select 1", columns=columns, constraints=constraints)
 
 
 def _test(
@@ -104,17 +54,10 @@ def _test(
     where: str | None = None,
     enabled: bool = True,
 ) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name=name, kwargs=dict(kwargs), enabled=enabled, where=where),
         attached_node=target,
@@ -160,7 +103,7 @@ def test_unique_test_on_source_grounds_on_the_source_relation() -> None:
 
 
 def test_unique_test_on_seed_grounds_on_the_seed_relation() -> None:
-    seed = _leaf("seed.shop.country_codes", kind=ResourceType.SEED)
+    seed = _node("seed.shop.country_codes", kind=ResourceType.SEED)
     test = _unique("test.shop.u", column="code", target=seed.unique_id)
     facts = list(unique_test_discoverer().discover(_manifest(seed, test), name_to_source={}))
     assert facts[0].scope == SourceRef(SourceKind.SEED, seed.unique_id)
@@ -168,7 +111,7 @@ def test_unique_test_on_seed_grounds_on_the_seed_relation() -> None:
 
 
 def test_unique_test_on_snapshot_grounds_on_the_snapshot_relation() -> None:
-    snap = _leaf("snapshot.shop.orders_snapshot", kind=ResourceType.SNAPSHOT)
+    snap = _node("snapshot.shop.orders_snapshot", kind=ResourceType.SNAPSHOT)
     test = _unique("test.shop.u", column="dbt_scd_id", target=snap.unique_id)
     facts = list(unique_test_discoverer().discover(_manifest(snap, test), name_to_source={}))
     assert facts[0].scope == SourceRef(SourceKind.SNAPSHOT, snap.unique_id)
@@ -176,7 +119,7 @@ def test_unique_test_on_snapshot_grounds_on_the_snapshot_relation() -> None:
 
 def test_unique_combination_on_snapshot_grounds_a_composite_key() -> None:
     # The arbiter-style SCD2 case: a composite unique_key declared on a snapshot.
-    snap = _leaf("snapshot.shop.matched_pairs", kind=ResourceType.SNAPSHOT)
+    snap = _node("snapshot.shop.matched_pairs", kind=ResourceType.SNAPSHOT)
     test = _test(
         "test.shop.uc",
         name="unique_combination_of_columns",

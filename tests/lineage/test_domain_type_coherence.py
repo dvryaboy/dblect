@@ -43,7 +43,9 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _SRC = SourceRef(SourceKind.SOURCE, "source.shop.raw.payments")
 _CUSTOMERS = SourceRef(SourceKind.SOURCE, "source.shop.raw.customers")
@@ -70,20 +72,9 @@ _NAME_TO_SOURCE: Mapping[str, SourceRef] = {
 }
 
 
-def _node(ref: SourceRef, sql: str | None) -> Node:
+def _relation(ref: SourceRef, sql: str | None) -> Node:
     kind = ResourceType.MODEL if ref.kind is SourceKind.MODEL else ResourceType.SOURCE
-    return Node(
-        unique_id=ref.unique_id,
-        name=ref.unique_id.split(".")[-1],
-        resource_type=kind,
-        fqn=(ref.unique_id,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(ref.unique_id, sql, kind=kind)
 
 
 def _propagate(
@@ -96,14 +87,10 @@ def _propagate(
     """Propagate functional dependencies over the relation graph, then domain type
     over the column graph with the FD store as its dependency context, returning every
     column's annotation alongside the coherence clears the guard emitted into the sink."""
-    nodes = [_node(_SRC, None), _node(_CUSTOMERS, None), _node(_MODEL, sql)]
+    nodes = [_relation(_SRC, None), _relation(_CUSTOMERS, None), _relation(_MODEL, sql)]
     if stg_sql is not None:
-        nodes.append(_node(_STG, stg_sql))
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+        nodes.append(_relation(_STG, stg_sql))
+    manifest = _manifest(*nodes)
 
     fd_fact = Fact(scope=_SRC, value=fds, provenance=Declared(DeclaredSource.USER_ASSERTED))
     fd_prop = functional_dependency_property(functional_dependency_grounding({_SRC: (fd_fact,)}))

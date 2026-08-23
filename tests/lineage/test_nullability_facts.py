@@ -31,65 +31,26 @@ from dblect.manifest import (
     Node,
     ResourceType,
 )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
-
-
-def _manifest(*nodes: Node, adapter_type: str = "duckdb") -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type=adapter_type,
-        nodes={n.unique_id: n for n in nodes},
-    )
 
 
 def _model(
     uid: str, *, columns: Mapping[str, Column] = {}, constraints: tuple[ConstraintSpec, ...] = ()
 ) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code="select 1",
-        original_file_path=None,
-        columns=columns,
-        constraints=constraints,
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(uid, "select 1", columns=columns, constraints=constraints)
 
 
 def _not_null_test(
     uid: str, *, column: str, target: str, where: str | None = None, enabled: bool = True
 ) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(
             name="not_null",
@@ -152,17 +113,10 @@ def test_non_nullability_test_is_ignored() -> None:
     """A discoverer is total within its axis: a ``unique`` test is not its concern."""
     src = _source("source.shop.raw.orders")
     other = _not_null_test("test.shop.u", column="id", target=src.unique_id)
-    other = Node(  # rebuild with a unique test rather than not_null
-        unique_id=other.unique_id,
-        name=other.name,
-        resource_type=ResourceType.OTHER,
-        fqn=other.fqn,
-        package_name=other.package_name,
+    other = _node(  # rebuild with a unique test rather than not_null
+        other.unique_id,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=other.depends_on,
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": "id"}),
         attached_node=src.unique_id,

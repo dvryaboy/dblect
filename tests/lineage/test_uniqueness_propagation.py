@@ -11,8 +11,6 @@ a declared key on a model unions with what the SQL proves.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 import sqlglot.expressions as exp
 
@@ -28,84 +26,25 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import (
-    Column,
     ConstraintSpec,
     ConstraintType,
     DbtTestMetadata,
-    Manifest,
     Node,
     ResourceType,
 )
 from dblect.sql import parse_sql
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
-def _model(
-    uid: str,
-    sql: str,
-    *,
-    constraints: tuple[ConstraintSpec, ...] = (),
-    columns: Mapping[str, Column] = {},
-) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns=columns,
-        constraints=constraints,
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _leaf(uid: str, *, kind: ResourceType) -> Node:
-    """A seed or snapshot leaf: a downstream model refs it by name like a source."""
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
@@ -119,11 +58,7 @@ def _key(*cols: str) -> Key:
 def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
     """Build a manifest from the nodes, propagate uniqueness, and return each
     model's candidate-key set keyed by unique_id."""
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     result = build_relation_graph(manifest)
     prop = uniqueness_property(manifest, _DUCKDB)
     anns = propagate(result.graph, prop)
@@ -135,27 +70,27 @@ def test_passthrough_carries_the_source_key() -> None:
     keys = _keys(
         src,
         _unique("test.shop.u", column="id", target=src.unique_id),
-        _model("model.shop.stg", "SELECT id, amount FROM orders"),
+        _node("model.shop.stg", "SELECT id, amount FROM orders"),
     )
     assert keys["model.shop.stg"] == CandidateKeySet.of(_key("id"))
 
 
 def test_unique_test_on_a_seed_flows_into_a_model_that_refs_it() -> None:
-    seed = _leaf("seed.shop.country_codes", kind=ResourceType.SEED)
+    seed = _node("seed.shop.country_codes", kind=ResourceType.SEED)
     keys = _keys(
         seed,
         _unique("test.shop.u", column="code", target=seed.unique_id),
-        _model("model.shop.stg_countries", "SELECT code, name FROM country_codes"),
+        _node("model.shop.stg_countries", "SELECT code, name FROM country_codes"),
     )
     assert keys["model.shop.stg_countries"] == CandidateKeySet.of(_key("code"))
 
 
 def test_unique_test_on_a_snapshot_flows_into_a_model_that_refs_it() -> None:
-    snap = _leaf("snapshot.shop.orders_snapshot", kind=ResourceType.SNAPSHOT)
+    snap = _node("snapshot.shop.orders_snapshot", kind=ResourceType.SNAPSHOT)
     keys = _keys(
         snap,
         _unique("test.shop.u", column="dbt_scd_id", target=snap.unique_id),
-        _model("model.shop.current_orders", "SELECT dbt_scd_id, amount FROM orders_snapshot"),
+        _node("model.shop.current_orders", "SELECT dbt_scd_id, amount FROM orders_snapshot"),
     )
     assert keys["model.shop.current_orders"] == CandidateKeySet.of(_key("dbt_scd_id"))
 
@@ -165,7 +100,7 @@ def test_projection_rename_remaps_the_key() -> None:
     keys = _keys(
         src,
         _unique("test.shop.u", column="id", target=src.unique_id),
-        _model("model.shop.stg", "SELECT id AS order_id, amount FROM orders"),
+        _node("model.shop.stg", "SELECT id AS order_id, amount FROM orders"),
     )
     assert keys["model.shop.stg"] == CandidateKeySet.of(_key("order_id"))
 
@@ -196,7 +131,7 @@ _SAME_KEY_SPELLINGS: list[tuple[str, str]] = [
 )
 def test_group_by_introduces_a_key_on_the_group_columns(sql: str) -> None:
     src = _source("source.shop.raw.orders")
-    keys = _keys(src, _model("model.shop.by_customer", sql))
+    keys = _keys(src, _node("model.shop.by_customer", sql))
     assert keys["model.shop.by_customer"] == CandidateKeySet.of(_key("customer_id"))
 
 
@@ -210,7 +145,7 @@ def test_group_by_bare_name_binds_to_the_joined_in_side_it_projects() -> None:
     keys = _keys(
         orders,
         customers,
-        _model(
+        _node(
             "model.shop.by_customer",
             "SELECT c.region, SUM(o.amount) AS total "
             "FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY region",
@@ -229,7 +164,7 @@ def test_group_by_name_shadowed_by_an_input_column_introduces_no_key() -> None:
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
-        _model(
+        _node(
             "model.shop.by_customer",
             "SELECT o.region AS customer_id, COUNT(*) AS n "
             "FROM orders o GROUP BY customer_id, o.region",
@@ -242,7 +177,7 @@ def test_distinct_introduces_a_full_tuple_key() -> None:
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
-        _model("model.shop.d", "SELECT DISTINCT customer_id, region FROM orders"),
+        _node("model.shop.d", "SELECT DISTINCT customer_id, region FROM orders"),
     )
     assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id", "region"))
 
@@ -257,7 +192,7 @@ def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> No
         customers,
         _unique("test.shop.o", column="id", target=orders.unique_id),
         _unique("test.shop.c", column="id", target=customers.unique_id),
-        _model(
+        _node(
             "model.shop.enriched",
             "SELECT o.id, c.region FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
         ),
@@ -276,7 +211,7 @@ def test_right_join_does_not_preserve_probe_keys() -> None:
         customers,
         _unique("test.shop.o", column="id", target=orders.unique_id),
         _unique("test.shop.c", column="id", target=customers.unique_id),
-        _model(
+        _node(
             "model.shop.enriched",
             "SELECT o.id, c.region FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
         ),
@@ -294,7 +229,7 @@ def test_full_join_does_not_preserve_probe_keys() -> None:
         customers,
         _unique("test.shop.o", column="id", target=orders.unique_id),
         _unique("test.shop.c", column="id", target=customers.unique_id),
-        _model(
+        _node(
             "model.shop.enriched",
             "SELECT o.id, c.region FROM orders o FULL JOIN customers c ON o.customer_id = c.id",
         ),
@@ -311,7 +246,7 @@ def test_join_drops_keys_when_joined_side_is_not_unique_on_the_key() -> None:
         orders,
         events,
         _unique("test.shop.o", column="id", target=orders.unique_id),
-        _model(
+        _node(
             "model.shop.joined",
             "SELECT o.id, e.kind FROM orders o LEFT JOIN events e ON o.id = e.order_id",
         ),
@@ -335,7 +270,7 @@ def test_anti_join_preserves_probe_keys_against_a_keyless_matched_side() -> None
         orders,
         events,
         _unique("test.shop.o", column="id", target=orders.unique_id),
-        _model(
+        _node(
             "model.shop.anti",
             "SELECT o.id FROM orders o ANTI JOIN events e ON o.id = e.order_id",
         ),
@@ -350,7 +285,7 @@ def test_semi_join_preserves_probe_keys_against_a_keyless_matched_side() -> None
         orders,
         events,
         _unique("test.shop.o", column="id", target=orders.unique_id),
-        _model(
+        _node(
             "model.shop.semi",
             "SELECT o.id FROM orders o SEMI JOIN events e ON o.id = e.order_id",
         ),
@@ -368,7 +303,7 @@ def test_left_join_is_null_anti_idiom_preserves_probe_keys() -> None:
         orders,
         events,
         _unique("test.shop.o", column="id", target=orders.unique_id),
-        _model(
+        _node(
             "model.shop.antinull",
             "SELECT o.id FROM orders o LEFT JOIN events e ON o.id = e.order_id "
             "WHERE e.order_id IS NULL",
@@ -389,7 +324,7 @@ def test_inner_join_carries_joined_in_key_when_probe_is_unique_on_the_join_cols(
         items,
         _unique("test.shop.o", column="order_id", target=orders.unique_id),
         _unique("test.shop.i", column="item_id", target=items.unique_id),
-        _model(
+        _node(
             "model.shop.lines",
             "SELECT o.order_id, i.item_id FROM orders o "
             "JOIN order_items i ON o.order_id = i.order_id",
@@ -408,7 +343,7 @@ def test_left_join_does_not_carry_the_joined_in_key() -> None:
         items,
         _unique("test.shop.o", column="order_id", target=orders.unique_id),
         _unique("test.shop.i", column="item_id", target=items.unique_id),
-        _model(
+        _node(
             "model.shop.lines",
             "SELECT o.order_id, i.item_id FROM orders o "
             "LEFT JOIN order_items i ON o.order_id = i.order_id",
@@ -426,7 +361,7 @@ def test_inner_join_drops_joined_in_key_when_probe_not_unique_on_the_join_cols()
         orders,
         items,
         _unique("test.shop.i", column="item_id", target=items.unique_id),
-        _model(
+        _node(
             "model.shop.lines",
             "SELECT o.order_id, i.item_id FROM orders o "
             "JOIN order_items i ON o.order_id = i.order_id",
@@ -443,7 +378,7 @@ def test_union_all_proves_no_key() -> None:
         b,
         _unique("test.shop.a", column="id", target=a.unique_id),
         _unique("test.shop.b", column="id", target=b.unique_id),
-        _model("model.shop.u", "SELECT id FROM a UNION ALL SELECT id FROM b"),
+        _node("model.shop.u", "SELECT id FROM a UNION ALL SELECT id FROM b"),
     )
     assert keys["model.shop.u"] == CandidateKeySet.of()
 
@@ -454,7 +389,7 @@ def test_union_distinct_proves_the_full_tuple_key() -> None:
     keys = _keys(
         a,
         b,
-        _model("model.shop.u", "SELECT id, kind FROM a UNION SELECT id, kind FROM b"),
+        _node("model.shop.u", "SELECT id, kind FROM a UNION SELECT id, kind FROM b"),
     )
     assert keys["model.shop.u"] == CandidateKeySet.of(_key("id", "kind"))
 
@@ -466,8 +401,8 @@ def test_cross_model_propagation_through_a_stage() -> None:
     keys = _keys(
         src,
         _unique("test.shop.u", column="id", target=src.unique_id),
-        _model("model.shop.stg", "SELECT id, amount FROM orders"),
-        _model("model.shop.mart", "SELECT id FROM stg"),
+        _node("model.shop.stg", "SELECT id, amount FROM orders"),
+        _node("model.shop.mart", "SELECT id FROM stg"),
     )
     assert keys["model.shop.mart"] == CandidateKeySet.of(_key("id"))
 
@@ -477,7 +412,7 @@ def test_passthrough_through_a_cte_carries_the_source_key() -> None:
     keys = _keys(
         src,
         _unique("test.shop.u", column="id", target=src.unique_id),
-        _model(
+        _node(
             "model.shop.stg",
             "WITH s AS (SELECT id, amount FROM orders) SELECT id FROM s",
         ),
@@ -502,7 +437,7 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
-        _model(
+        _node(
             "model.shop.d",
             "SELECT DISTINCT customer_id, region FROM orders",
             constraints=(
