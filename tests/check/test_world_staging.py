@@ -12,37 +12,18 @@ build and vary only the facts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from dblect.adapters import profile_for_adapter
 from dblect.check import base_world_facts, build_check_graphs, propagate_world
 from dblect.demo import Currency, Money
 from dblect.lineage.facts.model import BASE_WORLD
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Manifest, ResourceType
 from dblect.types import ModelContract
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 MoneyUSD = Money.refine(currency=Currency.USD)
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str, Column]) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
 
 
 def _creep_manifest() -> Manifest:
@@ -62,9 +43,7 @@ def _creep_manifest() -> Manifest:
             columns=_cols(amount="DECIMAL"),
         ),
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_base_world_facts_mirror_the_resolved_declared_facts() -> None:

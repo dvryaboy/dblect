@@ -18,7 +18,6 @@ domain-type internals.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import replace
 
 from dblect.adapters import profile_for_adapter
@@ -36,39 +35,15 @@ from dblect.demo import Currency, Money
 from dblect.lineage.facts.model import BASE_WORLD, CompileOrigin, CompileValue, Fact, WorldRef
 from dblect.lineage.graph import ColumnRef
 from dblect.lineage.properties.domain_type import DomainTag
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Manifest, ResourceType
 from dblect.types import ModelContract, active_registry, isolated_registry, resolve_contracts
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(
-    uid: str,
-    *,
-    kind: ResourceType,
-    sql: str | None,
-    columns: Mapping[str, Column],
-    raw: str | None = None,
-) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=raw,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
 
 
 def _passthrough_manifest() -> Manifest:
@@ -86,9 +61,7 @@ def _passthrough_manifest() -> Manifest:
             columns=_cols(amount="DECIMAL"),
         ),
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def _usd_source_fact(manifest: Manifest) -> Fact[DomainTag, ColumnRef]:
@@ -237,9 +210,7 @@ def test_world_findings_honor_noqa_suppression() -> None:
             columns=_cols(amount="DECIMAL"),
         ),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
     eur = _eur_source_fact(manifest)
 
     class StgPayments(ModelContract):

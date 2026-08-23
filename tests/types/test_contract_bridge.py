@@ -23,7 +23,7 @@ from dblect.lineage.properties.domain_type import (
     tagged,
 )
 from dblect.lineage.properties.uniqueness import CandidateKeySet, unique_test_discoverer
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata
 from dblect.types import (
     Decimal,
@@ -37,6 +37,8 @@ from dblect.types import (
     contract_tag_discoverer,
     resolve_contracts,
 )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 
 class Revenue(Money):
@@ -44,50 +46,13 @@ class Revenue(Money):
     contains_discount: bool
 
 
-def _node(
-    uid: str,
-    *,
-    kind: ResourceType = ResourceType.MODEL,
-    fqn: tuple[str, ...] | None = None,
-    package: str = "shop",
-) -> Node:
-    name = uid.split(".")[-1]
-    return Node(
-        unique_id=uid,
-        name=name,
-        resource_type=kind,
-        fqn=fqn if fqn is not None else (package, name),
-        package_name=package,
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _unique_test(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=("shop", uid.split(".")[-1]),
-        package_name="shop",
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
     )
 
 

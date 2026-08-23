@@ -36,6 +36,7 @@ from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
 from dblect.manifest.parse import Column
 from dblect.types import ModelContract, contract_tag_discoverer, resolve_contracts
+from tests._manifest_builders import cols as _cols
 
 MoneyUSD = Money.refine(currency=Currency.USD)
 
@@ -43,10 +44,6 @@ _SEED = SourceRef(SourceKind.SEED, "seed.jaffle_shop.raw_payments")
 _STG = SourceRef(SourceKind.MODEL, "model.jaffle_shop.stg_payments")
 _ORDERS = SourceRef(SourceKind.MODEL, "model.jaffle_shop.orders")
 _USD = tagged(dimension=Dimension.of(Concrete("usd")))
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
 
 
 _DOCUMENTED: Mapping[str, Mapping[str, Column]] = {

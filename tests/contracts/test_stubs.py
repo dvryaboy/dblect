@@ -11,37 +11,12 @@ namespace of those classes. The output must be importable Python.
 from __future__ import annotations
 
 import compileall
-from collections.abc import Mapping
 
 from dblect.contracts.stubs import generate_stub_module, model_class_name
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
-
-
-def _cols(*names: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type="VARCHAR", description=None) for n in names}
-
-
-def _node(uid: str, *, kind: ResourceType = ResourceType.MODEL, **cols: str) -> Node:
-    name = uid.split(".")[-1]
-    return Node(
-        unique_id=uid,
-        name=name,
-        resource_type=kind,
-        fqn=("shop", name),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns=_cols(*cols.keys()) if cols else {},
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+from dblect.manifest import ResourceType
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 
 def test_class_name_is_pascal_cased_and_prefixed() -> None:
@@ -51,8 +26,8 @@ def test_class_name_is_pascal_cased_and_prefixed() -> None:
 
 def test_emits_a_class_per_node_with_column_attributes() -> None:
     manifest = _manifest(
-        _node("model.shop.stg_orders", order_id="x", customer_id="x"),
-        _node("model.shop.fct_orders", order_id="x", order_total="x"),
+        _node("model.shop.stg_orders", columns=_cols("order_id", "customer_id")),
+        _node("model.shop.fct_orders", columns=_cols("order_id", "order_total")),
     )
     src = generate_stub_module(manifest)
     assert "class _StgOrders(ModelProxy):" in src
@@ -63,7 +38,7 @@ def test_emits_a_class_per_node_with_column_attributes() -> None:
 
 
 def test_models_namespace_binds_each_node_by_name() -> None:
-    manifest = _manifest(_node("model.shop.stg_orders", order_id="x"))
+    manifest = _manifest(_node("model.shop.stg_orders", columns=_cols("order_id")))
     src = generate_stub_module(manifest)
     assert "stg_orders: _StgOrders" in src
     assert "models = " in src  # a runtime value, typed as the namespace
@@ -71,9 +46,9 @@ def test_models_namespace_binds_each_node_by_name() -> None:
 
 def test_includes_sources_and_seeds() -> None:
     manifest = _manifest(
-        _node("model.shop.orders", id="x"),
-        _node("source.shop.raw.payments", kind=ResourceType.SOURCE, amount="x"),
-        _node("seed.shop.raw_customers", kind=ResourceType.SEED, id="x"),
+        _node("model.shop.orders", columns=_cols("id")),
+        _node("source.shop.raw.payments", kind=ResourceType.SOURCE, columns=_cols("amount")),
+        _node("seed.shop.raw_customers", kind=ResourceType.SEED, columns=_cols("id")),
     )
     src = generate_stub_module(manifest)
     assert "class _Payments(ModelProxy):" in src
@@ -91,8 +66,8 @@ def test_generated_module_is_importable_python(tmp_path: object) -> None:
 
     assert isinstance(tmp_path, pathlib.Path)
     manifest = _manifest(
-        _node("model.shop.stg_orders", order_id="x"),
-        _node("model.shop.fct_orders", order_total="x"),
+        _node("model.shop.stg_orders", columns=_cols("order_id")),
+        _node("model.shop.fct_orders", columns=_cols("order_total")),
     )
     path = tmp_path / "models.py"
     path.write_text(generate_stub_module(manifest))

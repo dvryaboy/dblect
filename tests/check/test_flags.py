@@ -11,8 +11,6 @@ pass in the world that agrees and fail in the world that does not.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from dblect.adapters import profile_for_adapter
 from dblect.check import (
     CheckFindingKind,
@@ -24,32 +22,15 @@ from dblect.check import (
 from dblect.demo import Currency, Money
 from dblect.lineage.facts.model import BASE_WORLD, WorldRef
 from dblect.lineage.graph import ColumnRef
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Manifest, ResourceType
 from dblect.types import ModelContract, isolated_registry, resolve_contracts
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str, Column]) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
 
 
 def _passthrough_manifest() -> Manifest:
@@ -67,9 +48,7 @@ def _passthrough_manifest() -> Manifest:
             columns=_cols(amount="DECIMAL"),
         ),
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def _source_amount_scope(manifest: Manifest) -> ColumnRef:

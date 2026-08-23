@@ -14,6 +14,8 @@ from typing import Any
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import SourceKind
 from dblect.manifest import Catalog, Column, Manifest, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 
 def _catalog_entry(uid: str, schema: str, name: str, **cols: str) -> dict[str, Any]:
@@ -50,21 +52,6 @@ def _raw_catalog(*, nodes: dict[str, Any], sources: dict[str, Any]) -> dict[str,
     }
 
 
-def _node(uid: str, *, kind: ResourceType, columns: dict[str, Column]) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns=columns,
-    )
-
-
 def test_catalog_parses_node_and_source_columns() -> None:
     catalog = Catalog.from_raw(
         _raw_catalog(
@@ -93,9 +80,7 @@ def test_catalog_parses_node_and_source_columns() -> None:
 
 def test_merge_fills_undocumented_leaf_columns() -> None:
     source = _node("source.shop.raw.payments", kind=ResourceType.SOURCE, columns={})
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={source.unique_id: source}
-    )
+    manifest = _manifest(source)
     catalog = Catalog.from_raw(
         _raw_catalog(
             nodes={},
@@ -120,9 +105,7 @@ def test_documented_columns_win_on_conflict() -> None:
         kind=ResourceType.SOURCE,
         columns={"amount": Column(name="amount", data_type="NUMERIC(38,9)", description="cents")},
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={source.unique_id: source}
-    )
+    manifest = _manifest(source)
     catalog = Catalog.from_raw(
         _raw_catalog(
             nodes={},
@@ -148,18 +131,7 @@ def test_documented_columns_win_on_conflict() -> None:
 
 
 def _sql_node(uid: str, *, kind: ResourceType, sql: str | None, columns: dict[str, Column]) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
+    return _node(uid, sql, kind=kind, path=f"models/{uid.split('.')[-1]}.sql", columns=columns)
 
 
 def test_catalog_lets_select_star_over_an_undocumented_source_resolve() -> None:
@@ -173,11 +145,7 @@ def test_catalog_lets_select_star_over_an_undocumented_source_resolve() -> None:
         sql="SELECT * FROM payments",
         columns={},
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={source.unique_id: source, model.unique_id: model},
-    )
+    manifest = _manifest(source, model)
 
     def model_columns(m: Manifest) -> set[str]:
         graph = build_manifest_graph(m).graph
@@ -213,7 +181,7 @@ def test_nodes_absent_from_catalog_pass_through_untouched() -> None:
         kind=ResourceType.MODEL,
         columns={"id": Column(name="id", data_type="INT", description=None)},
     )
-    manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={model.unique_id: model})
+    manifest = _manifest(model)
     merged = manifest.merge_catalog(Catalog.from_raw(_raw_catalog(nodes={}, sources={})))
     assert merged.nodes["model.shop.orders"] is manifest.nodes["model.shop.orders"]
 
@@ -223,9 +191,7 @@ def test_catalog_internal_case_collision_collapses_to_first() -> None:
     # for an otherwise-undocumented leaf must not yield two columns: the first
     # wins and the second case-folds into it.
     source = _node("source.shop.raw.payments", kind=ResourceType.SOURCE, columns={})
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={source.unique_id: source}
-    )
+    manifest = _manifest(source)
     catalog = Catalog.from_raw(
         _raw_catalog(
             nodes={},
@@ -253,11 +219,7 @@ def test_uppercase_catalog_columns_resolve_against_lowercase_sql() -> None:
         sql="SELECT * FROM payments",
         columns={},
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="snowflake",
-        nodes={source.unique_id: source, model.unique_id: model},
-    )
+    manifest = _manifest(source, model, adapter_type="snowflake")
     catalog = Catalog.from_raw(
         _raw_catalog(
             nodes={},

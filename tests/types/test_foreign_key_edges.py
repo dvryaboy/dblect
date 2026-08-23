@@ -26,24 +26,11 @@ from dblect.types import (
     dbt_relationship_edges,
     foreign_key_edges,
 )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _ORDERS = SourceRef(SourceKind.MODEL, "model.shop.orders")
 _CUSTOMERS = SourceRef(SourceKind.MODEL, "model.shop.customers")
-
-
-def _model(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", uid.split(".")[-1]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
 
 
 def _relationships_test(
@@ -62,26 +49,14 @@ def _relationships_test(
     }
     if parent_column is not None:
         kwargs["field"] = parent_column
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         fqn=("shop", uid.split(".")[-1]),
-        package_name="shop",
         schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({child, parent}),
-        attached_node=child,
         test_metadata=DbtTestMetadata(name="relationships", kwargs=kwargs, enabled=enabled),
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
+        attached_node=child,
     )
 
 
@@ -93,8 +68,8 @@ _EXPECTED = ForeignKeyEdge(
 
 def test_relationships_test_becomes_an_edge() -> None:
     manifest = _manifest(
-        _model("model.shop.orders"),
-        _model("model.shop.customers"),
+        _node("model.shop.orders"),
+        _node("model.shop.customers"),
         _relationships_test(
             "test.shop.rel",
             child="model.shop.orders",
@@ -108,8 +83,8 @@ def test_relationships_test_becomes_an_edge() -> None:
 
 def test_disabled_relationships_test_is_ignored() -> None:
     manifest = _manifest(
-        _model("model.shop.orders"),
-        _model("model.shop.customers"),
+        _node("model.shop.orders"),
+        _node("model.shop.customers"),
         _relationships_test(
             "test.shop.rel",
             child="model.shop.orders",
@@ -130,7 +105,7 @@ def test_relationships_test_missing_parent_column_is_skipped() -> None:
         parent="model.shop.customers",
         parent_column=None,  # no `field`: the parent column is unknown
     )
-    manifest = _manifest(_model("model.shop.orders"), _model("model.shop.customers"), broken)
+    manifest = _manifest(_node("model.shop.orders"), _node("model.shop.customers"), broken)
     assert dbt_relationship_edges(manifest) == ()
 
 
@@ -138,9 +113,9 @@ def test_foreign_key_edges_merges_contract_and_dbt_sources(
     registry: object,
 ) -> None:
     manifest = _manifest(
-        _model("model.shop.orders"),
-        _model("model.shop.customers"),
-        _model("model.shop.regions"),
+        _node("model.shop.orders"),
+        _node("model.shop.customers"),
+        _node("model.shop.regions"),
         _relationships_test(
             "test.shop.rel",
             child="model.shop.orders",
@@ -181,7 +156,7 @@ def test_relationships_against_real_jaffle(jaffle_manifest_path: Path) -> None:
 def test_primary_key_and_foreign_key_stay_separate_concerns() -> None:
     """A model carrying both a PrimaryKey and a ForeignKey contributes a key fact
     and an edge respectively; neither absorbs the other."""
-    manifest = _manifest(_model("model.shop.orders"), _model("model.shop.customers"))
+    manifest = _manifest(_node("model.shop.orders"), _node("model.shop.customers"))
 
     class Orders(ModelContract):
         dbt_model = "orders"

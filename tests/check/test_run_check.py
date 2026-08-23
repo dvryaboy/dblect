@@ -14,8 +14,6 @@ single-currency project stays quiet.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
 from dblect.adapters import profile_for_adapter
@@ -23,40 +21,16 @@ from dblect.audit import SpanBasis
 from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Manifest, ResourceType
 from dblect.types import IssueCode, ModelContract
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 MoneyUSD = Money.refine(currency=Currency.USD)
 MoneyEUR = Money.refine(currency=Currency.EUR)
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(
-    uid: str,
-    *,
-    kind: ResourceType,
-    sql: str | None,
-    columns: Mapping[str, Column],
-    raw: str | None = None,
-) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=raw,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
 
 
 def _kinds(report: object) -> list[CheckFindingKind]:
@@ -72,7 +46,7 @@ def test_unresolved_contract_is_a_finding() -> None:
         dbt_model = "does_not_exist"
         amount: MoneyUSD
 
-    manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes={})
+    manifest = _manifest()
     report = run_check(manifest, _DUCKDB)
     assert _kinds(report) == [CheckFindingKind.CONTRACT_ISSUE]
 
@@ -89,11 +63,7 @@ def test_contract_issue_findings_carry_their_distinct_cause_codes() -> None:
     orders_dupe = _node(
         "model.other.orders", kind=ResourceType.MODEL, sql="SELECT 1 AS x", columns=_cols(x="INT")
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={orders.unique_id: orders, orders_dupe.unique_id: orders_dupe},
-    )
+    manifest = _manifest(orders, orders_dupe)
 
     class Ambiguous(ModelContract):
         dbt_model = "orders"
@@ -120,9 +90,7 @@ def test_a_model_that_cannot_be_analyzed_is_surfaced() -> None:
         sql="select from where group",  # not valid SQL
         columns=_cols(x="INT"),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={broken.unique_id: broken}
-    )
+    manifest = _manifest(broken)
     report = run_check(manifest, _DUCKDB)
     assert [m.unique_id for m in report.unbuilt] == ["model.shop.broken"]
     assert report.models_analyzed == 0
@@ -153,11 +121,7 @@ _CREEP_NODES = (
 
 
 def _creep_manifest() -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in _CREEP_NODES},
-    )
+    return _manifest(*_CREEP_NODES)
 
 
 def test_currency_creep_flags_the_contradiction_and_its_blast_radius() -> None:
@@ -210,9 +174,7 @@ _AGG_NODES = (
 
 
 def _agg_manifest() -> Manifest:
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in _AGG_NODES}
-    )
+    return _manifest(*_AGG_NODES)
 
 
 def test_aggregation_finding_back_maps_to_the_source_line() -> None:
@@ -233,11 +195,7 @@ def test_aggregation_finding_back_maps_to_the_source_line() -> None:
         raw=raw,
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={_AGG_NODES[0].unique_id: _AGG_NODES[0], mart.unique_id: mart},
-    )
+    manifest = _manifest(_AGG_NODES[0], mart)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -272,11 +230,7 @@ def test_noqa_on_the_source_line_suppresses_a_macro_shifted_aggregation() -> Non
         raw=raw,
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={_AGG_NODES[0].unique_id: _AGG_NODES[0], mart.unique_id: mart},
-    )
+    manifest = _manifest(_AGG_NODES[0], mart)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -313,11 +267,7 @@ def test_noqa_on_the_macro_call_line_suppresses_a_macro_emitted_aggregation() ->
         raw=raw,
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={_AGG_NODES[0].unique_id: _AGG_NODES[0], mart.unique_id: mart},
-    )
+    manifest = _manifest(_AGG_NODES[0], mart)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -382,9 +332,7 @@ def _one_agg_manifest(sql_fn: str) -> Manifest:
             columns=_cols(country="VARCHAR", v="DECIMAL"),
         ),
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 # Two non-sum representatives: `avg` is a different sqlglot node than `sum`, and `median`
@@ -445,9 +393,7 @@ def test_collection_aggregate_over_a_tagged_column_is_not_flagged() -> None:
             columns=_cols(country="VARCHAR", amounts="DECIMAL[]"),
         ),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -479,9 +425,7 @@ def test_sum_over_a_case_expression_is_not_flagged() -> None:
             columns=_cols(k="VARCHAR", card="DECIMAL"),
         ),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -511,9 +455,7 @@ def test_sum_over_a_scaled_amount_is_flagged() -> None:
             columns=_cols(country="VARCHAR", v="DECIMAL"),
         ),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -549,9 +491,7 @@ def test_sum_grouped_by_a_computed_key_is_flagged() -> None:
             columns=_cols(m="TIMESTAMP", total="DECIMAL"),
         ),
     )
-    manifest = Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes)
 
     class Payments(ModelContract):
         dbt_model = "payments"
@@ -606,9 +546,7 @@ def _join_keys_manifest() -> Manifest:
             columns=_cols(amount="DECIMAL"),
         ),
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_join_on_incompatible_domain_types_is_flagged() -> None:
@@ -681,11 +619,7 @@ def test_resolution_floor_fires_on_blindness_and_is_silent_when_clean() -> None:
         sql="SELECT * FROM opaque",
         columns=_cols(x="INT"),
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={opaque.unique_id: opaque, passthru.unique_id: passthru},
-    )
+    manifest = _manifest(opaque, passthru)
 
     clean = run_check(manifest, _DUCKDB)
     # The star is a blind site, not a build failure, and nothing trips at 0%
@@ -725,23 +659,16 @@ def _agg_manifest_with_source(model_sql: str) -> Manifest:
         sql=None,
         columns=_cols(amount="DECIMAL", currency="VARCHAR", country="VARCHAR"),
     )
-    model = Node(
-        unique_id="model.shop.revenue_by_country",
+    model = _node(
+        "model.shop.revenue_by_country",
+        model_sql,
+        raw=model_sql,
         name="revenue_by_country",
-        resource_type=ResourceType.MODEL,
         fqn=("shop", "revenue_by_country"),
-        package_name="shop",
-        schema="analytics",
-        raw_code=model_sql,
-        compiled_code=model_sql,
-        original_file_path="models/revenue_by_country.sql",
+        path="models/revenue_by_country.sql",
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={payments.unique_id: payments, model.unique_id: model},
-    )
+    return _manifest(payments, model)
 
 
 def _register_payments_contract() -> None:

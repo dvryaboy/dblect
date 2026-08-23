@@ -9,57 +9,24 @@ analyses an empty body as if it were the model.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from dblect.adapters import profile_for_adapter
 from dblect.audit import run_audit
 from dblect.check import run_check
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Node
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _model(
-    uid: str,
-    *,
-    raw: str | None,
-    compiled: str | None,
-    compiled_flag: bool | None,
-    columns: Mapping[str, Column],
-) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-        compiled_flag=compiled_flag,
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
-
-
 def _stale() -> Node:
-    return _model(
+    return _node(
         "model.shop.stale",
         raw="select max(updated_at) from events",
-        compiled="",
+        sql="",
         compiled_flag=True,
         columns=_cols(updated_at="TIMESTAMP"),
     )
@@ -92,10 +59,10 @@ def test_audit_skips_a_stale_node_with_the_compilation_reason() -> None:
 
 def test_a_genuinely_compiled_model_still_builds() -> None:
     # The miss check must not block a faithfully compiled model.
-    ok = _model(
+    ok = _node(
         "model.shop.ok",
         raw="select id from upstream",
-        compiled="SELECT id FROM upstream",
+        sql="SELECT id FROM upstream",
         compiled_flag=True,
         columns=_cols(id="INT"),
     )
