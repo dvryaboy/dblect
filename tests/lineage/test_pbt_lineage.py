@@ -29,6 +29,7 @@ from dblect.lineage.builder import build_manifest_graph, build_model_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.manifest import Column, Manifest, Node, ResourceType
+from tests._manifest_builders import node as _node
 
 
 @dataclass(frozen=True)
@@ -263,33 +264,17 @@ def _leaf_node(le: LeafSpec) -> Node:
     if le.document_columns:
         for c in le.columns:
             columns[c] = Column(name=c, data_type=None, description=None)
-    return Node(
-        unique_id=_leaf_uid(le),
-        name=le.name,
-        resource_type=le.kind,
-        fqn=("test", le.name),
-        package_name="test",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns=columns,
-        depends_on=frozenset(),
-    )
+    return _node(_leaf_uid(le), kind=le.kind, name=le.name, schema=None, columns=columns)
 
 
 def _model_node(m: ModelSpec, upstream_uids: frozenset[str]) -> Node:
     sql = _build_sql(m)
-    return Node(
-        unique_id=_model_uid(m.name),
+    return _node(
+        _model_uid(m.name),
+        sql,
+        raw=sql,
         name=m.name,
-        resource_type=ResourceType.MODEL,
-        fqn=("test", m.name),
-        package_name="test",
         schema=None,
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=None,
         columns={
             p.out: Column(name=p.out, data_type=None, description=None) for p in m.projections
         },
