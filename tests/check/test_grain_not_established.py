@@ -21,8 +21,6 @@ any implementation that reads the flow value instead of the recorded inferred on
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import pytest
 
 from dblect.adapters import profile_for_adapter
@@ -32,51 +30,16 @@ from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
     DbtTestMetadata,
-    Manifest,
     ModelConfig,
     Node,
     ResourceType,
 )
-from dblect.manifest.parse import Column
 from dblect.types import ModelContract
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(
-    uid: str,
-    *,
-    sql: str | None,
-    columns: Mapping[str, Column],
-    config: ModelConfig | None = None,
-    constraints: tuple[ConstraintSpec, ...] = (),
-) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-        config=config,
-        constraints=constraints,
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
 
 
 _LINE_COLS = _cols(order_id="INT", line_number="INT", amount="DECIMAL")
@@ -316,17 +279,9 @@ def test_an_unrelated_surviving_key_is_not_a_witness() -> None:
 
 
 def _unique_test_node(*, where: str | None) -> Node:
-    return Node(
-        unique_id="test.shop.unique_fct_orders_order_id",
-        name="unique_fct_orders_order_id",
-        resource_type=ResourceType.OTHER,
-        fqn=("shop", "unique_fct_orders_order_id"),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
+    return _node(
+        "test.shop.unique_fct_orders_order_id",
+        kind=ResourceType.OTHER,
         test_metadata=DbtTestMetadata(
             name="unique", kwargs={"column_name": "order_id"}, where=where
         ),
