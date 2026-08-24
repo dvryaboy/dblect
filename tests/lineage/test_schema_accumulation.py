@@ -17,17 +17,16 @@ from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import Column
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _SEED = SourceRef(SourceKind.SEED, "seed.shop.raw")
 _UP = SourceRef(SourceKind.MODEL, "model.shop.up")
 _MART = SourceRef(SourceKind.MODEL, "model.shop.mart")
 
 
-def _cols(*names: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type="VARCHAR", description=None) for n in names}
-
-
-def _node(
+def _relation(
     ref: SourceRef,
     *,
     sql: str | None,
@@ -36,34 +35,20 @@ def _node(
     name: str | None = None,
 ) -> Node:
     kind = ResourceType.SEED if ref.kind is SourceKind.SEED else ResourceType.MODEL
-    return Node(
-        unique_id=ref.unique_id,
-        name=name if name is not None else ref.unique_id.split(".")[-1],
-        resource_type=kind,
-        fqn=("shop", ref.unique_id.split(".")[-1]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns=columns,
-        depends_on=depends_on,
-    )
+    return _node(ref.unique_id, sql, kind=kind, name=name, columns=columns, depends_on=depends_on)
 
 
-def _manifest() -> Manifest:
+def _chain_manifest() -> Manifest:
     nodes = [
-        _node(_SEED, sql=None, columns=_cols("a", "b")),
-        _node(_UP, sql="select * from raw", depends_on=frozenset({_SEED.unique_id})),
-        _node(_MART, sql="select a from up", depends_on=frozenset({_UP.unique_id})),
+        _relation(_SEED, sql=None, columns=_cols("a", "b")),
+        _relation(_UP, sql="select * from raw", depends_on=frozenset({_SEED.unique_id})),
+        _relation(_MART, sql="select a from up", depends_on=frozenset({_UP.unique_id})),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_downstream_resolves_columns_of_an_undocumented_upstream_model() -> None:
-    build = build_manifest_graph(_manifest())
+    build = build_manifest_graph(_chain_manifest())
     assert build.issues == ()
 
     # `up` selected `*` from the documented seed, so its columns are derived...
@@ -77,18 +62,16 @@ def _manifest_documented_but_unproduced() -> Manifest:
     # the documented column alongside the SQL-derived ones, so a dependent can resolve it.
     # This is the case a naive "replace the table with only the produced outputs" fold drops.
     nodes = [
-        _node(_SEED, sql=None, columns=_cols("a", "b")),
-        _node(
+        _relation(_SEED, sql=None, columns=_cols("a", "b")),
+        _relation(
             _UP,
             sql="select a, b from raw",
             columns=_cols("a", "b", "extra"),
             depends_on=frozenset({_SEED.unique_id}),
         ),
-        _node(_MART, sql="select extra from up", depends_on=frozenset({_UP.unique_id})),
+        _relation(_MART, sql="select extra from up", depends_on=frozenset({_UP.unique_id})),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_documented_column_survives_the_output_fold() -> None:
@@ -103,15 +86,11 @@ def test_a_model_whose_name_breaks_the_schema_mirror_degrades_to_an_issue() -> N
     # Mirroring a model's outputs into the running schema parses the relation name; a dotted
     # name parses to more parts than the depth-1 schema and raises. That must degrade the one
     # model to a BuildIssue, not abort the build and blank every other model's lineage.
-    good = _node(_UP, sql="select a, b from raw", columns=_cols("a", "b"))
-    dotted = _node(
+    good = _relation(_UP, sql="select a, b from raw", columns=_cols("a", "b"))
+    dotted = _relation(
         _MART, sql="select a from up", depends_on=frozenset({_UP.unique_id}), name="stg.orders"
     )
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={good.unique_id: good, dotted.unique_id: dotted},
-    )
+    manifest = _manifest(good, dotted)
 
     build = build_manifest_graph(manifest)  # must not raise
     assert any(issue.model_unique_id == _MART.unique_id for issue in build.issues)

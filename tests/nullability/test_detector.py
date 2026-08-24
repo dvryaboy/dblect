@@ -32,54 +32,27 @@ from dblect.nullability.detector import (
     make_nullability_detectors,
 )
 from dblect.sql import Finding, FindingKind, parse_sql
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
 def _source(name: str) -> Node:
-    return Node(
-        unique_id=f"source.shop.raw.{name}",
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=("shop", name),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return source(f"source.shop.raw.{name}")
 
 
 def _model(name: str, sql: str, *, depends_on: frozenset[str]) -> Node:
-    return Node(
-        unique_id=f"model.shop.{name}",
-        name=name,
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", name),
-        package_name="shop",
-        schema="analytics",
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        depends_on=depends_on,
-    )
+    return _node(f"model.shop.{name}", sql, raw=sql, depends_on=depends_on)
 
 
 def _not_null(source_name: str, column: str) -> Node:
     target = f"source.shop.raw.{source_name}"
-    return Node(
-        unique_id=f"test.shop.{source_name}_{column}_not_null",
+    return _node(
+        f"test.shop.{source_name}_{column}_not_null",
+        kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_not_null",
-        resource_type=ResourceType.OTHER,
-        fqn=("shop", f"{source_name}_{column}_not_null"),
-        package_name="shop",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}),
         attached_node=target,
@@ -95,7 +68,7 @@ _STG_SQL = "SELECT a.id AS id, b.tag AS tag FROM base a LEFT JOIN lkp b ON a.fk 
 _STG2_SQL = "SELECT a.id AS id, NULLIF(a.fk, 0) AS tag FROM base a"
 
 
-def _manifest(mart_sql: str) -> Manifest:
+def _mart_manifest(mart_sql: str) -> Manifest:
     nodes = [
         _source("base"),
         _source("lkp"),
@@ -115,14 +88,12 @@ def _manifest(mart_sql: str) -> Manifest:
             depends_on=frozenset({"model.shop.stg", "model.shop.stg2", "source.shop.raw.other"}),
         ),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def _join_finding(mart_sql: str) -> Finding:
     """The single ``join_on_nullable_key`` finding ``mart`` raises (asserts exactly one)."""
-    detectors = make_nullability_detectors(_manifest(mart_sql), _DUCKDB)
+    detectors = make_nullability_detectors(_mart_manifest(mart_sql), _DUCKDB)
     tree = parse_sql(mart_sql, dialect="duckdb")
     findings = [
         f
@@ -136,7 +107,7 @@ def _join_finding(mart_sql: str) -> Finding:
 
 def _findings(mart_sql: str) -> list[Finding]:
     """Every nullability finding the detectors raise on ``mart``."""
-    detectors = make_nullability_detectors(_manifest(mart_sql), _DUCKDB)
+    detectors = make_nullability_detectors(_mart_manifest(mart_sql), _DUCKDB)
     tree = parse_sql(mart_sql, dialect="duckdb")
     return [f for detector in detectors for f in detector(tree)]
 

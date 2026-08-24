@@ -33,6 +33,9 @@ from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import Nullability
 from dblect.lineage.properties.nullability import activated_nullability
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -76,40 +79,22 @@ def _null_sql(s: NullScenario) -> str:
 
 
 def _source(name: str) -> Node:
-    return Node(
-        unique_id=f"source.test.raw.{name}",
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=("test", name),
-        package_name="test",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return source(f"source.test.raw.{name}")
 
 
 def _not_null_test(source_name: str, column: str) -> Node:
     target = f"source.test.raw.{source_name}"
-    return Node(
-        unique_id=f"test.test.{source_name}_{column}_not_null",
+    return _node(
+        f"test.test.{source_name}_{column}_not_null",
+        kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_not_null",
-        resource_type=ResourceType.OTHER,
-        fqn=("test", f"{source_name}_{column}_not_null"),
-        package_name="test",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}),
         attached_node=target,
     )
 
 
-def _manifest(s: NullScenario) -> Manifest:
+def _scenario_manifest(s: NullScenario) -> Manifest:
     sql = _null_sql(s)
     nodes = [
         _source("bt"),
@@ -118,23 +103,15 @@ def _manifest(s: NullScenario) -> Manifest:
         _not_null_test("bt", "bv"),
         _not_null_test("jt", "jk"),
         _not_null_test("jt", "jv"),
-        Node(
-            unique_id=_MODEL_UID,
+        _node(
+            _MODEL_UID,
+            sql,
+            raw=sql,
             name="m",
-            resource_type=ResourceType.MODEL,
-            fqn=("test", "m"),
-            package_name="test",
-            schema="analytics",
-            raw_code=sql,
-            compiled_code=sql,
-            original_file_path=None,
-            columns={},
             depends_on=frozenset({"source.test.raw.bt", "source.test.raw.jt"}),
         ),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 @given(s=_null_scenario())
@@ -145,7 +122,7 @@ def test_non_null_columns_are_never_null_over_materialized_rows(
     """Every output column the analyzer calls NON_NULL has no nulls in the duckdb
     materialization. The check never recomputes which columns should be nullable; the
     data is the judge."""
-    anns = activated_nullability(_manifest(s), _DUCKDB)
+    anns = activated_nullability(_scenario_manifest(s), _DUCKDB)
     model = SourceRef(SourceKind.MODEL, _MODEL_UID)
     non_null_cols = [
         c for c in _OUTPUT_COLS if anns[ColumnRef(model, c)].value is Nullability.NON_NULL

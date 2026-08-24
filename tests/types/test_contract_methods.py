@@ -21,7 +21,7 @@ from dblect.lineage.facts.grounding import collect
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest
 from dblect.types import (
     ForeignKeyEdge,
     IssueCode,
@@ -30,33 +30,17 @@ from dblect.types import (
     contract_fd_discoverer,
     resolve_contracts,
 )
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _CHARGES = SourceRef(SourceKind.MODEL, "model.shop.stg_charges")
 _ORDERS = SourceRef(SourceKind.MODEL, "model.shop.fct_orders")
 _ITEMS = SourceRef(SourceKind.MODEL, "model.shop.stg_order_items")
 
 
-def _node(uid: str) -> Node:
-    name = uid.split(".")[-1]
-    return Node(
-        unique_id=uid,
-        name=name,
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", name),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _manifest() -> Manifest:
+def _shop_manifest() -> Manifest:
     nodes = [_node(_CHARGES.unique_id), _node(_ORDERS.unique_id), _node(_ITEMS.unique_id)]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 def test_determines_becomes_an_fd_fact() -> None:
@@ -67,7 +51,7 @@ def test_determines_becomes_an_fd_fact() -> None:
         def country_sets_currency(self: ContractSelf) -> object:
             return self.country.determines(self.currency)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.issues == ()
     assert {(f.scope, f.value) for f in resolved.fd_facts} == {
         (_CHARGES, FDSet.of(FD(frozenset({"country"}), "currency")))
@@ -89,7 +73,7 @@ def test_key_and_grain_become_candidate_keys() -> None:
         def composite(self: ContractSelf) -> object:
             return self.key(self.country, self.charge_date)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.issues == ()
     keys = {(f.scope, f.value) for f in resolved.key_facts}
     assert (_ORDERS, CandidateKeySet.of(frozenset({"order_id"}))) in keys
@@ -105,7 +89,7 @@ def test_key_marker_and_method_key_merge() -> None:
         def also_unique_on_external_id(self: ContractSelf) -> object:
             return self.key(self.external_id)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     keys = {f.value for f in resolved.key_facts if f.scope == _ORDERS}
     assert CandidateKeySet.of(frozenset({"order_id"})) in keys
     assert CandidateKeySet.of(frozenset({"external_id"})) in keys
@@ -119,7 +103,7 @@ def test_references_becomes_a_foreign_key_edge() -> None:
         def items_belong_to_orders(self: ContractSelf) -> object:
             return self.order_id.references(models.fct_orders.order_id)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.issues == ()
     assert resolved.foreign_keys == (
         ForeignKeyEdge(child=ColumnRef(_ITEMS, "order_id"), parent=ColumnRef(_ORDERS, "order_id")),
@@ -134,7 +118,7 @@ def test_cross_relation_determines_is_a_finding() -> None:
         def bad(self: ContractSelf) -> object:
             return models.fct_orders.country.determines(self.currency)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.fd_facts == ()
     assert [i.code for i in resolved.issues] == [IssueCode.MALFORMED_DECLARATION]
 
@@ -148,7 +132,7 @@ def test_method_columns_are_validated_against_known_columns() -> None:
             return self.country.determines(self.currency)
 
     known = {_CHARGES: frozenset({"country"})}  # 'currency' is absent from the relation
-    resolved = resolve_contracts(_manifest(), known_columns=known)
+    resolved = resolve_contracts(_shop_manifest(), known_columns=known)
     assert resolved.fd_facts == ()
     assert [i.code for i in resolved.issues] == [IssueCode.UNKNOWN_COLUMN]
 
@@ -163,7 +147,7 @@ def test_malformed_contract_is_a_finding_not_a_crash() -> None:
         def bad(self: ContractSelf) -> object:
             return (self.a.sum() < self.b.sum()).within(0.01)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.fd_facts == ()
     assert [i.code for i in resolved.issues] == [IssueCode.MALFORMED_DECLARATION]
 
@@ -179,7 +163,7 @@ def test_predicate_is_collected_not_grounded() -> None:
                 == models.stg_order_items.subtotal.sum().group_by(models.stg_order_items.order_id)
             ).within(0.01)
 
-    resolved = resolve_contracts(_manifest())
+    resolved = resolve_contracts(_shop_manifest())
     assert resolved.fd_facts == ()
     assert len(resolved.predicates) == 1
     pred = resolved.predicates[0]
@@ -196,5 +180,5 @@ def test_contract_fd_discoverer_grounds_the_fd_property() -> None:
         def country_sets_currency(self: ContractSelf) -> object:
             return self.country.determines(self.currency)
 
-    facts = collect(_manifest(), (contract_fd_discoverer(),), name_to_source={})
+    facts = collect(_shop_manifest(), (contract_fd_discoverer(),), name_to_source={})
     assert facts[_CHARGES][0].value == FDSet.of(FD(frozenset({"country"}), "currency"))

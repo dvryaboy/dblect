@@ -43,14 +43,17 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
+from dblect.manifest import Manifest
 from dblect.types import (
     ModelContract,
     contract_fd_discoverer,
     contract_tag_discoverer,
     resolve_contracts,
 )
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _PAYMENTS = SourceRef(SourceKind.SOURCE, "source.shop.raw.payments")
 _MART = SourceRef(SourceKind.MODEL, "model.shop.revenue_by_country")
@@ -60,40 +63,10 @@ _PER_ROW = tagged(dimension=Dimension.of(PerRow(ColumnRef(_PAYMENTS, "currency")
 _SQL = "SELECT country, SUM(amount) AS total FROM payments GROUP BY country"
 
 
-def _cols(*names: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type="VARCHAR", description=None) for n in names}
-
-
-def _manifest() -> Manifest:
-    payments = Node(
-        unique_id=_PAYMENTS.unique_id,
-        name="payments",
-        resource_type=ResourceType.SOURCE,
-        fqn=("shop", "raw", "payments"),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns=_cols("amount", "currency", "country"),
-    )
-    mart = Node(
-        unique_id=_MART.unique_id,
-        name="revenue_by_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("shop", "revenue_by_country"),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=_SQL,
-        original_file_path=None,
-        columns={},
-    )
-    return Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in (payments, mart)},
-    )
+def _revenue_manifest() -> Manifest:
+    payments = _source(_PAYMENTS.unique_id, columns=_cols("amount", "currency", "country"))
+    mart = _node(_MART.unique_id, _SQL)
+    return _manifest(*(payments, mart))
 
 
 def _aggregate_tag(manifest: Manifest) -> Annotation[DomainTag]:
@@ -127,7 +100,7 @@ def test_authored_dependency_discharges_the_grouped_sum() -> None:
         def country_sets_currency(self: ContractSelf) -> object:
             return self.country.determines(self.currency)
 
-    ann = _aggregate_tag(_manifest())
+    ann = _aggregate_tag(_revenue_manifest())
     assert ann.value == _PER_ROW  # the dependency kept the currency tag through the sum
 
 
@@ -136,5 +109,5 @@ def test_without_the_dependency_the_sum_clears() -> None:
         dbt_model = "payments"
         amount: Money.columns(amount="amount", currency="currency")
 
-    ann = _aggregate_tag(_manifest())
+    ann = _aggregate_tag(_revenue_manifest())
     assert ann.value == NAKED  # mixed-currency sum: not well typed, the finding fires

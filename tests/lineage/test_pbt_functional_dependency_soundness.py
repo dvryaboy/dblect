@@ -35,7 +35,9 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest, Node
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 from tests.lineage._group_spelling import GroupSpelling
 
 _SRC = SourceRef(SourceKind.SOURCE, "source.test.raw.t")
@@ -114,30 +116,8 @@ def _model_sql(s: Scenario) -> str:
 def _claimed(s: Scenario) -> FDSet:
     """The model's FD set, exactly as the relation property derives it."""
     nodes = {
-        _SRC.unique_id: Node(
-            unique_id=_SRC.unique_id,
-            name="t",
-            resource_type=ResourceType.SOURCE,
-            fqn=(_SRC.unique_id,),
-            package_name="test",
-            schema="raw",
-            raw_code=None,
-            compiled_code=None,
-            original_file_path=None,
-            columns={},
-        ),
-        _MODEL.unique_id: Node(
-            unique_id=_MODEL.unique_id,
-            name="m",
-            resource_type=ResourceType.MODEL,
-            fqn=(_MODEL.unique_id,),
-            package_name="test",
-            schema="analytics",
-            raw_code=None,
-            compiled_code=_model_sql(s),
-            original_file_path=None,
-            columns={},
-        ),
+        _SRC.unique_id: _source(_SRC.unique_id, name="t"),
+        _MODEL.unique_id: _node(_MODEL.unique_id, _model_sql(s), name="m"),
     }
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes=nodes)
     value = FDSet.of(FD(frozenset({"g"}), "x")) if s.declared else FDSet(frozenset())
@@ -269,18 +249,7 @@ def _join_sql(s: JoinScenario) -> str:
 
 
 def _source_node(ref: SourceRef, name: str) -> Node:
-    return Node(
-        unique_id=ref.unique_id,
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=(ref.unique_id,),
-        package_name="test",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return _source(ref.unique_id, name=name)
 
 
 def _join_claimed(s: JoinScenario) -> FDSet:
@@ -289,18 +258,7 @@ def _join_claimed(s: JoinScenario) -> FDSet:
     nodes = {
         _PAY.unique_id: _source_node(_PAY, "pay"),
         _DIM.unique_id: _source_node(_DIM, "dim"),
-        _JOIN_MODEL.unique_id: Node(
-            unique_id=_JOIN_MODEL.unique_id,
-            name="j",
-            resource_type=ResourceType.MODEL,
-            fqn=(_JOIN_MODEL.unique_id,),
-            package_name="test",
-            schema="analytics",
-            raw_code=None,
-            compiled_code=_join_sql(s),
-            original_file_path=None,
-            columns={},
-        ),
+        _JOIN_MODEL.unique_id: _node(_JOIN_MODEL.unique_id, _join_sql(s), name="j"),
     }
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes=nodes)
     facts = {

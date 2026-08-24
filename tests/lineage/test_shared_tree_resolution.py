@@ -16,40 +16,12 @@ from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.property import resolved_column_ref
-from dblect.manifest import Manifest, Node, ResourceType
 from dblect.sql import parse_sql
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _BQ = profile_for_adapter("bigquery")
-
-
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="app",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="app",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
 
 
 def _unnest_arg_column(tree: Expr) -> exp.Column:
@@ -65,13 +37,8 @@ def test_unnest_arg_through_cte_resolves_to_the_cte_column() -> None:
         "SELECT r.id, m.x FROM remapped r CROSS JOIN UNNEST(r.metrics) AS m"
     )
     tree = parse_sql(sql, dialect="bigquery")
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="bigquery",
-        nodes={
-            n.unique_id: n
-            for n in [_source("source.app.raw.raw_events"), _model("model.app.m", sql)]
-        },
+    manifest = _manifest(
+        _source("source.app.raw.raw_events"), _node("model.app.m", sql), adapter_type="bigquery"
     )
     build_manifest_graph(manifest, dialect=_BQ.sqlglot_dialect, parsed={"model.app.m": tree})
 
@@ -88,12 +55,10 @@ def test_unnest_arg_direct_model_ref_resolves_to_the_model_column() -> None:
     tree = parse_sql(mart_sql, dialect="bigquery")
     nodes = [
         _source("source.app.raw.raw_events"),
-        _model("model.app.stg", stg_sql),
-        _model("model.app.mart", mart_sql),
+        _node("model.app.stg", stg_sql),
+        _node("model.app.mart", mart_sql),
     ]
-    manifest = Manifest(
-        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
-    )
+    manifest = _manifest(*nodes, adapter_type="bigquery")
     build_manifest_graph(manifest, dialect=_BQ.sqlglot_dialect, parsed={"model.app.mart": tree})
 
     ref = resolved_column_ref(_unnest_arg_column(tree))
@@ -108,13 +73,8 @@ def test_passing_a_tree_leaves_its_structure_unqualified() -> None:
     sql = "SELECT id, amount FROM raw_events"
     tree = parse_sql(sql, dialect="bigquery")
     before = tree.sql(dialect="bigquery")
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="bigquery",
-        nodes={
-            n.unique_id: n
-            for n in [_source("source.app.raw.raw_events"), _model("model.app.m", sql)]
-        },
+    manifest = _manifest(
+        _source("source.app.raw.raw_events"), _node("model.app.m", sql), adapter_type="bigquery"
     )
     build_manifest_graph(manifest, dialect=_BQ.sqlglot_dialect, parsed={"model.app.m": tree})
     assert tree.sql(dialect="bigquery") == before

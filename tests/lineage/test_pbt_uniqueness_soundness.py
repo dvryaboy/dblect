@@ -56,6 +56,8 @@ from dblect.lineage.properties.uniqueness import (
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
 from tests.lineage._group_spelling import GroupSpelling
 
@@ -96,34 +98,16 @@ def _assert_keys_sound(
 
 
 def _source_node(name: str, schema: str = "raw") -> Node:
-    return Node(
-        unique_id=f"source.test.{schema}.{name}",
-        name=name,
-        resource_type=ResourceType.SOURCE,
-        fqn=("test", name),
-        package_name="test",
-        schema=schema,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(f"source.test.{schema}.{name}", kind=ResourceType.SOURCE, schema=schema)
 
 
 def _unique_test(source_name: str, *, column: str, where: str | None = None) -> Node:
     target = f"source.test.raw.{source_name}"
     suffix = "_cond" if where is not None else ""
-    return Node(
-        unique_id=f"test.test.{source_name}_{column}_unique{suffix}",
+    return _node(
+        f"test.test.{source_name}_{column}_unique{suffix}",
+        kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_unique{suffix}",
-        resource_type=ResourceType.OTHER,
-        fqn=("test", f"{source_name}_{column}_unique"),
-        package_name="test",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
         attached_node=target,
@@ -131,19 +115,7 @@ def _unique_test(source_name: str, *, column: str, where: str | None = None) -> 
 
 
 def _model_node(sql: str, *, depends_on: frozenset[str]) -> Node:
-    return Node(
-        unique_id=_MODEL_UID,
-        name="m",
-        resource_type=ResourceType.MODEL,
-        fqn=("test", "m"),
-        package_name="test",
-        schema="analytics",
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        depends_on=depends_on,
-    )
+    return _node(_MODEL_UID, sql, raw=sql, name="m", depends_on=depends_on)
 
 
 # --- unconditional shapes ---------------------------------------------------------
@@ -346,9 +318,7 @@ def _scenario_manifest(s: Scenario) -> Manifest:
             depends_on=frozenset(f"source.test.raw.{src.name}" for src in s.sources),
         )
     )
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 @given(s=_scenario())
@@ -430,9 +400,7 @@ def _cond_manifest(s: CondScenario) -> Manifest:
         _unique_test("orders", column="id", where=f"g > {s.test_threshold}"),
         _model_node(_cond_sql(s), depends_on=frozenset({"source.test.raw.orders"})),
     ]
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(*nodes)
 
 
 @given(s=_cond_scenario())

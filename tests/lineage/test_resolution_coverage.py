@@ -12,37 +12,12 @@ See ``docs/design/lineage-facts.md`` ("Coverage and degradation").
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from dblect.lineage.builder import build_manifest_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import Column
-
-
-def _cols(**types: str) -> Mapping[str, Column]:
-    return {n: Column(name=n, data_type=t, description=None) for n, t in types.items()}
-
-
-def _node(uid: str, *, kind: ResourceType, sql: str | None, columns: Mapping[str, Column]) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=kind,
-        fqn=tuple(uid.split(".")[1:]),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=f"models/{uid.split('.')[-1]}.sql",
-        columns=columns,
-    )
-
-
-def _manifest(*nodes: Node) -> Manifest:
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+from dblect.manifest import Manifest, ResourceType
+from tests._manifest_builders import cols as _cols
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 
 def _resolution(manifest: Manifest, uid: str) -> tuple[int, int, int]:

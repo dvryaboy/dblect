@@ -35,7 +35,9 @@ from dblect.lineage.properties.domain_type import (
 )
 from dblect.lineage.properties.nullability import taint_outer_joins
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _PAYMENTS = SourceRef(SourceKind.SOURCE, "source.shop.raw.payments")
 _ANCHOR = SourceRef(SourceKind.SOURCE, "source.shop.raw.anchor")
@@ -58,31 +60,15 @@ _KEPT = "SELECT p.amount AS amount FROM payments p LEFT JOIN anchor a ON p.cust_
 _INNER = "SELECT p.amount AS amount FROM anchor a JOIN payments p ON a.id = p.cust_id"
 
 
-def _node(ref: SourceRef, sql: str | None) -> Node:
+def _relation(ref: SourceRef, sql: str | None) -> Node:
     kind = ResourceType.MODEL if ref.kind is SourceKind.MODEL else ResourceType.SOURCE
-    return Node(
-        unique_id=ref.unique_id,
-        name=ref.unique_id.split(".")[-1],
-        resource_type=kind,
-        fqn=(ref.unique_id,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
+    return _node(ref.unique_id, sql, kind=kind)
 
 
 def _run(sql: str, *, amount: DomainTag = _PER_ROW, out: str = "amount") -> DomainTag:
     """Propagate domain type over the outer-join-tainted column graph and read ``out``."""
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={
-            n.unique_id: n
-            for n in (_node(_PAYMENTS, None), _node(_ANCHOR, None), _node(_MODEL, sql))
-        },
+    manifest = _manifest(
+        _relation(_PAYMENTS, None), _relation(_ANCHOR, None), _relation(_MODEL, sql)
     )
     graph = build_model_graph(
         model_uid=_MODEL.unique_id, sql=sql, name_to_source=_NAME_TO_SOURCE, schema=_SCHEMA

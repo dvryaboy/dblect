@@ -14,8 +14,10 @@ from dblect.audit import (
     SpanBasis,
     run_audit,
 )
-from dblect.manifest import Manifest, ModelConfig, Node, ResourceType
+from dblect.manifest import Manifest, ModelConfig, Node
 from dblect.sql import FindingKind
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -290,17 +292,10 @@ def test_non_deterministic_limit_fires_through_run_audit() -> None:
     # the tree object the walker hands the detector, so the table model fires and the view
     # with the same SQL stays exempt. This pins the per-tree plumbing the unit tests mock.
     sql = "select id from raw limit 10"
-    table = Node(
-        unique_id="model.pkg.sampled_table",
-        name="sampled_table",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "sampled_table"),
-        package_name="pkg",
-        schema=None,
-        raw_code=sql,
-        compiled_code=sql,
-        original_file_path="models/sampled_table.sql",
-        columns={},
+    table = _node(
+        "model.pkg.sampled_table",
+        sql,
+        raw=sql,
         config=ModelConfig(materialized="table"),
     )
     view = replace(
@@ -311,11 +306,7 @@ def test_non_deterministic_limit_fires_through_run_audit() -> None:
         original_file_path="models/sampled_view.sql",
         config=ModelConfig(materialized="view"),
     )
-    manifest = Manifest(
-        schema_version="x",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in (table, view)},
-    )
+    manifest = _manifest(table, view)
     report = run_audit(manifest, _DUCKDB)
     fired = {
         lf.model_unique_id
@@ -328,19 +319,12 @@ def test_non_deterministic_limit_fires_through_run_audit() -> None:
 def _user_country(raw: str, compiled: str) -> Manifest:
     """A one-model manifest for `model.pkg.user_country`, varying only the raw template
     and its compiled SQL: the two inputs the back-map tests turn."""
-    node = Node(
-        unique_id="model.pkg.user_country",
-        name="user_country",
-        resource_type=ResourceType.MODEL,
-        fqn=("pkg", "user_country"),
-        package_name="pkg",
-        schema=None,
-        raw_code=raw,
-        compiled_code=compiled,
-        original_file_path="models/user_country.sql",
-        columns={},
+    node = _node(
+        "model.pkg.user_country",
+        compiled,
+        raw=raw,
     )
-    return Manifest(schema_version="x", adapter_type="duckdb", nodes={node.unique_id: node})
+    return _manifest(node)
 
 
 def test_macro_emitted_join_visible_in_compiled_code() -> None:

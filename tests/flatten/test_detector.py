@@ -13,8 +13,11 @@ from __future__ import annotations
 from dblect.adapters import profile_for_adapter
 from dblect.audit.walker import run_audit
 from dblect.flatten.detector import make_array_nonemptiness_detectors
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest
 from dblect.sql import Finding, FindingKind, parse_sql
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _BQ = profile_for_adapter("bigquery")
 
@@ -40,41 +43,9 @@ _MART_SQL = (
 )
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="app",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="app",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
-def _manifest() -> Manifest:
-    nodes = [_source(_RAW), _model(_STG, _STG_SQL), _model(_MART, _MART_SQL)]
-    return Manifest(
-        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
-    )
+def _pipeline_manifest() -> Manifest:
+    nodes = [_source(_RAW), _node(_STG, _STG_SQL), _node(_MART, _MART_SQL)]
+    return _manifest(*nodes, adapter_type="bigquery")
 
 
 def _findings(manifest: Manifest, consumer_uid: str) -> tuple[Finding, ...]:
@@ -91,12 +62,12 @@ def _findings(manifest: Manifest, consumer_uid: str) -> tuple[Finding, ...]:
 
 
 def test_unnest_of_raw_source_array_fires() -> None:
-    findings = _findings(_manifest(), _STG)
+    findings = _findings(_pipeline_manifest(), _STG)
     assert [f.kind for f in findings] == [FindingKind.INNER_FLATTEN_ROW_DROP]
 
 
 def test_unnest_of_rebuilt_array_is_silent_across_the_model_boundary() -> None:
-    assert _findings(_manifest(), _MART) == ()
+    assert _findings(_pipeline_manifest(), _MART) == ()
 
 
 def test_unnest_of_array_rebuilt_in_a_cte_is_silent() -> None:
@@ -109,10 +80,8 @@ def test_unnest_of_array_rebuilt_in_a_cte_is_silent() -> None:
         "  FROM raw_events GROUP BY event_id"
         ") SELECT b.event_id, x.tag FROM built b CROSS JOIN UNNEST(b.tags) AS x"
     )
-    nodes = [_source(_RAW), _model("model.app.in_model_rebuild", sql)]
-    manifest = Manifest(
-        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
-    )
+    nodes = [_source(_RAW), _node("model.app.in_model_rebuild", sql)]
+    manifest = _manifest(*nodes, adapter_type="bigquery")
     assert _findings(manifest, "model.app.in_model_rebuild") == ()
 
 
@@ -127,10 +96,8 @@ def test_unnest_of_nonempty_array_through_a_left_join_still_fires() -> None:
         ") SELECT d.event_id, x.tag FROM raw_events d "
         "LEFT JOIN built ON d.event_id = built.event_id CROSS JOIN UNNEST(built.tags) AS x"
     )
-    nodes = [_source(_RAW), _model("model.app.left_join_unnest", sql)]
-    manifest = Manifest(
-        schema_version="v12", adapter_type="bigquery", nodes={n.unique_id: n for n in nodes}
-    )
+    nodes = [_source(_RAW), _node("model.app.left_join_unnest", sql)]
+    manifest = _manifest(*nodes, adapter_type="bigquery")
     assert [f.kind for f in _findings(manifest, "model.app.left_join_unnest")] == [
         FindingKind.INNER_FLATTEN_ROW_DROP
     ]
@@ -140,6 +107,6 @@ def test_run_audit_reports_the_flatten_finding_exactly_once() -> None:
     # End to end: the structural form is no longer in DEFAULT_DETECTORS, so the finding
     # comes solely through the fact-grounded factory. The raw-source unnest in staging
     # fires once; the mart's rebuilt-array unnest stays silent.
-    report = run_audit(_manifest(), _BQ)
+    report = run_audit(_pipeline_manifest(), _BQ)
     flatten = [lf for lf in report.findings if lf.kind is FindingKind.INNER_FLATTEN_ROW_DROP]
     assert [lf.model_unique_id for lf in flatten] == [_STG]

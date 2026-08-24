@@ -17,54 +17,18 @@ from collections.abc import Mapping
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.nullability import Nullability, activated_nullability
-from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
+from dblect.manifest import DbtTestMetadata, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
-def _model(uid: str, sql: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.MODEL,
-        fqn=(uid,),
-        package_name="shop",
-        schema="analytics",
-        raw_code=None,
-        compiled_code=sql,
-        original_file_path=None,
-        columns={},
-        constraints=(),
-    )
-
-
-def _source(uid: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.SOURCE,
-        fqn=(uid,),
-        package_name="shop",
-        schema="raw",
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
-    )
-
-
 def _not_null(uid: str, *, column: str, target: str) -> Node:
-    return Node(
-        unique_id=uid,
-        name=uid.split(".")[-1],
-        resource_type=ResourceType.OTHER,
-        fqn=(uid,),
-        package_name="shop",
-        schema=None,
-        raw_code=None,
-        compiled_code=None,
-        original_file_path=None,
-        columns={},
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}),
         attached_node=target,
@@ -72,11 +36,7 @@ def _not_null(uid: str, *, column: str, target: str) -> Node:
 
 
 def _activated(*nodes: Node) -> Mapping[ColumnRef, Nullability]:
-    manifest = Manifest(
-        schema_version="v12",
-        adapter_type="duckdb",
-        nodes={n.unique_id: n for n in nodes},
-    )
+    manifest = _manifest(*nodes)
     return {ref: ann.value for ref, ann in activated_nullability(manifest, _DUCKDB).items()}
 
 
@@ -95,7 +55,7 @@ _NN_JOINED = _not_null("test.nn_joined", column="jv", target="source.shop.raw.jo
 
 
 def _join_model(join: str) -> Node:
-    return _model(
+    return _node(
         "model.shop.m",
         f"SELECT b.bk AS bk, j.jv AS jv FROM base b {join} joined j ON b.bk = j.jk",
     )
@@ -134,11 +94,11 @@ def test_taint_rides_across_a_model_boundary() -> None:
         _JOINED,
         _NN_BASE,
         _NN_JOINED,
-        _model(
+        _node(
             "model.shop.stg",
             "SELECT b.bk AS bk, j.jv AS jv FROM base b LEFT JOIN joined j ON b.bk = j.jk",
         ),
-        _model("model.shop.dim", "SELECT bk, jv FROM stg"),
+        _node("model.shop.dim", "SELECT bk, jv FROM stg"),
     )
     assert res[_col("model.shop.dim", "bk")] is Nullability.NON_NULL
     assert res[_col("model.shop.dim", "jv")] is Nullability.NULLABLE
@@ -152,7 +112,7 @@ def test_taint_reaches_a_column_drawn_from_a_derived_table() -> None:
         _JOINED,
         _NN_BASE,
         _NN_JOINED,
-        _model(
+        _node(
             "model.shop.m",
             "SELECT b.bk AS bk, s.jv AS jv "
             "FROM base b LEFT JOIN (SELECT jk, jv FROM joined) s ON b.bk = s.jk",
@@ -170,7 +130,7 @@ def test_coalesce_guard_clears_the_taint() -> None:
         _JOINED,
         _NN_BASE,
         _NN_JOINED,
-        _model(
+        _node(
             "model.shop.m",
             "SELECT b.bk AS bk, COALESCE(j.jv, b.bk) AS jv "
             "FROM base b LEFT JOIN joined j ON b.bk = j.jk",

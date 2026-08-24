@@ -18,9 +18,11 @@ from __future__ import annotations
 from dblect.adapters import profile_for_adapter
 from dblect.audit import run_audit
 from dblect.contracts import ContractSelf, contract
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest, Node
 from dblect.sql import FindingKind
 from dblect.types import ModelContract, isolated_registry, resolve_contracts
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -36,25 +38,11 @@ _FACT_SQL = (
 )
 
 
-def _manifest() -> Manifest:
+def _shop_manifest() -> Manifest:
     def model(name: str, sql: str) -> Node:
-        return Node(
-            unique_id=f"model.shop.{name}",
-            name=name,
-            resource_type=ResourceType.MODEL,
-            fqn=("shop", name),
-            package_name="shop",
-            schema="analytics",
-            raw_code=None,
-            compiled_code=sql,
-            original_file_path=None,
-            columns={},
-        )
+        return _node(f"model.shop.{name}", sql)
 
-    nodes = (model("dim", _DIM_SQL), model("fact", _FACT_SQL))
-    return Manifest(
-        schema_version="v12", adapter_type="duckdb", nodes={n.unique_id: n for n in nodes}
-    )
+    return _manifest(model("dim", _DIM_SQL), model("fact", _FACT_SQL))
 
 
 def _join_message(manifest: Manifest) -> str:
@@ -84,7 +72,7 @@ def test_declared_dependency_consolidates_onto_the_root_key() -> None:
             def region_determines_country(self: ContractSelf) -> object:
                 return self.region_id.determines(self.country_id)
 
-        manifest = _manifest()
+        manifest = _shop_manifest()
         assert len(resolve_contracts(manifest).fd_facts) == 2
         msg = _join_message(manifest)
     assert "keys on store_id, which is nullable upstream" in msg
