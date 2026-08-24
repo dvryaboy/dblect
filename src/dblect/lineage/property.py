@@ -119,14 +119,16 @@ def propagate(
     the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
     silently (the substrate-only path).
 
-    ``inferred_sink`` is the pre-reconcile record (``refutation-and-verdicts.md``):
-    when supplied, each derived subject's inferred annotation is recorded there as
-    the reducer produced it, before reconciliation folds the grounded value in. The
-    flow value keeps its meaning (trust the declaration forward); the record is what
-    lets an emitter ask whether the derivation re-derived a declaration, which the
-    flow value cannot answer for a meet-reconciled property (the declaration unions
-    into it and would check itself). A leaf or a declared-opaque subject has no
-    derivation to judge, so neither is recorded.
+    ``inferred_sink``, when supplied, keeps what the SQL alone implied about each
+    node, before anything the user declared was folded in. Normally the two are
+    combined and only the combined value is kept, which is right for propagation but
+    leaves no way to ask whether the SQL supports a declaration: for a property whose
+    declared and derived values are both true and simply accumulate (candidate keys
+    are the case in hand), the declaration is part of the combined value, so checking
+    a declaration against it always succeeds. Keeping the derived value separately is
+    what lets a caller ask the question. Nodes with nothing to derive from, a source
+    or a node the modeller marked opaque, are absent rather than recorded empty.
+    ``refutation-and-verdicts.md`` covers what a caller can then conclude.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice

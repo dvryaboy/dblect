@@ -41,11 +41,12 @@ class CheckFindingKind(StrEnum):
     ISO-3), so the equated values cannot mean the same thing."""
 
     GRAIN_NOT_ESTABLISHED = auto()
-    """A declared grain or key the model's construction does not re-derive, with the
-    defeater witnessed: a strictly finer key survives to the output with no collapse
-    to the declared grain. The data may still satisfy the declaration (every order
-    may have exactly one line), so this reports "declared but not established",
-    never a violation; see ``docs/design/refutation-and-verdicts.md``."""
+    """A model's SQL does not produce the grain the user declared for it, and we can
+    name the finer key it produces instead (one row per order was declared; the SQL
+    keeps one row per order line). The data may still hold the declaration, since
+    every order might happen to have exactly one line, so this says the grain is not
+    established rather than that it is violated. See
+    ``docs/design/refutation-and-verdicts.md``."""
 
     RESOLUTION_BELOW_FLOOR = auto()
     """Lineage resolution across the project sits below the configured floor, so

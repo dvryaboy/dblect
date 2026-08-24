@@ -2,18 +2,17 @@
 # A contract method's ``self`` is a ContractSelf proxy at capture, not a real
 # instance; annotating it that way trips pyright's self-supertype rule while keeping
 # the proxy usage checked. Typed ``self`` in authored contracts is the stubs concern.
-"""The declared-grain not-established emitter, through the ``run_check`` boundary.
+"""Declaring a grain and running the real check over SQL that does or does not meet it.
 
-These pin the wiring a declared grain travels: contract to fact to propagation to
-finding. The decision procedure itself is pinned against brute force in
-``test_pbt_grain_established.py``, and the verdict vocabulary the wording follows is
-``docs/design/refutation-and-verdicts.md``.
+These follow a declared grain the whole way, from the contract a user writes to the
+finding that comes out, so they catch a break anywhere along that path. Whether the
+underlying decision is correct is settled separately, against brute force, in
+``test_pbt_grain_established.py``.
 
-The load-bearing regression is the pre-reconcile record. Uniqueness reconciles
-declared and inferred keys by meet, so the flow value always contains the
-declaration and a declaration reading it would check itself; the drift test fails
-against any implementation that reads the flow value rather than the recorded
-inferred one.
+The case worth protecting hardest is the first one. A declared key is merged into
+what we know about a model as soon as it is read, so an implementation that compares
+a declaration against the merged keys finds the declaration sitting there and reports
+nothing. That test fails against any such implementation.
 """
 
 from __future__ import annotations

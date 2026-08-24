@@ -130,9 +130,8 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
         # declared a floor to learn its coverage.
         case CheckFindingKind.RESOLUTION_BELOW_FLOOR:
             return Severity.WARN
-        # A witnessed not-established entailment, one grade below a contradiction:
-        # the construction fails to guarantee the declaration, but the data may
-        # still satisfy it, so it ships as a hazard rather than an error.
+        # One grade below a contradiction: the SQL does not guarantee the declared
+        # grain, but the data may still hold it, so this warns rather than errors.
         case CheckFindingKind.GRAIN_NOT_ESTABLISHED:
             return Severity.WARN
     assert_never(kind)

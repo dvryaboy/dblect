@@ -111,10 +111,10 @@ class CheckGraphs:
     the graph build keeps it in step with the graph instead of resting on the assumption
     that successive worlds share one."""
     uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
-    """Every candidate-key grounding fact by relation: the manifest channels plus the
-    resolved contract keys. World-invariant, and the single bucket both the uniqueness
-    propagation and the grain emitter read, so what grounds and what is judged can
-    never drift apart."""
+    """Every key declared for a relation, however it was declared: dbt tests, native
+    constraints, incremental config, and the keys resolved from Python contracts. The
+    same values feed the uniqueness propagation and the grain check, so the two cannot
+    disagree about what a user claimed. Does not vary by world."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,15 +153,16 @@ class WorldAnnotations:
     functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(
         default_factory=_no_fd_annotations
     )
-    """The FD flow per relation, kept for the readers that test coverage through the
-    closure (the grain emitter) rather than recomputed per consumer."""
+    """What each relation's functional dependencies came out as, kept so a consumer
+    that needs them (the grain check reads them to widen what a declared grain
+    covers) does not propagate the property a second time."""
     uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
         default_factory=_no_key_annotations
     )
-    """The pre-reconcile record for uniqueness: each derived relation's candidate keys
-    as the SQL derived them, before the declared keys folded in. What the grain
-    emitter compares a declaration against; the flow value cannot serve (the
-    declaration unions into it and would check itself)."""
+    """The candidate keys each relation's SQL implies on its own, recorded before the
+    declared keys were folded in. This is what the grain check compares a declaration
+    against; the combined value cannot serve, because the declaration is part of it
+    and would end up vouching for itself."""
 
 
 def build_check_graphs(

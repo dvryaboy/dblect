@@ -1,13 +1,14 @@
-"""Soundness PBT for the grain-established decision procedure.
+"""Checking the grain decision against brute force over small tables.
 
-``grain_established`` claims an entailment: a relation unique on each inferred key
-and satisfying the given functional dependencies is unique on the declared grain.
-The property checks that claim against brute force. Generate a small relation, hand
-the decision only claims the relation actually satisfies (its true uniqueness sets
-and true dependencies, any subset of them), and require that whenever the decision
-answers "established" the relation is in fact unique on the declared columns. The
-decision may be conservative (a False on a relation that happens to be unique is
-fine); it must never be credulous.
+``grain_established`` answers "given these keys and dependencies, is the table
+guaranteed unique on the declared columns?" Here we build an actual small table,
+work out which keys and dependencies genuinely hold over its rows, hand the decision
+some of those true facts, and require that any time it answers yes, the table really
+is unique on the declared columns.
+
+Only that direction is a bug. Answering no about a table that happens to be unique
+costs a missed finding; answering yes about one that is not would let a wrong grain
+through, which is what these rule out.
 """
 
 from __future__ import annotations

@@ -1297,12 +1297,15 @@ def uniqueness_facts(
     extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
 ) -> Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]:
-    """Every candidate-key grounding fact, bucketed by relation: the manifest
-    discoverers (unique tests, ``unique_combination_of_columns``, native PRIMARY
-    KEY / UNIQUE, the config ``unique_key`` of a deduplicating incremental model,
-    the surrogate-hash expansion), any ``extra`` discoverers, and any
-    ``extra_facts`` already resolved in the caller's hand (the check threads the
-    contract-declared keys this way, so contracts are resolved once per run)."""
+    """Every key the project declares, collected per relation.
+
+    Reads each way a dbt project can state one: ``unique`` and
+    ``unique_combination_of_columns`` tests, native PRIMARY KEY and UNIQUE
+    constraints, the ``unique_key`` of an incremental model whose strategy actually
+    deduplicates, and a key stated on a surrogate hash (which also tells us the
+    columns hashed into it). ``extra`` adds more readers. ``extra_facts`` takes keys
+    the caller already has in hand, which is how the check passes in keys declared in
+    Python contracts without resolving those contracts a second time."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
