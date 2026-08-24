@@ -83,9 +83,13 @@ def test_established_implies_uniqueness_on_the_declared_grain(
 # --- the edges the closure marks, pinned as counterexamples -------------------------
 
 
-def test_fd_closure_is_what_licenses_coverage() -> None:
-    # unique on (a, b) plus a -> b entails unique on (a); without the dependency the
-    # same key entails nothing about (a) (two rows (1, 1) and (1, 2) separate them).
+def test_coverage_is_containment_through_the_closure_not_an_exact_match() -> None:
+    # A key within the declared columns covers them: unique on (a) is unique on
+    # (a, b), so a non-minimal declaration is established.
+    assert grain_established(frozenset({"a", "b"}), frozenset({frozenset({"a"})}), FDSet.of())
+    # The closure extends that reach: unique on (a, b) plus a -> b entails unique on
+    # (a), where without the dependency the same key entails nothing about (a) (two
+    # rows (1, 1) and (1, 2) separate them).
     grain = frozenset({"a"})
     inferred = frozenset({frozenset({"a", "b"})})
     assert grain_established(grain, inferred, FDSet.of(FD(frozenset({"a"}), "b")))
