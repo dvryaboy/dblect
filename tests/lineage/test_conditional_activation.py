@@ -38,7 +38,6 @@ def _unique(uid: str, *, column: str, target: str, where: str | None = None) -> 
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
         attached_node=target,

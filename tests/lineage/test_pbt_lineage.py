@@ -29,6 +29,7 @@ from dblect.lineage.builder import build_manifest_graph, build_model_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.manifest import Column, Manifest, Node, ResourceType
+from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
 
 
@@ -264,7 +265,7 @@ def _leaf_node(le: LeafSpec) -> Node:
     if le.document_columns:
         for c in le.columns:
             columns[c] = Column(name=c, data_type=None, description=None)
-    return _node(_leaf_uid(le), kind=le.kind, name=le.name, schema=None, columns=columns)
+    return _node(_leaf_uid(le), kind=le.kind, name=le.name, columns=columns)
 
 
 def _model_node(m: ModelSpec, upstream_uids: frozenset[str]) -> Node:
@@ -274,7 +275,6 @@ def _model_node(m: ModelSpec, upstream_uids: frozenset[str]) -> Node:
         sql,
         raw=sql,
         name=m.name,
-        schema=None,
         columns={
             p.out: Column(name=p.out, data_type=None, description=None) for p in m.projections
         },
@@ -294,7 +294,7 @@ def _build_manifest(scenario: Scenario) -> Manifest:
         n = _model_node(m, upstream_uids=upstream_uids)
         nodes[n.unique_id] = n
         name_to_uid[m.name] = n.unique_id
-    return Manifest(schema_version="x", adapter_type="duckdb", nodes=nodes)
+    return _manifest(*nodes.values())
 
 
 def _ground_truth(scenario: Scenario) -> dict[tuple[str, str], frozenset[tuple[str, str]]]:

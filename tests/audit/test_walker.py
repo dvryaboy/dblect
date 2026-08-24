@@ -296,9 +296,6 @@ def test_non_deterministic_limit_fires_through_run_audit() -> None:
         "model.pkg.sampled_table",
         sql,
         raw=sql,
-        name="sampled_table",
-        schema=None,
-        path="models/sampled_table.sql",
         config=ModelConfig(materialized="table"),
     )
     view = replace(
@@ -309,7 +306,7 @@ def test_non_deterministic_limit_fires_through_run_audit() -> None:
         original_file_path="models/sampled_view.sql",
         config=ModelConfig(materialized="view"),
     )
-    manifest = _manifest(*(table, view), schema_version="x")
+    manifest = _manifest(table, view)
     report = run_audit(manifest, _DUCKDB)
     fired = {
         lf.model_unique_id
@@ -326,11 +323,8 @@ def _user_country(raw: str, compiled: str) -> Manifest:
         "model.pkg.user_country",
         compiled,
         raw=raw,
-        name="user_country",
-        schema=None,
-        path="models/user_country.sql",
     )
-    return _manifest(node, schema_version="x")
+    return _manifest(node)
 
 
 def test_macro_emitted_join_visible_in_compiled_code() -> None:

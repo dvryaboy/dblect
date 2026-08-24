@@ -663,9 +663,6 @@ def _agg_manifest_with_source(model_sql: str) -> Manifest:
         "model.shop.revenue_by_country",
         model_sql,
         raw=model_sql,
-        name="revenue_by_country",
-        fqn=("shop", "revenue_by_country"),
-        path="models/revenue_by_country.sql",
         columns=_cols(country="VARCHAR", total="DECIMAL"),
     )
     return _manifest(payments, model)

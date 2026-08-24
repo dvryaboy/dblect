@@ -24,9 +24,10 @@ from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.properties.uniqueness import Key, uniqueness_property
 from dblect.lineage.property import propagate
-from dblect.manifest import Node, ResourceType
+from dblect.manifest import Node
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -36,7 +37,7 @@ _POOL = ("c0", "c1", "c2")  # every model projects all three, so a partition sub
 
 
 def _source(unique_id: str = _RAW, name: str = "events") -> Node:
-    return _node(unique_id, kind=ResourceType.SOURCE, name=name, schema="raw")
+    return source(unique_id, name=name)
 
 
 def _model(sql: str, *, deps: frozenset[str]) -> Node:

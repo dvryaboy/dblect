@@ -57,9 +57,14 @@ def node(
     ``sql`` is the dbt-rendered ``compiled_code`` (what the analysis layer
     parses); ``raw`` is the source template. ``name`` defaults to the last
     unique_id segment and ``fqn`` to the segments after the resource type,
-    matching how dbt shapes both.
+    matching how dbt shapes both. A model's ``path`` defaults to
+    ``models/<name>.sql``, the location dbt would give it, so a finding
+    carries a realistic file path without every test restating one; the
+    other kinds live elsewhere in a project and default to no path.
     """
     resolved_name = name if name is not None else uid.split(".")[-1]
+    if path is None and kind is ResourceType.MODEL:
+        path = f"models/{resolved_name}.sql"
     return Node(
         unique_id=uid,
         name=resolved_name,

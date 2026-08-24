@@ -167,7 +167,6 @@ def test_non_model_resource_grounds_nothing() -> None:
     src = _node(
         "source.shop.raw.events",
         kind=ResourceType.SOURCE,
-        name="events",
         schema="raw",
         config=ModelConfig(
             materialized="incremental", incremental_strategy="merge", unique_key=("id",)

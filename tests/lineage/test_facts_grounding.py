@@ -34,6 +34,7 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.manifest import Manifest
+from tests._manifest_builders import manifest as _manifest
 
 # A flat lattice over a tiny domain: two committed values "A"/"B" that meet to
 # bottom, plus an explicit top and bottom sentinel.
@@ -66,7 +67,7 @@ _FLAT: Lattice[str] = Lattice(meet=_flat_meet, join=_flat_join, top=_TOP, bottom
 _SRC = SourceRef(SourceKind.SOURCE, "source.shop.raw.orders")
 _COL_A = ColumnRef(_SRC, "a")
 _COL_B = ColumnRef(_SRC, "b")
-_EMPTY_MANIFEST = Manifest(schema_version="1", adapter_type="duckdb", nodes={})
+_EMPTY_MANIFEST = _manifest()
 
 
 def _fact(scope: ColumnRef, value: str) -> Fact[str, ColumnRef]:

@@ -23,6 +23,7 @@ from dblect.uniqueness.detector import (
 )
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -747,14 +748,13 @@ def test_fanout_collapse_ignores_aggregate_in_nested_subquery() -> None:
 
 
 def _source_with_identifier(uid: str, *, name: str, identifier: str) -> Node:
-    return _node(uid, kind=ResourceType.SOURCE, name=name, schema="raw", identifier=identifier)
+    return _source(uid, name=name, identifier=identifier)
 
 
 def _unique_test(uid: str, *, column: str, target: str) -> Node:
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,

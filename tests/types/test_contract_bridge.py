@@ -50,7 +50,6 @@ def _unique_test(uid: str, *, column: str, target: str) -> Node:
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}),
         attached_node=target,
     )
@@ -217,8 +216,8 @@ def test_wrong_qualifier_does_not_resolve() -> None:
 
 def test_ambiguous_bare_name_is_a_finding() -> None:
     manifest = _manifest(
-        _node("model.shop.dim_users", fqn=("shop", "dim_users")),
-        _node("model.crm.dim_users", fqn=("crm", "dim_users"), package="crm"),
+        _node("model.shop.dim_users"),
+        _node("model.crm.dim_users", package="crm"),
     )
 
     class DimUsers(ModelContract):

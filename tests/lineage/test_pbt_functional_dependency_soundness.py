@@ -35,8 +35,9 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, Node, ResourceType
+from dblect.manifest import Manifest, Node
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 from tests.lineage._group_spelling import GroupSpelling
 
 _SRC = SourceRef(SourceKind.SOURCE, "source.test.raw.t")
@@ -115,7 +116,7 @@ def _model_sql(s: Scenario) -> str:
 def _claimed(s: Scenario) -> FDSet:
     """The model's FD set, exactly as the relation property derives it."""
     nodes = {
-        _SRC.unique_id: _node(_SRC.unique_id, kind=ResourceType.SOURCE, name="t", schema="raw"),
+        _SRC.unique_id: _source(_SRC.unique_id, name="t"),
         _MODEL.unique_id: _node(_MODEL.unique_id, _model_sql(s), name="m"),
     }
     manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes=nodes)
@@ -248,7 +249,7 @@ def _join_sql(s: JoinScenario) -> str:
 
 
 def _source_node(ref: SourceRef, name: str) -> Node:
-    return _node(ref.unique_id, kind=ResourceType.SOURCE, name=name, schema="raw")
+    return _source(ref.unique_id, name=name)
 
 
 def _join_claimed(s: JoinScenario) -> FDSet:

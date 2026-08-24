@@ -50,7 +50,6 @@ def _not_null_test(
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(
             name="not_null",
@@ -116,7 +115,6 @@ def test_non_nullability_test_is_ignored() -> None:
     other = _node(  # rebuild with a unique test rather than not_null
         other.unique_id,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=other.depends_on,
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": "id"}),
         attached_node=src.unique_id,

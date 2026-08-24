@@ -52,8 +52,6 @@ def _relationships_test(
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        fqn=("shop", uid.split(".")[-1]),
-        schema=None,
         depends_on=frozenset({child, parent}),
         test_metadata=DbtTestMetadata(name="relationships", kwargs=kwargs, enabled=enabled),
         attached_node=child,

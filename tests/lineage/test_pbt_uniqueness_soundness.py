@@ -108,7 +108,6 @@ def _unique_test(source_name: str, *, column: str, where: str | None = None) -> 
         f"test.test.{source_name}_{column}_unique{suffix}",
         kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_unique{suffix}",
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
         attached_node=target,

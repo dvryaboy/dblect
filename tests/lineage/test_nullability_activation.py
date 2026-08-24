@@ -29,7 +29,6 @@ def _not_null(uid: str, *, column: str, target: str, where: str | None = None) -
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}, where=where),
         attached_node=target,

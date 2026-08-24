@@ -57,7 +57,6 @@ def _test(
     return _node(
         uid,
         kind=ResourceType.OTHER,
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name=name, kwargs=dict(kwargs), enabled=enabled, where=where),
         attached_node=target,

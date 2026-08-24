@@ -24,16 +24,12 @@ _DUCKDB = profile_for_adapter("duckdb")
 
 
 def _sql_manifest(compiled_sql: str) -> Manifest:
-    node = _node(
-        "model.pkg.m", compiled_sql, raw=compiled_sql, name="m", schema=None, path="models/m.sql"
-    )
-    return _manifest(node, schema_version="x")
+    node = _node("model.pkg.m", compiled_sql, raw=compiled_sql)
+    return _manifest(node)
 
 
-def _model_node(uid: str, name: str, sql: str, *, depends_on: frozenset[str] = frozenset()) -> Node:
-    return _node(
-        uid, sql, raw=sql, name=name, schema=None, path=f"models/{name}.sql", depends_on=depends_on
-    )
+def _model_node(uid: str, sql: str, *, depends_on: frozenset[str] = frozenset()) -> Node:
+    return _node(uid, sql, raw=sql, depends_on=depends_on)
 
 
 def _multi_model_manifest() -> Manifest:
@@ -41,16 +37,15 @@ def _multi_model_manifest() -> Manifest:
     # and its LEFT JOIN feeding a GROUP BY trips a structural detector. Both families reach
     # across more than one model, so the door exercises the shared build the single-model case
     # would miss.
-    up = _model_node("model.pkg.up", "up", "select id, country from raw_users")
+    up = _model_node("model.pkg.up", "select id, country from raw_users")
     mart = _model_node(
         "model.pkg.mart",
-        "mart",
         "select u.id, d.country, count(*) as n\n"
         "from up u left join up d on u.id = d.id\n"
         "group by u.id, d.country",
         depends_on=frozenset({"model.pkg.up"}),
     )
-    return _manifest(up, mart, schema_version="x")
+    return _manifest(up, mart)
 
 
 def test_analyze_is_the_union_of_both_detector_families() -> None:

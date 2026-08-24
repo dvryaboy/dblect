@@ -34,12 +34,13 @@ from dblect.nullability.detector import (
 from dblect.sql import Finding, FindingKind, parse_sql
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source
 
 _DUCKDB = profile_for_adapter("duckdb")
 
 
 def _source(name: str) -> Node:
-    return _node(f"source.shop.raw.{name}", kind=ResourceType.SOURCE, schema="raw")
+    return source(f"source.shop.raw.{name}")
 
 
 def _model(name: str, sql: str, *, depends_on: frozenset[str]) -> Node:
@@ -52,7 +53,6 @@ def _not_null(source_name: str, column: str) -> Node:
         f"test.shop.{source_name}_{column}_not_null",
         kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_not_null",
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}),
         attached_node=target,

@@ -131,7 +131,7 @@ def test_documented_columns_win_on_conflict() -> None:
 
 
 def _sql_node(uid: str, *, kind: ResourceType, sql: str | None, columns: dict[str, Column]) -> Node:
-    return _node(uid, sql, kind=kind, path=f"models/{uid.split('.')[-1]}.sql", columns=columns)
+    return _node(uid, sql, kind=kind, columns=columns)
 
 
 def test_catalog_lets_select_star_over_an_undocumented_source_resolve() -> None:

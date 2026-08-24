@@ -35,6 +35,7 @@ from dblect.lineage.properties.nullability import activated_nullability
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source
 from tests.lineage._duckdb_oracle import Table, materialized, scalar
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -78,7 +79,7 @@ def _null_sql(s: NullScenario) -> str:
 
 
 def _source(name: str) -> Node:
-    return _node(f"source.test.raw.{name}", kind=ResourceType.SOURCE, schema="raw")
+    return source(f"source.test.raw.{name}")
 
 
 def _not_null_test(source_name: str, column: str) -> Node:
@@ -87,7 +88,6 @@ def _not_null_test(source_name: str, column: str) -> Node:
         f"test.test.{source_name}_{column}_not_null",
         kind=ResourceType.OTHER,
         name=f"{source_name}_{column}_not_null",
-        schema=None,
         depends_on=frozenset({target}),
         test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": column}),
         attached_node=target,

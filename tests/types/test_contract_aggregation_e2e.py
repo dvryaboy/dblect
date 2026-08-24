@@ -43,7 +43,7 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_property,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import Manifest, ResourceType
+from dblect.manifest import Manifest
 from dblect.types import (
     ModelContract,
     contract_fd_discoverer,
@@ -53,6 +53,7 @@ from dblect.types import (
 from tests._manifest_builders import cols as _cols
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 _PAYMENTS = SourceRef(SourceKind.SOURCE, "source.shop.raw.payments")
 _MART = SourceRef(SourceKind.MODEL, "model.shop.revenue_by_country")
@@ -63,17 +64,8 @@ _SQL = "SELECT country, SUM(amount) AS total FROM payments GROUP BY country"
 
 
 def _revenue_manifest() -> Manifest:
-    payments = _node(
-        _PAYMENTS.unique_id,
-        kind=ResourceType.SOURCE,
-        name="payments",
-        fqn=("shop", "raw", "payments"),
-        schema="raw",
-        columns=_cols("amount", "currency", "country"),
-    )
-    mart = _node(
-        _MART.unique_id, _SQL, name="revenue_by_country", fqn=("shop", "revenue_by_country")
-    )
+    payments = _source(_PAYMENTS.unique_id, columns=_cols("amount", "currency", "country"))
+    mart = _node(_MART.unique_id, _SQL)
     return _manifest(*(payments, mart))
 
 
