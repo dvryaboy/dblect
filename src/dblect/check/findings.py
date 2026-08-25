@@ -48,6 +48,12 @@ class CheckFindingKind(StrEnum):
     established rather than that it is violated. See
     ``docs/design/refutation-and-verdicts.md``."""
 
+    DEPENDENCY_NOT_ESTABLISHED = auto()
+    """A model's SQL drops a declared dependency at a UNION whose every arm carried
+    it (each arm can honour ``zip -> city`` alone while mapping one zip differently).
+    The arms may still agree on every shared zip, so this too says not established
+    rather than violated."""
+
     RESOLUTION_BELOW_FLOOR = auto()
     """Lineage resolution across the project sits below the configured floor, so
     the analysis covers only a fraction of columns and a clean report would

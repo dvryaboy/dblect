@@ -29,6 +29,7 @@ from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
+from dblect.check.dependency import declared_dependency_findings
 from dblect.check.findings import (
     CheckFinding,
     CheckFindingKind,
@@ -155,7 +156,14 @@ class WorldAnnotations:
     )
     """What each relation's functional dependencies came out as, kept so a consumer
     that needs them (the grain check reads them to widen what a declared grain
-    covers) does not propagate the property a second time."""
+    covers; the dependency check reads a model's sources at them) does not
+    propagate the property a second time."""
+    functional_dependency_inferred: Mapping[SourceRef, Annotation[FDSet]] = field(
+        default_factory=_no_fd_annotations
+    )
+    """The dependencies each relation's SQL implies on its own, recorded before the
+    declared ones were folded in: the dependency check's counterpart of
+    ``uniqueness_inferred``."""
     uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
         default_factory=_no_key_annotations
     )
@@ -222,7 +230,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         functional_dependency_grounding(by_scope(facts.fd_facts))
     )
     store = AnnotationStore()
-    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop))
+    fd_inferred: dict[SourceRef, Annotation[FDSet]] = {}
+    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop, inferred_sink=fd_inferred))
     for scope, ann in fd_anns.items():
         store.record(fd_prop.name, scope, ann)
 
@@ -242,6 +251,7 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         domain_type=domain_type,
         coherence_clears=tuple(clears),
         functional_dependency=fd_anns,
+        functional_dependency_inferred=fd_inferred,
         uniqueness_inferred=uniqueness_inferred,
     )
 
@@ -373,6 +383,16 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             graphs.uniqueness_facts,
             world.uniqueness_inferred,
             world.functional_dependency,
+        )
+    )
+    findings.extend(
+        declared_dependency_findings(
+            graphs.manifest,
+            by_scope(graphs.resolved.fd_facts),
+            world.functional_dependency_inferred,
+            world.functional_dependency,
+            graphs.relation_build.graph,
+            line_maps,
         )
     )
     return findings

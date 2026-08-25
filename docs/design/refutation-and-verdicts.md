@@ -110,14 +110,15 @@ UNKNOWN, because `consistent` passes top (`facts/lattice.py`).
 |---|---|---|---|
 | `domain_type` | yes (`consistent`) | yes (`provisional`) | yes (`DOMAIN_TYPE_CONTRADICTION`, `check/run.py`) |
 | `nullability` | yes (`consistent`) | yes (`provisional`) | no |
-| `uniqueness` | **never consulted** | no | no |
-| `functional_dependency` | **never consulted** | no | no |
+| `uniqueness` | yes (the pre-reconcile record) | yes (`inferred_sink`) | yes (`GRAIN_NOT_ESTABLISHED`, `check/grain.py`) |
+| `functional_dependency` | yes (the pre-reconcile record) | yes (`inferred_sink`) | yes (`DEPENDENCY_NOT_ESTABLISHED`, `check/dependency.py`) |
 | `referential` | no property yet | — | — |
 
 The nullability row is the near-free win: the conflict is already computed, and
 what surfacing it yields is a not-established finding, never a refutation.
 
-The uniqueness and FD rows are blind for a mechanical reason. Both reconcile by meet (`reconcile_by_meet`,
+The uniqueness and FD rows were blind for a mechanical reason, and the record
+described below is what opened them. Both reconcile by meet (`reconcile_by_meet`,
 `lineage/property.py`): declared and inferred keys are same-polarity lower
 bounds, so the flow value is their union and `consistent` is never consulted.
 The consequence bites the contract layer directly: after reconcile, the stored
@@ -243,11 +244,16 @@ defeater tells it exactly which hop to test.
 - **The contract-layer notes are not blocked.** Their emitters are
   not-established emitters, and nothing they propose consumes machinery that
   does not exist.
-- **The two-channel record lands with its first consumer**, the #202 grain
-  emitter, since that is the reader the record exists for.
+- **The two-channel record landed with its first consumer**, the #202 grain
+  emitter (`check/grain.py`), since that is the reader the record exists for.
+- **The FD reader** (`check/dependency.py`) reuses it. Its witness lives in the
+  dependency walk: a union records what each arm carried into it, renamed
+  through later projections beside the dependency set, so the reader can name
+  the union that dropped a declaration every arm held. The policy both readers
+  share, which declarations are claims about the SELECT and which models have
+  a derived record to compare against, sits in `check/declared.py`.
 - **The nullability not-established finding** follows, reusing the shared
   reader with site-localized reporting.
-- **The FD reader** reuses the uniqueness machinery.
 - **Proven negatives wait** on cardinality and non-emptiness facts (#38 and
   relatives) and re-enter, when they do, as an evidence grade on hazards.
 - **Referential** waits on the property.
@@ -258,9 +264,12 @@ defeater tells it exactly which hop to test.
   soften from a run-stopping error to a Refuted finding, now that a finding
   grade exists for it to land in?
 - Where does the witnessed defeater live structurally? The nullability taint
-  carries it in the graph; the uniqueness walk would need to return the
-  surviving finer key alongside the key set, a small widening of the reducer's
-  return channel.
+  carries it in the graph; the uniqueness witness is a member of the derived
+  key set itself; the dependency walk carries its union witness beside the
+  dependency set and exposes it through a second walk over the tree
+  (`union_merges`) rather than through the reducer's return value. Whether
+  that second walk should become a recorded channel of the one propagation is
+  open.
 - Does Established deserve surfacing (a proven count beside the caveat), or
   does counting proofs invite the same false comfort the finding-count
   discipline avoids?

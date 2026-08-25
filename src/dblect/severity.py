@@ -132,7 +132,7 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             return Severity.WARN
         # One grade below a contradiction: the SQL does not guarantee the declared
         # grain, but the data may still hold it, so this warns rather than errors.
-        case CheckFindingKind.GRAIN_NOT_ESTABLISHED:
+        case CheckFindingKind.GRAIN_NOT_ESTABLISHED | CheckFindingKind.DEPENDENCY_NOT_ESTABLISHED:
             return Severity.WARN
     assert_never(kind)
 
