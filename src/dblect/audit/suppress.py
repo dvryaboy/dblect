@@ -88,10 +88,9 @@ class Suppressible(Protocol):
 _F = TypeVar("_F", bound=Suppressible)
 
 # Match ``noqa`` only when it stands alone: followed by ``:``, whitespace, or
-# end-of-token. The ``(?![\w-])`` is load-bearing: it stops ``noqa-file`` and
-# ``noqa-fixture`` (SQLFluff's file-level directive, and dblect's retired one) from
-# being misread as a bare ``noqa`` that silences everything. That misread is the
-# exact collision this rewrite exists to avoid.
+# end-of-token. The ``(?![\w-])`` lookahead is load-bearing: without it, ``noqa-file``
+# and ``noqa-fixture`` (SQLFluff's file-level directive, and a retired dblect one) would
+# be misread as a bare ``noqa`` that silences everything on the line.
 _NOQA = re.compile(r"--\s*noqa(?![\w-])\s*(?::\s*(?P<codes>[^\n]*))?", re.IGNORECASE)
 
 
@@ -209,9 +208,10 @@ class FramedDirectives:
 
     @classmethod
     def for_node(cls, node: Node) -> FramedDirectives:
-        """Both frames for a manifest node: the source frame from its template and the
-        compiled frame from the SQL the analysis layer parses. The single place the
-        node-field-to-frame binding lives, shared by the structural and declaration runs."""
+        """Both frames for a manifest node: ``raw_code`` is the source frame, and
+        ``analysis_sql`` (the SQL the analysis layer parses) is the compiled frame. The
+        one place that binding lives, so the structural and declaration runs agree on
+        which of a node's texts is which."""
         return cls.parse(raw=node.raw_code, compiled=node.analysis_sql)
 
 

@@ -1,8 +1,9 @@
-"""The fact bridge: registered contracts become substrate facts and findings.
+"""Turns registered contracts into the facts and findings the lineage engine
+consumes.
 
-This is the connective tissue between the authoring surface and the lineage
-engine. It resolves every contract's ``dbt_model`` and column references against
-the manifest, then emits the facts the propagation properties ground from:
+This module connects the Python declarations in this package to the dbt
+project: it resolves each contract's ``dbt_model`` and column references
+against the manifest, then produces:
 
 * a :class:`~dblect.lineage.properties.domain_type.DomainTag` per typed
   magnitude column, with its unit and nominal companions bound to the columns
@@ -12,10 +13,11 @@ the manifest, then emits the facts the propagation properties ground from:
   ``collect`` with the keys read from dbt ``unique`` tests and constraints;
 * the foreign-key edges the grain analysis reads.
 
-Resolution runs after the whole registry is populated, so a name that does not
-resolve becomes a :class:`ContractIssue` and the remaining contracts still
-ground their facts. The discoverers wrap this for the substrate's
-``FactDiscoverer`` protocol. See ``docs/design/propagation-soundness.md``.
+Resolution runs after every contract has registered, so a name that fails to
+resolve becomes a :class:`ContractIssue` while the rest still produce their
+facts. The discoverer classes below just adapt this resolution step to the
+interface the lineage engine uses to collect facts. See
+``docs/design/propagation-soundness.md``.
 """
 
 from __future__ import annotations
@@ -174,8 +176,8 @@ def _column_of(spec: DomainSpec, fname: str) -> str:
 def _build_tag(
     decl_name: str, spec: DomainSpec, src: SourceRef, known: frozenset[str] | None
 ) -> tuple[BoundTag | None, list[ContractIssue]]:
-    """Derive the bound tag for one domain-typed column, or the findings that
-    keep it from grounding.
+    """Build the domain tag for one domain-typed column, or explain why it
+    can't be built.
 
     Returns ``(None, [])`` when the type carries no magnitude (nothing to tag,
     and nothing wrong). Validation against a known column set runs only when one
@@ -418,9 +420,11 @@ def _resolve_methods(
     manifest: Manifest,
     out: _Accumulator,
 ) -> None:
-    """Lower each captured ``@contract`` method onto the substrate. A fact becomes
-    its matching ground fact (a dependency, a key, an edge); a predicate is set
-    aside for the execution loop. A body that failed at capture is a finding."""
+    """Turn each captured ``@contract`` method into what it declared: a fact
+    becomes the matching kind of fact on the resolved output (a dependency, a
+    key, an edge), while a predicate is set aside for the execution loop to
+    check later. A method whose body failed to parse at capture time surfaces
+    here as a finding."""
     for method in cspec.methods:
         if method.error is not None:
             out.issues.append(
@@ -550,11 +554,11 @@ def _own_columns(
 ) -> list[str] | None:
     """The column names of ``columns``, all of which must live on the contract's
     own model and (when ``known`` is supplied) name a real column. A reference into
-    another model is a finding, since the dependency and key facts the substrate
-    carries are single-relation; a column absent from ``known`` is an unknown-column
-    finding, matching the declaration path. ``fold`` case-folds the returned names
-    to the dependency property's lowercased column universe; key and grain facts
-    keep the authored case, which is why they pass ``fold=False``."""
+    another model is a finding, since dependency and key facts here only range over
+    a single relation; a column absent from ``known`` is an unknown-column
+    finding, matching the declaration path. ``fold`` lowercases the returned names
+    to match the functional-dependency property's column casing; key and grain
+    facts keep the name as written, which is why they pass ``fold=False``."""
     names: list[str] = []
     for col in columns:
         if col.model is not None:
@@ -680,8 +684,7 @@ def foreign_key_edges(
 ) -> tuple[ForeignKeyEdge, ...]:
     """Every foreign-key edge the project declares: contract ``ForeignKey``
     markers merged with dbt ``relationships`` tests, de-duplicated so an edge
-    stated both ways appears once. The merge point a future fan-out finding or
-    fixture generator reads from."""
+    stated both ways appears once."""
     contract_edges = resolve_contracts(manifest, registry=registry).foreign_keys
     return tuple(dict.fromkeys((*contract_edges, *dbt_relationship_edges(manifest))))
 
@@ -712,7 +715,8 @@ class _KeyDiscoverer:
 
 class _FdDiscoverer:
     """Yields the contract-sourced functional-dependency facts (from
-    ``self.a.determines(self.b)`` methods) that ground the FD property."""
+    ``self.a.determines(self.b)`` methods) that feed the functional-dependency
+    property."""
 
     def discover(
         self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]

@@ -101,13 +101,13 @@ def _structural_severity(kind: FindingKind) -> Severity:
             | FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
             | FindingKind.NON_DETERMINISTIC_FUNCTION
             # Real-project calibration (#125) found the fanout pair firing on every
-            # intended fact-to-dimension surrogate-key
-            # join: the dimension declares its key on the natural key, and the surrogate
-            # key is a function of it that uniqueness does not yet ground through. They
-            # ship advisory so a textbook star schema stays visible without failing the
-            # build. Raise them back to error once uniqueness grounds through the
-            # surrogate-key expression, or once the lenient/strict split (#116) can hold
-            # the error default in the strict profile.
+            # intended fact-to-dimension surrogate-key join: the dimension declares its
+            # key on the natural key, and the surrogate key is computed from it, but the
+            # analysis does not yet know that a function of a unique column is itself
+            # unique. They ship as warn so a textbook star schema stays visible without
+            # failing the build. Raise them back to error once the analysis can prove
+            # that, or once the lenient/strict split (#116) can hold the error default
+            # in the stricter mode.
             | FindingKind.JOIN_FANOUT
             | FindingKind.CROSS_MODEL_FANOUT
         ):

@@ -16,12 +16,12 @@ to make a claim, and stay silent otherwise):
   ``LIMIT`` has no ``ORDER BY``, or one whose order keys are not covered by a known
   uniqueness key, so a re-run materializes a different slice of rows.
 * ``detect_cross_model_fanout``: a duplicate-sensitive aggregate that folds a
-  magnitude an upstream fan-out replicated, over a relation no longer keyed at the
-  magnitude's grain. This one also reads ``where_provenance`` to find the origin a
-  magnitude traces to, the grain ``grain_preserved`` is asked about. A COUNT fold
-  (``COUNT(*)``, ``COUNT(col)``) yields a cardinality, not a magnitude: it counts the
-  relation's rows, whose grain the relation preserves, so it stays silent (the ``SUM(qty)``
-  analog), unlike ``SUM(amount)``.
+  magnitude (a summed value, say) an upstream fan-out replicated, over a relation no
+  longer keyed at the magnitude's grain. It traces the magnitude back to its origin via
+  ``where_provenance``, then asks ``grain_preserved`` whether that origin's grain still
+  holds. A COUNT fold (``COUNT(*)``, ``COUNT(col)``) yields a cardinality, not a
+  magnitude: it counts the relation's rows, whose grain the relation preserves, so it
+  stays silent (the ``SUM(qty)`` analog), unlike ``SUM(amount)``.
 
 The first two read keys from the lineage.facts uniqueness substrate: per-model keys
 come from cross-model propagation (``uniqueness_property`` over the relation graph),

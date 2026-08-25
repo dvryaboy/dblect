@@ -1,8 +1,10 @@
 """Run dbt models end-to-end in DuckDB and capture the output.
 
-This is the substrate the static-analysis invariant checks and the runtime
-PBT loop sit on. We use a subprocess as the v1 approach for fidelity:
-in-process Jinja rendering is a follow-up when perf bites.
+Other parts of dblect build on this: the static-analysis invariant checks and
+the runtime PBT loop both call `run_model` when they need a model's actual
+materialized rows, not an inferred fact. We run dbt as a subprocess for
+fidelity; rendering Jinja in-process ourselves is a possible optimization if
+performance becomes a problem.
 
 The contract:
 

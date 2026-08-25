@@ -225,12 +225,13 @@ class Column:
 class Macro:
     """A macro definition as carried in the manifest's ``macros`` block.
 
-    The source body (`macro_sql`) is what the var-inference macro-following
-    engine expands to reach `var()` calls; `depends_on_macros` is the
-    macro-to-macro edge set that walk recurses through. This view is a faithful
-    transcription of the manifest entry; resolving a name to a definition (the
-    bare-name-then-package lookup) lands with macro-following, which defines what
-    that resolution must satisfy.
+    Lets a caller look inside a macro call instead of treating it as opaque:
+    `macro_sql` is the macro's own source, and `depends_on_macros` lists the
+    other macros it calls, so a caller can follow a chain of calls to find,
+    say, a `var()` buried several macros deep. This is a straight
+    transcription of the manifest entry; resolving a bare macro name to one
+    of these definitions is a separate concern, worked out in
+    ``docs/design/var-inference-spec.md``.
     """
 
     unique_id: str
@@ -294,9 +295,9 @@ class Node:
         """How faithfully ``compiled_code`` represents this model.
 
         ``NOT_COMPILED`` when dbt's own flag says so. Otherwise ``STALE_OR_ABSENT``
-        when there is a non-trivial source template but no compiled code (the
-        non-hermetic-compile gap), and ``COMPILED`` when there is compiled code or
-        nothing non-trivial to compile.
+        when there is a non-trivial source template but no compiled code (a compile
+        that never reached the warehouse), and ``COMPILED`` when there is compiled
+        code or nothing non-trivial to compile.
 
         Only SQL nodes carry this signal: a Python (or other non-SQL) model is not
         SQL-analysable, so an empty SQL ``compiled_code`` is not the compile gap and the
@@ -346,7 +347,7 @@ def generic_test_target_uid(
     Prefer ``attached_node`` (the modern manifest shape); fall back to the first
     eligible entry in ``depends_on`` for older manifests where ``attached_node``
     isn't populated. ``eligible_prefixes`` narrows which target kinds count, so a
-    caller that grounds only models and sources can pass a subset of the
+    caller that only cares about models and sources can pass a subset of the
     data-flow default.
     """
     if node.attached_node and node.attached_node.startswith(eligible_prefixes):
@@ -401,8 +402,8 @@ class Manifest:
             raise ValueError("manifest is missing metadata.adapter_type")
 
         # Macros live under their own top-level `macros` block, separate from
-        # the data-flow `nodes`. They carry no edges into the DAG; the registry
-        # is consumed by macro-following, not by lineage.
+        # the data-flow `nodes`. They carry no edges into the DAG; see
+        # :class:`Macro` for what consumes this registry.
         macros = {uid: _macro_from_parsed(uid, m) for uid, m in (parsed.macros or {}).items()}
         return cls(
             schema_version=schema_version,

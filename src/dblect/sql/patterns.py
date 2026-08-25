@@ -548,10 +548,10 @@ def detect_inner_flatten_row_drop(
     spelling (``UNNEST``, spark ``explode``, snowflake ``FLATTEN``): a literal ``ARRAY[...]``
     constructor with one or more elements is the local, always-on case (the wide-to-long pivot
     idiom). ``column_is_nonempty``, when supplied, answers
-    whether an unnested *column* is provably non-empty; the audit builds it over the
-    ``array_nonemptiness`` property resolved across model and CTE boundaries, so a
-    rebuilt-then-unnested array stays quiet. The detector treats columns as opaque
-    otherwise, which keeps this module free of lineage types.
+    whether an unnested *column* is provably non-empty; the audit builds it from the
+    ``array_nonemptiness`` property, resolved across model and CTE boundaries, so a
+    rebuilt-then-unnested array stays quiet. Without it, a column's non-emptiness is simply
+    unknown, which keeps this module free of lineage types.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -808,9 +808,9 @@ def _array_expr_nonempty(
 
     The intrinsic constructors the SQL vocabulary proves from the node alone are the always-on
     local cases: a literal ``ARRAY[...]``, a ``GENERATE_ARRAY`` over literal bounds. For a
-    column, the answer comes from ``column_is_nonempty``, the lineage-grounded predicate the
-    audit supplies; without it, a column is treated as opaque, so the detector module stays
-    free of lineage types.
+    column, the answer comes from ``column_is_nonempty``, a check the audit supplies from facts
+    traced across model boundaries; without it, a column's non-emptiness is simply unknown, so
+    this module stays free of lineage types.
 
     Non-emptiness is proved where the array is *produced*. A column that arrives through the
     nullable side of an outer join can still be NULL at the unnest, and ``UNNEST(NULL)`` drops

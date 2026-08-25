@@ -10,10 +10,11 @@ or the ``LEFT JOIN ... IS NULL`` idiom): a filter over the probe side preserves 
 cannot fan out. The nullability detector consumes every form, since a NULL probe key is kept
 as a spurious non-match rather than dropped, the inverse of an ordinary join's hazard.
 
-The classifier is deliberately oracle-free: it decides each form structurally so any consumer
-can call it without threading the nullability substrate. The one edge that needs nullability,
-a ``LEFT JOIN ... IS NULL`` on a column that is not a join key, is left unrecognised here (see
-:func:`_left_is_null_anti_join`); a consumer that holds the substrate decides it itself.
+The classifier is deliberately oracle-free: it decides each form structurally so any caller
+can use it without first working out which columns can be NULL. The one edge that needs that
+information, a ``LEFT JOIN ... IS NULL`` on a column that is not a join key, is left
+unrecognised here (see :func:`_left_is_null_anti_join`); a caller that already has it decides
+that case itself.
 """
 
 from __future__ import annotations
@@ -147,8 +148,8 @@ def _left_is_null_anti_join(j: exp.Join, *, leaves: list[Expr], from_alias: str)
     column is one of ``R``'s join-key columns in ``P``. A matched row then has ``l.x = R.col`` so
     ``R.col`` is non-NULL there and the filter drops it, keeping exactly the unmatched rows. The
     equality match proves the column non-NULL, so the recognition needs no nullability oracle. An
-    ``IS NULL`` on a non-key column can leak matched rows and is left for a substrate-backed
-    consumer to decide."""
+    ``IS NULL`` on a non-key column can leak matched rows and is left for a caller that knows
+    which columns can be NULL to decide."""
     matched_alias = j.this.alias_or_name
     matched_cols = _sides_of(sg.on_of(j)).get(matched_alias, frozenset())
     if not matched_cols:
@@ -218,8 +219,8 @@ def _not_in_anti_join(in_node: exp.In, *, from_alias: str, node: Expr) -> AntiJo
 
 def single_projected_column(query: Expr) -> tuple[str, str] | None:
     """The ``(relation, column)`` a subquery projects, when it is a single bare column over a
-    single bare-table FROM with no joins; else ``None``. The lower-cased column matches the
-    nullability substrate's own column keys."""
+    single bare-table FROM with no joins; else ``None``. The column name is lower-cased to
+    match how dblect's nullability tracking keys its own columns."""
     select = query.this if isinstance(query, exp.Subquery) else query
     if not isinstance(select, exp.Select) or sg.joins_of(select):
         return None

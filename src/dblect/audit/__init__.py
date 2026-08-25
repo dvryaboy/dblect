@@ -1,4 +1,5 @@
-"""Audit pipeline: static detectors, replay-determinism, heuristic invariants."""
+"""Runs SQL detectors over a manifest, locates each finding in the developer's
+source, and applies ``-- noqa`` suppressions."""
 
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import SuppressionDirective

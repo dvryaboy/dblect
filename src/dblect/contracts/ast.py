@@ -23,8 +23,9 @@ from enum import StrEnum, auto
 
 
 class AggFunc(StrEnum):
-    """The reductions a column proxy offers. ``COUNT`` and ``COUNT_DISTINCT`` are
-    always well typed; the rest carry the coherence obligation the algebra names."""
+    """The reductions a column proxy offers. ``COUNT`` and ``COUNT_DISTINCT`` need
+    no unit checking; the rest (sum, average, min, max) require the values being
+    combined to share one unit or currency, which dblect verifies separately."""
 
     SUM = auto()
     AVG = auto()
@@ -35,8 +36,8 @@ class AggFunc(StrEnum):
 
 
 class ArithOp(StrEnum):
-    """Binary arithmetic over magnitudes (the dimensional algebra lives downstream;
-    here we only record the operator)."""
+    """Binary arithmetic (add, subtract, multiply, divide) over magnitude columns.
+    Unit and currency checking happens elsewhere; this only records the operator."""
 
     ADD = auto()
     SUB = auto()
@@ -170,9 +171,10 @@ Pred = Compare | IsNull | InSet | Between | BoolNode
 
 # --- facts ----------------------------------------------------------------------
 #
-# A contract method that returns one of these feeds the substrate rather than
-# being run: it is a vouched assertion the analyzer trusts to discharge
-# obligations and propagate. The bridge lowers each to the matching substrate fact.
+# A contract method that returns one of these is never run: it hands dblect a
+# fact to trust outright, the same way a declared key is trusted, and that fact
+# then feeds every check downstream. The fact bridge (outside this package)
+# converts each into the matching internal fact record.
 
 
 @dataclass(frozen=True, slots=True)

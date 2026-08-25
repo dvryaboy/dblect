@@ -5,18 +5,21 @@ the propagator's aggregate dispatch already uses, dialect-neutral: bigquery
 ``min_by``/``max_by`` arrive as ``ArgMin``/``ArgMax``, duckdb ``median``/``quantile`` have
 dedicated nodes). They are recorded together rather than in two parallel tables.
 
-**Magnitude (result domain).** What domain the result lives in, which decides the
-currency-coherence obligation (``docs/design/domain-type-algebra.md``):
+**Magnitude (result domain).** What domain the result lives in. A COMBINE aggregate like
+``sum`` blends every row into one new value, so if the rows carry different per-row tags
+(mixed currencies, say) the blend is meaningless; this axis is what tells the domain-type
+checker to demand a constant tag across the group before trusting the result
+(``docs/design/domain-type-algebra.md``):
 
 * **COMBINE** synthesizes a new value out of many (``sum``, ``avg``, a spread, a middle).
-  A per-row companion that varies within the group corrupts the result, so a combining
-  reduction carries the coherence obligation.
+  A per-row tag that varies within the group corrupts the result, so this class needs the
+  constant-tag check.
 * **SELECT** returns one of the input values (``min``, ``max``, ``arg_min``). The value is
-  real, so the operation does not fail; only its tag is uncertain, because the comparison
-  that chose it was tag-blind. The result widens to top.
+  real, so the operation does not fail; only its tag is uncertain, since the comparison
+  that chose it never looked at tags. The result's tag widens to "unknown".
 * **COUNT** ignores the magnitude and yields a tag-free cardinality.
-* ``None`` is "no magnitude obligation": the boolean, bitwise, and collection folds live
-  on non-magnitude domains, so the lenient default reads them as having no obligation
+* ``None`` means no magnitude obligation applies: the boolean, bitwise, and collection folds
+  live outside this domain typing, so the lenient default treats them as unconstrained
   rather than guessing.
 
 **Multiplicity (duplicate-sensitivity).** Whether a fan-out that duplicates input rows
@@ -110,7 +113,7 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     exp.Count: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=True),
     exp.CountIf: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=True),
     exp.ApproxDistinct: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=False),
-    # Non-magnitude folds (no coherence obligation), classified on the multiplicity axis.
+    # Non-magnitude folds (outside the constant-tag check), classified on the multiplicity axis.
     # Boolean and bitwise-and/or have an idempotent combine (``x AND x = x``, ``x & x = x``),
     # so they are safe; bitwise xor cancels a duplicated row (``x ^ x = 0``) and collection
     # folds gather every row into a container, so both are sensitive.
@@ -161,12 +164,12 @@ def strips_duplicates(agg: exp.Func) -> bool:
 def duplicate_sensitive(agg: exp.Func, *, safe_builtins: frozenset[str] = frozenset()) -> bool:
     """True if a fan-out that duplicates ``agg``'s input rows would distort its result.
 
-    The duplicate-sensitivity predicate of the hazard algebra. A ``DISTINCT`` on the input
-    removes the duplicates before the fold, so any aggregate becomes safe
-    (``count(distinct x)``). Otherwise the answer is the aggregate type's registry fact;
-    a ``max`` or ``bool_or`` is safe, a ``sum`` or ``array_agg`` is sensitive. An
-    ``exp.Anonymous`` UDF has no registry type, so it is sensitive unless the adapter names
-    it in ``safe_builtins`` (case-insensitive): the firewall posture keeps an unknown fold
+    This is the duplicate-sensitivity check from ``docs/design/hazard-algebra.md``. A
+    ``DISTINCT`` on the input removes the duplicates before the fold, so any aggregate
+    becomes safe (``count(distinct x)``). Otherwise the answer is the aggregate type's
+    registry fact; a ``max`` or ``bool_or`` is safe, a ``sum`` or ``array_agg`` is
+    sensitive. An ``exp.Anonymous`` UDF has no registry type, so it is sensitive unless
+    the adapter names it in ``safe_builtins`` (case-insensitive): an unknown fold keeps
     firing rather than clearing a fan-out on a guess."""
     if strips_duplicates(agg):
         return False

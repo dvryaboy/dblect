@@ -1,14 +1,14 @@
 """Scalar field types and the rule that classifies a field by its meaning.
 
-A domain type's field is read by what it *is*, not annotated by hand. The
-classification is the seam between the author's ordinary Python annotations and
-the substrate's tag algebra (``docs/design/domain-type-algebra.md``):
+A domain type's field is read by what it *is*, not annotated by hand. This
+classification connects the author's ordinary Python annotations to dblect's
+tag algebra (``docs/design/domain-type-algebra.md``):
 
 * a numeric :class:`Decimal` (or ``Decimal(p, s)``), a :class:`Count`, or a
   floating-point ``float`` / :class:`Float` is a **magnitude**, the field a tag
   rides on;
 * a :class:`~dblect.types.enums.UnitEnum` (a currency) is a **unit**, the
-  dimensional companion of the magnitude;
+  companion that the magnitude is measured in;
 * a :class:`~dblect.types.enums.NominalEnum`, a ``bool``, a ``str``, or a
   :class:`Varchar` is a **nominal** category, carried by equality;
 * a :class:`Date`, a :class:`Timestamp` / ``datetime``, and a bare integer
@@ -17,7 +17,7 @@ the substrate's tag algebra (``docs/design/domain-type-algebra.md``):
 A bare integer is the one scalar whose role its algebra does not settle: an
 integer is algebraically a perfect quantity, yet by role it is as often an
 identifier or a calendar year, which are tags. The lenient default reads it as
-opaque (inert), making no claim either way; a measure is spelled ``Count`` /
+inert, making no claim either way; a measure is spelled ``Count`` /
 ``Decimal`` and an identifier or year carries its own domain type. A future
 strict mode rejects a bare integer instead, per the lenient/strict switch in
 ``docs/design/domain-type-algebra.md``.
@@ -41,7 +41,7 @@ class FieldKind(StrEnum):
     """How a field participates in a tag."""
 
     MAGNITUDE = auto()  # the numeric value a tag rides on (an amount, a count)
-    UNIT = auto()  # a dimensional companion (a currency)
+    UNIT = auto()  # the companion a magnitude is measured in (a currency)
     NOMINAL = auto()  # a categorical companion carried by equality
     INERT = auto()  # a scalar that carries no tag (a date)
 
@@ -66,9 +66,9 @@ class FieldDef:
 
 class Decimal:
     """A fixed-point magnitude type, usable bare (``Decimal``) or parameterized
-    (``Decimal(18, 2)``). The parameters annotate precision and scale; the
-    substrate does not yet reason over them, but the contract carries them so a
-    later width check has them to hand."""
+    (``Decimal(18, 2)``). The parameters annotate precision and scale; dblect
+    does not yet reason over them, but the contract carries them so a later
+    width check has them to hand."""
 
     __slots__ = ("precision", "scale")
 

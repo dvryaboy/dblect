@@ -9,8 +9,8 @@ with nothing built. Each world is read back as an ordinary
 
 The override reaches the bare ``{{ is_incremental() }}`` call. A model that calls
 ``dbt.is_incremental()`` explicitly, or a branch that introspects the existing
-relation's schema at compile, is not reached and degrades to an opaque world
-(reported with its error) while the other world still stands.
+relation's schema at compile, is not reached, so that world's compile fails and
+is reported with its error, while the other world still stands.
 """
 
 from __future__ import annotations
@@ -34,9 +34,10 @@ from dblect.execution.project_env import (
 from dblect.lineage.facts.model import WorldRef
 from dblect.manifest import Manifest
 
-# The run-mode axis and its two worlds, expressed as the same ``WorldRef``
-# assignment vocabulary the flag layer uses, so an incremental world composes
-# with flag worlds as a union of assignments rather than a separate notion.
+# is_incremental is represented as a WorldRef assignment, the same
+# representation the flag layer uses for its own axes. That lets code combine
+# an incremental world with a flag world by merging assignments, instead of
+# treating incrementality as a special case.
 INCREMENTAL_AXIS = "is_incremental"
 FULL_REFRESH_WORLD: WorldRef = WorldRef(frozenset({(INCREMENTAL_AXIS, False)}))
 STEADY_STATE_WORLD: WorldRef = WorldRef(frozenset({(INCREMENTAL_AXIS, True)}))
@@ -136,7 +137,8 @@ def _compile_world(
     env: Mapping[str, str],
 ) -> CompiledWorld:
     """Write the override for ``value``, compile, and harvest the manifest. A
-    non-zero compile or a missing manifest yields an opaque world, never a raise."""
+    non-zero compile or a missing manifest is reported as a world whose compile
+    failed, never raised as an exception."""
     macro_path.write_text(_override_macro(value))
     proc = run_dbt(dbt, ["compile", "--project-dir", str(work)], env=env)
     if proc.returncode != 0:

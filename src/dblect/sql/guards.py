@@ -14,12 +14,13 @@ The guards read one fact about the surrounding query: which relation aliases the
 join NULL-pads (``nullable``, from :func:`outer_join_optional_aliases`). A column whose
 qualifier is not among them is drawn from a relation the join keeps present, so it is a
 guaranteed-present value for the fallback rules. An unqualified column carries no alias to
-check, so it is treated as not-guaranteed-present: the firewall posture keeps firing under
-uncertainty rather than clearing on a guess.
+check, so it is treated as not-guaranteed-present: uncertainty keeps the finding firing
+rather than clearing it on a guess.
 
-The catalog is the evidence side of the broad-net posture (``docs/design/hazard-algebra.md``):
-each guard recognises a proven-safe shape, and an unrecognised shape keeps firing, so an
-incomplete catalog costs a false positive, never a false negative.
+That is the same conservative default the catalog as a whole follows
+(``docs/design/hazard-algebra.md``): each guard recognises a proven-safe shape, and an
+unrecognised shape keeps firing, so an incomplete catalog costs a false positive, never a
+false negative.
 """
 
 from __future__ import annotations

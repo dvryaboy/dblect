@@ -2,10 +2,11 @@
 
 A ``Finding`` is a single structural observation about one SQL statement, located
 by a line span. Every detector layer emits these: the structural pattern detectors
-in :mod:`dblect.sql.patterns`, the lineage-grounded detectors under
-:mod:`dblect.nullability`, :mod:`dblect.uniqueness`, :mod:`dblect.snapshot`, and
-:mod:`dblect.flatten`. ``FindingKind`` is their shared vocabulary, so it lives here
-rather than in any one detector module.
+in :mod:`dblect.sql.patterns`, which look at one statement alone, and the detectors
+under :mod:`dblect.nullability`, :mod:`dblect.uniqueness`, :mod:`dblect.snapshot`,
+and :mod:`dblect.flatten`, which draw on facts traced across model boundaries.
+``FindingKind`` is their shared vocabulary, so it lives here rather than in any one
+detector module.
 
 These are span-in-one-statement findings, distinct from the declaration-level
 findings :mod:`dblect.check.findings` carries (``CheckFindingKind`` /
@@ -69,7 +70,7 @@ class Finding:
     """A single static-analysis observation about a SQL statement.
 
     ``line_start`` and ``line_end`` are 1-indexed line numbers in the SQL
-    the detector was given — the model's ``compiled_code``, which dbt
+    the detector was given: the model's ``compiled_code``, which dbt
     renders with refs and macro calls expanded inline. Line numbers
     correspond to the compiled output; the reporter still surfaces the
     model's source file path so navigation works as expected.

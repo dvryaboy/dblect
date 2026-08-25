@@ -9,9 +9,9 @@ narrows a type all land in the same spec, so they mean the same thing:
 * ``T.columns(field="col")`` maps fields to warehouse columns;
 * the call form ``T(field=value, amount="col")`` is sugar for both, splitting a
   magnitude's string into a column map and everything else into a fixing;
-* subclassing extends (adds fields) and fixes (a class-level default), with
-  multiple inheritance taking the union of facets and requiring agreement where
-  two bases fix the same field.
+* subclassing extends (adds fields) and fixes (a class-level default); with
+  multiple inheritance, the result has every field and fixing either base has,
+  and two bases that fix the same field must agree.
 
 This mirrors Pydantic's class-as-declaration shape without its runtime: the
 class is never instantiated to validate a row. Calling it returns a *narrowed

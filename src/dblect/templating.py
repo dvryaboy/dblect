@@ -75,9 +75,9 @@ def make_environment() -> Environment:
 def shared_environment() -> Environment:
     """The dbt-template parsing environment, materialized once on first use.
 
-    Building an environment wires three extensions, and a caller parsing one
-    environment per node otherwise. The environment only ever ``parse``s (it never
-    renders and holds no per-source state), so a single instance serves every walk.
-    Callers that want an isolated environment build one with :func:`make_environment`.
+    Building an environment wires up three extensions, wasted work if a caller built
+    one per node instead. The environment only ever ``parse``s (it never renders and
+    holds no per-source state), so one instance can safely serve every walk. Callers
+    that want an isolated environment build one with :func:`make_environment`.
     """
     return make_environment()

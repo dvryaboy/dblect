@@ -58,12 +58,14 @@ from dblect.uniqueness.detector import (
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
-# The dialect-agnostic structural detectors. Context-bound detectors (non-determinism
-# from the resolved adapter, uniqueness and nullability grounded against declared
-# facts, inner-flatten grounded against propagated array non-emptiness) are built per
-# run in `run_audit` and appended there, so they are not listed. The inner-flatten check
-# in particular is run only through its fact-grounded factory so it sees the cross-model
-# non-emptiness map; listing the structural form here too would double-report it.
+# The dialect-agnostic structural detectors: the ones that need nothing beyond the SQL
+# itself. Context-aware detectors (non-determinism checked against the resolved
+# adapter; uniqueness and nullability checked against declared facts; inner-flatten
+# checked against array non-emptiness propagated from other models) are built per run
+# in `run_audit` and appended there, so they are not listed here. The inner-flatten
+# check in particular runs only through that context-aware factory, so it can see
+# non-emptiness facts from other models; listing the plain structural form here too
+# would double-report the same hazard.
 DEFAULT_DETECTORS: tuple[Detector, ...] = (
     detect_null_group_after_outer_join,
     detect_coalesce_on_join_key,
@@ -161,35 +163,36 @@ def run_audit(
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
 
-    ``profile`` is the run's resolved target: its dialect parses every model and
-    its semantics ground the fact-based detectors, so parsing and enforcement read
-    the same adapter.
+    ``profile`` is the run's resolved target: its dialect parses every model, and its
+    adapter-specific facts (e.g. which builtins are non-deterministic) feed the
+    detectors that need them, so parsing and detection agree on the same adapter.
 
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
     Models whose ``compiled_code`` is missing or unparseable are listed in
     the report's ``skipped`` field with a reason rather than raising.
 
-    Context-bound detectors run alongside the configured `detectors` list, each
-    built from the resolved profile and the pre-parsed trees: the non-determinism
-    detector (its builtin names come from the profile), the uniqueness window
-    order-keys, join-fanout, and non-deterministic-``LIMIT`` detectors (grounded
-    against declared keys, the last also against each model's materialization), the
-    nullability hazard detectors (GROUP BY, join key, and NOT IN on an
-    inherited-nullable column, grounded against the propagated nullability
-    property), the inner-flatten row-drop detector (grounded against the
-    propagated array-non-emptiness property, so a rebuilt-then-unnested array is
-    not flagged), and the snapshot temporal-filter detector (grounded against the
-    manifest's snapshots and their validity columns). The fact-grounded ones are
-    opportunistic, silent on projects that declare nothing, so they need no opt-in
-    flag. They share the audit's pre-parsed trees, so the SQL is parsed once.
+    Besides the configured `detectors` list, this run also builds and appends detectors
+    that need the resolved profile or a prior analysis pass: the non-determinism
+    detector (its builtin names come from the profile), the uniqueness detectors for
+    window order-keys, join fanout, and non-deterministic ``LIMIT`` (checked against a
+    model's declared keys, the last also against its materialization), the nullability
+    hazard detectors for GROUP BY, join keys, and NOT IN on a column that inherited
+    nullability (checked against nullability already propagated through the lineage
+    graph), the inner-flatten row-drop detector (checked against array non-emptiness
+    propagated the same way, so a rebuilt-then-unnested array is not flagged), and the
+    snapshot temporal-filter detector (checked against the manifest's snapshots and
+    their validity columns). These detectors stay quiet on a project that has declared
+    nothing to check against, so they need no opt-in flag. They share the audit's
+    pre-parsed trees, so the SQL is parsed once.
 
-    This is the structural family alone. A consumer that needs every family's
-    findings over a manifest (any multi-world or finding-threading path) calls
-    :func:`dblect.analysis.analyze` instead, which carries both families so a family
-    is never dropped by being forgotten.
+    This is the structural family alone. A caller that also needs the declaration-level
+    findings, or that has to track findings across multiple build variants of the
+    project, should call :func:`dblect.analysis.analyze` instead, which runs both
+    families so neither is forgotten.
     """
-    # ``analyze`` shares the parse and both lineage graphs it already built (rebuilding them,
-    # the heavy substrate, dominates a run); omitted, this builds them, the standalone path.
+    # `analyze` passes in the parse and both lineage graphs it already built, since
+    # rebuilding them is the expensive part of a run; omitted, as in a standalone
+    # audit run, this function builds them itself.
     if parsed is None:
         parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
     else:

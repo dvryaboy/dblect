@@ -170,8 +170,8 @@ def check(
 
     Both detector families run over the project. The structural family needs only the
     compiled SQL, so it reports on any project. The declaration family resolves the
-    contracts under ``<project_dir>/dblect/`` if present; with none declared it simply
-    reports zero contracts resolved rather than nothing to do.
+    contracts under ``<project_dir>/dblect/`` if present; with none declared, it still
+    runs and reports zero contracts resolved instead of skipping silently.
     """
     from dataclasses import replace
 

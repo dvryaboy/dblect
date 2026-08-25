@@ -9,7 +9,7 @@ under a unique synthetic package name; the framework imports the modules use
 project's own relative imports (``from ..types import ...``) resolve within the
 synthetic package. And one broken module must not abort the scan, so an import
 failure is recorded as a :class:`LoadIssue` and the remaining modules still load.
-The whole import runs inside a fresh registry, returned for the bridge to resolve.
+The whole import runs inside a fresh registry, returned for the fact bridge to resolve.
 
 See ``docs/design/dblect_technical_intro.md`` (loading lifecycle).
 """

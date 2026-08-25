@@ -1,10 +1,12 @@
-"""Var inference: discover every ``var()`` / ``env_var()`` reference in a dbt
-project and infer enough about each to enumerate worlds.
+"""Var inference: find every ``var()`` / ``env_var()`` reference in a dbt
+project and work out enough about each one to check the project under every
+value it could take.
 
-This package is the discovery half of the flag system. The Jinja front end
+This package is the discovery half of dblect's flag system, which turns dbt
+vars and env vars into typed configuration. The Jinja front end
 (:mod:`dblect.templating`, :mod:`dblect.varinf.walker`) turns a node's source
-Jinja into :class:`~dblect.varinf.usage.VarUsage` records; later streams fold
-those into typed, domain-bearing flags.
+Jinja into :class:`~dblect.varinf.usage.VarUsage` records; later stages turn
+those into flags with a declared type and a known set of values.
 """
 
 from dblect.varinf.usage import (

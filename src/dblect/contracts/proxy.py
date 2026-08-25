@@ -262,8 +262,9 @@ def _existing_ref(cmp: Compare) -> ValueExpr | None:
 
 
 class FactProxy:
-    """A fact a contract method returns. Inert: it only carries the AST node the
-    bridge lowers to a substrate fact."""
+    """A fact a contract method returns. Inert on its own: it just carries the AST
+    node that the fact bridge (outside this package) later turns into a fact
+    dblect trusts about the data."""
 
     __slots__ = ("fact",)
 

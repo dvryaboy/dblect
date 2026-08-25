@@ -1,18 +1,19 @@
 """Walk a node's source Jinja and emit a :class:`VarUsage` per ``var()`` /
 ``env_var()`` reference, tagged with the syntactic position it sits in.
 
-The walk is context-carrying: each recursive step knows what context to assign a
-bare ``var`` call found directly at that position (the ``default`` argument),
-while the operator nodes that define a richer context (``If`` tests, ``Compare``,
-arithmetic, other calls) classify their ``var`` operands themselves. The
-control-flow versus value-substitution signal the world enumerator depends on is
-read straight off the resulting :data:`UsageContext` variant, with no text
-heuristics.
+The walk carries context as it recurses: a bare ``var`` call keeps the context
+its enclosing node set (the ``default`` argument), while a node that gives its
+children a more specific meaning (an ``if`` test, a comparison, an arithmetic
+expression, another call) classifies its own ``var`` operands. That is how a
+var that picks which branch runs (``{% if var('flag') %}``) is told apart from
+one that is just substituted into the rendered SQL (``{{ var('limit') }}``):
+the answer comes straight from which :data:`UsageContext` variant the var
+landed in, never from inspecting the surrounding text.
 
-Direct usage only. A ``var`` reached through a macro is the macro-following
-stream's concern, so a ``var`` passed to another call is recorded as a
-:class:`MacroArg` here and followed there. A body the environment cannot parse
-degrades to one :class:`OpaqueNode` diagnostic rather than raising.
+Direct usage only. A ``var`` reached through a macro call is left for a later
+pass that follows macros; here it is only recorded as a :class:`MacroArg`. A
+body the environment cannot parse degrades to one :class:`OpaqueNode`
+diagnostic rather than raising.
 """
 
 from __future__ import annotations

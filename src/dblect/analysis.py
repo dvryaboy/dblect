@@ -6,8 +6,8 @@ the declaration-level ones (contract resolution, domain-type contradictions acro
 the DAG, not-well-typed aggregations), located by model, column, and contract.
 :func:`~dblect.audit.run_audit` reports the SQL-structural ones (join fan-out,
 window order, the nullability hazards, the rest), located by a span in one compiled
-statement. The two stay distinct in representation and altitude; issue #107 weighs
-whether to merge the representations as well.
+statement. The two stay distinct in shape rather than merged into one; issue #107
+weighs whether to unify them too.
 
 What this module removes is the obligation to *know* there are two families. Asking
 for "the findings of a manifest" should not require remembering to call both
@@ -72,8 +72,9 @@ def cross_world_identity(finding: AnalysisFinding) -> FindingIdentity:
 class AnalysisReport:
     """Every finding for one manifest, from every detector family, plus each family's
     own report so a caller that needs the family-specific extras (coverage blocks,
-    suppressed directives) still has them. ``findings`` is the merged, sealed view the
-    finding-threading consumers read; the rest is there when an altitude matters."""
+    suppressed directives) still has them. ``findings`` is the merged, sealed list
+    most callers read; ``check`` and ``audit`` are there when a caller needs one
+    family's own view instead."""
 
     findings: tuple[AnalysisFinding, ...]
     check: CheckReport

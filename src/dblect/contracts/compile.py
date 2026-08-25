@@ -7,13 +7,14 @@ aggregate call), :func:`compile_predicate` renders a row-level predicate, and
 denotes. Rendering through sqlglot keeps the dialect handling and quoting in one
 well-exercised place.
 
-:func:`evaluate_predicate` is the execution end: a comparison of two aggregates
-(the conservation shape, ``a.sum() == b.sum()`` per group) compiled to a query per
-side, run against generated rows in an in-memory DuckDB, and compared group by
-group under the predicate's tolerance. This is the runtime-checked half of the
-contract surface, the analyzer never reasons over it. Cross-relation joins
-(``joined_on``) and the materialized-DataFrame escape hatch are not lowered here
-yet; they are the natural next increment.
+:func:`evaluate_predicate` is the execution end: a comparison of two aggregates,
+for example ``a.sum() == b.sum()`` per group (checking that a total tallied one
+way matches a total tallied another way), compiled to a query per side, run
+against generated rows in an in-memory DuckDB, and compared group by group under
+the predicate's tolerance. This is the runtime-checked half of the contract
+surface; the analyzer never reasons over it. Cross-relation joins (``joined_on``)
+and a planned way to skip the proxy DSL and hand dblect an already-computed
+DataFrame directly are not lowered here yet; both are natural next steps.
 """
 
 from __future__ import annotations

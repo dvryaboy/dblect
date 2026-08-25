@@ -1,10 +1,10 @@
-"""The dblect declaration layer: domain types, model contracts, and the bridge
-that turns them into substrate facts.
+"""dblect's declaration layer: domain types, model contracts, and the bridge
+that turns them into facts the lineage engine can act on.
 
 A project declares meaning here, in Python beside its dbt project: domain types
 built from SQL primitives, bound to models by contracts. The framework reads the
-classes as schemas (never instantiating them), resolves them against the dbt
-manifest, and feeds the lineage engine the facts it propagates. See
+classes as schemas (it never instantiates them), resolves them against the dbt
+manifest, and feeds the resulting facts to the lineage engine. See
 ``docs/design/declaration-dsl.md``.
 """
 

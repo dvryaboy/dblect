@@ -60,9 +60,10 @@ _CONSTRAINT_ALIASES: Mapping[str, tuple[str, float]] = {
 
 @dataclass(frozen=True, slots=True)
 class _FieldSpec:
-    """What a ``Field(...)`` call captured: checkable constraints and inline
-    fixings (the vouched-meaning half, applied as a refinement of the column's
-    declared type)."""
+    """What a ``Field(...)`` call captured: constraints checked against real
+    data, and inline fixings (a meaning the caller asserts and dblect trusts
+    rather than verifies), applied as a refinement of the column's declared
+    type."""
 
     constraints: Constraints | None
     fixings: Mapping[str, object]
