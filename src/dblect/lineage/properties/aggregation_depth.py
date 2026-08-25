@@ -2,9 +2,9 @@
 
 **Demo, not a production detector.** A ``SUM(t.x)`` in a CTE re-aggregated by
 ``SUM(r.total)`` at the outer projection surfaces as depth 2; a "double
-aggregation" check is ``depth > 1`` per model column. The gaps before this is a
-real detector (window functions, GROUP BY/HAVING context, DISTINCT/FILTER inside
-aggregates) are unchanged by this migration.
+aggregation" check is ``depth > 1`` per model column. Window functions, GROUP
+BY/HAVING context, and DISTINCT/FILTER inside aggregates are not modelled yet,
+so those gaps stand between this and a real detector.
 
 The engine is the max-semiring on non-negative ints: ``plus`` and ``times`` both
 take the max, so UNION arms and times-folded children inherit the deepest path.

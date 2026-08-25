@@ -135,8 +135,9 @@ class Fact(Generic[K, S]):
 
 
 def by_scope(facts: tuple[Fact[K, S], ...]) -> dict[S, tuple[Fact[K, S], ...]]:
-    """Bucket ``facts`` by their scope, preserving order. The one grouping every
-    grounding fold takes (the check family and the audit's FD grounding both read it)."""
+    """Bucket ``facts`` by their scope, preserving order. Every place in the
+    codebase that folds facts into a grounded value groups them with this same
+    function first, so they can never disagree about how facts are bucketed."""
     grouped: dict[S, list[Fact[K, S]]] = {}
     for fact in facts:
         grouped.setdefault(fact.scope, []).append(fact)

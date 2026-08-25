@@ -1,23 +1,25 @@
 """The fact-level world enumerator: one shared build, many worlds.
 
-A world is a set of ``CompileValue`` facts layered on top of the manifest's declared
-facts. The enumerator holds one ``CheckGraphs`` build and, for each world, grounds
-that world's facts over the shared graph and re-propagates, collecting the findings
-keyed by the world they hold under. This is the design's "shared walk, only the
-leaves vary": the declared facts and the graph are shared, the compile facts are the
-per-world leaves.
+A world is a set of ``CompileValue`` facts (say, one value a dbt var could take)
+layered on top of the manifest's declared facts. The enumerator builds the lineage
+graphs once and, for each world, grounds that world's facts over the shared graph
+and re-propagates, collecting the findings keyed by the world they hold under. The
+graph and the declared facts are shared across worlds; only each world's own facts
+change.
 
-It covers value-substitution worlds, where the SQL is identical across worlds and
-only the grounded values differ. Control-flow worlds, where the SQL itself changes,
-need graph patching or the variability-aware front end and are out of scope here.
+It covers worlds where the SQL text is identical and only a substituted value
+differs. A world where the SQL itself branches, such as a dbt incremental model's
+full-refresh versus steady-state compile, needs a different mechanism (see
+:mod:`dblect.check.incremental`) and is out of scope here.
 
-A finding present in some worlds and absent in others is data, not an error: that is
-exactly the "holds under world A, fails under world B" signal the analysis exists to
-surface. The enumerator never raises on disagreement.
+A finding present in some worlds and absent in others is exactly the signal this
+analysis exists to surface: the issue holds under one configuration and not
+another. The enumerator reports that as data and never raises on the disagreement.
 
-The enumerator does not cache annotations across worlds. Sharing propagation work
-across worlds is the lifted-representation optimization the design defers to the
-factoring stream; doing it here would couple worlds that must stay independent.
+The enumerator re-propagates from scratch for every world rather than reusing work
+across them. Sharing propagation results across worlds is a real optimization for
+later, deferred because doing it now would let worlds that must stay independent
+leak into each other.
 """
 
 from __future__ import annotations
@@ -42,14 +44,16 @@ from dblect.lineage.properties.functional_dependency import FDSet
 
 @dataclass(frozen=True, slots=True)
 class TagCompileFact:
-    """A per-world domain-type fact (a refinement axis the flag layer sets)."""
+    """A per-world fact about a column's domain type: what a flag value pins the
+    column's type to in that world."""
 
     fact: Fact[DomainTag, ColumnRef]
 
 
 @dataclass(frozen=True, slots=True)
 class FdCompileFact:
-    """A per-world functional-dependency fact (a key the flag layer grounds)."""
+    """A per-world fact about a relation's functional-dependency key: what a flag
+    value pins the key to in that world."""
 
     fact: Fact[FDSet, SourceRef]
 
@@ -80,9 +84,9 @@ class EnumeratedFindings:
         return WorldCoverage.over(result.world for result in self.per_world)
 
     def by_finding(self) -> Mapping[CheckFinding, frozenset[WorldRef]]:
-        """Each finding mapped to the worlds it holds under. A finding whose world
-        set is a strict subset of the enumerated worlds is the cross-world signal: it
-        failed in those worlds and held in the rest."""
+        """Each finding mapped to the worlds it fired in. When that set is a strict
+        subset of all enumerated worlds, that's the cross-world signal: whatever the
+        finding flags broke in those worlds while working fine in the rest."""
         out: dict[CheckFinding, set[WorldRef]] = {}
         for result in self.per_world:
             for finding in result.findings:
@@ -114,8 +118,9 @@ def enumerate_worlds(
     order, so a caller that passes an ordered mapping gets a deterministic report.
 
     A world carrying no compile facts (``BASE_WORLD`` mapped to ``()``) reproduces
-    ``run_check``'s world-varying findings, which makes base-world identity the
-    enumerator's anchoring contract."""
+    ``run_check``'s world-varying findings exactly; keeping that agreement is what
+    verifies the enumerator has not drifted from the single-world check it
+    generalizes."""
     results: list[WorldResult] = []
     for world, compile_facts in world_facts.items():
         annotations = propagate_world(graphs, _world_facts(graphs, world, compile_facts))

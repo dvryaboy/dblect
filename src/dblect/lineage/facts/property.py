@@ -1,10 +1,12 @@
-"""``Property[K, S]``: a lattice, transfer catalogs, and a grounding function.
+"""``Property[K, S]``: everything the propagator needs to check one property,
+such as nullability or uniqueness, across a SQL model.
 
-A property bundles everything the propagator needs to walk one axis: its
-:class:`Lattice`, per-operator and per-aggregate transfers, the ``ground``
-function that gives each node its declared :class:`Annotation`, and an optional
-:class:`Semiring` for counting or accumulating axes. The transfer calculus and
-its obligations are in ``docs/design/propagation-soundness.md``.
+A property bundles its :class:`Lattice` (the order of how precise a value
+is), a transfer for each SQL operator and aggregate function, the ``ground``
+function that reads a node's declared :class:`Annotation`, and an optional
+:class:`Semiring` for a property that counts or accumulates rather than just
+refines. What a transfer is obliged to preserve is worked out in
+``docs/design/propagation-soundness.md``.
 
 A property's typed handle, :class:`PropertyRef`, is minted once by the smart
 constructors behind a module-private token, so a caller cannot forge a handle of
@@ -137,14 +139,15 @@ class UndischargedCompanion:
 @dataclass(frozen=True, slots=True)
 class CoherenceClear(Generic[K]):
     """The structured event a coherence guard records when it clears an aggregate: the
-    real reason the output tag went to top, surfaced rather than re-inferred downstream.
+    real reason the result went to top, surfaced here instead of a caller having to
+    re-derive it downstream.
 
-    ``cleared_value`` is the operand's tag at the moment of the clear (the tag that
-    carried the live companions, the one a diagnostic renders through
+    ``cleared_value`` is the operand's value at the moment of the clear (the value
+    that still carried the live companions, the one a diagnostic renders through
     :attr:`Property.display`). ``aggregate`` is the cleared call (its line and function),
     ``site`` the scope it was judged in, and ``undischarged`` the companions that blocked
     it. An empty ``undischarged`` is never recorded: the guard clears only when at least
-    one companion survives, so a naked operand (no companion) emits nothing."""
+    one companion survives, so an aggregate with no companion at all emits nothing."""
 
     aggregate: exp.AggFunc
     site: AggregationSite | None
@@ -219,14 +222,16 @@ class Property(Generic[K, S]):
     display: Callable[[K], AxisDisplay] | None = None
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
     reconcile_by_meet: bool = False
-    """How a derived node's declared and inferred annotations combine.
+    """How a node's declared value (from a fact) and its value inferred from
+    the SQL combine when both exist.
 
-    Default (``False``): an inferred value that fails ``consistent`` against the
-    declaration is a conflict; the flow value keeps the declaration, tainted
-    provisional (nullability: a declared ``NOT NULL`` the SQL can violate). Set
-    (``True``): declared and inferred are the same-polarity lower bounds and
-    compose by the lattice ``meet``, never conflicting (uniqueness: a declared
-    candidate key and a SQL-derived one both hold, so they union)."""
+    Default (``False``): an inferred value that does not honour the
+    declaration is a conflict. The declared value wins but is marked
+    provisional, since the two disagree (nullability: a column declared
+    ``NOT NULL`` that the SQL can still make null). Set (``True``): declared
+    and inferred can never conflict, since both are lower bounds on the same
+    answer; they combine by the lattice ``meet`` and both stick (uniqueness: a
+    declared candidate key and one the SQL derives both hold at once)."""
     reducer: Reducer | None = None
     """The scope-specific step that turns a derivation into an inferred annotation.
 
