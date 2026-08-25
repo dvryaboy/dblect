@@ -732,8 +732,8 @@ class _Walker:
     def _aggregation_input(self, sel: exp.Select, scope: Scope) -> SourceRef | None:
         """The one relation the scope aggregates over: a join-free FROM of a single
         resolvable table (a manifest relation, or a CTE/derived table's synthetic
-        ref). ``None`` closes the guard's dependency read, since the FD property
-        has no scope to answer for."""
+        ref). ``None`` means there is no relation to check a companion column's
+        functional dependency against, so the guard can't discharge it that way."""
         if sg.joins_of(sel):
             return None
         from_ = sg.from_of(sel)
@@ -993,7 +993,7 @@ def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
 
     Includes models (by ``name``), sources (by ``identifier or name`` since
     dbt compiles ``{{ source(...) }}`` to ``identifier``), and seeds. On a
-    name collision, models win — matching the convention that ``ref('x')``
+    name collision, models win, matching the convention that ``ref('x')``
     refers to a model named ``x`` over a source that happens to share it.
 
     This is the single owner of the compiled-SQL name resolution convention. The

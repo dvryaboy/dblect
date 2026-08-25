@@ -1,11 +1,12 @@
-"""Turning declarations into grounded annotations: collection, grounding, and
-the typed/untyped seam combine.
+"""Resolving what a user declared into what dblect actually knows about a
+column or relation.
 
 ``collect`` runs the discoverers and buckets their facts by scope; ``grounding``
-folds each bucket through ``resolve`` into the per-node grounded annotation
-(EXPLICIT for an opt-out, CONCRETE for a resolved value, IMPLICIT otherwise);
-``combine`` is the binary seam rule that decides whether a cleared refinement
-speaks. The errors are a small sealed set so a caller can react to each.
+folds each bucket into one value per scope: CONCRETE for a resolved value,
+EXPLICIT for a declared opt-out, IMPLICIT when nothing was declared at all;
+``combine`` is the rule for two such values meeting at an expression: it
+decides whether an unresolved side warns or stays quiet. The errors below are
+a small, closed set so a caller can react to each.
 """
 
 from __future__ import annotations
@@ -51,8 +52,9 @@ class FactConflictError(Exception):
 
 
 class SeamContradictionError(Exception):
-    """Raised by ``combine`` when two committed, incompatible operands meet at a
-    scalar expression. It becomes a finding at the combine site."""
+    """Raised by ``combine`` when two concrete values meeting at the same
+    expression disagree, so there is no value both sides could be right about.
+    Surfaces as a finding at that expression."""
 
     def __init__(self, a: Annotation[Any], b: Annotation[Any]) -> None:
         self.a = a
@@ -95,24 +97,23 @@ def _ground(
     opaque: Collection[S],
     lat: Lattice[K],
 ) -> dict[S, Annotation[K]]:
-    """The fold itself: the explicit map from scope to grounded annotation, with
-    no IMPLICIT-top default applied. The single home for "what grounds", shared by
-    ``grounding`` (which wraps it in the default-filling lookup) and
-    ``grounded_scopes`` (which reads back which scopes a fact actually grounded).
+    """Build the scope-to-annotation map, with no default filled in for a scope
+    that has nothing recorded. ``grounding`` wraps this in the "nothing
+    declared" default, and ``grounded_scopes`` reads it back to report which
+    scopes actually came from a fact; both stay in sync because they share
+    this one fold.
 
-    An opaque scope grounds ``Annotation(top, EXPLICIT)`` regardless of any facts
-    present (an opt-out is consulted before facts). A scope whose bucket resolves
-    grounds ``Annotation(value, CONCRETE)``.
+    A scope opted out of refinement always maps to top, tagged EXPLICIT, no
+    matter what facts exist for it. Otherwise, a scope's facts that hold
+    unconditionally (``condition is None``) resolve to one value, tagged
+    CONCRETE. A fact scoped to a row filter is skipped here rather than
+    applied everywhere, since that would claim more than it proved; if only
+    such facts exist for a scope, the scope is left out of the map, exactly as
+    if nothing were declared, though the facts themselves are kept for later
+    filter-matching to use.
 
-    Conditional facts (those carrying a ``condition``) are excluded from the fold:
-    they hold only over a row filter, so grounding them unconditionally would
-    over-claim. A scope whose only facts are conditional is absent from the map,
-    so it falls to the IMPLICIT-top default exactly as if nothing were declared;
-    the facts stay captured in the bucket for an activation step to consume.
-
-    A bucket that resolves to ``bottom`` is a contradiction and raises
-    ``FactConflictError`` here, at build time, rather than swallowing it; recovery
-    is a propagator concern that lands with the findings layer.
+    Facts that cannot be reconciled to one value raise ``FactConflictError``
+    here, at build time, instead of silently picking an answer.
     """
     opaque_set = set(opaque)
     grounded: dict[S, Annotation[K]] = {}
@@ -167,13 +168,16 @@ def grounded_scopes(
 
 
 def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:
-    """The binary seam rule at a scalar expression.
+    """The rule for two annotations meeting at one scalar expression, for
+    example the two sides of a binary operator.
 
-    Meet the two values; a ``bottom`` meet is two committed, incompatible operands
-    and raises ``SeamContradictionError``. Agreeing operands preserve their value. When
-    one operand is top and the other committed, the result clears to top and
-    inherits *that operand's* opacity, so an un-annotated (IMPLICIT) clear speaks
-    at the seam while a declared (EXPLICIT) opt-out flows silently.
+    Two concrete values that disagree raise ``SeamContradictionError``. Two
+    that agree keep their shared value. When one side is concrete and the
+    other has no information, the result loses the concrete side's
+    information too, since the uninformed side could still turn out to break
+    it; the opacity of *that* side then decides whether the loss warns or
+    stays quiet: a declared opt-out (EXPLICIT) stays quiet, a genuine gap
+    (IMPLICIT) warns.
     """
     provisional = a.provisional or b.provisional
     m = lat.meet(a.value, b.value)

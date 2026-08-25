@@ -1,11 +1,13 @@
-"""The facts substrate: declarations become grounded values that enter the
-property walk, under one soundness contract.
+"""Turns what a user declared, a dbt test, a schema.yml contract, a Python
+``SemanticType``, into the values dblect's propagator checks the SQL against.
 
-The design is in ``docs/design/lineage-facts.md`` and the full type surface in
-``docs/design/lineage-facts-types.md``. A :class:`Fact` is a typed,
-provenance-carrying claim about one column or one relation; a property's
-:class:`Lattice` resolves several facts at a node into the :class:`Annotation`
-the propagator reads at leaves and checks at derived nodes.
+A :class:`Fact` is one such declaration, addressed to a column or a relation
+and tagged with where it came from. A property's :class:`Lattice` resolves
+every fact at a node down to one :class:`Annotation`, which the propagator
+reads at the leaves of the lineage graph and checks again at every node
+derived from them. See ``docs/design/lineage-facts.md`` (and
+``docs/design/lineage-facts-types.md`` for the full type surface) for the
+theory.
 """
 
 from dblect.lineage.facts.grounding import (

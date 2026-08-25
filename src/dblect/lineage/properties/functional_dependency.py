@@ -1,13 +1,13 @@
 """Functional-dependency property: the dependencies a relation's rows satisfy.
 
 A relation's value is a set of functional dependencies over its output column
-names, each one ``X -> y``: rows equal on ``X`` are equal on ``y``. This is the
-discharge substrate the aggregate coherence guard reads. ``sum(amount) group by
-country`` over a per-row currency is well typed exactly when the group key holds
-the currency constant per group, and a ``country -> currency`` dependency is the
-summarizability argument for that (Lenz & Shoshani, SSDBM 1997; Hurtado &
-Mendelzon, ICDT 2001). Entailment (:func:`determines`) is attribute closure under
-Armstrong's axioms.
+names, each one ``X -> y``: rows equal on ``X`` are equal on ``y``. This is what
+the aggregate coherence guard checks before trusting an aggregate:
+``sum(amount) group by country`` over a per-row currency is well typed exactly
+when the group key holds the currency constant per group, and a ``country ->
+currency`` dependency is the summarizability argument for that (Lenz &
+Shoshani, SSDBM 1997; Hurtado & Mendelzon, ICDT 2001). Entailment
+(:func:`determines`) is attribute closure under Armstrong's axioms.
 
 The lattice orders by precision exactly as uniqueness orders keys: knowing more
 dependencies is more precise, so ``meet`` (resolution of declarations) unions the
