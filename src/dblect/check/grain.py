@@ -35,17 +35,11 @@ for claims about rows.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import assert_never
 
+from dblect.check.declared import judged_declarations
 from dblect.check.findings import CheckFinding, CheckFindingKind
-from dblect.lineage.facts.model import (
-    Annotation,
-    CompileValue,
-    Declared,
-    Fact,
-    NativeConstraint,
-    Provenance,
-)
+from dblect.check.locate import file_of
+from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.graph import SourceRef
 from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, determines
 from dblect.lineage.properties.uniqueness import CandidateKeySet, Key
@@ -90,60 +84,27 @@ def declared_grain_findings(
     ``key_facts`` holds every key a user declared, read from the same place the
     propagation reads them so the two cannot disagree about what was claimed.
     ``inferred`` holds the keys each model's SQL implies on its own, recorded before
-    declared keys were merged in.
-
-    A model missing from ``inferred`` has no SQL of its own to judge, a source or a
-    model that failed to build, and is passed over; the coverage report is what
-    surfaces the ones that failed to build. We also stay quiet when the keys we
-    derived rest on contradictory upstream declarations, since evidence drawn from a
-    known contradiction is not worth reporting.
+    declared keys were merged in. Which declarations are judged at all, and against
+    which models, is :func:`judged_declarations`' policy, shared with the dependency
+    check.
     """
     out: list[CheckFinding] = []
     judged: set[tuple[SourceRef, Key]] = set()
-    for scope, bucket in sorted(key_facts.items(), key=lambda kv: kv[0].unique_id):
-        inferred_ann = inferred.get(scope)
-        if inferred_ann is None or inferred_ann.provisional:
-            continue
-        derived = inferred_ann.value
-        if derived.is_bottom:
-            continue  # the formal universal element already carries every key
+    for scope, fact, derived in judged_declarations(key_facts, inferred):
         fd_ann = fd.get(scope)
         fds = fd_ann.value if fd_ann is not None else NO_FDS
-        for fact in bucket:
-            if not _judged_provenance(fact.provenance):
+        for authored in fact.value.keys:
+            declared = frozenset(col.lower() for col in authored)
+            if (scope, declared) in judged:
                 continue
-            if fact.condition is not None:
-                continue  # a conditional key holds only over a row filter; activation owns it
-            for authored in fact.value.keys:
-                declared = frozenset(col.lower() for col in authored)
-                if (scope, declared) in judged:
-                    continue
-                judged.add((scope, declared))
-                if grain_established(declared, derived.keys, fds):
-                    continue
-                witness = grain_witness(declared, derived.keys)
-                if witness is None:
-                    continue
-                out.append(_finding(manifest, scope, fact, authored, witness))
+            judged.add((scope, declared))
+            if grain_established(declared, derived.keys, fds):
+                continue
+            witness = grain_witness(declared, derived.keys)
+            if witness is None:
+                continue
+            out.append(_finding(manifest, scope, fact, authored, witness))
     return out
-
-
-def _judged_provenance(provenance: Provenance) -> bool:
-    """Whether a key from this source is a claim about what the SELECT itself
-    produces, deciding every kind we can receive.
-
-    A key someone wrote down, in a contract or a dbt test, is such a claim, so we
-    check it. A native warehouse constraint is enforced when the table is written
-    rather than by the query, and whether the warehouse really enforces it is #48's
-    question. An incremental model's ``unique_key`` under a merge strategy is the
-    same story: the merge collapses duplicates on write, so its SELECT is expected to
-    produce finer rows and flagging that would be wrong (#7 covers the write path)."""
-    match provenance:
-        case Declared():
-            return True
-        case NativeConstraint() | CompileValue():
-            return False
-    assert_never(provenance)
 
 
 def _finding(
@@ -156,7 +117,6 @@ def _finding(
     declared_cols = ", ".join(sorted(declared))
     witness_cols = ", ".join(sorted(witness))
     attribution = f" (declared by {fact.detail})" if fact.detail else ""
-    node = manifest.nodes.get(scope.unique_id)
     single = next(iter(declared)) if len(declared) == 1 else None
     return CheckFinding(
         kind=CheckFindingKind.GRAIN_NOT_ESTABLISHED,
@@ -168,6 +128,6 @@ def _finding(
             "produces."
         ),
         model_unique_id=scope.unique_id,
-        file_path=node.original_file_path if node is not None else None,
+        file_path=file_of(manifest, scope),
         column=single,
     )

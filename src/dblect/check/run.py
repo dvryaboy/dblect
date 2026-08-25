@@ -26,7 +26,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
+from dblect.audit.sourcemap import LineMap
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.check.findings import (
@@ -37,6 +37,7 @@ from dblect.check.findings import (
     UnbuiltModel,
 )
 from dblect.check.grain import declared_grain_findings
+from dblect.check.locate import file_of, source_span, span_of
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -50,7 +51,6 @@ from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
-    Derivation,
     SourceKind,
     SourceRef,
 )
@@ -507,7 +507,7 @@ def _contradiction_findings(
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:
             continue
-        line_start, line_end = _span_of(column_graph.derivation(ref))
+        line_start, line_end = span_of(column_graph.derivation(ref))
         uid = ref.source.unique_id
         out.append(
             CheckFinding(
@@ -517,11 +517,11 @@ def _contradiction_findings(
                     "that flows in from upstream"
                 ),
                 model_unique_id=uid,
-                file_path=_file_of(manifest, ref.source),
+                file_path=file_of(manifest, ref.source),
                 column=ref.column,
                 line_start=line_start,
                 line_end=line_end,
-                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
+                source_span=source_span(manifest, uid, line_start, line_end, line_maps),
             )
         )
     return out
@@ -562,18 +562,18 @@ def _aggregation_findings(
         # The aggregate node pins the line; the projection derivation is the fallback so
         # the finding still lands near the right place when the aggregate carries no
         # stamped line (a literal-only shape).
-        line_start, line_end = _span_of(agg, column_graph.derivation(owner))
+        line_start, line_end = span_of(agg, column_graph.derivation(owner))
         uid = owner.source.unique_id
         out.append(
             CheckFinding(
                 kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
                 message=_aggregation_message(owner, clear),
                 model_unique_id=uid,
-                file_path=_file_of(manifest, owner.source),
+                file_path=file_of(manifest, owner.source),
                 column=owner.column,
                 line_start=line_start,
                 line_end=line_end,
-                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
+                source_span=source_span(manifest, uid, line_start, line_end, line_maps),
             )
         )
     # The clear order follows the propagation walk; sort so the report is deterministic.
@@ -669,17 +669,17 @@ def _join_key_findings(
             if not isinstance(on, Expr):
                 continue
             for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
-                line_start, line_end = _span_of(left, right, on)
+                line_start, line_end = span_of(left, right, on)
                 out.append(
                     CheckFinding(
                         kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
                         message=_join_key_message(left, right, left_tag, right_tag),
                         model_unique_id=uid,
-                        file_path=_file_of(manifest, source),
+                        file_path=file_of(manifest, source),
                         column=left.name or None,
                         line_start=line_start,
                         line_end=line_end,
-                        source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
+                        source_span=source_span(manifest, uid, line_start, line_end, line_maps),
                     )
                 )
     out.sort(key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""))
@@ -719,51 +719,3 @@ def _sorted(
     """Annotations in a stable order (by model then column) so the report is
     deterministic."""
     return sorted(annotations.items(), key=lambda kv: (kv[0].source.unique_id, kv[0].column))
-
-
-def _file_of(manifest: Manifest, source: SourceRef) -> str | None:
-    node = manifest.nodes.get(source.unique_id)
-    return node.original_file_path if node is not None else None
-
-
-def _source_span(
-    manifest: Manifest,
-    uid: str,
-    line_start: int,
-    line_end: int,
-    cache: dict[str, LineMap],
-) -> SourceSpan:
-    """Back-map a compiled span onto the model's source template (see
-    :mod:`dblect.audit.sourcemap`), reusing one line map per model across the world's
-    findings."""
-    # The "no line" sentinel has no source position; skip building the map for a model
-    # whose findings are all unlocated.
-    if line_start == 0:
-        return SourceSpan.compiled(line_start, line_end)
-    line_map = cache.get(uid)
-    if line_map is None:
-        node = manifest.nodes.get(uid)
-        compiled = node.analysis_sql if node is not None else None
-        raw = node.raw_code if node is not None else None
-        line_map = build_line_map(compiled, raw)
-        cache[uid] = line_map
-    return line_map.map_span(line_start, line_end)
-
-
-def _span_of(*nodes: Derivation | None) -> tuple[int, int]:
-    """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
-    a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
-    convention a finding with no locatable line uses (never line-suppressible).
-
-    The span is in the compiled SQL's line space. The located finding kinds carry it
-    on ``line_start``/``line_end`` and additionally back-map it onto ``raw_code`` via
-    :func:`_source_span`, so the report can point at the source line the developer
-    wrote when the construct passes through verbatim. A non-``Expr`` derivation (a
-    ``UnionConfluence``) carries no line and is skipped like ``None``."""
-    for node in nodes:
-        if not isinstance(node, Expr):
-            continue
-        span = sg.line_range(node)
-        if span is not None:
-            return span
-    return (0, 0)
