@@ -25,6 +25,11 @@ by source alias) plus an inner join's ``ON`` equalities as mutual determinations
 Posture elsewhere is silent-when-unproven: an outer join's NULL-padded side and
 two UNION arms that can each satisfy a dependency their union violates both prove
 nothing.
+
+A union is silent but not blind: what each arm carried into it is kept beside
+the (empty) result as a :class:`UnionMerge`, renamed through later projections
+exactly as dependencies are, so the declared-dependency check can name the union
+that dropped a dependency every arm held. It never enters the property's value.
 """
 
 from __future__ import annotations
@@ -182,14 +187,40 @@ def functional_dependency_grounded_scopes(
 # outside the modelled fragment drops to the empty set rather than over-claiming.
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class UnionMerge:
+    """A union and what each of its arms carried into it, in the output column
+    names of the scope holding the record (renamed as the walk climbs). The union
+    proves nothing on its own; the arms let a reader ask whether every arm entailed
+    a dependency the merge then dropped. Compared by identity, since it is minted
+    once per union per scope and holds a live tree node."""
+
+    union: exp.Union
+    arms: tuple[frozenset[FD], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _Carried:
+    """What a scope carries to its output: its dependencies, and the union merges
+    below it whose arms' dependencies still name columns this scope exposes."""
+
+    fds: frozenset[FD]
+    merges: frozenset[UnionMerge] = frozenset()
+
+
+_EMPTY: _Carried = _Carried(frozenset())
+
+
 @dataclass(frozen=True, slots=True)
 class _Base:
     """What a resolved FROM source contributes: its dependencies (in its output
-    column names) and, for a base table with the uniqueness edge live, its
-    candidate keys (each of which determines the columns read alongside it)."""
+    column names), any union merges it carries, and, for a base table with the
+    uniqueness edge live, its candidate keys (each of which determines the columns
+    read alongside it)."""
 
     fds: frozenset[FD]
     keys: frozenset[Key] = frozenset()
+    merges: frozenset[UnionMerge] = frozenset()
 
 
 _NOTHING: _Base = _Base(frozenset())
@@ -206,36 +237,69 @@ class _FdWalk:
     ``base_resolve`` resolves a base table; CTEs and inline subqueries are
     resolved structurally within the walk. Single-source scopes carry fully; a
     join carries its kept sides (see :meth:`_join_select`); a UNION proves
-    nothing, and an unmodellable group shape (positional or computed group keys)
-    drops the scope's dependencies entirely.
+    nothing but records what its arms brought (see :meth:`_union`), and an
+    unmodellable group shape (positional or computed group keys) drops the
+    scope's dependencies entirely.
     """
 
     def __init__(self, base_resolve: _BaseResolve) -> None:
         self._base_resolve = base_resolve
 
-    def scope_fds(self, node: Expr, *, cte_scope: Mapping[str, frozenset[FD]]) -> frozenset[FD]:
+    def scope_fds(self, node: Expr, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
         if isinstance(node, exp.Select):
             return self._select(node, cte_scope=cte_scope)
-        return frozenset()
+        if isinstance(node, exp.Union):
+            return self._union(node, cte_scope=cte_scope)
+        # INTERSECT and EXCEPT keep a subset of the left arm's rows, and a dependency
+        # that holds on a relation holds on any subset of it, so neither can break
+        # one; they claim nothing (left as is) and are no witness either.
+        return _EMPTY
 
-    def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[FD]]) -> frozenset[FD]:
+    def _with_scope(self, node: Expr, cte_scope: Mapping[str, _Carried]) -> dict[str, _Carried]:
+        """``cte_scope`` extended with the CTEs ``node`` declares, each resolved in
+        the scope the ones before it built."""
         local = dict(cte_scope)
-        with_ = sel.args.get("with_")
+        with_ = node.args.get("with_")
         if isinstance(with_, exp.With):
             for cte in with_.expressions:
                 if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
                     local[cte.alias_or_name] = self.scope_fds(cte.this, cte_scope=local)
+        return local
+
+    def _union(self, u: exp.Union, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
+        """A union proves nothing: the same determinant value can map to different
+        dependents per arm. What each arm carried is recorded instead, translated to
+        the union's output names (the first arm's, the rest lined up by position, as
+        SQL does). An arm without positionally nameable outputs (a star, a duplicated
+        name, not a plain SELECT) leaves nothing to line up."""
+        local = self._with_scope(u, cte_scope)
+        arms = _union_arms(u)
+        carried = [self.scope_fds(arm, cte_scope=local) for arm in arms]
+        names = [_positional_outputs(arm) for arm in arms]
+        first = names[0] if names else None
+        if first is None or any(n is None or len(n) != len(first) for n in names):
+            return _EMPTY
+        aligned: list[frozenset[FD]] = []
+        for arm_names, arm_carried in zip(names, carried, strict=True):
+            assert arm_names is not None
+            rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
+            aligned.append(_remap(arm_carried.fds, rename))
+        return _Carried(frozenset(), frozenset({UnionMerge(u, tuple(aligned))}))
+
+    def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
+        local = self._with_scope(sel, cte_scope)
 
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):
-            return frozenset()
+            return _EMPTY
         joins = sg.joins_of(sel)
         if joins:
             return self._join_select(sel, from_.this, joins, cte_scope=local)
         base = self._resolve_source(from_.this, cte_scope=local)
         if base is None:
-            return frozenset()
+            return _EMPTY
         carried = base.fds
+        merges = base.merges
 
         # A dependency is universally quantified over row pairs, and a WHERE only
         # removes pairs, so everything carries; an equality filter additionally pins
@@ -261,14 +325,22 @@ class _FdWalk:
         if group is not None and group.expressions:
             group_names = _group_columns(sel)
             if group_names is None:
-                return frozenset()  # unmodellable group shape: prove nothing
+                return _EMPTY  # unmodellable group shape: prove nothing
             # Grouping aggregates everything outside the group key away, so only a
             # dependency lying entirely within it still describes the output rows.
-            carried = frozenset(
-                fd for fd in carried if fd.determinant | {fd.dependent} <= group_names
+            # A merge's arm sets are cut the same way: two groups that disagree on
+            # a dependent inside the key are still two rows of the output.
+            carried = _within(carried, group_names)
+            merges = frozenset(
+                UnionMerge(m.union, tuple(_within(arm, group_names) for arm in m.arms))
+                for m in merges
             )
 
         out = carried if star else _remap(carried, rename)
+        if not star:
+            merges = frozenset(
+                UnionMerge(m.union, tuple(_remap(arm, rename) for arm in m.arms)) for m in merges
+            )
         if group_names is not None:
             group_out = group_names if star else _remap_columns(group_names, rename)
             if group_out is not None:
@@ -277,20 +349,20 @@ class _FdWalk:
                 out = out | {
                     FD(group_out, name) for name in _named_outputs(sel) if name not in group_out
                 }
-        return out
+        return _Carried(out, merges)
 
-    def _resolve_source(
-        self, node: Expr, *, cte_scope: Mapping[str, frozenset[FD]]
-    ) -> _Base | None:
+    def _resolve_source(self, node: Expr, *, cte_scope: Mapping[str, _Carried]) -> _Base | None:
         if isinstance(node, exp.Table):
             if node.name in cte_scope:
-                return _Base(cte_scope[node.name])
+                cte = cte_scope[node.name]
+                return _Base(cte.fds, merges=cte.merges)
             return self._base_resolve(node)
         if isinstance(node, exp.Subquery):
             inner = node.this
             if not isinstance(inner, Expr):
                 return None
-            return _Base(self.scope_fds(inner, cte_scope=cte_scope))
+            sub = self.scope_fds(inner, cte_scope=cte_scope)
+            return _Base(sub.fds, merges=sub.merges)
         return None
 
     def _join_select(
@@ -299,8 +371,8 @@ class _FdWalk:
         from_node: Expr,
         joins: list[exp.Join],
         *,
-        cte_scope: Mapping[str, frozenset[FD]],
-    ) -> frozenset[FD]:
+        cte_scope: Mapping[str, _Carried],
+    ) -> _Carried:
         """Dependencies a join carries to the projection.
 
         An FD that holds on a joined relation holds on the join wherever that side's
@@ -320,18 +392,19 @@ class _FdWalk:
         INNER and CROSS pad nothing (a cross join only duplicates rows). Aggregation
         over a join is deferred (the FD scope a downstream guard would read is not a
         single source), and a candidate-key-derived dependency is not minted across a
-        join (sound to omit; the key path stays single-source for now)."""
+        join (sound to omit; the key path stays single-source for now), and neither
+        is a union merge, so a union feeding a join is not offered as a witness."""
         group = sg.group_of(sel)
         if group is not None and group.expressions:
-            return frozenset()
+            return _EMPTY
 
         sources: list[tuple[str, _Base]] = []
         for node in (from_node, *(j.this for j in joins)):
             if not isinstance(node, Expr):
-                return frozenset()
+                return _EMPTY
             base = self._resolve_source(node, cte_scope=cte_scope)
             if base is None:
-                return frozenset()
+                return _EMPTY
             sources.append((node.alias_or_name.lower(), base))
 
         aliases = [alias for alias, _ in sources]
@@ -373,8 +446,8 @@ class _FdWalk:
 
         qrename, star = _qualified_rename(sel)
         if star:
-            return frozenset()  # a star over a join leaves the output universe ambiguous
-        return _project_qualified(qfds, qrename)
+            return _EMPTY  # a star over a join leaves the output universe ambiguous
+        return _Carried(_project_qualified(qfds, qrename))
 
 
 def _group_columns(sel: exp.Select) -> frozenset[str] | None:
@@ -393,6 +466,41 @@ def _group_columns(sel: exp.Select) -> frozenset[str] | None:
             return None
         out.add(sg.column_name(g).lower())
     return frozenset(out)
+
+
+def _union_arms(u: exp.Union) -> list[Expr]:
+    """The arms of ``u`` in order, a chain of unions (left-nested by the parser)
+    flattened so a dependency every arm carries is reported against one union."""
+    arms: list[Expr] = []
+    for side in (u.this, u.expression):
+        if isinstance(side, exp.Union):
+            arms.extend(_union_arms(side))
+        elif isinstance(side, Expr):
+            arms.append(side)
+    return arms
+
+
+def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
+    """An arm's output column names in projection order, or ``None`` when they
+    cannot be lined up positionally (a star, a duplicated name, not a SELECT)."""
+    if not isinstance(arm, exp.Select):
+        return None
+    names: list[str] = []
+    for proj in arm.expressions:
+        if isinstance(proj, exp.Star):
+            return None
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star):
+            return None
+        names.append(proj.alias_or_name.lower())
+    if len(set(names)) != len(names):
+        return None
+    return tuple(names)
+
+
+def _within(fds: frozenset[FD], columns: frozenset[str]) -> frozenset[FD]:
+    """The dependencies mentioning only ``columns``."""
+    return frozenset(fd for fd in fds if fd.determinant | {fd.dependent} <= columns)
 
 
 def _remap(fds: frozenset[FD], rename: Mapping[str, tuple[str, ...]]) -> frozenset[FD]:
@@ -492,6 +600,23 @@ def _project_qualified(
     return frozenset(out)
 
 
+def union_merges(tree: Expr, model_fds: Mapping[SourceRef, FDSet]) -> frozenset[UnionMerge]:
+    """The unions in ``tree`` whose arms' dependencies reach its output, each with
+    what its arms carried, in the output's column names: the same walk the reducer
+    runs, with base tables resolved by stamped :class:`SourceRef` against
+    ``model_fds`` (the per-model values propagation produced). The declared-dependency
+    check reads this, since the reducer keeps only the dependency set. Valid only
+    for the lifetime of ``tree``."""
+
+    def base_resolve(table: exp.Table) -> _Base:
+        ref = source_ref_meta(table)
+        if ref is None or ref not in model_fds:
+            return _NOTHING
+        return _Base(model_fds[ref].fds)
+
+    return _FdWalk(base_resolve).scope_fds(tree, cte_scope={}).merges
+
+
 # --- the property ------------------------------------------------------------
 
 
@@ -531,7 +656,7 @@ def functional_dependency_property(
                     keys = key_ann.value.keys
             return _Base(ann.value.fds, keys)
 
-        fds = _FdWalk(base_resolve).scope_fds(deriv, cte_scope={})
+        fds = _FdWalk(base_resolve).scope_fds(deriv, cte_scope={}).fds
         opacity = Opacity.CONCRETE if fds else Opacity.IMPLICIT
         return Annotation(FDSet(fds), opacity, provisional=provisional)
 
