@@ -1,17 +1,17 @@
 """Run the declaration check: resolve contracts, propagate, derive findings.
 
-The pipeline is the substrate-first story made user-facing. Contracts resolve into
-the facts the properties ground from, two properties propagate (the
-functional-dependency property over the relation graph, then the domain-type
-property over the column graph reading it), and the findings fall out of what the
-substrate concluded:
+A user's contracts (a declared domain type, a declared grain, a declared key)
+resolve into facts, two properties propagate over the lineage graphs built from
+the project's SQL (functional dependencies over relations, then domain type over
+columns), and findings fall out of what propagation concluded:
 
-* a contract that did not resolve is a finding directly off the bridge;
-* a column whose flow value is provisional carries a declared type the inferred
-  one contradicts, which is currency creep, and it lands wherever the taint
-  reached, declared model or not;
-* an aggregate whose tag cleared to naked while an operand it summed still carried
-  one is a reduction the algebra cannot call well typed, the mixed-currency sum.
+* a contract that never resolved against the manifest is a finding on its own;
+* a column where the type propagation infers disagrees with a declared type is a
+  contradiction (currency creep), reported everywhere downstream the disagreement
+  reaches, not just where it was declared;
+* summing a column loses its domain type unless every other field in the row
+  stays constant across the group; when it doesn't, the sum is flagged as not well
+  typed (the mixed-currency sum).
 
 Predicates are collected and counted, not run: executing them needs materialized
 data, which belongs to the fixture/PBT loop, so the static check stays static.
@@ -120,9 +120,9 @@ class CheckGraphs:
 @dataclass(frozen=True, slots=True)
 class WorldFacts:
     """The facts that ground one world's propagation. The declared facts are
-    world-invariant (shared across worlds); a world's ``CompileValue`` leaves are
-    appended by the enumerator. Keeping the two apart means the enumerator only
-    adds, never recomputes, the declared facts."""
+    world-invariant (shared across worlds); a world's own ``CompileValue`` facts
+    are appended by the enumerator. Keeping the two apart means the enumerator
+    only adds, never recomputes, the declared facts."""
 
     world: WorldRef
     fd_facts: tuple[Fact[FDSet, SourceRef], ...]
@@ -500,8 +500,9 @@ def _contradiction_findings(
     column_graph: ColumnLineageGraph,
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
-    """One finding per column whose flow value is provisional: a declared type the
-    inferred one contradicts, reported wherever the taint reached."""
+    """One finding per column where propagation found the type flowing in
+    conflicts with a declared type (skips ``NAKED``, which carries nothing to
+    conflict about), reported at every downstream column the conflict reaches."""
     out: list[CheckFinding] = []
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:
