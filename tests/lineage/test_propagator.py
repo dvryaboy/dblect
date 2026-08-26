@@ -228,6 +228,44 @@ def test_reconcile_by_meet_composes_declared_and_inferred_without_conflict() -> 
     assert not anns[out].provisional
 
 
+def test_inferred_sink_records_the_pre_reconcile_value_beside_the_flow() -> None:
+    """The pre-reconcile record (``refutation-and-verdicts.md``): under
+    ``reconcile_by_meet`` the flow value folds the declaration in, so the value the
+    SQL actually derived is otherwise discarded, and a declaration would check
+    itself. The sink must hold the inferred value as derived, distinct from the
+    reconciled flow value."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    ground = _concrete_for({leaf: frozenset({1, 2}), out: frozenset({0, 1})})
+    inferred: dict[ColumnRef, Annotation[_Set]] = {}
+    anns = propagate(graph, _subset_prop(ground, reconcile_by_meet=True), inferred_sink=inferred)
+    assert anns[out].value == frozenset({1})
+    assert inferred[out].value == frozenset({1, 2})
+
+
+def test_inferred_sink_covers_only_derived_subjects() -> None:
+    """A leaf has no derivation, so there is no entailment to record: the sink holds
+    the derived subject and not the leaf."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    inferred: dict[ColumnRef, Annotation[_Set]] = {}
+    propagate(graph, _subset_prop(_concrete_for({})), inferred_sink=inferred)
+    assert out in inferred
+    assert leaf not in inferred
+
+
 def test_opaque_inferred_keeps_grounded_without_a_taint() -> None:
     """When the SQL reveals nothing (inferred top), the grounded value stands and
     is not tainted."""

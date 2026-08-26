@@ -1,17 +1,17 @@
 """Run the declaration check: resolve contracts, propagate, derive findings.
 
-The pipeline is the substrate-first story made user-facing. Contracts resolve into
-the facts the properties ground from, two properties propagate (the
-functional-dependency property over the relation graph, then the domain-type
-property over the column graph reading it), and the findings fall out of what the
-substrate concluded:
+A user's contracts (a declared domain type, a declared grain, a declared key)
+resolve into facts, two properties propagate over the lineage graphs built from
+the project's SQL (functional dependencies over relations, then domain type over
+columns), and findings fall out of what propagation concluded:
 
-* a contract that did not resolve is a finding directly off the bridge;
-* a column whose flow value is provisional carries a declared type the inferred
-  one contradicts, which is currency creep, and it lands wherever the taint
-  reached, declared model or not;
-* an aggregate whose tag cleared to naked while an operand it summed still carried
-  one is a reduction the algebra cannot call well typed, the mixed-currency sum.
+* a contract that never resolved against the manifest is a finding on its own;
+* a column where the type propagation infers disagrees with a declared type is a
+  contradiction (currency creep), reported everywhere downstream the disagreement
+  reaches, not just where it was declared;
+* summing a column loses its domain type unless every other field in the row
+  stays constant across the group; when it doesn't, the sum is flagged as not well
+  typed (the mixed-currency sum).
 
 Predicates are collected and counted, not run: executing them needs materialized
 data, which belongs to the fixture/PBT loop, so the static check stays static.
@@ -20,7 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -36,6 +36,7 @@ from dblect.check.findings import (
     SuppressedCheckFinding,
     UnbuiltModel,
 )
+from dblect.check.grain import declared_grain_findings
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -67,6 +68,11 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounded_scopes,
     functional_dependency_grounding,
     functional_dependency_property,
+)
+from dblect.lineage.properties.uniqueness import (
+    CandidateKeySet,
+    uniqueness_facts,
+    uniqueness_property_from_facts,
 )
 from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
@@ -104,18 +110,31 @@ class CheckGraphs:
     per world: it derives from the world-invariant declared facts, so colocating it with
     the graph build keeps it in step with the graph instead of resting on the assumption
     that successive worlds share one."""
+    uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
+    """Every key declared for a relation, however it was declared: dbt tests, native
+    constraints, incremental config, and the keys resolved from Python contracts. The
+    same values feed the uniqueness propagation and the grain check, so the two cannot
+    disagree about what a user claimed. Does not vary by world."""
 
 
 @dataclass(frozen=True, slots=True)
 class WorldFacts:
     """The facts that ground one world's propagation. The declared facts are
-    world-invariant (shared across worlds); a world's ``CompileValue`` leaves are
-    appended by the enumerator. Keeping the two apart means the enumerator only
-    adds, never recomputes, the declared facts."""
+    world-invariant (shared across worlds); a world's own ``CompileValue`` facts
+    are appended by the enumerator. Keeping the two apart means the enumerator
+    only adds, never recomputes, the declared facts."""
 
     world: WorldRef
     fd_facts: tuple[Fact[FDSet, SourceRef], ...]
     tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
+
+
+def _no_fd_annotations() -> dict[SourceRef, Annotation[FDSet]]:
+    return {}
+
+
+def _no_key_annotations() -> dict[SourceRef, Annotation[CandidateKeySet]]:
+    return {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +150,19 @@ class WorldAnnotations:
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
     coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
+    functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(
+        default_factory=_no_fd_annotations
+    )
+    """What each relation's functional dependencies came out as, kept so a consumer
+    that needs them (the grain check reads them to widen what a declared grain
+    covers) does not propagate the property a second time."""
+    uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
+        default_factory=_no_key_annotations
+    )
+    """The candidate keys each relation's SQL implies on its own, recorded before the
+    declared keys were folded in. This is what the grain check compares a declaration
+    against; the combined value cannot serve, because the declaration is part of it
+    and would end up vouching for itself."""
 
 
 def build_check_graphs(
@@ -169,6 +201,9 @@ def build_check_graphs(
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
         join_key_ground=domain_type_grounding(by_scope(resolved.tag_facts)),
+        uniqueness_facts=uniqueness_facts(
+            manifest, profile, extra_facts=resolved.key_facts, parsed=trees
+        ),
     )
 
 
@@ -187,7 +222,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         functional_dependency_grounding(by_scope(facts.fd_facts))
     )
     store = AnnotationStore()
-    for scope, ann in propagate(graphs.relation_build.graph, fd_prop).items():
+    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop))
+    for scope, ann in fd_anns.items():
         store.record(fd_prop.name, scope, ann)
 
     dt_prop = domain_type_property(
@@ -197,8 +233,16 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
     clears: list[CoherenceClear[DomainTag]] = []
     domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx, sink=clears)
+
+    uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
+    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
+    propagate(graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred)
     return WorldAnnotations(
-        world=facts.world, domain_type=domain_type, coherence_clears=tuple(clears)
+        world=facts.world,
+        domain_type=domain_type,
+        coherence_clears=tuple(clears),
+        functional_dependency=fd_anns,
+        uniqueness_inferred=uniqueness_inferred,
     )
 
 
@@ -321,6 +365,14 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             world.domain_type,
             graphs.join_key_ground,
             line_maps,
+        )
+    )
+    findings.extend(
+        declared_grain_findings(
+            graphs.manifest,
+            graphs.uniqueness_facts,
+            world.uniqueness_inferred,
+            world.functional_dependency,
         )
     )
     return findings
@@ -448,8 +500,9 @@ def _contradiction_findings(
     column_graph: ColumnLineageGraph,
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
-    """One finding per column whose flow value is provisional: a declared type the
-    inferred one contradicts, reported wherever the taint reached."""
+    """One finding per column where propagation found the type flowing in
+    conflicts with a declared type (skips ``NAKED``, which carries nothing to
+    conflict about), reported at every downstream column the conflict reaches."""
     out: list[CheckFinding] = []
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:

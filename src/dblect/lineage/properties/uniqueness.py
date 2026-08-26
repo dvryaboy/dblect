@@ -1289,25 +1289,23 @@ class _Projection:
 # --- the property ------------------------------------------------------------
 
 
-def uniqueness_property(
+def uniqueness_facts(
     manifest: Manifest,
     profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
-) -> Property[CandidateKeySet, SourceRef]:
-    """The manifest-backed uniqueness property: declared keys (unique tests,
-    ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, the
-    config ``unique_key`` of a deduplicating incremental model, plus any
-    ``extra``) ground each relation, and the relation reducer infers more from the
-    SQL. Declared and inferred keys both hold, so they compose by meet
-    (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
-    set is empty. The property carries its relation-algebra walk as ``reducer`` so
-    the propagator dispatches it without a global registry.
+) -> Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]:
+    """Every key the project declares, collected per relation.
 
-    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
-    and dedup semantics, and carries any ``--dialect`` override so grammar and
-    semantics stay coherent."""
+    Reads each way a dbt project can state one: ``unique`` and
+    ``unique_combination_of_columns`` tests, native PRIMARY KEY and UNIQUE
+    constraints, the ``unique_key`` of an incremental model whose strategy actually
+    deduplicates, and a key stated on a surrogate hash (which also tells us the
+    columns hashed into it). ``extra`` adds more readers. ``extra_facts`` takes keys
+    the caller already has in hand, which is how the check passes in keys declared in
+    Python contracts without resolving those contracts a second time."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
@@ -1318,7 +1316,25 @@ def uniqueness_property(
     )
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
-    facts = collect(manifest, discoverers, name_to_source={})
+    collected = collect(manifest, discoverers, name_to_source={})
+    if not extra_facts:
+        return collected
+    merged: dict[SourceRef, list[Fact[CandidateKeySet, SourceRef]]] = {
+        scope: list(bucket) for scope, bucket in collected.items()
+    }
+    for fact in extra_facts:
+        merged.setdefault(fact.scope, []).append(fact)
+    return {scope: tuple(bucket) for scope, bucket in merged.items()}
+
+
+def uniqueness_property_from_facts(
+    facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> Property[CandidateKeySet, SourceRef]:
+    """The uniqueness property grounded from ``facts``. Declared and inferred keys
+    both hold, so they compose by meet (``reconcile_by_meet``); no opaque opt-out
+    reader is wired yet, so the opaque set is empty. The property carries its
+    relation-algebra walk as ``reducer`` so the propagator dispatches it without a
+    global registry."""
     return relation_property(
         name="uniqueness",
         lattice=UNIQUENESS_LATTICE,
@@ -1327,6 +1343,24 @@ def uniqueness_property(
         ground=_grounding_with_conditional(facts),
         reconcile_by_meet=True,
         reducer=relation_reduce,
+    )
+
+
+def uniqueness_property(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    parsed: Mapping[str, Expr] | None = None,
+) -> Property[CandidateKeySet, SourceRef]:
+    """The manifest-backed uniqueness property: :func:`uniqueness_facts` grounds
+    each relation and the relation reducer infers more from the SQL.
+
+    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
+    and dedup semantics, and carries any ``--dialect`` override so grammar and
+    semantics stay coherent."""
+    return uniqueness_property_from_facts(
+        uniqueness_facts(manifest, profile, extra=extra, parsed=parsed)
     )
 
 

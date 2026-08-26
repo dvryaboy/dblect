@@ -28,7 +28,7 @@ property's :class:`~dblect.lineage.facts.DepContext` reads.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from functools import reduce
 from typing import Any, TypeVar, cast
 
@@ -87,11 +87,13 @@ def propagate(
     dep_context: DepContext = _NULL_DEP_CONTEXT,
     subjects: Iterable[S] | None = None,
     sink: CoherenceSink[K] | None = None,
+    inferred_sink: MutableMapping[S, Annotation[K]] | None = None,
 ) -> Mapping[S, Annotation[K]]:
     """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
-    This is the one propagation engine: a memoised grounded fixpoint over the
-    lineage DAG. For each subject it grounds a declared annotation, short-circuits
+    This is the one propagation engine: one walk over the lineage graph, caching
+    each subject's result so a value read by many downstream columns is computed
+    once. For each subject it grounds a declared annotation, short-circuits
     on a declared opt-out, reduces the subject's derivation to an inferred
     annotation, and reconciles the two. The scope-specific part is the *reducer*:
     how a derivation reduces, and how recursion into referenced subjects is
@@ -115,8 +117,19 @@ def propagate(
     ``sink`` collects the :class:`CoherenceClear` events an aggregate guard records
     when it clears a tag, so a caller (the check) reads *why* a tag went to top rather
     than re-inferring it from the output. It is per-call: the propagator never mutates
-    the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
-    silently (the substrate-only path).
+    the shared graph, so one ``sink`` belongs to one world's run. ``None`` skips
+    that bookkeeping and just returns the computed value.
+
+    ``inferred_sink``, when supplied, keeps what the SQL alone implied about each
+    node, before anything the user declared was folded in. Normally the two are
+    combined and only the combined value is kept, which is right for propagation but
+    leaves no way to ask whether the SQL supports a declaration: for a property whose
+    declared and derived values are both true and simply accumulate (candidate keys
+    are the case in hand), the declaration is part of the combined value, so checking
+    a declaration against it always succeeds. Keeping the derived value separately is
+    what lets a caller ask the question. Nodes with nothing to derive from, a source
+    or a node the modeller marked opaque, are absent rather than recorded empty.
+    ``refutation-and-verdicts.md`` covers what a caller can then conclude.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
@@ -145,6 +158,8 @@ def propagate(
                     result = grounded  # a leaf anchors on its grounded value
                 else:
                     inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
+                    if inferred_sink is not None:
+                        inferred_sink[subject] = inferred
                     result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
             annotations[subject] = result
             return result
