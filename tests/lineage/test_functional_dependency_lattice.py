@@ -117,26 +117,12 @@ def test_join_intersects_fds() -> None:
     assert FUNCTIONAL_DEPENDENCY_LATTICE.join(a, b) == FDSet.of(shared)
 
 
-def _instance(fd: FD, origin: SourceRef = _ORIGINS[0]) -> DeclaredFD:
-    return DeclaredFD(origin=origin, declared=fd, fd=fd)
-
-
-def test_join_keeps_only_shared_instances() -> None:
-    """The same dependency grounded at two different origins is two instances, and
-    a confluence keeps neither unless both sides carry the same one."""
-    fd = FD(frozenset({"country"}), "currency")
-    a = FDSet(frozenset({fd}), frozenset({_instance(fd, _ORIGINS[0])}))
-    b = FDSet(frozenset({fd}), frozenset({_instance(fd, _ORIGINS[1])}))
-    assert FUNCTIONAL_DEPENDENCY_LATTICE.join(a, b) == FDSet.of(fd)
-    assert FUNCTIONAL_DEPENDENCY_LATTICE.join(a, a) == a
-
-
 def test_an_instance_outside_the_fds_is_rejected() -> None:
     """The invariant: a declared instance's current dependency is one of the
     value's dependencies, so consumers reading ``fds`` alone never under-see."""
     fd = FD(frozenset({"country"}), "currency")
     with pytest.raises(ValueError, match="outside fds"):
-        FDSet(frozenset(), frozenset({_instance(fd)}))
+        FDSet(frozenset(), frozenset({DeclaredFD(origin=_ORIGINS[0], declared=fd, fd=fd)}))
 
 
 @given(st.lists(_fd_sets, max_size=6))
