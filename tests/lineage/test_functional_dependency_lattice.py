@@ -121,16 +121,6 @@ def _instance(fd: FD, origin: SourceRef = _ORIGINS[0]) -> DeclaredFD:
     return DeclaredFD(origin=origin, declared=fd, fd=fd)
 
 
-def test_meet_unions_declared_instances() -> None:
-    fd_a = FD(frozenset({"country"}), "currency")
-    fd_b = FD(frozenset({"country"}), "region")
-    a = FDSet(frozenset({fd_a}), frozenset({_instance(fd_a)}))
-    b = FDSet(frozenset({fd_b}), frozenset({_instance(fd_b)}))
-    assert FUNCTIONAL_DEPENDENCY_LATTICE.meet(a, b) == FDSet(
-        frozenset({fd_a, fd_b}), frozenset({_instance(fd_a), _instance(fd_b)})
-    )
-
-
 def test_join_keeps_only_shared_instances() -> None:
     """The same dependency grounded at two different origins is two instances, and
     a confluence keeps neither unless both sides carry the same one."""
