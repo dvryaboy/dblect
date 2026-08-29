@@ -18,15 +18,15 @@ to make a claim, and stay silent otherwise):
 * ``detect_cross_model_fanout``: a duplicate-sensitive aggregate that folds a
   magnitude an upstream fan-out replicated, over a relation no longer keyed at the
   magnitude's grain. This one also reads ``where_provenance`` to find the origin a
-  magnitude traces to, the grain ``grain_preserved`` is asked about. A COUNT fold
-  (``COUNT(*)``, ``COUNT(col)``) yields a cardinality, not a magnitude: it counts the
-  relation's rows, whose grain the relation preserves, so it stays silent (the ``SUM(qty)``
-  analog), unlike ``SUM(amount)``.
+  magnitude traces to, then asks ``grain_preserved`` whether that origin's grain
+  still holds. A COUNT fold (``COUNT(*)``, ``COUNT(col)``) yields a cardinality, not
+  a magnitude: it counts the relation's rows, whose grain the relation preserves, so
+  it stays silent (the ``SUM(qty)`` analog), unlike ``SUM(amount)``.
 
-The first two read keys from the lineage.facts uniqueness substrate: per-model keys
-come from cross-model propagation (``uniqueness_property`` over the relation graph),
-and a per-tree scope index (``relation_scope_keys``) supplies the keys of CTE and
-inline-subquery scopes, which are not relations the propagator annotates.
+The first two read keys from two places: cross-model propagation
+(``uniqueness_property`` over the relation graph) supplies per-model keys, and a
+per-tree scope index (``relation_scope_keys``) supplies the keys of CTE and
+inline-subquery scopes, which the propagator does not annotate as relations.
 """
 
 from __future__ import annotations
@@ -160,13 +160,13 @@ def detect_non_unique_aggregate_order_keys(
 
     Only the top-n shape fires: an ordered aggregate with no inner ``LIMIT`` keeps every element,
     so its membership is deterministic regardless of ties (only the internal tie order is
-    unstable, which the unordered-aggregate detector's territory). An aggregate with no
+    unstable, which is the unordered-aggregate detector's territory). An aggregate with no
     ``ORDER BY`` at all is that detector's job too, and stays silent here.
 
     Conservative toward silence, like the window check: single-source scopes only (a join or
     ``UNION`` needs column-level lineage), bare-column order and group keys only (an expression
     needs an equivalence we do not model), and silent when no source key is known (the firewall
-    posture, with no grain to name there is no positive fact to fire on).
+    posture: with no grain to name, there is no positive fact to fire on).
     """
     scopes = _scope_index_for(tree, model_keys, scope_index)
     out: list[Finding] = []
@@ -531,7 +531,7 @@ def make_fact_grounded_detectors(
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
     fd_by_name: Mapping[str, FDSet] | None = None,
 ) -> tuple[Detector, ...]:
-    """Curry the fact-grounded detectors against substrate-derived keys.
+    """Curry the fact-grounded detectors against the propagated uniqueness keys.
 
     Per-model keys come from one cross-model propagation of the uniqueness
     property over the relation graph; ``parsed`` lets the caller share the audit's
@@ -658,8 +658,8 @@ def detect_cross_model_fanout(
 
     Silent when the FROM is not a single ref'd relation (a join or a CTE/subquery needs
     column-level reasoning kept for later), when the aggregate is duplicate-safe, and when the
-    origin relation has no known key, the firewall posture: with no grain to name there is no
-    positive fact to fire on. Also silent on a COUNT-behavior fold (``COUNT(*)``, ``COUNT(1)``,
+    origin relation has no known key (the firewall posture: with no grain to name, there is
+    no positive fact to fire on). Also silent on a COUNT-behavior fold (``COUNT(*)``, ``COUNT(1)``,
     ``COUNT(col)``, ``COUNT_IF``): it yields a cardinality, not a magnitude, so it counts the
     relation's rows (whose grain the relation preserves) rather than summing a replicated value.
     That makes every COUNT the ``SUM(qty)`` analog (a fold at the genuine, un-replicated grain),

@@ -5,9 +5,9 @@ SQL for the execution path.
 A model contract relates several columns, rows, or models through methods marked
 :func:`contract`. The method body manipulates column proxies (``self.col``,
 ``models.other.col``), and the operators build an :mod:`~dblect.contracts.ast`
-tree the framework reads. A returned fact feeds the substrate; a returned
-predicate is checked by running. See ``docs/design/declaration-dsl.md`` and
-``docs/design/dblect_technical_intro.md``.
+tree the framework reads. A returned fact is trusted outright, the way a
+declared key is; a returned predicate is checked by running. See
+``docs/design/declaration-dsl.md`` and ``docs/design/dblect_technical_intro.md``.
 """
 
 from __future__ import annotations

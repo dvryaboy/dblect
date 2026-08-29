@@ -4,8 +4,8 @@ A model usually compiles to a single ``SELECT``, but a macro that emits a helper
 inline produces a script: leading ``CREATE [TEMPORARY] FUNCTION`` / ``DECLARE`` /
 ``SET`` statements before the terminal query. `parse_result_statement` keeps the final
 top-level query and drops the prelude. A call to an inline-defined function stays an
-ordinary call, which the propagator reads as a value-erasing transform, so an inline
-UDF degrades to the opaque posture rather than failing the parse.
+ordinary call, which the propagator conservatively treats as a value-erasing transform
+rather than failing the parse.
 
 A script with more than one query, or none, cannot be reduced to a single model, so
 the caller records a resolution-coverage miss instead of guessing. `parse_sql` is the

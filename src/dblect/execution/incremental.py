@@ -9,8 +9,8 @@ with nothing built. Each world is read back as an ordinary
 
 The override reaches the bare ``{{ is_incremental() }}`` call. A model that calls
 ``dbt.is_incremental()`` explicitly, or a branch that introspects the existing
-relation's schema at compile, is not reached and degrades to an opaque world
-(reported with its error) while the other world still stands.
+relation's schema at compile, is not reached: that world's compile does not
+succeed, so it is reported with its error while the other world still stands.
 """
 
 from __future__ import annotations
@@ -136,7 +136,8 @@ def _compile_world(
     env: Mapping[str, str],
 ) -> CompiledWorld:
     """Write the override for ``value``, compile, and harvest the manifest. A
-    non-zero compile or a missing manifest yields an opaque world, never a raise."""
+    non-zero compile or a missing manifest returns a ``CompiledWorld`` whose
+    compile did not succeed, never a raise."""
     macro_path.write_text(_override_macro(value))
     proc = run_dbt(dbt, ["compile", "--project-dir", str(work)], env=env)
     if proc.returncode != 0:

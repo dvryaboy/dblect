@@ -1,9 +1,10 @@
 """Illustrative enum vocabularies: ISO 4217 currencies and ISO 3166-1 countries.
 
-Partial slices, enough to exercise the tag algebra in the walkthrough. They are
-ordinary :class:`~dblect.types.UnitEnum` / :class:`~dblect.types.NominalEnum`
-subclasses, the markers that live in ``dblect.types``; a project declares its
-own categories the same way. Widening these is a data edit, not a design change.
+Partial slices, enough to give the walkthrough's unit and category types
+something to hold. They are ordinary :class:`~dblect.types.UnitEnum` /
+:class:`~dblect.types.NominalEnum` subclasses, the markers that live in
+``dblect.types``; a project declares its own categories the same way. Widening
+these is a data edit, not a design change.
 """
 
 from __future__ import annotations

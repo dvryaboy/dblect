@@ -11,7 +11,8 @@ by compilation does not match, so for those we reach for a second anchor: the
 source line of the ``{{ ... }}`` call that emitted it, found in the raw template's
 Jinja structure. When the gap between two verbatim anchors holds exactly one call
 site the emitted span anchors there (``MACRO_CALL``); SQLFluff reaches the same
-position from an instrumented render, and this reconstructs it from artifacts.
+position by rendering the template with instrumentation, and this reconstructs it
+from the compiled SQL and the parsed template alone, without a custom render.
 When no single source line can be found (several calls in the gap, or a fully
 generated model) the span stays compiled-relative: a wrong source line reads as a
 bug in the tool, so we keep the honest compiled line instead of guessing.

@@ -49,8 +49,8 @@ def _ensure_loaded() -> None:
 def _conservative(adapter_type: str, *, sqlglot_dialect: str | None = None) -> AdapterProfile:
     """The profile for an adapter dblect has no specific knowledge of: NOT NULL
     enforced (true on essentially every warehouse), PRIMARY KEY / UNIQUE advisory,
-    no known dedup default (so an unset incremental strategy claims no key), and
-    only the portable non-determinism baseline."""
+    no known dedup default (so an unset incremental strategy carries no dedup
+    guarantee), and only the portable non-determinism baseline."""
     return AdapterProfile(
         adapter_type=adapter_type,
         sqlglot_dialect=sqlglot_dialect if sqlglot_dialect is not None else adapter_type,

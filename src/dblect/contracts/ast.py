@@ -24,7 +24,8 @@ from enum import StrEnum, auto
 
 class AggFunc(StrEnum):
     """The reductions a column proxy offers. ``COUNT`` and ``COUNT_DISTINCT`` are
-    always well typed; the rest carry the coherence obligation the algebra names."""
+    always well typed; ``SUM``, ``AVG``, ``MIN``, and ``MAX`` require the values
+    they combine to share a unit or currency."""
 
     SUM = auto()
     AVG = auto()
@@ -35,8 +36,8 @@ class AggFunc(StrEnum):
 
 
 class ArithOp(StrEnum):
-    """Binary arithmetic over magnitudes (the dimensional algebra lives downstream;
-    here we only record the operator)."""
+    """Binary arithmetic over magnitudes (unit and currency checking happens
+    downstream; here we only record the operator)."""
 
     ADD = auto()
     SUB = auto()
@@ -170,9 +171,9 @@ Pred = Compare | IsNull | InSet | Between | BoolNode
 
 # --- facts ----------------------------------------------------------------------
 #
-# A contract method that returns one of these feeds the substrate rather than
-# being run: it is a vouched assertion the analyzer trusts to discharge
-# obligations and propagate. The bridge lowers each to the matching substrate fact.
+# A contract method that returns one of these is trusted outright rather than
+# run: it is an assertion the analyzer takes as given, the way a declared key
+# is. The bridge lowers each into the matching fact the lineage engine tracks.
 
 
 @dataclass(frozen=True, slots=True)
