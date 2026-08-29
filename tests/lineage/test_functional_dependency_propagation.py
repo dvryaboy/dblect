@@ -536,36 +536,17 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
 # The union merge keeps exactly the declared instances every arm shares, whole,
 # after positional alignment: a union adds only cross pairs (one row per arm), an
 # arm-local witness leaves them uncovered, and one shared axiom covers them. The
-# rows enumerate the decision space: one carry per composition path the merge must
-# thread (operator, alignment, chain flattening, the dbt CTE-and-rename shell) and
-# one drop per soundness edge (derived witness, two worlds, an unknown arm, two
-# axioms of one world on the same columns, crossed columns, a star arm), plus the
-# other set operators, which claim nothing. The union PBT in
-# test_pbt_functional_dependency_soundness.py judges the same rule against
-# materialized data.
+# carry side is owned by the union PBT in
+# test_pbt_functional_dependency_soundness.py, whose anti-vacuity arm spans both
+# operators, both arm orders, and differing arm aliases; the rows here pin what
+# its generator cannot reach: the two structural carries (chain flattening, the
+# dbt CTE-and-rename shell), one drop per soundness edge (derived witness, two
+# worlds, an unknown arm, two axioms of one world on the same columns, crossed
+# columns, a star arm), and the other set operators, which claim nothing.
 
 _CC = _fd("currency", "country")
 
 _SET_OPERATIONS = [
-    pytest.param(
-        _declared(_CC),
-        "SELECT country, currency FROM payments UNION ALL SELECT country, currency FROM payments",
-        _carried(_inst(_CC)),
-        id="one-world-slices-carry",
-    ),
-    pytest.param(
-        _declared(_CC),
-        "SELECT country, currency FROM payments UNION SELECT country, currency FROM payments",
-        _carried(_inst(_CC)),
-        id="union-distinct-carries-alike",
-    ),
-    pytest.param(
-        _declared(_CC),
-        "SELECT country AS nation, currency AS curr FROM payments "
-        "UNION ALL SELECT country AS c1, currency AS c2 FROM payments",
-        _carried(_inst(_CC, as_fd=_fd("curr", "nation"))),
-        id="arms-align-by-position",
-    ),
     pytest.param(
         _declared(_CC),
         "SELECT country, currency FROM payments "
@@ -581,13 +562,6 @@ _SET_OPERATIONS = [
         "SELECT country AS nation, currency AS curr FROM unioned",
         _carried(_inst(_CC, as_fd=_fd("curr", "nation"))),
         id="dbt-shape-cte-then-rename",
-    ),
-    pytest.param(
-        _declared(_fd("region", "country"), _fd("currency", "region")),
-        "SELECT country, region, currency FROM payments "
-        "UNION ALL SELECT country, region, currency FROM payments",
-        _carried(_inst(_fd("region", "country")), _inst(_fd("currency", "region"))),
-        id="declared-chain-kept-whole",
     ),
     pytest.param(
         _declared(),
