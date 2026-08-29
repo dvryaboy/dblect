@@ -12,8 +12,8 @@ well-exercised place.
 side, run against generated rows in an in-memory DuckDB, and compared group by
 group under the predicate's tolerance. This is the runtime-checked half of the
 contract surface, the analyzer never reasons over it. Cross-relation joins
-(``joined_on``) and the materialized-DataFrame escape hatch are not lowered here
-yet; they are the natural next increment.
+(``joined_on``) and the materialized-DataFrame contract form are not lowered
+here yet; they are the natural next increment.
 """
 
 from __future__ import annotations

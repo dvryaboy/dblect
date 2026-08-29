@@ -11,9 +11,10 @@ cannot fan out. The nullability detector consumes every form, since a NULL probe
 as a spurious non-match rather than dropped, the inverse of an ordinary join's hazard.
 
 The classifier is deliberately oracle-free: it decides each form structurally so any consumer
-can call it without threading the nullability substrate. The one edge that needs nullability,
-a ``LEFT JOIN ... IS NULL`` on a column that is not a join key, is left unrecognised here (see
-:func:`_left_is_null_anti_join`); a consumer that holds the substrate decides it itself.
+can call it without threading the nullability analysis through. The one edge that needs
+nullability, a ``LEFT JOIN ... IS NULL`` on a column that is not a join key, is left
+unrecognised here (see :func:`_left_is_null_anti_join`); a consumer that holds that analysis
+decides it itself.
 """
 
 from __future__ import annotations
@@ -147,8 +148,8 @@ def _left_is_null_anti_join(j: exp.Join, *, leaves: list[Expr], from_alias: str)
     column is one of ``R``'s join-key columns in ``P``. A matched row then has ``l.x = R.col`` so
     ``R.col`` is non-NULL there and the filter drops it, keeping exactly the unmatched rows. The
     equality match proves the column non-NULL, so the recognition needs no nullability oracle. An
-    ``IS NULL`` on a non-key column can leak matched rows and is left for a substrate-backed
-    consumer to decide."""
+    ``IS NULL`` on a non-key column can leak matched rows and is left for a consumer with the
+    nullability analysis to decide."""
     matched_alias = j.this.alias_or_name
     matched_cols = _sides_of(sg.on_of(j)).get(matched_alias, frozenset())
     if not matched_cols:
@@ -219,7 +220,7 @@ def _not_in_anti_join(in_node: exp.In, *, from_alias: str, node: Expr) -> AntiJo
 def single_projected_column(query: Expr) -> tuple[str, str] | None:
     """The ``(relation, column)`` a subquery projects, when it is a single bare column over a
     single bare-table FROM with no joins; else ``None``. The lower-cased column matches the
-    nullability substrate's own column keys."""
+    column-key casing the nullability analysis uses."""
     select = query.this if isinstance(query, exp.Subquery) else query
     if not isinstance(select, exp.Select) or sg.joins_of(select):
         return None

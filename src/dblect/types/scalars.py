@@ -2,7 +2,7 @@
 
 A domain type's field is read by what it *is*, not annotated by hand. The
 classification is the seam between the author's ordinary Python annotations and
-the substrate's tag algebra (``docs/design/domain-type-algebra.md``):
+dblect's tag algebra (``docs/design/domain-type-algebra.md``):
 
 * a numeric :class:`Decimal` (or ``Decimal(p, s)``), a :class:`Count`, or a
   floating-point ``float`` / :class:`Float` is a **magnitude**, the field a tag
@@ -15,9 +15,9 @@ the substrate's tag algebra (``docs/design/domain-type-algebra.md``):
   (``int`` / :class:`Integer` / :class:`BigInt`) carry **no** tag.
 
 A bare integer is the one scalar whose role its algebra does not settle: an
-integer is algebraically a perfect quantity, yet by role it is as often an
+integer is algebraically a quantity, yet by role it is as often an
 identifier or a calendar year, which are tags. The lenient default reads it as
-opaque (inert), making no claim either way; a measure is spelled ``Count`` /
+inert, making no claim either way; a measure is spelled ``Count`` /
 ``Decimal`` and an identifier or year carries its own domain type. A future
 strict mode rejects a bare integer instead, per the lenient/strict switch in
 ``docs/design/domain-type-algebra.md``.
@@ -53,7 +53,7 @@ class FieldDef:
     ``enum`` is set for a unit or nominal enum field; ``pytype`` is set for a
     plain ``bool``/``str`` nominal field; ``precision``/``scale`` carry a
     decimal magnitude's parameters. They pin what a fixing must look like and
-    how the bridge builds the field's tag coordinate.
+    how the fact bridge builds the field's tag coordinate.
     """
 
     name: str
@@ -66,9 +66,9 @@ class FieldDef:
 
 class Decimal:
     """A fixed-point magnitude type, usable bare (``Decimal``) or parameterized
-    (``Decimal(18, 2)``). The parameters annotate precision and scale; the
-    substrate does not yet reason over them, but the contract carries them so a
-    later width check has them to hand."""
+    (``Decimal(18, 2)``). The parameters annotate precision and scale; dblect does
+    not yet reason over them, but the contract carries them so a later width
+    check has them to hand."""
 
     __slots__ = ("precision", "scale")
 

@@ -263,7 +263,7 @@ def _existing_ref(cmp: Compare) -> ValueExpr | None:
 
 class FactProxy:
     """A fact a contract method returns. Inert: it only carries the AST node the
-    bridge lowers to a substrate fact."""
+    bridge lowers into a fact the lineage engine tracks."""
 
     __slots__ = ("fact",)
 
@@ -287,8 +287,8 @@ class ContractSelf:
         return ColumnProxy(Col(None, name))
 
     def __getitem__(self, name: str) -> ColumnProxy:
-        """A column by name, the escape hatch for one that collides with a method
-        here (``self["key"]``, ``self["grain"]``). Indexing never resolves to a
+        """A column by name, for one whose name collides with a method here
+        (``self["key"]``, ``self["grain"]``). Indexing never resolves to a
         method, so it reaches any column attribute access would shadow."""
         return ColumnProxy(Col(None, name))
 
@@ -322,8 +322,8 @@ class ModelProxy:
         return ColumnProxy(Col(self.model, name))
 
     def __getitem__(self, name: str) -> ColumnProxy:
-        """A column by name, the escape hatch for one that collides with the
-        ``model`` slot (``models.other["model"]``). Indexing always names a column."""
+        """A column by name, for one whose name collides with the ``model`` slot
+        (``models.other["model"]``). Indexing always names a column."""
         return ColumnProxy(Col(self.model, name))
 
 

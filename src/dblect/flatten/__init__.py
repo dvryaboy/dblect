@@ -1,4 +1,4 @@
-"""Inner-flatten row-drop detection grounded against propagated array non-emptiness.
+"""Inner-flatten row-drop detection checked against propagated array non-emptiness.
 
 The structural detector in :mod:`dblect.sql.patterns` flags an inner ``UNNEST`` that
 can drop a parent row, clearing only the locally provable cases (an outer form, a

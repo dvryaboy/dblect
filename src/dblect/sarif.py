@@ -409,7 +409,7 @@ def _notification(descriptor_id: str, text: str, logical_name: str) -> _Notifica
 
 
 def _fingerprint(finding: AnalysisFinding) -> str:
-    # Hash the cross-run identity (kind plus where it lands, no line numbers) so a
+    # Hash the cross-world identity (kind plus where it lands, no line numbers) so a
     # consumer can track the same finding across compilations.
     return hashlib.sha256(repr(cross_world_identity(finding)).encode("utf-8")).hexdigest()
 

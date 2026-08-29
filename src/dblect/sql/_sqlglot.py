@@ -72,7 +72,7 @@ class GroupBinding(StrEnum):
     would bind an input column of that name first and the AST cannot rule one out.
 
     A detector may read all three, since over-reporting is its safe direction. A consumer that
-    *grounds* a fact from the group key stops at ``DECIDED`` (see
+    treats the group key as an established fact stops at ``DECIDED`` (see
     :attr:`GroupTarget.grounded_expression`): keys and dependencies are read downstream to
     clear hazards, so a wrong resolution there silences real findings instead of adding a
     spurious one.
@@ -91,8 +91,8 @@ class GroupTarget:
     A finding about the *grouping decision* belongs at ``written_at``, so ``GROUP BY 1`` is
     diagnosed at the clause an analyst reads. One about something written inside the target (a
     ``now()`` call) belongs at ``expression``, where that call is spelled out. The two nodes
-    coincide for a target written in full. ``binding`` decides whether a consumer may ground a
-    fact from ``expression``: see :attr:`grounded_expression`.
+    coincide for a target written in full. ``binding`` decides whether a consumer may treat
+    ``expression`` as an established fact: see :attr:`grounded_expression`.
     """
 
     expression: Expr
@@ -101,8 +101,8 @@ class GroupTarget:
 
     @property
     def grounded_expression(self) -> Expr:
-        """The reading a consumer may ground a fact from: the resolved expression where SQL's
-        own rules decide the binding, and the written node where they do not.
+        """The reading a consumer may treat as an established fact: the resolved expression
+        where SQL's own rules decide the binding, and the written node where they do not.
 
         Falling back to ``written_at`` on a ``PRESUMED`` binding is the conservative reading, and
         it is the one SQL takes whenever the name really is an input column. Two targets can also
@@ -363,9 +363,9 @@ def fn_of(w: exp.Window) -> Expr | None:
 
 
 def row_number_window(node: Expr) -> exp.Window | None:
-    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` grounds
-    a dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row, whereas
-    ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
+    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` gives a
+    working dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row,
+    whereas ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
     if isinstance(node, exp.Window) and isinstance(node.this, exp.RowNumber):
         return node
     return None
@@ -379,7 +379,8 @@ def rank_one_guard_operand(leaf: Expr) -> Expr | None:
     """The operand a ``= 1`` / ``<= 1`` dedup guard constrains to the top rank, or ``None``.
     Recognises ``X = 1``, ``1 = X``, ``X <= 1`` and ``1 >= X`` with a literal integer ``1`` (a
     row number is ``>= 1``, so ``<= 1`` coincides with ``= 1``). Any other comparison keeps more
-    than the top row and grounds no key. ``X`` is returned unevaluated for the caller to test."""
+    than the top row and yields no usable dedup key. ``X`` is returned unevaluated for the
+    caller to test."""
     if isinstance(leaf, exp.EQ):
         if _is_literal_one(leaf.expression):
             return leaf.this

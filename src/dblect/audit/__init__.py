@@ -1,4 +1,4 @@
-"""Audit pipeline: static detectors, replay-determinism, heuristic invariants."""
+"""Audit pipeline: detect SQL hazards, back-map findings to source, and apply suppressions."""
 
 from dblect.audit.sourcemap import SourceSpan, SpanBasis
 from dblect.audit.suppress import SuppressionDirective

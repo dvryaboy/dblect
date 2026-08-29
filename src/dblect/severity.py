@@ -7,15 +7,10 @@ fails at. A correctness hazard (the analysis says the query returns wrong rows) 
 drift between runs) is a ``warn``; an ``info`` is an observation worth surfacing that on
 its own should not fail anyone's build.
 
-``Severity`` is a ``StrEnum`` so the level values read as the plain words (the CLI flag
-and the JSON field both want ``info``/``warn``/``error``). Comparison is overridden to
-follow an explicit rank rather than the inherited string order, so ``>=`` is a real
-ordering and not a lexicographic accident; comparing a ``Severity`` to anything else
-raises rather than silently falling back to ``str`` order. The per-kind mapping is the
-single place a kind's default level is decided, written as a ``match`` closed by
-``assert_never`` so a new kind without a level is a type error rather than a silent
-default; ``severity_of`` reads a finding's level without the caller knowing which
-detector family produced it.
+The per-kind mapping is the single place a kind's default level is decided, written
+as a ``match`` closed by ``assert_never`` so a new kind without a level is a type
+error rather than a silent default; ``severity_of`` reads a finding's level without
+the caller knowing which detector family produced it.
 """
 
 from __future__ import annotations
@@ -103,11 +98,11 @@ def _structural_severity(kind: FindingKind) -> Severity:
             # Real-project calibration (#125) found the fanout pair firing on every
             # intended fact-to-dimension surrogate-key
             # join: the dimension declares its key on the natural key, and the surrogate
-            # key is a function of it that uniqueness does not yet ground through. They
-            # ship advisory so a textbook star schema stays visible without failing the
-            # build. Raise them back to error once uniqueness grounds through the
-            # surrogate-key expression, or once the lenient/strict split (#116) can hold
-            # the error default in the strict profile.
+            # key is a function of it that the analysis does not yet know is also unique.
+            # They ship advisory so a textbook star schema stays visible without failing
+            # the build. Raise them back to error once the analysis can prove the
+            # surrogate-key expression is unique too, or once the lenient/strict split
+            # (#116) can hold the error default in the strict profile.
             | FindingKind.JOIN_FANOUT
             | FindingKind.CROSS_MODEL_FANOUT
         ):
