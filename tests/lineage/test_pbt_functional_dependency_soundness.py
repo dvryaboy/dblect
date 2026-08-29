@@ -1,8 +1,9 @@
 """Empirical soundness PBT for the functional-dependency property: the data judges.
 
 The FD walk claims dependencies on a model's output from three sources: a declared
-dependency carried through the relational algebra, a constancy minted by an
-equality filter, and the group key determining every other output of a GROUP BY.
+dependency carried through the relational algebra (a union of arms drawn from the
+declaring relation included), a constancy minted by an equality filter, and the
+group key determining every other output of a GROUP BY.
 The soundness obligation is uniform: every claimed ``X -> y`` must hold on the
 materialized result, meaning no two result rows agree on ``X`` and differ on ``y``.
 
@@ -31,6 +32,7 @@ from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import (
     FD,
     FDSet,
+    determines,
     functional_dependency_grounding,
     functional_dependency_property,
 )
@@ -332,4 +334,133 @@ def test_every_claimed_join_fd_holds_on_the_data(
         assert witness is None, (
             f"claimed FD {sorted(fd.determinant)} -> {fd.dependent} violated at "
             f"determinant value {witness} for sql={_join_sql(s)!r} rows={rows}"
+        )
+
+
+# --- declared dependencies across a union ------------------------------------------
+#
+# Two base tables each honour ``g -> x`` in their own data, under their own mapping.
+# The walk may keep the dependency across a union only when every arm's pairs come
+# from one declared world; two worlds' mappings disagree, and the materialized union
+# is the judge. The anti-vacuity arm pins the flip side: when both arms are slices
+# of the one declared relation, projected identically, silence is a failure.
+
+_T1 = SourceRef(SourceKind.SOURCE, "source.test.raw.t1")
+_T2 = SourceRef(SourceKind.SOURCE, "source.test.raw.t2")
+_U_MODEL = SourceRef(SourceKind.MODEL, "model.test.u")
+_ARM_ORDERS: tuple[tuple[str, str], ...] = (("g", "x"), ("x", "g"))
+
+
+@dataclass(frozen=True)
+class UnionScenario:
+    same_world: bool  # arm two reads t1 (the declaring relation) rather than t2
+    declare_t2: bool  # t2 carries its own ``g -> x`` declaration
+    rows_t1: tuple[tuple[int, int], ...]  # (g, x), x a function of g
+    rows_t2: tuple[tuple[int, int], ...]  # (g, x), x a function of g, independent mapping
+    arm1_cols: tuple[str, str]  # projection order of the first arm
+    arm2_cols: tuple[str, str]  # projection order of the second arm (may swap)
+    arm2_names: tuple[str, str]  # the second arm's aliases (alignment is positional)
+    distinct: bool  # UNION rather than UNION ALL
+
+
+@st.composite
+def _union_scenario(draw: st.DrawFn) -> UnionScenario:
+    def rows(mapping: Mapping[int, int]) -> tuple[tuple[int, int], ...]:
+        out: list[tuple[int, int]] = []
+        for _ in range(draw(st.integers(min_value=0, max_value=6))):
+            g = draw(st.integers(min_value=0, max_value=2))
+            out.append((g, mapping[g]))
+        return tuple(out)
+
+    map1 = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
+    map2 = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
+    return UnionScenario(
+        same_world=draw(st.booleans()),
+        declare_t2=draw(st.booleans()),
+        rows_t1=rows(map1),
+        rows_t2=rows(map2),
+        arm1_cols=draw(st.sampled_from(_ARM_ORDERS)),
+        arm2_cols=draw(st.sampled_from(_ARM_ORDERS)),
+        arm2_names=draw(st.sampled_from((("o0", "o1"), ("p0", "p1")))),
+        distinct=draw(st.booleans()),
+    )
+
+
+def _union_sql(s: UnionScenario) -> str:
+    arm1 = f"SELECT {s.arm1_cols[0]} AS o0, {s.arm1_cols[1]} AS o1 FROM t1"
+    arm2_table = "t1" if s.same_world else "t2"
+    arm2 = (
+        f"SELECT {s.arm2_cols[0]} AS {s.arm2_names[0]}, "
+        f"{s.arm2_cols[1]} AS {s.arm2_names[1]} FROM {arm2_table}"
+    )
+    op = "UNION" if s.distinct else "UNION ALL"
+    return f"{arm1} {op} {arm2}"
+
+
+def _g_to_x_fact(scope: SourceRef) -> Fact[FDSet, SourceRef]:
+    return Fact(
+        scope=scope,
+        value=FDSet.of(FD(frozenset({"g"}), "x")),
+        provenance=Declared(DeclaredSource.USER_ASSERTED),
+    )
+
+
+def _union_claimed(s: UnionScenario) -> FDSet:
+    nodes = {
+        _T1.unique_id: _source(_T1.unique_id, name="t1"),
+        _T2.unique_id: _source(_T2.unique_id, name="t2"),
+        _U_MODEL.unique_id: _node(_U_MODEL.unique_id, _union_sql(s), name="u"),
+    }
+    manifest = Manifest(schema_version="v12", adapter_type="duckdb", nodes=nodes)
+    facts = {_T1: (_g_to_x_fact(_T1),)}
+    if s.declare_t2:
+        facts[_T2] = (_g_to_x_fact(_T2),)
+    prop = functional_dependency_property(functional_dependency_grounding(facts))
+    anns = propagate(build_relation_graph(manifest).graph, prop)
+    return anns[_U_MODEL].value
+
+
+def _union_materialize(
+    con: duckdb.DuckDBPyConnection, s: UnionScenario
+) -> tuple[tuple[str, ...], list[tuple[object, ...]]]:
+    try:
+        con.execute("CREATE OR REPLACE TABLE t1 (g INTEGER, x INTEGER)")
+        con.execute("CREATE OR REPLACE TABLE t2 (g INTEGER, x INTEGER)")
+        if s.rows_t1:
+            con.executemany("INSERT INTO t1 VALUES (?, ?)", [list(r) for r in s.rows_t1])
+        if s.rows_t2:
+            con.executemany("INSERT INTO t2 VALUES (?, ?)", [list(r) for r in s.rows_t2])
+        cursor = con.execute(_union_sql(s))
+        description = cursor.description
+        assert description is not None
+        names = tuple(str(d[0]).lower() for d in description)
+        return names, [tuple(r) for r in cursor.fetchall()]
+    finally:
+        con.execute("DROP TABLE IF EXISTS t1")
+        con.execute("DROP TABLE IF EXISTS t2")
+
+
+@given(s=_union_scenario())
+@settings(max_examples=300, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_every_claimed_union_fd_holds_on_the_data(
+    oracle_con: duckdb.DuckDBPyConnection, s: UnionScenario
+) -> None:
+    claimed = _union_claimed(s)
+    assert not claimed.is_bottom
+    if s.same_world and s.arm1_cols == s.arm2_cols:
+        # Anti-vacuity: both arms are the declared relation projected identically,
+        # so the merge must keep the declared dependency (silence cannot pass).
+        out = {col: f"o{i}" for i, col in enumerate(s.arm1_cols)}
+        assert determines(claimed, frozenset({out["g"]}), out["x"]), (
+            f"same-world union dropped the declared FD for sql={_union_sql(s)!r}"
+        )
+    names, rows = _union_materialize(oracle_con, s)
+    for fd in claimed.fds:
+        assert {fd.dependent, *fd.determinant} <= set(names), (
+            f"claimed FD names a column the result lacks: {fd} vs {names} for sql={_union_sql(s)!r}"
+        )
+        witness = _fd_holds(fd, names, rows)
+        assert witness is None, (
+            f"claimed FD {sorted(fd.determinant)} -> {fd.dependent} violated at "
+            f"determinant value {witness} for sql={_union_sql(s)!r} rows={rows}"
         )
