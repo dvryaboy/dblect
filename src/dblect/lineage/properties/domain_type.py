@@ -21,8 +21,9 @@ summarizability story (Lenz & Shoshani, SSDBM 1997); see
 
 Naked-amount taint falls out of lineage: when ``amount`` flows to a model where
 its companion ``currency`` column was projected away, the binding rides as a
-reference that no longer agrees at a confluence and widens to ``NAKED``; the
-coherence guard then blocks a downstream sum until a dependency discharges it.
+reference that no longer agrees at a UNION's confluence and widens to
+``NAKED``; the coherence guard then blocks a downstream sum until a dependency
+discharges it.
 The guard is armed by :func:`domain_type_property` when the caller passes the
 functional-dependency property's ref.
 
@@ -157,11 +158,10 @@ class _Polymorphic:
     """The dimension of a bare numeric literal: no fixed unit, but not a no-claim
     unknown either. It adopts the other operand's unit under ``+``/``-`` (so
     ``amount + 5`` stays the amount's currency rather than conflicting on a scalar)
-    and acts as dimensionless under ``*``/``/`` (so ``amount * 0.9`` keeps it). This
-    is the "a literal sits at bottom, polymorphic, until context fixes it" reading of
-    the algebra doc, kept distinct from ``None`` (an unknown magnitude, which absorbs
-    under every operator) and from the empty monomial (a *certified* dimensionless
-    value, which conflicts when added to a unit). A singleton; carries no payload."""
+    and acts as dimensionless under ``*``/``/`` (so ``amount * 0.9`` keeps it).
+    Distinct from ``None`` (an unknown magnitude, which absorbs under every
+    operator) and from the empty monomial (a *certified* dimensionless value,
+    which conflicts when added to a unit). A singleton; carries no payload."""
 
 
 POLYMORPHIC: Final[_Polymorphic] = _Polymorphic()
@@ -538,9 +538,8 @@ def _aggregate_rules(
     companion is not held constant per group: for ``COMBINE`` that cleared result is the
     mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
     widen-to-top of a tag-blind selection (``min`` over mixed currencies), caught later
-    where a definite tag is required. The produce rule is the same for both; the finding
-    tells them apart. The classification (:data:`AGGREGATE_BEHAVIORS`) is the single
-    source of truth, in :mod:`dblect.sql.aggregates`."""
+    where a definite tag is required. The classification (:data:`AGGREGATE_BEHAVIORS`)
+    is the single source of truth, in :mod:`dblect.sql.aggregates`."""
     rules: dict[type[exp.AggFunc], AggregateRule[DomainTag]] = {}
     for agg_type, behavior in AGGREGATE_BEHAVIORS.items():
         # COMBINE and SELECT deliberately share one produce rule (the finding tells them
@@ -619,7 +618,7 @@ def domain_type_display(tag: DomainTag) -> AxisDisplay:
     return AxisDisplay(name="a magnitude in " + ", ".join(pieces))
 
 
-# --- join-key type compatibility (substrate signal) -----------------------------
+# --- join-key type compatibility (a signal, not a finding) -----------------------
 
 
 def join_key_conflicts(

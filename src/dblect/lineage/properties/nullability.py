@@ -366,10 +366,10 @@ def _conditional_notnull_carrier(
     carrying it needs (rename columns and predicates through each projection, drop on a
     join / group / computed projection) is property-agnostic; only the *meaning* of the
     payload differs, and a one-column key reads here as "this column is non-null under
-    the predicate". The borrow is the pragmatic reuse for the second axis. If a third
-    axis wants the same carrying, lift this into a generic
-    ``conditional_carrier(claims, lattice)`` rather than reaching further into
-    uniqueness, so the shared mechanism stops depending on one property's value type.
+    the predicate". If a third caller wants the same carrying, lift this into a
+    generic ``conditional_carrier(claims, lattice)`` rather than reaching further
+    into uniqueness, so the shared mechanism stops depending on one property's
+    value type.
     """
     facts = collect(
         manifest,
@@ -564,7 +564,7 @@ def _outer_join_output_columns(
 def outer_join_nullable_columns(
     manifest: Manifest, *, parsed: Mapping[str, Expr] | None = None
 ) -> Mapping[str, Mapping[str, JoinSide]]:
-    """Per model name, the output columns whose nullability the substrate attributes to an
+    """Per model name, the output columns whose nullability this analysis attributes to an
     outer join at that model's own top-level FROM/JOIN structure, each mapped to the join
     kind (LEFT/RIGHT/FULL) that padded it.
 

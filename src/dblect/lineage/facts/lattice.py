@@ -21,8 +21,9 @@ K = TypeVar("K")
 @dataclass(frozen=True, slots=True)
 class Lattice(Generic[K]):
     """``meet`` is the greatest lower bound (the more precise value), ``join`` the
-    least upper bound (used at a confluence). ``top`` is 'no information'; ``bottom``
-    is 'contradiction', a value that no data can satisfy."""
+    least upper bound (used where two branches merge, e.g. a UNION). ``top`` is
+    'no information'; ``bottom`` is 'contradiction', a value that no data can
+    satisfy."""
 
     meet: Callable[[K, K], K]
     join: Callable[[K, K], K]

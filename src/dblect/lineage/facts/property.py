@@ -101,7 +101,7 @@ class CoherenceGuard(Generic[K, F]):
     aggregating scope's own WHERE, or an ``entails`` read of the ``fd`` dependency
     at the aggregation input (antecedent: the group columns, in the input
     relation's names). Where no path discharges a companion, the aggregate clears
-    to top and the seam rule reports it. See ``propagation-soundness.md``.
+    to top, which warns at ``combine``. See ``propagation-soundness.md``.
 
     ``fd`` must appear in the carrying property's ``depends_on``, so the registry
     orders the dependency first and the read is never silently unevaluated."""
@@ -157,7 +157,7 @@ class CoherenceClear(Generic[K]):
 
 # The channel a guard records a clear into during propagation. A plain list kept by the
 # caller of :func:`propagate`: the propagator appends, the consumer reads. ``None`` means
-# the caller is not collecting, so the guard clears silently (the substrate-only path).
+# the caller is not collecting, so the guard clears silently with no diagnostic recorded.
 CoherenceSink = list[CoherenceClear[K]]
 
 
@@ -173,7 +173,7 @@ class AggregateRule(Generic[K]):
 
 @dataclass(frozen=True, slots=True)
 class AxisDisplay:
-    """The human-facing names the seam diagnostic fills its template from. The
+    """The human-facing names the ``combine`` warning fills its template from. The
     types layer supplies it from a declaration, with fallback to the bare type and
     axis names."""
 
@@ -198,7 +198,7 @@ class Property(Generic[K, S]):
 
     Build one with :func:`column_property` or :func:`relation_property`, which
     mint ``ref`` and fix ``scope_kind`` to match the scope type. ``semiring`` is
-    set only for a property whose confluence or cross counts or accumulates; when
+    set only for a property whose UNION or JOIN counts or accumulates; when
     set, the relational operators derive from it and must not be redefined in
     ``operators``.
     """
@@ -243,7 +243,7 @@ class Property(Generic[K, S]):
     here rather than relying on a global registry."""
 
     def __post_init__(self) -> None:
-        # A semiring-carrying property derives its confluence and cross from
+        # A semiring-carrying property derives its UNION and JOIN behavior from
         # plus/times, so it must not also pin those operators by hand. The semiring
         # laws themselves are PBT obligations (see propagation-soundness.md), not
         # decidable here.

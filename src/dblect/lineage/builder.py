@@ -188,8 +188,8 @@ def build_manifest_graph(
     # reference resolves against an upstream model the project never documented.
     schema: dict[str, dict[str, str]] = {k: dict(v) for k, v in _build_schema(manifest).items()}
     # One persistent Schema, `add_table`-ing only the touched table per model, rather than a raw
-    # dict `qualify` re-normalizes whole every call. `schema` stays the merge accumulator (the
-    # documented-wins/UNKNOWN-for-new fold); the Schema mirrors it table by table.
+    # dict, which `qualify` re-normalizes in full on every call. `schema` stays the merge
+    # accumulator (the documented-wins/UNKNOWN-for-new fold); the Schema mirrors it table by table.
     mapping_schema: Schema = MappingSchema(
         cast("dict[str, object]", schema), dialect=dialect, normalize=True
     )
@@ -1021,9 +1021,9 @@ def index_by_name(manifest: Manifest, by_source: Mapping[SourceRef, _ByName]) ->
     """Re-key a per-relation map by the relation name as it appears in compiled SQL.
 
     A detector propagates a property to a ``Mapping[SourceRef, ...]`` but looks relations
-    up by the name in a parsed tree. Rather than re-encode the name convention (the
-    fragile-cooperation hazard), it composes the one resolver, :func:`build_name_to_source`,
-    with its own ``SourceRef``-keyed facts. A name whose relation has no entry in
+    up by the name in a parsed tree. Rather than re-encode the name convention, it composes
+    the one resolver, :func:`build_name_to_source`, with its own ``SourceRef``-keyed facts.
+    A name whose relation has no entry in
     ``by_source`` is omitted, so a lookup miss reads as "no fact" exactly as a per-relation
     absence would; on a model/source name collision the model wins, as in ``ref`` resolution.
     """

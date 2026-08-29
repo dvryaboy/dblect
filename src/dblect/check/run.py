@@ -1,17 +1,18 @@
 """Run the declaration check: resolve contracts, propagate, derive findings.
 
-The pipeline is the substrate-first story made user-facing. Contracts resolve into
-the facts the properties ground from, two properties propagate (the
-functional-dependency property over the relation graph, then the domain-type
-property over the column graph reading it), and the findings fall out of what the
-substrate concluded:
+Contracts resolve into the facts the properties ground from, two properties
+propagate (the functional-dependency property over the relation graph, then the
+domain-type property over the column graph reading it), and the findings fall out
+of what propagation concluded:
 
-* a contract that did not resolve is a finding directly off the bridge;
-* a column whose flow value is provisional carries a declared type the inferred
-  one contradicts, which is currency creep, and it lands wherever the taint
-  reached, declared model or not;
-* an aggregate whose tag cleared to naked while an operand it summed still carried
-  one is a reduction the algebra cannot call well typed, the mixed-currency sum.
+* a contract that fails to resolve is a finding on its own, straight out of
+  contract resolution;
+* a column carries a declared type the inferred one contradicts, which is
+  currency creep, and it lands on every downstream column the disagreement
+  flows to, declared model or not;
+* an aggregate whose tag cleared to naked while an operand it summed still
+  carried one is a reduction the algebra cannot call well typed, the
+  mixed-currency sum.
 
 Predicates are collected and counted, not run: executing them needs materialized
 data, which belongs to the fixture/PBT loop, so the static check stays static.
@@ -99,18 +100,18 @@ class CheckGraphs:
     A model the build skipped (a compilation miss, a build error) is absent, so the check
     never reads an unstamped tree as a clean one."""
     join_key_ground: Callable[[ColumnRef], Annotation[DomainTag]]
-    """The declared-grounding fallback the join-key check reads a never-projected key's
-    tag through. Folded once here, alongside the graph it is judged against, rather than
-    per world: it derives from the world-invariant declared facts, so colocating it with
-    the graph build keeps it in step with the graph instead of resting on the assumption
-    that successive worlds share one."""
+    """The fallback the join-key check uses to look up a never-projected key's declared
+    tag. Built once here, next to the graph it is checked against, rather than per world:
+    it comes from the facts that do not change across worlds, so keeping it with the
+    graph build keeps the two in sync instead of assuming every world reuses the same
+    graph."""
 
 
 @dataclass(frozen=True, slots=True)
 class WorldFacts:
     """The facts that ground one world's propagation. The declared facts are
-    world-invariant (shared across worlds); a world's ``CompileValue`` leaves are
-    appended by the enumerator. Keeping the two apart means the enumerator only
+    world-invariant (shared across worlds); the enumerator appends each world's own
+    ``CompileValue`` facts on top. Keeping the two apart means the enumerator only
     adds, never recomputes, the declared facts."""
 
     world: WorldRef
@@ -224,7 +225,7 @@ def run_check(
     the same sequence the enumerator runs per world.
 
     This is the declaration-level family alone. A consumer that needs every family's
-    findings over a manifest (any multi-world or finding-threading path) calls
+    findings over a manifest, such as a cross-world diff, calls
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
     is never dropped by being forgotten.
 
@@ -355,7 +356,7 @@ def _grounding_coverage(
     the domain-type annotation map, which includes source leaves the lineage flows
     from (these are absent from ``graph.subjects()``, yet a contract on a source
     column is genuinely checkable). "Grounded" reads the property's own grounding
-    fold (``*_grounded_scopes``), the very fold ``_propagate`` grounds from, so the
+    fold (``*_grounded_scopes``), the very fold ``propagate`` grounds from, so the
     coverage number cannot drift from what was actually grounded. The per-property
     denominator keeps only model-kind columns, since the synthetic CTE and UNION
     scaffolding is internal, not a column a fact would ever ground."""
@@ -448,8 +449,8 @@ def _contradiction_findings(
     column_graph: ColumnLineageGraph,
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
-    """One finding per column whose flow value is provisional: a declared type the
-    inferred one contradicts, reported wherever the taint reached."""
+    """One finding per column whose declared type the inferred one contradicts,
+    reported wherever the disagreement flows downstream."""
     out: list[CheckFinding] = []
     for ref, ann in _sorted(annotations):
         if not ann.provisional or ann.value == NAKED:
@@ -488,7 +489,7 @@ def _aggregation_findings(
     cannot tell a cleared live tag from an operand that was naked before the reduction).
     A ``SELECT`` clear (``min``/``max`` widening a tag-blind selection) is not this
     finding, so only the combining class is rendered. A clear whose site is unstamped
-    (a windowed aggregate) is the deferred windowed obligation, left for later; an opaque
+    (a windowed aggregate) is skipped for now, left as future work; an opaque
     group shape (a positional or computed GROUP BY, ``group_refs is None``) is surfaced,
     since the companion is no more held by a group the builder cannot enumerate than by a
     resolved one that omits it, and the guard recorded the clear rather than guessing."""
@@ -534,8 +535,8 @@ def _aggregate_owners(column_graph: ColumnLineageGraph) -> dict[int, ColumnRef]:
 
     The propagator walked these very derivations, so the ``AggFunc`` in a clear is the
     same object found here; keyed on ``id`` because two distinct calls can be equal by
-    value. The first owner wins, which is unambiguous since each projection subtree is a
-    distinct output column's own."""
+    value. The first owner wins, which is unambiguous since each projection subtree
+    belongs to exactly one output column."""
     owners: dict[int, ColumnRef] = {}
     for ref in column_graph.subjects():
         derivation = column_graph.derivation(ref)

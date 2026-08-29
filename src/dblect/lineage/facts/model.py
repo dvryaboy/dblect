@@ -1,4 +1,4 @@
-"""Value types for the facts substrate: facts, provenance, and annotations.
+"""Value types this package works with: facts, provenance, and annotations.
 
 A :class:`Fact` is a typed, provenance-carrying claim about one node of the
 lineage graph (a column when ``S`` is :class:`ColumnRef`, a relation when ``S``
@@ -29,9 +29,9 @@ S = TypeVar("S", ColumnRef, SourceRef)
 
 @dataclass(frozen=True, slots=True)
 class WorldRef:
-    """A world assignment chosen by the flag layer. Opaque to the substrate in
-    meaning; facts bucket by world, so its identity must be stable (hashable,
-    value equality)."""
+    """A world assignment chosen by the flag layer. Its meaning is opaque here;
+    facts bucket by world, so its identity must be stable (hashable, value
+    equality)."""
 
     assignments: frozenset[tuple[str, Hashable]]
 
@@ -122,9 +122,9 @@ class Fact(Generic[K, S]):
     A candidate key ``{customer_id, region}`` is a relation fact whose *value*
     names the columns: the address is the relation, never the column set.
 
-    ``condition`` scopes the claim to a row filter when present (a ``where``-
-    filtered dbt test). A conditional fact is captured and carried through
-    ``collect``, but grounding does not fold it into the unconditional annotation.
+    ``condition`` scopes the claim to a row filter when present; see
+    :class:`Predicate`. ``collect`` keeps such a fact, but grounding leaves it
+    out of the unconditional fold.
     """
 
     scope: S
@@ -147,7 +147,7 @@ def by_scope(facts: tuple[Fact[K, S], ...]) -> dict[S, tuple[Fact[K, S], ...]]:
 class Opacity(StrEnum):
     CONCRETE = "concrete"  # value carries information (value is not top)
     EXPLICIT = "explicit"  # value is top by a declared opt-out; flows silently
-    IMPLICIT = "implicit"  # value is top incidentally (nothing declared it); warns at a seam
+    IMPLICIT = "implicit"  # top incidentally (nothing declared); warns on meeting a concrete value
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +157,7 @@ class Annotation(Generic[K]):
     ``opacity`` carries information only when ``value`` is the lattice top:
     ``CONCRETE`` *is* "value is not top", and the choice that matters is
     ``EXPLICIT`` (a declared opt-out, flows silently) versus ``IMPLICIT``
-    (incidental top, warns at a refinement seam).
+    (incidental top, warns when it meets a concrete value).
 
     ``provisional`` is the one bit that is not about knowing or not knowing: an
     error-recovery taint set when a node's inferred value conflicts with its
