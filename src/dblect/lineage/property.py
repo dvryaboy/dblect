@@ -116,7 +116,7 @@ def propagate(
     when it clears a tag, so a caller (the check) reads *why* a tag went to top rather
     than re-inferring it from the output. It is per-call: the propagator never mutates
     the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
-    silently (the substrate-only path).
+    silently, for a caller that only wants the annotation values, not the reasons.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
@@ -301,7 +301,7 @@ def _apply_aggregate(
     The guard is the one channel a dependency enters an aggregate through: where a
     per-row companion of the aggregated value is not provably constant per group,
     the result clears to the lattice top. The cleared top is IMPLICIT, so a
-    downstream seam warns on it rather than reading it as a declared opt-out. When the
+    downstream consumer warns on it rather than reading it as a declared opt-out. When the
     guard clears and a ``sink`` is collecting, the structured reason (the operand tag
     and the undischarged companions with the paths checked) is recorded there, so the
     consumer reads the event rather than re-inferring it from the cleared output.

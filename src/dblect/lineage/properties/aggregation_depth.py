@@ -27,8 +27,8 @@ from dblect.lineage.semiring import Semiring
 
 
 class MaxSemiring:
-    """Max-semiring on non-negative ints. Non-strict near-semiring; ``plus`` and
-    ``times`` both take the max, so the deepest path wins at confluence and cross."""
+    """Max-semiring on non-negative ints. Non-strict: ``plus`` and ``times`` both
+    take the max, so the deepest path always wins."""
 
     zero: int = 0
     one: int = 0

@@ -66,7 +66,7 @@ class DiscovererError(Exception):
     """The one exception ``collect`` treats as expected: a discoverer that hits a
     manifest shape it cannot read raises this, drops all of its own facts, and
     leaves every other discoverer's facts untouched. Any other exception is a
-    substrate bug and propagates."""
+    bug in dblect itself and propagates."""
 
 
 def collect(
@@ -137,7 +137,7 @@ def grounding(
     opaque: Collection[S],
     lat: Lattice[K],
 ) -> Callable[[S], Annotation[K]]:
-    """Fold each scope's bucket into its grounded annotation and return the lookup.
+    """Fold each scope's bucket into its value and return the lookup.
 
     A scope absent from the fold grounds ``Annotation(top, IMPLICIT)``, the
     "nothing declared" default. See ``_ground`` for the grounding rule itself.
