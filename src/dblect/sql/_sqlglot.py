@@ -13,10 +13,10 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeGuard, cast
+from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -61,6 +61,24 @@ def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
 
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
+
+
+_V = TypeVar("_V")
+
+
+def with_scope(
+    node: Expr, cte_scope: Mapping[str, _V], resolve: Callable[[Expr, Mapping[str, _V]], _V]
+) -> dict[str, _V]:
+    """``cte_scope`` extended with the CTEs ``node`` declares, each resolved by
+    ``resolve`` in the scope the ones before it built. The one CTE fold every
+    relation walk shares, whatever value it carries per scope."""
+    local = dict(cte_scope)
+    with_ = node.args.get("with_")
+    if isinstance(with_, exp.With):
+        for cte in with_.expressions:
+            if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
+                local[cte.alias_or_name] = resolve(cte.this, local)
+    return local
 
 
 class GroupBinding(StrEnum):
