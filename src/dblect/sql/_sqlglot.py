@@ -33,12 +33,8 @@ class JoinSide(StrEnum):
 
 
 def from_of(sel: exp.Select) -> exp.From | None:
-    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent.
-
-    sqlglot 30+ keys the arg ``"from_"``; older 25.x kept it as ``"from"``.
-    We try both so the static-analysis layer doesn't pin a minor version.
-    """
-    return cast("exp.From | None", sel.args.get("from_") or sel.args.get("from"))
+    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent."""
+    return cast("exp.From | None", sel.args.get("from_"))
 
 
 def where_of(sel: exp.Select) -> exp.Where | None:
