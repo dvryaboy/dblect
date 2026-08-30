@@ -9,7 +9,16 @@ drops what it cannot carry, a WHERE preserves them and pins filtered columns
 constant, a GROUP BY determines every other output from the group key, a key read
 from the uniqueness property determines the columns selected alongside it, a join
 carries its kept sides' dependencies plus an inner join's ON equalities, and a
-UNION proves nothing.
+UNION keeps exactly the declared dependencies every arm carries from one
+declaration while everything derived drops.
+
+The union rule rests on the pair-coverage argument: a dependency is universally
+quantified over row pairs, and a union adds exactly the cross pairs, one row from
+each arm. A derived dependency's witness is arm-local (each arm can pin a column
+to a different constant), so the cross pairs are uncovered and it dies. A declared
+dependency is an axiom about the declaring relation's world, so when every arm's
+pairs are that world's pairs, the cross pairs are covered too and the merge keeps
+it, with the same grounding.
 """
 
 from __future__ import annotations
@@ -20,12 +29,23 @@ import pytest
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
-from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact
+from dblect.lineage.facts.model import (
+    BASE_WORLD,
+    Annotation,
+    CompileOrigin,
+    CompileValue,
+    Declared,
+    DeclaredSource,
+    Fact,
+    NativeConstraint,
+    Provenance,
+)
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import (
     FD,
     NO_FDS,
+    DeclaredFD,
     FDSet,
     functional_dependency_grounding,
     functional_dependency_property,
@@ -66,6 +86,22 @@ def _fd(dependent: str, *determinant: str) -> FD:
     return FD(frozenset(determinant), dependent)
 
 
+def _inst(
+    fd: FD, *, origin: SourceRef = _PAYMENTS, renames: Mapping[str, str] | None = None
+) -> DeclaredFD:
+    """A declared dependency's instance: ``fd`` as declared at ``origin``, each
+    column bound to its current name (itself, unless ``renames`` maps it)."""
+    current = renames or {}
+    binding = frozenset((c, current.get(c, c)) for c in fd.determinant | {fd.dependent})
+    return DeclaredFD(origin=origin, declared=fd, binding=binding)
+
+
+def _carried(*instances: DeclaredFD, derived: tuple[FD, ...] = ()) -> FDSet:
+    """The value a relation holds when it carries these declared instances plus
+    any purely derived dependencies."""
+    return FDSet(frozenset(i.fd for i in instances) | frozenset(derived), frozenset(instances))
+
+
 def _fds(facts: _FdFacts, *nodes: Node, read_keys: bool = False) -> dict[str, FDSet]:
     """Build a manifest from the nodes, propagate the FD property (after uniqueness
     when ``read_keys`` is set, so the key-derived source is live), and return each
@@ -95,7 +131,7 @@ def test_passthrough_carries_the_declared_fd() -> None:
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country, currency, amount FROM payments"),
     )
-    assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.stg"] == _carried(_inst(_fd("currency", "country")))
 
 
 def test_projection_renames_both_sides() -> None:
@@ -104,7 +140,9 @@ def test_projection_renames_both_sides() -> None:
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country AS nation, currency AS curr FROM payments"),
     )
-    assert out["model.shop.stg"] == FDSet.of(_fd("curr", "nation"))
+    assert out["model.shop.stg"] == _carried(
+        _inst(_fd("currency", "country"), renames={"country": "nation", "currency": "curr"})
+    )
 
 
 def test_dropping_a_dependency_column_drops_the_fd() -> None:
@@ -122,7 +160,7 @@ def test_star_carries_everything() -> None:
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT * FROM payments"),
     )
-    assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.stg"] == _carried(_inst(_fd("currency", "country")))
 
 
 # --- WHERE ----------------------------------------------------------------------
@@ -136,7 +174,7 @@ def test_where_preserves_fds() -> None:
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country, currency FROM payments WHERE amount > 0"),
     )
-    assert out["model.shop.stg"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.stg"] == _carried(_inst(_fd("currency", "country")))
 
 
 def test_where_equality_pins_a_column_constant() -> None:
@@ -216,9 +254,9 @@ def test_group_by_keeps_fds_among_the_group_columns() -> None:
             "GROUP BY country, currency",
         ),
     )
-    assert out["model.shop.by_cc"] == FDSet.of(
-        _fd("currency", "country"),
-        _fd("total", "country", "currency"),
+    assert out["model.shop.by_cc"] == _carried(
+        _inst(_fd("currency", "country")),
+        derived=(_fd("total", "country", "currency"),),
     )
 
 
@@ -248,24 +286,6 @@ def test_star_over_a_group_by_keeps_only_within_group_fds() -> None:
         _node("model.shop.g", "SELECT * FROM payments GROUP BY country"),
     )
     assert out["model.shop.g"] == NO_FDS
-
-
-# --- shapes the walk does not model ----------------------------------------------
-
-
-def test_union_all_proves_nothing() -> None:
-    """Two arms can each satisfy a dependency while their union violates it (the same
-    determinant value mapping to different dependents per arm)."""
-    out = _fds(
-        _declared(_fd("currency", "country")),
-        _source(_PAYMENTS.unique_id),
-        _node(
-            "model.shop.u",
-            "SELECT country, currency FROM payments "
-            "UNION ALL SELECT country, currency FROM payments",
-        ),
-    )
-    assert out["model.shop.u"] == NO_FDS
 
 
 # --- the key-derived source -------------------------------------------------------
@@ -331,7 +351,7 @@ def test_inner_join_carries_a_joined_relations_fd() -> None:
             "JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
 def test_inner_join_carries_both_sides_fds() -> None:
@@ -350,7 +370,10 @@ def test_inner_join_carries_both_sides_fds() -> None:
             "JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("amount", "ref"), _fd("currency", "country"))
+    assert out["model.shop.m"] == _carried(
+        _inst(_fd("amount", "ref")),
+        _inst(_fd("currency", "country"), origin=_CUSTOMERS),
+    )
 
 
 def test_inner_join_qualifies_under_a_name_collision() -> None:
@@ -368,7 +391,7 @@ def test_inner_join_qualifies_under_a_name_collision() -> None:
             "FROM payments p JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
 def test_left_join_drops_the_optional_sides_fds() -> None:
@@ -401,7 +424,7 @@ def test_left_join_carries_the_kept_sides_fds() -> None:
             "LEFT JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("amount", "ref"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("amount", "ref")))
 
 
 def test_left_join_does_not_mint_the_on_equality() -> None:
@@ -438,7 +461,7 @@ def test_right_join_keeps_the_joined_in_side() -> None:
             "RIGHT JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
 def test_full_join_proves_nothing() -> None:
@@ -474,7 +497,7 @@ def test_cross_join_carries_side_fds() -> None:
             "SELECT p.amount, c.country, c.currency FROM payments p CROSS JOIN customers c",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("currency", "country"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
 def test_a_later_outer_join_pads_an_earlier_inner_joins_equality() -> None:
@@ -494,7 +517,7 @@ def test_a_later_outer_join_pads_an_earlier_inner_joins_equality() -> None:
             "RIGHT JOIN extra e ON c.id = e.k",
         ),
     )
-    assert out["model.shop.m"] == FDSet.of(_fd("v", "g"))
+    assert out["model.shop.m"] == _carried(_inst(_fd("v", "g"), origin=extra))
 
 
 def test_inner_join_carries_a_where_pin_on_either_side() -> None:
@@ -510,3 +533,140 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
         ),
     )
     assert out["model.shop.m"] == FDSet.of(_fd("currency"))
+
+
+# --- set operations ---------------------------------------------------------------
+#
+# The union merge keeps exactly the declared instances every arm shares, whole,
+# after positional alignment: a union adds only cross pairs (one row per arm), an
+# arm-local witness leaves them uncovered, and one shared axiom covers them. The
+# carry side is owned by the union PBT in
+# test_pbt_functional_dependency_soundness.py, whose anti-vacuity arm spans both
+# operators, arm orders, and arm aliases; the rows here pin the structural
+# carries (chain flattening, parenthesized arms, the dbt CTE-and-rename shell),
+# one drop per soundness edge (derived witness, two worlds, an unknown arm, two
+# axioms of one world on the same columns, crossed columns, crossed determinant
+# columns, a merge by name, a star arm), and the other set operators, which
+# claim nothing.
+
+_CC = _fd("currency", "country")
+
+_SET_OPERATIONS = [
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments "
+        "UNION ALL SELECT country, currency FROM payments "
+        "UNION ALL SELECT country, currency FROM payments",
+        _carried(_inst(_CC)),
+        id="chained-arms-flatten",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "WITH unioned AS (SELECT country, currency FROM payments "
+        "UNION ALL SELECT country, currency FROM payments) "
+        "SELECT country AS nation, currency AS curr FROM unioned",
+        _carried(_inst(_CC, renames={"country": "nation", "currency": "curr"})),
+        id="dbt-shape-cte-then-rename",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "(SELECT country, currency FROM payments) "
+        "UNION ALL (SELECT country, currency FROM payments)",
+        _carried(_inst(_CC)),
+        id="parenthesized-arms-carry",
+    ),
+    pytest.param(
+        _declared(),
+        "SELECT country, currency FROM payments WHERE currency = 'usd' "
+        "UNION ALL SELECT country, currency FROM payments WHERE currency = 'eur'",
+        NO_FDS,
+        id="derived-witness-dies",
+    ),
+    pytest.param(
+        _declared_on({_PAYMENTS: (_CC,), _CUSTOMERS: (_CC,)}),
+        "SELECT country, currency FROM payments UNION ALL SELECT country, currency FROM customers",
+        NO_FDS,
+        id="two-declared-worlds-drop",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments UNION ALL SELECT country, currency FROM customers",
+        NO_FDS,
+        id="declared-meets-unknown-arm-drops",
+    ),
+    pytest.param(
+        _declared(_fd("b", "a"), _fd("d", "c")),
+        "SELECT a AS m, b AS n FROM payments UNION ALL SELECT c AS m, d AS n FROM payments",
+        NO_FDS,
+        id="two-axioms-of-one-world-on-the-same-columns-drop",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments "
+        "UNION ALL SELECT currency AS country, country AS currency FROM payments",
+        NO_FDS,
+        id="crossed-columns-drop",
+    ),
+    pytest.param(
+        _declared(_fd("c", "a", "b")),
+        "SELECT a, b, c FROM payments UNION ALL SELECT b AS a, a AS b, c FROM payments",
+        NO_FDS,
+        id="crossed-determinant-columns-drop",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments "
+        "UNION ALL BY NAME SELECT country, currency FROM payments",
+        NO_FDS,
+        id="by-name-merge-claims-nothing",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments UNION ALL SELECT * FROM payments",
+        NO_FDS,
+        id="star-arm-leaves-nothing-to-align",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments INTERSECT SELECT country, currency FROM payments",
+        NO_FDS,
+        id="intersect-claims-nothing",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments EXCEPT SELECT country, currency FROM payments",
+        NO_FDS,
+        id="except-claims-nothing",
+    ),
+]
+
+
+@pytest.mark.parametrize(("facts", "sql", "expected"), _SET_OPERATIONS)
+def test_set_operation_merges(facts: _FdFacts, sql: str, expected: FDSet) -> None:
+    out = _fds(
+        facts,
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _node("model.shop.u", sql),
+    )
+    assert out["model.shop.u"] == expected
+
+
+# Only a person's claim about the world mints a grounded instance; the closed
+# provenance space is decided per kind (a native constraint holds by the
+# warehouse's write path, a compile value is minted by the toolchain).
+@pytest.mark.parametrize(
+    ("provenance", "expected"),
+    [
+        pytest.param(Declared(DeclaredSource.USER_ASSERTED), _carried(_inst(_CC)), id="declared"),
+        pytest.param(NativeConstraint(enforced_on_write=True), FDSet.of(_CC), id="native"),
+        pytest.param(
+            CompileValue(origin=CompileOrigin.DBT_VAR, world=BASE_WORLD),
+            FDSet.of(_CC),
+            id="compile-value",
+        ),
+    ],
+)
+def test_only_a_declaration_grounds_an_instance(provenance: Provenance, expected: FDSet) -> None:
+    fact = Fact(scope=_PAYMENTS, value=FDSet.of(_CC), provenance=provenance)
+    assert functional_dependency_grounding({_PAYMENTS: (fact,)})(_PAYMENTS).value == expected

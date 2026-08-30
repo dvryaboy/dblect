@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from itertools import combinations, product
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -31,6 +32,7 @@ from dblect.lineage.properties.functional_dependency import (
     FD,
     FUNCTIONAL_DEPENDENCY_LATTICE,
     NO_FDS,
+    DeclaredFD,
     FDSet,
     determines,
     minimal_cover,
@@ -41,12 +43,37 @@ _COLS = ("a", "b", "c", "d")
 
 _col_sets = st.frozensets(st.sampled_from(_COLS), max_size=3)
 _fds = st.builds(FD, determinant=_col_sets, dependent=st.sampled_from(_COLS))
-_fd_sets = st.frozensets(_fds, max_size=4).map(FDSet)
+
+_REL = SourceRef(SourceKind.MODEL, "model.shop.payments")
+_ORIGINS = (
+    SourceRef(SourceKind.SOURCE, "source.shop.raw.payments"),
+    SourceRef(SourceKind.SOURCE, "source.shop.raw.customers"),
+)
+
+
+@st.composite
+def _declared_instance(draw: st.DrawFn) -> DeclaredFD:
+    """An instance with an arbitrary binding of the declared columns onto the
+    column universe, the shape a walk's renames produce."""
+    declared = draw(_fds)
+    cols = declared.determinant | {declared.dependent}
+    binding = frozenset((c, draw(st.sampled_from(_COLS))) for c in cols)
+    return DeclaredFD(origin=draw(st.sampled_from(_ORIGINS)), declared=declared, binding=binding)
+
+
+@st.composite
+def _fd_set(draw: st.DrawFn) -> FDSet:
+    """An FD set whose declared instances respect the value's invariant: each
+    instance's current dependency is among ``fds``."""
+    fds = draw(st.frozensets(_fds, max_size=4))
+    declared = draw(st.frozensets(_declared_instance(), max_size=3))
+    return FDSet(fds | frozenset(inst.fd for inst in declared), declared)
+
+
+_fd_sets = _fd_set()
 # Mostly real FD sets, occasionally the bottom sentinel, so the law arms that
 # touch bottom are exercised without swamping the normal cases.
 _values = st.one_of(_fd_sets, st.just(ALL_FDS))
-
-_REL = SourceRef(SourceKind.MODEL, "model.shop.payments")
 
 
 def _fact(value: FDSet) -> Fact[FDSet, SourceRef]:
@@ -84,6 +111,22 @@ def test_join_intersects_fds() -> None:
     assert FUNCTIONAL_DEPENDENCY_LATTICE.join(a, b) == FDSet.of(shared)
 
 
+def test_an_instance_outside_the_fds_is_rejected() -> None:
+    """The invariant: a declared instance's current dependency is one of the
+    value's dependencies, so consumers reading ``fds`` alone never under-see."""
+    fd = FD(frozenset({"country"}), "currency")
+    with pytest.raises(ValueError, match="outside fds"):
+        FDSet(frozenset(), frozenset({DeclaredFD.identity(_ORIGINS[0], fd)}))
+
+
+def test_a_binding_off_the_declared_columns_is_rejected() -> None:
+    """The instance invariant: the binding maps exactly the declared columns, so
+    the current dependency is always derivable."""
+    fd = FD(frozenset({"country"}), "currency")
+    with pytest.raises(ValueError, match="declared columns"):
+        DeclaredFD(origin=_ORIGINS[0], declared=fd, binding=frozenset({("country", "country")}))
+
+
 @given(st.lists(_fd_sets, max_size=6))
 def test_resolution_never_contradicts(values: list[FDSet]) -> None:
     """FD declarations only ever union, so a bucket of real FD sets resolves to
@@ -91,10 +134,12 @@ def test_resolution_never_contradicts(values: list[FDSet]) -> None:
     facts = tuple(_fact(v) for v in values)
     value, is_contradiction = resolve(FUNCTIONAL_DEPENDENCY_LATTICE, facts)
     assert not is_contradiction
-    expected: frozenset[FD] = frozenset()
+    expected_fds: frozenset[FD] = frozenset()
+    expected_declared: frozenset[DeclaredFD] = frozenset()
     for v in values:
-        expected = expected | v.fds
-    assert value == FDSet(expected)
+        expected_fds = expected_fds | v.fds
+        expected_declared = expected_declared | v.declared
+    assert value == FDSet(expected_fds, expected_declared)
 
 
 # --- entailment ----------------------------------------------------------------

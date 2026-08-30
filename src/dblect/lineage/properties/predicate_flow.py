@@ -160,12 +160,7 @@ class _FlowWalk:
     def _select(
         self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Canon]]
     ) -> frozenset[Canon]:
-        local = dict(cte_scope)
-        with_ = sel.args.get("with_")
-        if isinstance(with_, exp.With):
-            for cte in with_.expressions:
-                if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
-                    local[cte.alias_or_name] = self.scope_filter(cte.this, cte_scope=local)
+        local = sg.with_scope(sel, cte_scope, lambda n, s: self.scope_filter(n, cte_scope=s))
 
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):

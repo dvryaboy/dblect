@@ -13,10 +13,10 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeGuard, cast
+from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -33,12 +33,8 @@ class JoinSide(StrEnum):
 
 
 def from_of(sel: exp.Select) -> exp.From | None:
-    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent.
-
-    sqlglot 30+ keys the arg ``"from_"``; older 25.x kept it as ``"from"``.
-    We try both so the static-analysis layer doesn't pin a minor version.
-    """
-    return cast("exp.From | None", sel.args.get("from_") or sel.args.get("from"))
+    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent."""
+    return cast("exp.From | None", sel.args.get("from_"))
 
 
 def where_of(sel: exp.Select) -> exp.Where | None:
@@ -61,6 +57,48 @@ def laterals_of(sel: exp.Select) -> list[exp.Lateral]:
 
 def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
+
+
+_V = TypeVar("_V")
+
+
+def with_scope(
+    node: Expr, cte_scope: Mapping[str, _V], resolve: Callable[[Expr, Mapping[str, _V]], _V]
+) -> dict[str, _V]:
+    """``cte_scope`` extended with the CTEs ``node`` declares, each resolved by
+    ``resolve`` in the scope the ones before it built. The one CTE fold every
+    relation walk shares, whatever value it carries per scope."""
+    local = dict(cte_scope)
+    with_ = node.args.get("with_")
+    if isinstance(with_, exp.With):
+        for cte in with_.expressions:
+            if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
+                local[cte.alias_or_name] = resolve(cte.this, local)
+    return local
+
+
+def union_arms(u: exp.Union) -> list[Expr] | None:
+    """The arms of a union chain in order: same-operator nesting flattened and
+    parenthesized arms unwrapped, since parens change neither the merged rows nor
+    the arms' output names (dbt_utils-style generated unions parenthesize every
+    arm). Mixing UNION and UNION ALL is fine: the merged rows are drawn from the
+    arms' rows either way. ``None`` when any link merges by name (``BY NAME``,
+    ``CORRESPONDING``), where alignment is by alias rather than position."""
+    if u.args.get("by_name"):
+        return None
+    arms: list[Expr] = []
+    for side in (u.this, u.expression):
+        if not isinstance(side, Expr):
+            return None
+        node = side.unnest()
+        if isinstance(node, exp.Union):
+            inner = union_arms(node)
+            if inner is None:
+                return None
+            arms.extend(inner)
+        else:
+            arms.append(node)
+    return arms
 
 
 class GroupBinding(StrEnum):

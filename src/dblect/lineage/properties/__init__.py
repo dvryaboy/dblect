@@ -32,6 +32,7 @@ from dblect.lineage.properties.domain_type import (
 )
 from dblect.lineage.properties.functional_dependency import (
     FD,
+    DeclaredFD,
     FDSet,
     determines,
     functional_dependency_grounding,
@@ -59,6 +60,7 @@ __all__ = [
     "ArrayNonEmpty",
     "CandidateKeySet",
     "Concrete",
+    "DeclaredFD",
     "Dimension",
     "DomainTag",
     "FDSet",

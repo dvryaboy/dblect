@@ -20,9 +20,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from dblect.adapters import profile_for_adapter
 from dblect.check import (
     CheckFindingKind,
+    FdCompileFact,
     TagCompileFact,
     base_world_facts,
     build_check_graphs,
@@ -32,9 +35,20 @@ from dblect.check import (
     world_findings,
 )
 from dblect.demo import Currency, Money
-from dblect.lineage.facts.model import BASE_WORLD, CompileOrigin, CompileValue, Fact, WorldRef
-from dblect.lineage.graph import ColumnRef
+from dblect.lineage.facts.model import (
+    BASE_WORLD,
+    CompileOrigin,
+    CompileValue,
+    Declared,
+    DeclaredSource,
+    Fact,
+    NativeConstraint,
+    Provenance,
+    WorldRef,
+)
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.domain_type import DomainTag
+from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.manifest import Manifest, ResourceType
 from dblect.types import ModelContract, active_registry, isolated_registry, resolve_contracts
 from tests._manifest_builders import cols as _cols
@@ -223,3 +237,25 @@ def test_world_findings_honor_noqa_suppression() -> None:
 
     kinds = [f.kind for r in result.per_world for f in r.findings]
     assert CheckFindingKind.DOMAIN_TYPE_CONTRADICTION not in kinds
+
+
+# A compile fact is the per-world seam: only a toolchain-minted value belongs in
+# one. A declared fact routed through would be lifted by the FD grounding into a
+# world axiom that survives unions, silently promoting a flag-pinned value into a
+# user assertion, so the wrappers refuse every other provenance at construction.
+@pytest.mark.parametrize(
+    "provenance",
+    [Declared(DeclaredSource.USER_ASSERTED), NativeConstraint(enforced_on_write=True)],
+    ids=["declared", "native-constraint"],
+)
+def test_compile_facts_require_compile_value_provenance(provenance: Provenance) -> None:
+    manifest = _passthrough_manifest()
+    with pytest.raises(ValueError, match="CompileValue"):
+        TagCompileFact(replace(_usd_source_fact(manifest), provenance=provenance))
+    fd_fact = Fact(
+        scope=SourceRef(SourceKind.SOURCE, "source.shop.raw.payments"),
+        value=FDSet.of(FD(frozenset({"country"}), "currency")),
+        provenance=provenance,
+    )
+    with pytest.raises(ValueError, match="CompileValue"):
+        FdCompileFact(fd_fact)

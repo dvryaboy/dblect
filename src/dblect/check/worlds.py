@@ -36,10 +36,18 @@ from dblect.check.run import (
     suppress_check_findings,
     world_findings,
 )
-from dblect.lineage.facts.model import Fact, WorldRef
+from dblect.lineage.facts.model import CompileValue, Fact, Provenance, WorldRef
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.domain_type import DomainTag
 from dblect.lineage.properties.functional_dependency import FDSet
+
+
+def _require_compile_value(provenance: Provenance) -> None:
+    """A compile fact carries only a toolchain-minted value. Any other provenance
+    routed through this seam would be re-grounded as if declared; for FDs that
+    would lift a flag-pinned value into a world axiom that survives unions."""
+    if not isinstance(provenance, CompileValue):
+        raise ValueError(f"a compile fact requires CompileValue provenance, got {provenance}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +57,9 @@ class TagCompileFact:
 
     fact: Fact[DomainTag, ColumnRef]
 
+    def __post_init__(self) -> None:
+        _require_compile_value(self.fact.provenance)
+
 
 @dataclass(frozen=True, slots=True)
 class FdCompileFact:
@@ -56,6 +67,9 @@ class FdCompileFact:
     value pins the key to in that world."""
 
     fact: Fact[FDSet, SourceRef]
+
+    def __post_init__(self) -> None:
+        _require_compile_value(self.fact.provenance)
 
 
 # A per-world fact, tagged by the property it grounds so the enumerator routes it
