@@ -82,16 +82,52 @@ class DeclaredFD:
     """A declared dependency's live instance in one relation.
 
     ``origin`` and ``declared`` name the axiom: the relation the dependency was
-    declared about, and the dependency in that relation's column names. ``fd`` is
-    the same dependency under the current relation's output names, renamed as the
-    walk climbs. All three fields key the match at a union merge: origin alone is
-    not enough (one relation can declare two dependencies that arms rename onto
-    the same output columns), and the axiom alone is not either (an arm can cross
-    the declared columns, running the instance the other way)."""
+    declared about, and the dependency in that relation's column names.
+    ``binding`` maps each declared column to the output column now carrying its
+    value, one pair per declared column, maintained as the walk climbs. The
+    per-column form is what a union merge compares: origin alone is not enough
+    (one relation can declare two dependencies that arms rename onto the same
+    output columns), and a renamed dependency is not either, because it forgets
+    which declared column feeds which output, so arms crossing the columns of a
+    multi-column determinant would look identical while running the axiom two
+    different ways."""
 
     origin: SourceRef
     declared: FD
-    fd: FD
+    binding: frozenset[tuple[str, str]]
+
+    def __post_init__(self) -> None:
+        cols = self.declared.determinant | {self.declared.dependent}
+        if frozenset(c for c, _ in self.binding) != cols or len(self.binding) != len(cols):
+            raise ValueError(f"binding must map exactly the declared columns {sorted(cols)}")
+
+    @staticmethod
+    def identity(origin: SourceRef, declared: FD) -> DeclaredFD:
+        """The instance at its declaring relation: every column bound to itself."""
+        cols = declared.determinant | {declared.dependent}
+        return DeclaredFD(origin, declared, frozenset((c, c) for c in cols))
+
+    @property
+    def fd(self) -> FD:
+        """The dependency under the current relation's output names."""
+        current = dict(self.binding)
+        return FD(
+            frozenset(current[c] for c in self.declared.determinant),
+            current[self.declared.dependent],
+        )
+
+    def renamed(self, lookup: Callable[[str], tuple[str, ...] | None]) -> DeclaredFD | None:
+        """The instance carried through a projection: each bound column renamed to
+        one of the output names ``lookup`` gives it, or ``None`` when a column does
+        not survive. One output name per column suffices (copies of a column carry
+        equal values), picked stably."""
+        bound: set[tuple[str, str]] = set()
+        for declared_col, current in self.binding:
+            names = lookup(current)
+            if not names:
+                return None
+            bound.add((declared_col, min(names)))
+        return replace(self, binding=frozenset(bound))
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +250,7 @@ def _lift_declared(fact: Fact[FDSet, SourceRef]) -> Fact[FDSet, SourceRef]:
         case Declared():
             if fact.value.is_bottom:
                 return fact
-            instances = frozenset(DeclaredFD(fact.scope, fd, fd) for fd in fact.value.fds)
+            instances = frozenset(DeclaredFD.identity(fact.scope, fd) for fd in fact.value.fds)
             return replace(fact, value=FDSet(fact.value.fds, fact.value.declared | instances))
         case NativeConstraint() | CompileValue():
             return fact
@@ -302,15 +338,7 @@ class _FdWalk:
         return NO_FDS
 
     def _with_scope(self, node: Expr, cte_scope: Mapping[str, FDSet]) -> dict[str, FDSet]:
-        """``cte_scope`` extended with the CTEs ``node`` declares, each resolved in
-        the scope the ones before it built."""
-        local = dict(cte_scope)
-        with_ = node.args.get("with_")
-        if isinstance(with_, exp.With):
-            for cte in with_.expressions:
-                if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
-                    local[cte.alias_or_name] = self.scope_fds(cte.this, cte_scope=local)
-        return local
+        return sg.with_scope(node, cte_scope, lambda n, s: self.scope_fds(n, cte_scope=s))
 
     def _union(self, u: exp.Union, *, cte_scope: Mapping[str, FDSet]) -> FDSet:
         """The union merge: keep exactly the declared instances every arm shares.
@@ -318,27 +346,32 @@ class _FdWalk:
         A union adds the cross pairs, one row from each arm, so survival is a
         coverage question. Every derived dependency's witness is arm-local and
         dies. A declared instance carried by every arm from one declaration, with
-        the same current columns once the arms are lined up by position under the
+        the same column binding once the arms are lined up by position under the
         first arm's names (as SQL merges them), draws every merged row's pair from
         that one world, so the cross pairs are covered and the instance survives
-        whole. UNION and UNION ALL merge alike (the dedup only removes rows). An
-        arm without positionally nameable outputs (a star, a duplicated name, not
-        a plain SELECT) leaves nothing to line up."""
-        local = self._with_scope(u, cte_scope)
-        arms = _union_arms(u)
-        carried = [self.scope_fds(arm, cte_scope=local) for arm in arms]
+        whole. UNION and UNION ALL merge alike (the dedup only removes rows). A
+        merge by name, or an arm without positionally nameable outputs (a star, a
+        duplicated name, not a plain SELECT), leaves nothing to line up. The arms'
+        names are checked before any arm is walked, and the walk stops at the
+        first empty intersection, so a merge that cannot keep anything skips the
+        recursion it would not use."""
+        arms = sg.union_arms(u)
+        if arms is None:
+            return NO_FDS
         names = [_positional_outputs(arm) for arm in arms]
         first = names[0] if names else None
         if first is None or any(n is None or len(n) != len(first) for n in names):
             return NO_FDS
+        local = self._with_scope(u, cte_scope)
         shared: frozenset[DeclaredFD] | None = None
-        for arm_names, arm_value in zip(names, carried, strict=True):
+        for arm_names, arm in zip(names, arms, strict=True):
             assert arm_names is not None
             rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
-            aligned = _remap_declared(arm_value.declared, rename)
+            aligned = _remap_declared(self.scope_fds(arm, cte_scope=local).declared, rename)
             shared = aligned if shared is None else shared & aligned
-        if not shared:
-            return NO_FDS
+            if not shared:
+                return NO_FDS
+        assert shared is not None
         return FDSet(frozenset(inst.fd for inst in shared), shared)
 
     def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, FDSet]) -> FDSet:
@@ -384,13 +417,10 @@ class _FdWalk:
             # Grouping aggregates everything outside the group key away, so only a
             # dependency lying entirely within it still describes the output rows.
             # The group rows' pairs are a subset of the input's, so an instance
-            # inside the key keeps its grounding.
+            # inside the key keeps its grounding: one survival rule, applied to the
+            # plain set and then read back for the instances.
             carried = _within(carried, group_names)
-            declared = frozenset(
-                inst
-                for inst in declared
-                if inst.fd.determinant | {inst.fd.dependent} <= group_names
-            )
+            declared = frozenset(inst for inst in declared if inst.fd in carried)
 
         out = carried if star else _remap(carried, rename)
         out_declared = declared if star else _remap_declared(declared, rename)
@@ -471,21 +501,21 @@ class _FdWalk:
                 padded.add(aliases[i])
                 padded.update(aliases[:i])
 
+        qrename, star = _qualified_rename(sel)
+        if star:
+            return NO_FDS  # a star over a join leaves the output universe ambiguous
+
         qfds: set[tuple[frozenset[_QCol], _QCol]] = set()
-        qdeclared: list[tuple[DeclaredFD, frozenset[_QCol], _QCol]] = []
+        declared_out: set[DeclaredFD] = set()
         for alias, base in sources:
             if alias in padded:
                 continue
             for fd in base.value.fds:
                 qfds.add((frozenset((alias, d) for d in fd.determinant), (alias, fd.dependent)))
-            qdeclared.extend(
-                (
-                    inst,
-                    frozenset((alias, d) for d in inst.fd.determinant),
-                    (alias, inst.fd.dependent),
-                )
-                for inst in base.value.declared
-            )
+            for inst in base.value.declared:
+                carried = inst.renamed(lambda cur, alias=alias: qrename.get((alias, cur)))
+                if carried is not None:
+                    declared_out.add(carried)
         for j in joins:
             if sg.join_side_of(j) is not sg.JoinSide.INNER:
                 continue
@@ -505,14 +535,6 @@ class _FdWalk:
                 if qc is not None:
                     qfds.add((frozenset(), qc))
 
-        qrename, star = _qualified_rename(sel)
-        if star:
-            return NO_FDS  # a star over a join leaves the output universe ambiguous
-        declared_out: set[DeclaredFD] = set()
-        for inst, det, dep in qdeclared:
-            fd = _project_one(det, dep, qrename)
-            if fd is not None:
-                declared_out.add(replace(inst, fd=fd))
         return FDSet(_project_qualified(qfds, qrename), frozenset(declared_out))
 
 
@@ -532,20 +554,6 @@ def _group_columns(sel: exp.Select) -> frozenset[str] | None:
             return None
         out.add(sg.column_name(g).lower())
     return frozenset(out)
-
-
-def _union_arms(u: exp.Union) -> list[Expr]:
-    """The arms of ``u`` in order, a chain of unions (left-nested by the parser)
-    flattened so an instance shared by every arm survives the whole chain in one
-    pass. Mixing UNION and UNION ALL is fine: the merged rows are drawn from the
-    arms' rows either way."""
-    arms: list[Expr] = []
-    for side in (u.this, u.expression):
-        if isinstance(side, exp.Union):
-            arms.extend(_union_arms(side))
-        elif isinstance(side, Expr):
-            arms.append(side)
-    return arms
 
 
 def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
@@ -585,15 +593,12 @@ def _remap(fds: frozenset[FD], rename: Mapping[str, tuple[str, ...]]) -> frozens
 def _remap_declared(
     instances: frozenset[DeclaredFD], rename: Mapping[str, tuple[str, ...]]
 ) -> frozenset[DeclaredFD]:
-    """Rename each instance's current dependency by the same rules as
+    """Rename each instance's binding by the same survival rules as
     :func:`_remap`, keeping its grounding; an instance whose columns do not all
     survive drops with them."""
-    out: set[DeclaredFD] = set()
-    for inst in instances:
-        fd = _remap_one(inst.fd, rename)
-        if fd is not None:
-            out.add(replace(inst, fd=fd))
-    return frozenset(out)
+    return frozenset(
+        carried for inst in instances if (carried := inst.renamed(rename.get)) is not None
+    )
 
 
 def _remap_one(fd: FD, rename: Mapping[str, tuple[str, ...]]) -> FD | None:

@@ -51,8 +51,14 @@ _ORIGINS = (
 )
 
 
-def _fd_sort_key(fd: FD) -> tuple[tuple[str, ...], str]:
-    return (tuple(sorted(fd.determinant)), fd.dependent)
+@st.composite
+def _declared_instance(draw: st.DrawFn) -> DeclaredFD:
+    """An instance with an arbitrary binding of the declared columns onto the
+    column universe, the shape a walk's renames produce."""
+    declared = draw(_fds)
+    cols = declared.determinant | {declared.dependent}
+    binding = frozenset((c, draw(st.sampled_from(_COLS))) for c in cols)
+    return DeclaredFD(origin=draw(st.sampled_from(_ORIGINS)), declared=declared, binding=binding)
 
 
 @st.composite
@@ -60,20 +66,8 @@ def _fd_set(draw: st.DrawFn) -> FDSet:
     """An FD set whose declared instances respect the value's invariant: each
     instance's current dependency is among ``fds``."""
     fds = draw(st.frozensets(_fds, max_size=4))
-    declared: frozenset[DeclaredFD] = frozenset()
-    if fds:
-        declared = draw(
-            st.frozensets(
-                st.builds(
-                    DeclaredFD,
-                    origin=st.sampled_from(_ORIGINS),
-                    declared=_fds,
-                    fd=st.sampled_from(sorted(fds, key=_fd_sort_key)),
-                ),
-                max_size=3,
-            )
-        )
-    return FDSet(fds, declared)
+    declared = draw(st.frozensets(_declared_instance(), max_size=3))
+    return FDSet(fds | frozenset(inst.fd for inst in declared), declared)
 
 
 _fd_sets = _fd_set()
@@ -122,7 +116,15 @@ def test_an_instance_outside_the_fds_is_rejected() -> None:
     value's dependencies, so consumers reading ``fds`` alone never under-see."""
     fd = FD(frozenset({"country"}), "currency")
     with pytest.raises(ValueError, match="outside fds"):
-        FDSet(frozenset(), frozenset({DeclaredFD(origin=_ORIGINS[0], declared=fd, fd=fd)}))
+        FDSet(frozenset(), frozenset({DeclaredFD.identity(_ORIGINS[0], fd)}))
+
+
+def test_a_binding_off_the_declared_columns_is_rejected() -> None:
+    """The instance invariant: the binding maps exactly the declared columns, so
+    the current dependency is always derivable."""
+    fd = FD(frozenset({"country"}), "currency")
+    with pytest.raises(ValueError, match="declared columns"):
+        DeclaredFD(origin=_ORIGINS[0], declared=fd, binding=frozenset({("country", "country")}))
 
 
 @given(st.lists(_fd_sets, max_size=6))

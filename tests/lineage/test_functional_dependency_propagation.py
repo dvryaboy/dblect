@@ -86,10 +86,14 @@ def _fd(dependent: str, *determinant: str) -> FD:
     return FD(frozenset(determinant), dependent)
 
 
-def _inst(fd: FD, *, origin: SourceRef = _PAYMENTS, as_fd: FD | None = None) -> DeclaredFD:
-    """A declared dependency's instance: ``fd`` as declared at ``origin``, carried
-    under the current relation's names (``as_fd`` when a projection renamed it)."""
-    return DeclaredFD(origin=origin, declared=fd, fd=fd if as_fd is None else as_fd)
+def _inst(
+    fd: FD, *, origin: SourceRef = _PAYMENTS, renames: Mapping[str, str] | None = None
+) -> DeclaredFD:
+    """A declared dependency's instance: ``fd`` as declared at ``origin``, each
+    column bound to its current name (itself, unless ``renames`` maps it)."""
+    current = renames or {}
+    binding = frozenset((c, current.get(c, c)) for c in fd.determinant | {fd.dependent})
+    return DeclaredFD(origin=origin, declared=fd, binding=binding)
 
 
 def _carried(*instances: DeclaredFD, derived: tuple[FD, ...] = ()) -> FDSet:
@@ -137,7 +141,7 @@ def test_projection_renames_both_sides() -> None:
         _node("model.shop.stg", "SELECT country AS nation, currency AS curr FROM payments"),
     )
     assert out["model.shop.stg"] == _carried(
-        _inst(_fd("currency", "country"), as_fd=_fd("curr", "nation"))
+        _inst(_fd("currency", "country"), renames={"country": "nation", "currency": "curr"})
     )
 
 
@@ -538,11 +542,12 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
 # arm-local witness leaves them uncovered, and one shared axiom covers them. The
 # carry side is owned by the union PBT in
 # test_pbt_functional_dependency_soundness.py, whose anti-vacuity arm spans both
-# operators, both arm orders, and differing arm aliases; the rows here pin what
-# its generator cannot reach: the two structural carries (chain flattening, the
-# dbt CTE-and-rename shell), one drop per soundness edge (derived witness, two
-# worlds, an unknown arm, two axioms of one world on the same columns, crossed
-# columns, a star arm), and the other set operators, which claim nothing.
+# operators, arm orders, and arm aliases; the rows here pin the structural
+# carries (chain flattening, parenthesized arms, the dbt CTE-and-rename shell),
+# one drop per soundness edge (derived witness, two worlds, an unknown arm, two
+# axioms of one world on the same columns, crossed columns, crossed determinant
+# columns, a merge by name, a star arm), and the other set operators, which
+# claim nothing.
 
 _CC = _fd("currency", "country")
 
@@ -560,8 +565,15 @@ _SET_OPERATIONS = [
         "WITH unioned AS (SELECT country, currency FROM payments "
         "UNION ALL SELECT country, currency FROM payments) "
         "SELECT country AS nation, currency AS curr FROM unioned",
-        _carried(_inst(_CC, as_fd=_fd("curr", "nation"))),
+        _carried(_inst(_CC, renames={"country": "nation", "currency": "curr"})),
         id="dbt-shape-cte-then-rename",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "(SELECT country, currency FROM payments) "
+        "UNION ALL (SELECT country, currency FROM payments)",
+        _carried(_inst(_CC)),
+        id="parenthesized-arms-carry",
     ),
     pytest.param(
         _declared(),
@@ -594,6 +606,19 @@ _SET_OPERATIONS = [
         "UNION ALL SELECT currency AS country, country AS currency FROM payments",
         NO_FDS,
         id="crossed-columns-drop",
+    ),
+    pytest.param(
+        _declared(_fd("c", "a", "b")),
+        "SELECT a, b, c FROM payments UNION ALL SELECT b AS a, a AS b, c FROM payments",
+        NO_FDS,
+        id="crossed-determinant-columns-drop",
+    ),
+    pytest.param(
+        _declared(_CC),
+        "SELECT country, currency FROM payments "
+        "UNION ALL BY NAME SELECT country, currency FROM payments",
+        NO_FDS,
+        id="by-name-merge-claims-nothing",
     ),
     pytest.param(
         _declared(_CC),

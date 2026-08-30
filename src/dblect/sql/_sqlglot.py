@@ -81,6 +81,30 @@ def with_scope(
     return local
 
 
+def union_arms(u: exp.Union) -> list[Expr] | None:
+    """The arms of a union chain in order: same-operator nesting flattened and
+    parenthesized arms unwrapped, since parens change neither the merged rows nor
+    the arms' output names (dbt_utils-style generated unions parenthesize every
+    arm). Mixing UNION and UNION ALL is fine: the merged rows are drawn from the
+    arms' rows either way. ``None`` when any link merges by name (``BY NAME``,
+    ``CORRESPONDING``), where alignment is by alias rather than position."""
+    if u.args.get("by_name"):
+        return None
+    arms: list[Expr] = []
+    for side in (u.this, u.expression):
+        if not isinstance(side, Expr):
+            return None
+        node = side.unnest()
+        if isinstance(node, exp.Union):
+            inner = union_arms(node)
+            if inner is None:
+                return None
+            arms.extend(inner)
+        else:
+            arms.append(node)
+    return arms
+
+
 class GroupBinding(StrEnum):
     """How firmly a ``GROUP BY`` target is bound to the expression it denotes.
 
