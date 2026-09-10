@@ -54,7 +54,6 @@ from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
 from dblect.lineage.properties.activation import activate
 from dblect.lineage.properties.predicate_flow import RowFilter
 from dblect.lineage.properties.scope_closure import (
-    EMPTY_INPUT,
     ConditionalKey,
     Input,
     Key,
@@ -90,18 +89,11 @@ class CandidateKeySet:
     real declarations reaches it, since uniqueness claims only ever union. Equality
     is structural, so ``CandidateKeySet(frozenset())`` (top) and the bottom sentinel
     are distinct values.
-
-    ``exact`` says whether the derivation passed only through operators the engine
-    models exactly and every input it read was itself exact, so an absent key is a
-    proven absence rather than a shape the engine gave up on. A declaration, the top
-    and bottom sentinels, and any relation the engine never walked are exact by
-    default; only the SQL walk can make a value inexact.
     """
 
     keys: frozenset[Key]
     conditional: frozenset[ConditionalKey] = frozenset()
     is_bottom: bool = False
-    exact: bool = True
 
     @staticmethod
     def of(*keys: frozenset[str]) -> CandidateKeySet:
@@ -120,25 +112,19 @@ ALL_KEYS: CandidateKeySet = CandidateKeySet(frozenset(), is_bottom=True)
 
 def _meet(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
     """Most precise value consistent with both: union of the known keys (and of the
-    carried conditional keys, which also only ever accumulate). ``exact`` is the
-    conjunction: a meet is exact only when both sides are, ``True`` its identity,
-    matching the meet identity ``top`` (which is exact).
+    carried conditional keys, which also only ever accumulate).
 
     Bottom annihilates (it already "knows" every key), so a meet touching bottom
     stays bottom.
     """
     if a.is_bottom or b.is_bottom:
         return ALL_KEYS
-    return CandidateKeySet(
-        a.keys | b.keys, a.conditional | b.conditional, exact=a.exact and b.exact
-    )
+    return CandidateKeySet(a.keys | b.keys, a.conditional | b.conditional)
 
 
 def _join(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
     """Least precise value both refine: the keys both sides carry (intersection),
-    conditional keys likewise. ``exact`` is the disjunction: a join is exact when
-    either side is, the dual of meet's conjunction, so ``top`` (exact) stays the
-    join annihilator regardless of the other operand's own bit.
+    conditional keys likewise.
 
     Bottom is the identity (it refines nothing finer than the other side), so a
     join with bottom returns the other operand.
@@ -147,7 +133,7 @@ def _join(a: CandidateKeySet, b: CandidateKeySet) -> CandidateKeySet:
         return b
     if b.is_bottom:
         return a
-    return CandidateKeySet(a.keys & b.keys, a.conditional & b.conditional, exact=a.exact or b.exact)
+    return CandidateKeySet(a.keys & b.keys, a.conditional & b.conditional)
 
 
 UNIQUENESS_LATTICE: Lattice[CandidateKeySet] = Lattice(
@@ -647,15 +633,15 @@ def relation_reduce(
         nonlocal provisional
         ref = source_ref_meta(table)
         if ref is None:
-            return EMPTY_INPUT
+            return Input(exact=False)  # a table the graph could not resolve: a hole, not a proof
         ann = recurse(ref)
         provisional = provisional or ann.provisional
-        return Input(ann.value.keys, conditional=ann.value.conditional, exact=ann.value.exact)
+        return Input(ann.value.keys, conditional=ann.value.conditional, exact=ann.exact)
 
     resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
-    value = CandidateKeySet(resolved.keys, resolved.conditional, exact=resolved.exact)
+    value = CandidateKeySet(resolved.keys, resolved.conditional)
     opacity = Opacity.CONCRETE if (resolved.keys or resolved.conditional) else Opacity.IMPLICIT
-    return Annotation(value, opacity, provisional=provisional)
+    return Annotation(value, opacity, provisional=provisional, exact=resolved.exact)
 
 
 def relation_scope_keys(

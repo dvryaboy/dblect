@@ -29,6 +29,7 @@ property's :class:`~dblect.lineage.facts.DepContext` reads.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
 from functools import reduce
 from typing import Any, TypeVar, cast
 
@@ -205,17 +206,26 @@ def _reconcile(
     (consistent) inference tightens to the inferred value; a conflict keeps the
     grounded value as the contract but taints it provisional, so one upstream
     regression does not blank analysis of every consumer.
+
+    ``exact`` is the AND of both sides on every path, a declaration's own taint
+    (always ``True`` today) combined with the inference's: one inexact contributor
+    taints the flow value regardless of which branch below decides it. A grounded
+    opt-out never reaches here (``propagate`` short-circuits on it before calling),
+    so that channel's exactness is untouched.
     """
+    exact = grounded.exact and inferred.exact
     if grounded.opacity is Opacity.IMPLICIT:
-        return inferred
+        return replace(inferred, exact=exact)
     if inferred.value == lat.top:
-        return grounded
+        return replace(grounded, exact=exact)
     if reconcile_by_meet:
         provisional = grounded.provisional or inferred.provisional
-        return Annotation(lat.meet(grounded.value, inferred.value), grounded.opacity, provisional)
+        return Annotation(
+            lat.meet(grounded.value, inferred.value), grounded.opacity, provisional, exact=exact
+        )
     if check(grounded.value, inferred.value):
-        return inferred
-    return Annotation(grounded.value, grounded.opacity, provisional=True)
+        return replace(inferred, exact=exact)
+    return Annotation(grounded.value, grounded.opacity, provisional=True, exact=exact)
 
 
 def _column_reduce(

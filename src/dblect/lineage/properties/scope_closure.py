@@ -231,13 +231,8 @@ class Input:
     exact: bool = True
 
 
-EMPTY_INPUT: Input = Input()
-
 # The scope gave up: a shape outside the modelled fragment (see the module
-# docstring). Distinct from ``EMPTY_INPUT``, which also stands for "this base
-# table contributes nothing" at a resolution boundary outside the engine's own
-# shape analysis (an unresolvable table reference), where the engine has no
-# evidence either way and stays exact by default.
+# docstring).
 _GIVE_UP: Input = Input(exact=False)
 
 BaseResolve = Callable[[exp.Table], Input]
