@@ -67,7 +67,8 @@ def _fd_set(draw: st.DrawFn) -> FDSet:
     instance's current dependency is among ``fds``."""
     fds = draw(st.frozensets(_fds, max_size=4))
     declared = draw(st.frozensets(_declared_instance(), max_size=3))
-    return FDSet(fds | frozenset(inst.fd for inst in declared), declared)
+    exact = draw(st.booleans())
+    return FDSet(fds | frozenset(inst.fd for inst in declared), declared, exact=exact)
 
 
 _fd_sets = _fd_set()
@@ -136,10 +137,12 @@ def test_resolution_never_contradicts(values: list[FDSet]) -> None:
     assert not is_contradiction
     expected_fds: frozenset[FD] = frozenset()
     expected_declared: frozenset[DeclaredFD] = frozenset()
+    expected_exact = True
     for v in values:
         expected_fds = expected_fds | v.fds
         expected_declared = expected_declared | v.declared
-    assert value == FDSet(expected_fds, expected_declared)
+        expected_exact = expected_exact and v.exact
+    assert value == FDSet(expected_fds, expected_declared, exact=expected_exact)
 
 
 # --- entailment ----------------------------------------------------------------
