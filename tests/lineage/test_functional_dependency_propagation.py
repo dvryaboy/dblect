@@ -575,6 +575,12 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
 
 _CC = _fd("currency", "country")
 
+# A shape the union merge cannot align (a star or BY NAME arm) or a set operator it
+# does not model (INTERSECT, EXCEPT) is a give-up, not a proof of "no dependency":
+# the engine's fragment claims nothing rather than a wrong answer, and the bit
+# says so.
+_GIVE_UP = FDSet(frozenset(), exact=False)
+
 _SET_OPERATIONS = [
     pytest.param(
         _declared(_CC),
@@ -641,25 +647,25 @@ _SET_OPERATIONS = [
         _declared(_CC),
         "SELECT country, currency FROM payments "
         "UNION ALL BY NAME SELECT country, currency FROM payments",
-        NO_FDS,
+        _GIVE_UP,
         id="by-name-merge-claims-nothing",
     ),
     pytest.param(
         _declared(_CC),
         "SELECT country, currency FROM payments UNION ALL SELECT * FROM payments",
-        NO_FDS,
+        _GIVE_UP,
         id="star-arm-leaves-nothing-to-align",
     ),
     pytest.param(
         _declared(_CC),
         "SELECT country, currency FROM payments INTERSECT SELECT country, currency FROM payments",
-        NO_FDS,
+        _GIVE_UP,
         id="intersect-claims-nothing",
     ),
     pytest.param(
         _declared(_CC),
         "SELECT country, currency FROM payments EXCEPT SELECT country, currency FROM payments",
-        NO_FDS,
+        _GIVE_UP,
         id="except-claims-nothing",
     ),
 ]

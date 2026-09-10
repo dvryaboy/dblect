@@ -15,13 +15,37 @@ GROUP BY, DISTINCT), then projects that fact set back down to an ``Input`` in
 the scope's own output names, closure-aware: a key or dependency survives
 whenever the closure reaches it, however indirectly the columns that witness
 it are named.
+
+Every key and dependency the engine derives is a sound under-approximation: a
+shape it cannot model yields nothing rather than a guess. ``Input.exact``
+records whether that "yields nothing" was a proven absence or a give-up, so a
+consumer wanting a negative claim (a key is not derivable, a grain does not
+hold) can tell the two apart. The fragment the engine models exactly:
+
+Exact: a FROM that is a table, CTE, or subquery; INNER, CROSS, LEFT, RIGHT,
+FULL, SEMI, ANTI joins and the ``LEFT JOIN ... IS NULL`` idiom; a WHERE, ON,
+HAVING, or QUALIFY whose every conjunctive leaf is a column equality, a
+literal equality, the recognized ``ROW_NUMBER`` guard, or a row-local
+comparison over this scope's own columns (``a > 1``, ``a <> b``, ``a IN (1,
+2)``, ``a IS NULL``, ``LIKE``, ``BETWEEN``, and AND/OR/NOT over these); a
+GROUP BY over bare columns; DISTINCT; UNION and UNION ALL; a projection of
+bare columns, or expressions with no subquery and no window other than the
+recognized ``ROW_NUMBER`` dedup.
+
+Inexact: any subquery, EXISTS, IN-with-subquery, or window reference inside a
+predicate; a projection containing a subquery or an unrecognized window; a
+group target that is not a bare column; a star over a join; a FROM that is
+anything else (a function, UNNEST, VALUES); INTERSECT and EXCEPT; and every
+site where the engine gives up on a shape it does not recognize. A row-local
+comparison is exact because such a filter cannot guarantee a collapse, so a
+coarser key being absent after it is real evidence.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -190,15 +214,31 @@ class Input:
     carried conditional keys, each in the source's own output column names. A
     base table resolves through the caller's ``base_resolve``; a CTE or inline
     subquery resolves to its own nested scope's projected facts, which are
-    exactly this shape."""
+    exactly this shape.
+
+    ``exact`` says whether this input's own derivation passed only through
+    operators the engine models exactly (see the module docstring for the
+    fragment) and every input *it* read was itself exact. A scope that mints
+    from an inexact input, or that itself contains an operator outside the
+    fragment, is inexact; the bit is the identity ``True`` everywhere else, so
+    a caller that never touches exactness sees no change in behavior.
+    """
 
     keys: frozenset[Key] = frozenset()
     fds: frozenset[FD] = frozenset()
     declared: frozenset[DeclaredFD] = frozenset()
     conditional: frozenset[ConditionalKey] = frozenset()
+    exact: bool = True
 
 
 EMPTY_INPUT: Input = Input()
+
+# The scope gave up: a shape outside the modelled fragment (see the module
+# docstring). Distinct from ``EMPTY_INPUT``, which also stands for "this base
+# table contributes nothing" at a resolution boundary outside the engine's own
+# shape analysis (an unresolvable table reference), where the engine has no
+# evidence either way and stays exact by default.
+_GIVE_UP: Input = Input(exact=False)
 
 BaseResolve = Callable[[exp.Table], Input]
 
@@ -234,7 +274,7 @@ def scope_facts(
     elif isinstance(node, exp.Union):
         result = _union_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
     else:
-        return EMPTY_INPUT
+        return _GIVE_UP  # INTERSECT, EXCEPT, or any other shape outside the modelled fragment
     if record is not None:
         record[id(node)] = result
     return result
@@ -308,6 +348,87 @@ def _predicate_qfds(predicate: Expr, *, default_alias: str) -> set[QFD]:
         elif right_col is not None and isinstance(left, exp.Literal):
             out.add((frozenset(), _qcol(right_col, default_alias=default_alias)))
     return out
+
+
+# --- exactness ---------------------------------------------------------------
+#
+# A WHERE, ON, HAVING, or QUALIFY stays in the modelled fragment only when every
+# leaf is one of a closed set of row-local shapes; everything else (an aggregate,
+# a subquery, an unrecognized window) is a shape the engine does not understand
+# well enough to call the resulting absence a proof. This is a stricter fragment
+# than a projection's: a projection may carry an arbitrary opaque expression
+# through by name without the engine needing to reason about its value, but a
+# predicate's shape decides whether rows can be filtered without breaking a
+# key or dependency claim, so only recognized comparisons qualify.
+
+_COMPARISONS: tuple[type[Expr], ...] = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
+
+
+def _row_local(e: Expr) -> bool:
+    """A bare column or a literal: the only operand shapes a row-local comparison
+    allows, so no aggregate, subquery, or arbitrary expression sneaks through."""
+    return isinstance(e, exp.Column | exp.Literal)
+
+
+def _leaf_is_exact(leaf: Expr) -> bool:
+    """Whether one non-boolean predicate leaf is a shape the fragment models
+    exactly: a comparison, ``IN``, ``IS NULL``, ``LIKE``, or ``BETWEEN`` over bare
+    columns and literals, or the ``ROW_NUMBER`` dedup guard."""
+    guard_operand = sg.rank_one_guard_operand(leaf)
+    if guard_operand is not None and sg.row_number_window(guard_operand) is not None:
+        return True  # the inline ROW_NUMBER dedup guard
+    if isinstance(leaf, _COMPARISONS):
+        return _row_local(leaf.this) and _row_local(leaf.expression)
+    if isinstance(leaf, exp.In):
+        exprs = leaf.args.get("expressions")
+        return (
+            isinstance(leaf.this, exp.Column)
+            and bool(exprs)
+            and all(isinstance(x, exp.Literal) for x in cast("list[Expr]", exprs))
+        )
+    if isinstance(leaf, exp.Is):
+        return isinstance(leaf.this, exp.Column) and isinstance(leaf.expression, exp.Null)
+    if isinstance(leaf, exp.Like | exp.ILike):
+        return isinstance(leaf.this, exp.Column) and isinstance(leaf.expression, exp.Literal)
+    if isinstance(leaf, exp.Between):
+        return isinstance(leaf.this, exp.Column)
+    return False
+
+
+def _predicate_is_exact(e: Expr) -> bool:
+    """Whether a WHERE, ON, HAVING, or QUALIFY predicate stays inside the fragment:
+    AND/OR/NOT over leaves :func:`_leaf_is_exact` recognizes."""
+    if isinstance(e, exp.Paren):
+        return isinstance(e.this, Expr) and _predicate_is_exact(e.this)
+    if isinstance(e, exp.And | exp.Or):
+        left, right = e.this, e.expression
+        return (
+            isinstance(left, Expr)
+            and isinstance(right, Expr)
+            and _predicate_is_exact(left)
+            and _predicate_is_exact(right)
+        )
+    if isinstance(e, exp.Not):
+        return isinstance(e.this, Expr) and _predicate_is_exact(e.this)
+    return _leaf_is_exact(e)
+
+
+def _projection_is_exact(sel: exp.Select) -> bool:
+    """Whether every projected expression stays inside the fragment: a star, a
+    bare column, or an expression with no subquery and no window other than a
+    ``ROW_NUMBER`` (the only window family the ``ROW_NUMBER`` dedup idiom needs,
+    filtered locally or by an outer scope's guard on this select's own output)."""
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Star):
+            continue
+        inner = proj.this if isinstance(proj, exp.Alias) else proj
+        if not isinstance(inner, Expr):
+            continue
+        if sg.find_all_selects(inner):
+            return False
+        if any(sg.row_number_window(w) is None for w in sg.find_all_windows(inner)):
+            return False
+    return True
 
 
 def _left_join_breakdown(
@@ -421,12 +542,12 @@ def _select_facts(
 
     from_ = sg.from_of(sel)
     if from_ is None or not isinstance(from_.this, Expr):
-        return EMPTY_INPUT
+        return _GIVE_UP  # no FROM, or a shape sqlglot did not give an Expr for
     from_resolved = _resolve_source(
         from_.this, cte_scope=local, base_resolve=base_resolve, record=record
     )
     if from_resolved is None:
-        return EMPTY_INPUT
+        return _GIVE_UP  # a FROM that is a function, UNNEST, VALUES, or other unmodelled shape
     from_alias = from_resolved[0]
 
     # A window computed inside the FROM subquery keys the from relation, so it joins the
@@ -442,12 +563,12 @@ def _select_facts(
     join_sources: list[tuple[str, Input]] = []
     for j in joins:
         if not isinstance(j.this, Expr):
-            return EMPTY_INPUT
+            return _GIVE_UP  # a join source sqlglot did not give an Expr for
         resolved = _resolve_source(
             j.this, cte_scope=local, base_resolve=base_resolve, record=record
         )
         if resolved is None:
-            return EMPTY_INPUT
+            return _GIVE_UP  # a join source that is a function, UNNEST, VALUES, or the like
         join_sources.append(resolved)
 
     anti_arms = anti_join.anti_arm_ids(sel)
@@ -462,6 +583,9 @@ def _select_facts(
     declared_by_alias: dict[str, frozenset[DeclaredFD]] = {}
     conditional_by_alias: dict[str, frozenset[ConditionalKey]] = {}
     active_aliases: list[str] = []
+    # Inexact when any minted input is, or when this scope's own WHERE/ON/HAVING/
+    # QUALIFY/projection shape falls outside the fragment (checked below).
+    scope_exact = True
 
     def mint(
         alias: str,
@@ -470,6 +594,8 @@ def _select_facts(
         keep_fds: bool = True,
         key_filter: Callable[[Key], bool] | None = None,
     ) -> None:
+        nonlocal scope_exact
+        scope_exact = scope_exact and inp.exact
         token = RowToken(alias)
         for key in inp.keys:
             if key_filter is not None and not key_filter(key):
@@ -490,6 +616,9 @@ def _select_facts(
 
     for (alias, inp), j in zip(join_sources, joins, strict=True):
         side = sg.join_side_of(j)
+        on_expr = sg.on_of(j)
+        if on_expr is not None and not _predicate_is_exact(on_expr):
+            scope_exact = False
         if side in (sg.JoinSide.SEMI, sg.JoinSide.ANTI) or id(j) in anti_arms:
             continue  # a filters the accumulated side; mint nothing, exclude from r_out
         if side is sg.JoinSide.LEFT:
@@ -538,9 +667,27 @@ def _select_facts(
 
     where = sg.where_of(sel)
     if where is not None and isinstance(where.this, Expr):
+        if not _predicate_is_exact(where.this):
+            scope_exact = False
         minted = _predicate_qfds(where.this, default_alias=from_alias)
         facts |= minted
         predicate_pairs |= minted
+
+    qualify = sg.qualify_of(sel)
+    if (
+        qualify is not None
+        and isinstance(qualify.this, Expr)
+        and not _predicate_is_exact(qualify.this)
+    ):
+        scope_exact = False
+
+    having = sel.args.get("having")
+    if (
+        isinstance(having, exp.Having)
+        and isinstance(having.this, Expr)
+        and not _predicate_is_exact(having.this)
+    ):
+        scope_exact = False
 
     if active_aliases:
         facts.add((frozenset(RowToken(a) for a in active_aliases), _OUTPUT_TOKEN))
@@ -554,7 +701,7 @@ def _select_facts(
     if grouped:
         g_cols = _group_qcols(sel, from_alias=from_alias)
         if g_cols is None:
-            return EMPTY_INPUT
+            return _GIVE_UP  # a GROUP BY target that is not a bare column
         g_attrs: frozenset[Attr] = frozenset(g_cols)
         facts, declared_by_alias, r_out = _apply_group_by(facts, declared_by_alias, g_attrs)
         candidate_aliases: list[str] = []
@@ -568,7 +715,9 @@ def _select_facts(
 
     proj = _build_projection(sel, from_alias=from_alias, active_aliases=active_aliases)
     if proj.blocked:
-        return EMPTY_INPUT
+        return _GIVE_UP  # a star projected over more than one input: an ambiguous output universe
+    if not _projection_is_exact(sel):
+        scope_exact = False
 
     for name in proj.computed:
         facts.add((frozenset({r_out}), Computed(name)))
@@ -583,7 +732,7 @@ def _select_facts(
 
     classes = _equivalence_classes(tuple(predicate_pairs))
     declared_final = _rename_declared(declared_by_alias, classes, proj)
-    return _project(
+    result = _project(
         facts,
         declared_final,
         candidate_aliases,
@@ -593,6 +742,7 @@ def _select_facts(
         classes=classes,
         conditional_by_alias=conditional_by_alias,
     )
+    return replace(result, exact=scope_exact)
 
 
 def _rename_declared(
@@ -812,25 +962,23 @@ def _union_facts(
     keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
-        return Input(keys)
+        return Input(keys, exact=False)  # an unflattened or otherwise unreadable set-op chain
     names = [_positional_outputs(arm) for arm in arms]
     first = names[0] if names else None
     if first is None or any(n is None or len(n) != len(first) for n in names):
-        return Input(keys)
+        return Input(keys, exact=False)  # an arm's output columns can't be read positionally
     local = _with_scope(u, cte_scope, base_resolve, record)
     shared: frozenset[DeclaredFD] | None = None
+    arms_exact = True
     for arm_names, arm in zip(names, arms, strict=True):
         assert arm_names is not None
         rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
-        aligned = _remap_declared(
-            scope_facts(arm, cte_scope=local, base_resolve=base_resolve, record=record).declared,
-            rename,
-        )
+        arm_input = scope_facts(arm, cte_scope=local, base_resolve=base_resolve, record=record)
+        arms_exact = arms_exact and arm_input.exact
+        aligned = _remap_declared(arm_input.declared, rename)
         shared = aligned if shared is None else shared & aligned
-        if not shared:
-            return Input(keys)
     assert shared is not None
-    return Input(keys, frozenset(inst.fd for inst in shared), shared)
+    return Input(keys, frozenset(inst.fd for inst in shared), shared, exact=arms_exact)
 
 
 def _union_key(u: exp.Union) -> frozenset[Key]:

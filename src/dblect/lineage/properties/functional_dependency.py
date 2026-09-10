@@ -91,11 +91,18 @@ class FDSet:
     no resolution of real declarations reaches it, since dependency claims only
     ever union. Equality is structural, so ``FDSet(frozenset())`` (top) and the
     bottom sentinel are distinct values.
+
+    ``exact`` says whether the derivation passed only through operators the engine
+    models exactly and every input it read was itself exact, so an absent
+    dependency is a proven absence rather than a shape the engine gave up on. A
+    declaration, the top and bottom sentinels, and any relation the engine never
+    walked are exact by default; only the SQL walk can make a value inexact.
     """
 
     fds: frozenset[FD]
     declared: frozenset[DeclaredFD] = frozenset()
     is_bottom: bool = False
+    exact: bool = True
 
     def __post_init__(self) -> None:
         missing = {inst.fd for inst in self.declared} - self.fds
@@ -118,21 +125,26 @@ ALL_FDS: FDSet = FDSet(frozenset(), is_bottom=True)
 
 def _meet(a: FDSet, b: FDSet) -> FDSet:
     """Most precise value consistent with both: the union of the dependencies,
-    grounded instances included."""
+    grounded instances included. ``exact`` is the conjunction: a meet is exact only
+    when both sides are, ``True`` its identity, matching the meet identity ``top``
+    (which is exact)."""
     if a.is_bottom or b.is_bottom:
         return ALL_FDS
-    return FDSet(a.fds | b.fds, a.declared | b.declared)
+    return FDSet(a.fds | b.fds, a.declared | b.declared, exact=a.exact and b.exact)
 
 
 def _join(a: FDSet, b: FDSet) -> FDSet:
     """Least precise value both refine: the dependencies both sides carry. An
     instance survives only whole (same grounding, same current columns), so the
-    same dependency grounded at two different origins keeps neither instance."""
+    same dependency grounded at two different origins keeps neither instance.
+    ``exact`` is the disjunction: a join is exact when either side is, the dual of
+    meet's conjunction, so ``top`` (exact) stays the join annihilator regardless of
+    the other operand's own bit."""
     if a.is_bottom:
         return b
     if b.is_bottom:
         return a
-    return FDSet(a.fds & b.fds, a.declared & b.declared)
+    return FDSet(a.fds & b.fds, a.declared & b.declared, exact=a.exact or b.exact)
 
 
 FUNCTIONAL_DEPENDENCY_LATTICE: Lattice[FDSet] = Lattice(
@@ -266,13 +278,16 @@ def functional_dependency_property(
             ann = recurse(ref)
             provisional = provisional or ann.provisional
             keys: frozenset[Key] = frozenset()
+            keys_exact = True
             if uniqueness is not None:
                 key_ann = ctx.annotation(uniqueness, ref)
                 if key_ann is not None:
                     keys = key_ann.value.keys
+                    keys_exact = key_ann.value.exact
             # The bottom sentinel carries no dependencies to walk with; strip it to
             # the plain sets here, exactly as the walk always has.
-            return Input(keys, ann.value.fds, ann.value.declared)
+            exact = ann.value.exact and keys_exact
+            return Input(keys, ann.value.fds, ann.value.declared, exact=exact)
 
         resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
         # A declared instance's own dependency joins the plain set explicitly: the
@@ -281,7 +296,7 @@ def functional_dependency_property(
         # instance's own, unsimplified form absent from ``fds`` on its own. Both
         # are sound; ``FDSet`` requires every instance's ``fd`` to be a member.
         fds = resolved.fds | {inst.fd for inst in resolved.declared}
-        value = FDSet(fds, resolved.declared)
+        value = FDSet(fds, resolved.declared, exact=resolved.exact)
         opacity = Opacity.CONCRETE if value.fds else Opacity.IMPLICIT
         return Annotation(value, opacity, provisional=provisional)
 

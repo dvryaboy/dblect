@@ -538,3 +538,156 @@ def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
         _node("model.shop.m", "SELECT id, amount FROM orders WHERE id = 5"),
     )
     assert keys["model.shop.m"] == CandidateKeySet.of(_key("id"))
+
+
+# --- exactness -----------------------------------------------------------------
+#
+# The engine's fragment is exact for a closed set of shapes (see scope_closure's
+# module docstring); everything outside it makes the engine give up on the whole
+# scope. One row per shape family, one row per give-up trigger: the closed input
+# space the bit decides over.
+
+_ORDERS = _source("source.shop.raw.orders")
+_CUSTOMERS = _source("source.shop.raw.customers")
+
+
+def _exact(sql: str) -> bool:
+    """The ``exact`` bit of one model's inferred candidate-key set, over a manifest
+    carrying keyless ``orders`` and ``customers`` sources the model's SQL can draw on."""
+    man = _manifest(_ORDERS, _CUSTOMERS, _node("model.shop.x", sql))
+    result = build_relation_graph(man)
+    anns = propagate(result.graph, uniqueness_property(man, _DUCKDB))
+    return next(ann.value.exact for ref, ann in anns.items() if ref.unique_id == "model.shop.x")
+
+
+_EXACTNESS_CASES: list[tuple[str, str, bool]] = [
+    # --- exact: the modelled fragment --------------------------------------------
+    ("from_table", "SELECT id FROM orders", True),
+    ("from_cte", "WITH s AS (SELECT id FROM orders) SELECT id FROM s", True),
+    ("from_subquery", "SELECT id FROM (SELECT id FROM orders) s", True),
+    ("inner_join", "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id", True),
+    ("cross_join", "SELECT o.id FROM orders o CROSS JOIN customers c", True),
+    (
+        "left_join",
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "right_join",
+        "SELECT o.id FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "full_join",
+        "SELECT o.id FROM orders o FULL JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "semi_join",
+        "SELECT o.id FROM orders o SEMI JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "anti_join",
+        "SELECT o.id FROM orders o ANTI JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "left_join_is_null_idiom",
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON o.customer_id = c.id "
+        "WHERE c.id IS NULL",
+        True,
+    ),
+    ("where_column_equality", "SELECT id FROM orders WHERE id = customer_id", True),
+    ("where_literal_equality", "SELECT id FROM orders WHERE region = 'US'", True),
+    (
+        "rownumber_guard",
+        "SELECT id FROM orders "
+        "QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) = 1",
+        True,
+    ),
+    ("where_gt_literal", "SELECT id FROM orders WHERE amount > 1", True),
+    ("where_neq_columns", "SELECT id FROM orders WHERE customer_id <> amount", True),
+    ("where_in_literals", "SELECT id FROM orders WHERE amount IN (1, 2)", True),
+    ("where_is_null", "SELECT id FROM orders WHERE region IS NULL", True),
+    ("where_like", "SELECT id FROM orders WHERE region LIKE 'U%'", True),
+    ("where_between", "SELECT id FROM orders WHERE amount BETWEEN 1 AND 10", True),
+    (
+        "where_and_or_not",
+        "SELECT id FROM orders WHERE (amount > 1 AND region = 'US') OR NOT (customer_id = 5)",
+        True,
+    ),
+    (
+        "group_by_bare_column",
+        "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        True,
+    ),
+    ("distinct", "SELECT DISTINCT customer_id FROM orders", True),
+    ("union_all", "SELECT id FROM orders UNION ALL SELECT id FROM customers", True),
+    ("union_distinct", "SELECT id FROM orders UNION SELECT id FROM customers", True),
+    ("projection_bare_columns", "SELECT id, customer_id FROM orders", True),
+    ("projection_expression", "SELECT id, amount * 2 AS doubled FROM orders", True),
+    # --- inexact: the engine gives up --------------------------------------------
+    (
+        "where_exists",
+        "SELECT id FROM orders o "
+        "WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)",
+        False,
+    ),
+    ("where_in_subquery", "SELECT id FROM orders WHERE id IN (SELECT id FROM customers)", False),
+    (
+        "where_scalar_subquery",
+        "SELECT id FROM orders WHERE amount > (SELECT avg(amount) FROM orders)",
+        False,
+    ),
+    (
+        "predicate_unrecognized_window",
+        "SELECT id FROM orders QUALIFY RANK() OVER (ORDER BY amount) = 1",
+        False,
+    ),
+    ("projection_subquery", "SELECT id, (SELECT count(*) FROM customers) AS n FROM orders", False),
+    (
+        "projection_unrecognized_window",
+        "SELECT id, SUM(amount) OVER (PARTITION BY customer_id) AS running FROM orders",
+        False,
+    ),
+    (
+        "group_by_expression",
+        "SELECT customer_id + 1 AS grp, COUNT(*) AS n FROM orders GROUP BY customer_id + 1",
+        False,
+    ),
+    ("star_over_join", "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id", False),
+    ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
+    ("intersect", "SELECT id FROM orders INTERSECT SELECT id FROM customers", False),
+    ("except_", "SELECT id FROM orders EXCEPT SELECT id FROM customers", False),
+    (
+        "having_aggregate_comparison",
+        "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id HAVING COUNT(*) > 1",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [(sql, expected) for _id, sql, expected in _EXACTNESS_CASES],
+    ids=[case_id for case_id, _sql, _expected in _EXACTNESS_CASES],
+)
+def test_scope_exactness(sql: str, expected: bool) -> None:
+    assert _exact(sql) is expected
+
+
+def test_inexact_upstream_makes_downstream_inexact() -> None:
+    """An inexact upstream model taints the downstream flow value even though the
+    downstream SQL is entirely within the modelled fragment."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node(
+            "model.shop.upstream",
+            "SELECT id FROM orders WHERE id IN (SELECT id FROM orders)",
+        ),
+        _node("model.shop.downstream", "SELECT id FROM upstream"),
+    )
+    assert not keys["model.shop.upstream"].exact
+    assert not keys["model.shop.downstream"].exact
