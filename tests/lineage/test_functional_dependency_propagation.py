@@ -246,6 +246,10 @@ def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
 
 
 def test_group_by_keeps_fds_among_the_group_columns() -> None:
+    """``country -> currency`` also makes ``country`` alone a minimal group key
+    (``currency`` is redundant, since it is already determined), so the closure
+    engine keys the aggregate off ``country`` alone rather than the full,
+    reducible group-column pair."""
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
@@ -257,7 +261,7 @@ def test_group_by_keeps_fds_among_the_group_columns() -> None:
     )
     assert out["model.shop.by_cc"] == _carried(
         _inst(_fd("currency", "country")),
-        derived=(_fd("total", "country", "currency"),),
+        derived=(_fd("total", "country"),),
     )
 
 
@@ -428,9 +432,13 @@ def test_left_join_carries_the_kept_sides_fds() -> None:
     assert out["model.shop.m"] == _carried(_inst(_fd("amount", "ref")))
 
 
-def test_left_join_does_not_mint_the_on_equality() -> None:
-    """The ON equality holds only on matched rows; a padded row carries NULL on the
-    optional side, so no mutual determination is minted for an outer join's keys."""
+def test_left_join_mints_only_the_accumulated_to_joined_in_direction() -> None:
+    """The ON equality's reverse direction (the joined-in column determining the
+    accumulated side's) does not survive: two padded rows can share the NULL
+    ``c.id`` while differing on ``p.customer_id``. The forward direction does
+    survive: a matched row's ``c.id`` equals ``p.customer_id`` by the join
+    predicate itself, and an unmatched row's is NULL either way, so fixing
+    ``p.customer_id`` fixes ``c.id`` on every output row."""
     out = _fds(
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
@@ -441,7 +449,7 @@ def test_left_join_does_not_mint_the_on_equality() -> None:
             "LEFT JOIN customers c ON p.customer_id = c.id",
         ),
     )
-    assert out["model.shop.m"] == NO_FDS
+    assert out["model.shop.m"] == FDSet.of(_fd("id", "customer_id"))
 
 
 def test_right_join_keeps_the_joined_in_side() -> None:
@@ -676,10 +684,6 @@ def test_only_a_declaration_grounds_an_instance(provenance: Provenance, expected
 # --- shapes the FD-closure key engine will newly derive (not yet from this walk) ----
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="keys from the FD closure: the walk does not track the self-join-to-group-max idiom",
-)
 def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
     """``m.line_number`` is the per-order max, single-valued per ``order_id`` by
     construction, and every surviving ``l`` row equals it, so ``order_id`` determines
@@ -698,10 +702,6 @@ def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
     assert determines(out["model.shop.m"], frozenset({"order_id"}), "line_number")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="keys from the FD closure: the group-by rule does not yet reach through a join",
-)
 def test_group_by_over_a_join_determines_the_aggregate() -> None:
     """The group key determines every other output regardless of whether the grouped
     relation is a base table or a join; the walk's group-by rule does not yet reach

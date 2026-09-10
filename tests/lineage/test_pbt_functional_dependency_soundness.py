@@ -291,15 +291,18 @@ def test_every_claimed_join_fd_holds_on_the_data(
     for alias, (det, dep) in declared.items():
         if det not in selected or dep not in selected:
             continue
-        out_fd = FD(frozenset({selected[det]}), selected[dep])
+        # Entailment, not exact-tuple membership: the closure engine may qualify
+        # a determinant through the join partner's equal column, so it can name
+        # this dependency under either side's output alias.
+        holds = determines(claimed, frozenset({selected[det]}), selected[dep])
         if alias in _KEPT[s.side]:
             # Anti-vacuity: a kept side's declared dependency must be carried through
             # the join (a silent walk cannot pass on silence alone).
-            assert out_fd in claimed.fds, f"kept-side FD dropped for sql={_join_sql(s)!r}"
+            assert holds, f"kept-side FD dropped for sql={_join_sql(s)!r}"
         else:
             # The padded side's drop is the contract: NULL padding can break the
             # dependency, so the walk must stay silent about it.
-            assert out_fd not in claimed.fds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
+            assert not holds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
     names, rows = _materialize(
         oracle_con,
         _join_sql(s),
