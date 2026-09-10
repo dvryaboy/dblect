@@ -462,18 +462,13 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
     )
 
 
-# --- shapes the FD-closure key engine will newly derive (not yet from this walk) ----
+# --- shapes the FD-closure key engine derives -------------------------------------
 #
 # `lines` is keyed on the composite pair (order_id, line_number), never on order_id
 # alone: a fact table where an order spans many lines. Each shape below has a real key
-# that a walk over the FD closure can justify but this structural walk cannot yet see.
+# that a walk over the FD closure can justify.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="keys from the FD closure: the walk cannot tie a projected column to "
-    "another relation's key through an ON equality",
-)
 def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
     """The ON equates ``o.order_id`` with ``l.order_id``, and the output projects
     ``o.order_id`` rather than ``l.order_id``, so this walk cannot tie the projected
@@ -496,10 +491,6 @@ def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
     assert _key("order_id", "line_number") in keys["model.shop.m"].keys
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="keys from the FD closure: the walk does not track the self-join-to-group-max idiom",
-)
 def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
     """Self-joining to the per-order max line number keeps one row per order, so
     ``order_id`` alone is a key, not just the declared pair: the walk would need
@@ -521,11 +512,6 @@ def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
     assert _key("order_id") in keys["model.shop.m"].keys
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="keys from the FD closure: the walk does not collapse a composite key "
-    "when a filter pins one of its columns constant",
-)
 def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> None:
     """Pinning ``line_number`` constant makes the declared pair key redundant in its
     second column, so ``order_id`` alone is a key of the filtered output."""
