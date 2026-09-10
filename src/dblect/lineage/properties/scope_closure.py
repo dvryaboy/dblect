@@ -429,13 +429,8 @@ def _select_facts(
         return EMPTY_INPUT
     from_alias = from_resolved[0]
 
-    # A ``ROW_NUMBER() ... = 1`` dedup keys the output on its partition columns. Where the
-    # window is evaluated decides when the key holds: one computed inside the FROM subquery
-    # (filtered by an outer guard) is a key of the from relation, in the from relation's own
-    # output names, so it folds into the from input's keys and rides join preservation like any
-    # other from-side key; one this SELECT computes (inline in the guard or a projected alias)
-    # is evaluated over the post-join, post-group rows, so it mints directly against this
-    # scope's own output token once that token is known.
+    # A window computed inside the FROM subquery keys the from relation, so it joins the
+    # from input's keys; one this SELECT computes keys the post-join rows (minted below).
     rn_postjoin, rn_fromside = _rownumber_facts(sel, from_node=from_.this, from_alias=from_alias)
     if rn_fromside:
         from_resolved = (
