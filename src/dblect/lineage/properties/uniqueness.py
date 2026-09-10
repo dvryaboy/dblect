@@ -50,17 +50,16 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
-from dblect.lineage.predicate import (
-    Canon,
-    CmpAtom,
-    InAtom,
-    atom_column,
-    atoms_of,
-    parse_predicate,
-    rename_atom,
-)
+from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
 from dblect.lineage.properties.activation import activate
 from dblect.lineage.properties.predicate_flow import RowFilter
+from dblect.lineage.properties.scope_closure import (
+    EMPTY_INPUT,
+    ConditionalKey,
+    Input,
+    Key,
+    scope_facts,
+)
 from dblect.manifest import (
     ConstraintSpec,
     ConstraintType,
@@ -74,30 +73,13 @@ from dblect.sql import (
     SURROGATE_HASH_PASSTHROUGH,
     SURROGATE_HASH_STRUCTURAL,
     SQLParseError,
-    anti_join,
     parse_sql,
 )
 from dblect.sql import _sqlglot as sg
-from dblect.sql._sqlglot import JoinSide
 
-# A single candidate key is a set of (case-folded) column names; a relation can
-# carry several, so its value is a set of those.
-Key = frozenset[str]
-
-
-@dataclass(frozen=True, slots=True)
-class ConditionalKey:
-    """A candidate key that holds only over the rows matching ``predicate``.
-
-    A ``where``-filtered ``unique`` test grounds one of these rather than an
-    unconditional key. It is carried (never folded into ``keys``) until a scope's
-    flowed row filter implies ``predicate``, at which point activation promotes it.
-    ``predicate`` is the test's ``where`` parsed to the engine's atoms, so it feeds
-    :func:`~dblect.lineage.predicate.entails_atoms` directly.
-    """
-
-    key: Key
-    predicate: frozenset[Canon]
+# ``Key`` and ``ConditionalKey`` live in the scope-closure engine: they describe
+# what the engine's relation-algebra walk carries and projects, and this module
+# imports them back for its lattice and public API.
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,43 +611,13 @@ def surrogate_key_discoverer(
 
 # --- the relation reducer ----------------------------------------------------
 #
-# The relation-algebra walk for candidate keys. It mirrors the column reducer's
-# job (turn a derivation into an inferred annotation, recursing into referenced
-# nodes) but over relation algebra: a FROM carries the source's keys; an INNER or LEFT
-# JOIN keeps the probe side's keys when the joined-in side is unique on the join columns
-# (so it cannot multiply them), while RIGHT/FULL (which NULL-pad the probe) and CROSS
-# (which multiplies) drop them; a SEMI or ANTI join, and the LEFT JOIN ... IS NULL
-# anti-join idiom, filter the probe side and so preserve its keys unconditionally. An
-# INNER JOIN additionally carries the joined-in side's keys when the probe is unique on
-# them (each side surviving when the other cannot multiply it); GROUP BY / DISTINCT
-# introduce a key, UNION ALL keeps none, and
-# the projection remaps keys onto output names. Posture is silent-when-unproven: a
-# shape the walk does not model drops keys rather than over-claiming.
-
-# A column qualified by its FROM/JOIN source alias, tracked inside one scope so a
-# multi-source scope's join keys line up; the qualifier collapses to bare output
-# names at the projection boundary.
-_QCol = tuple[str, str]
-_QKey = frozenset[_QCol]
-
-
-@dataclass(frozen=True, slots=True)
-class _Carried:
-    """What a scope carries up the walk: its candidate keys and the conditional keys
-    riding through it (each in the scope's own output column names)."""
-
-    keys: frozenset[Key]
-    conditional: frozenset[ConditionalKey] = frozenset()
-
-
-_EMPTY: _Carried = _Carried(frozenset())
-
-# Resolves a base (non-CTE) table reference to what it carries. Two implementations:
-# the graph reducer reads the table's stamped SourceRef and recurses through the
-# shared propagator (so conditional keys cross model boundaries); the detector index
-# resolves the table by name against the per-model keys propagation already produced
-# (it consumes already-activated keys, so it carries no conditional payload).
-_BaseResolve = Callable[["exp.Table"], _Carried]
+# The relation reducer runs the scope-closure engine (``scope_facts``) over a
+# model's parsed tree: a base table resolves through ``recurse`` (or, for the
+# detector's per-tree index, by name against an already-propagated map), and
+# the engine's own relation algebra (join sides, GROUP BY, DISTINCT, the
+# ROW_NUMBER dedup idiom, conditional-key carriage) derives the keys and
+# carried conditional keys the SQL proves. CTEs and inline subqueries resolve
+# structurally within the engine's own walk.
 
 
 def relation_reduce(
@@ -680,7 +632,7 @@ def relation_reduce(
 
     A base table resolves through ``recurse`` on its stamped ``SourceRef``, so
     cross-model keys, conditional keys, declarations, and the provisional taint flow
-    in. CTEs and inline subqueries are resolved structurally within the walk.
+    in. CTEs and inline subqueries are resolved structurally within the engine.
 
     This also serves as the relation-algebra carrier for any one-column conditional
     claim, since a relation that grounds no unconditional keys carries only its
@@ -689,18 +641,18 @@ def relation_reduce(
     """
     provisional = False
 
-    def base_resolve(table: exp.Table) -> _Carried:
+    def base_resolve(table: exp.Table) -> Input:
         nonlocal provisional
         ref = source_ref_meta(table)
         if ref is None:
-            return _EMPTY
+            return EMPTY_INPUT
         ann = recurse(ref)
         provisional = provisional or ann.provisional
-        return _Carried(ann.value.keys, ann.value.conditional)
+        return Input(ann.value.keys, conditional=ann.value.conditional)
 
-    carried = _RelationWalk(base_resolve).scope_keys(deriv, cte_scope={})
-    value = CandidateKeySet(carried.keys, carried.conditional)
-    opacity = Opacity.CONCRETE if (carried.keys or carried.conditional) else Opacity.IMPLICIT
+    resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
+    value = CandidateKeySet(resolved.keys, resolved.conditional)
+    opacity = Opacity.CONCRETE if (resolved.keys or resolved.conditional) else Opacity.IMPLICIT
     return Annotation(value, opacity, provisional=provisional)
 
 
@@ -710,23 +662,23 @@ def relation_scope_keys(
     """Per-scope candidate keys for every SELECT/UNION node in ``tree``, keyed by
     ``id(node)``.
 
-    The same relation algebra the reducer runs, but for one already-parsed tree
-    and with base tables resolved by name against ``model_keys`` (the per-model
-    keys propagation produced) rather than by stamp. This is what an audit
-    detector consults to get a CTE's or inline subquery's keys, since those
-    intermediate scopes are not relations the propagator annotates. The returned
-    map is valid only for the lifetime of ``tree``.
+    The same engine the reducer runs, but for one already-parsed tree and with base
+    tables resolved by name against ``model_keys`` (the per-model keys propagation
+    produced) rather than by stamp. This is what an audit detector consults to get a
+    CTE's or inline subquery's keys, since those intermediate scopes are not
+    relations the propagator annotates. The returned map is valid only for the
+    lifetime of ``tree``.
 
     Base keys here are already activated (the per-model map is built after
     activation), so this walk carries no conditional payload of its own.
     """
 
-    def base_resolve(table: exp.Table) -> _Carried:
-        return _Carried(model_keys.get(table.name, frozenset()))
+    def base_resolve(table: exp.Table) -> Input:
+        return Input(model_keys.get(table.name, frozenset()))
 
-    walk = _RelationWalk(base_resolve, record=True)
-    walk.scope_keys(tree, cte_scope={})
-    return {node_id: carried.keys for node_id, carried in walk.scopes.items()}
+    record: dict[int, Input] = {}
+    scope_facts(tree, cte_scope={}, base_resolve=base_resolve, record=record)
+    return {node_id: inp.keys for node_id, inp in record.items()}
 
 
 def activated_scope_keys(
@@ -739,546 +691,38 @@ def activated_scope_keys(
     own row filter, keyed by ``id(node)``.
 
     Like :func:`relation_scope_keys`, but base tables resolve to both their keys and
-    their conditional keys, so the walk carries conditional keys into each
+    their conditional keys, so the engine carries conditional keys into each
     intermediate scope, and each scope promotes the ones its flow (``scope_flow``,
     from :func:`~dblect.lineage.properties.predicate_flow.relation_scope_filters`)
     implies. This lets a window or join over a CTE that filters an upstream see the
     key the filter activates.
     """
 
-    def base_resolve(table: exp.Table) -> _Carried:
+    def base_resolve(table: exp.Table) -> Input:
         name = table.name
-        return _Carried(
-            model_keys.get(name, frozenset()), conditional_by_name.get(name, frozenset())
+        return Input(
+            model_keys.get(name, frozenset()),
+            conditional=conditional_by_name.get(name, frozenset()),
         )
 
-    walk = _RelationWalk(base_resolve, record=True)
-    walk.scope_keys(tree, cte_scope={})
+    record: dict[int, Input] = {}
+    scope_facts(tree, cte_scope={}, base_resolve=base_resolve, record=record)
     out: dict[int, frozenset[Key]] = {}
-    for node_id, carried in walk.scopes.items():
-        # The flow walk does not record every scope this key walk does: it stops at a
+    for node_id, inp in record.items():
+        # The flow walk does not record every scope this engine does: it stops at a
         # join rather than recursing into it, so a scope nested inside a joined
         # subquery has no recorded flow. ``scope_flow.get`` defaults such a scope to
         # the empty filter, which implies nothing and so activates nothing. That is
         # the safe direction (a conditional key stays conditional), and it matches the
         # flow's own posture of dropping at a join.
         promoted = activate(
-            CandidateKeySet(carried.keys),
-            ((CandidateKeySet.of(ck.key), ck.predicate) for ck in carried.conditional),
+            CandidateKeySet(inp.keys),
+            ((CandidateKeySet.of(ck.key), ck.predicate) for ck in inp.conditional),
             scope_flow.get(node_id, frozenset()),
             _meet,
         )
         out[node_id] = promoted.keys
     return out
-
-
-class _RelationWalk:
-    """Bottom-up candidate-key inference over one relational tree.
-
-    ``base_resolve`` resolves a base (non-CTE) table to what it carries; CTEs and
-    inline subqueries are resolved structurally within the walk. Conditional keys
-    ride through, renamed onto a scope's output columns, wherever the row set is not
-    multiplied and their columns stay disambiguated: a single source, or a
-    non-multiplying join under a star-free projection. A GROUP BY, a UNION, a
-    fanning-out join, or a star over a join drops them, so a carried key only ever
-    survives where it could still soundly activate downstream. With ``record`` set,
-    every SELECT/UNION scope's output is kept in ``scopes`` keyed by ``id(node)`` so
-    a detector can read intermediate-scope keys.
-    """
-
-    def __init__(self, base_resolve: _BaseResolve, *, record: bool = False) -> None:
-        self._base_resolve = base_resolve
-        self._record = record
-        self.scopes: dict[int, _Carried] = {}
-
-    def scope_keys(self, node: Expr, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
-        if isinstance(node, exp.Select):
-            carried = self._select(node, cte_scope=cte_scope)
-        elif isinstance(node, exp.Union):
-            carried = self._union(node, cte_scope=cte_scope)
-        else:
-            return _EMPTY
-        if self._record:
-            self.scopes[id(node)] = carried
-        return carried
-
-    def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
-        local = sg.with_scope(sel, cte_scope, lambda n, s: self.scope_keys(n, cte_scope=s))
-
-        from_ = sg.from_of(sel)
-        if from_ is None or not isinstance(from_.this, Expr):
-            return _EMPTY
-        resolved = self._resolve_source(from_.this, cte_scope=local)
-        if resolved is None:
-            return _EMPTY
-        from_alias, from_carried = resolved
-        combined = _qualify(from_alias, from_carried.keys)
-
-        # A ``ROW_NUMBER() ... = 1`` dedup keys the output on its partition columns. Where the
-        # window is evaluated decides when the key holds: one computed inside the FROM subquery
-        # (filtered by an outer guard) is a key of the from relation, so it joins the from-side
-        # keys and must survive join preservation; one this SELECT computes (inline in the guard
-        # or a projected alias) is evaluated over the post-join, post-group rows, so it unions in
-        # after those steps.
-        rn_postjoin, rn_fromside = _rownumber_keys(sel, from_node=from_.this, from_alias=from_alias)
-        combined |= rn_fromside
-
-        # WHERE filters cannot add duplicates, so keys (and conditional keys) are
-        # preserved across it; the WHERE is the predicate flow's concern, not ours.
-        joins = sg.joins_of(sel)
-        # An anti-join (native ANTI, or the LEFT JOIN ... IS NULL idiom) filters the probe side,
-        # so it preserves the probe's keys unconditionally; ``_join_preserves`` reads these arm
-        # ids to tell an anti-join arm from an ordinary LEFT join.
-        anti_arms = anti_join.anti_arm_ids(sel)
-        joins_preserve = True
-        for j in joins:
-            resolved = (
-                self._resolve_source(j.this, cte_scope=local) if isinstance(j.this, Expr) else None
-            )
-            # One walk of the ON predicate's equalities serves both join-key rules below.
-            on = sg.on_of(j)
-            by_alias = sg.equality_cols_by_alias(on) if on is not None else None
-            preserved = self._join_preserves(
-                j, resolved=resolved, by_alias=by_alias, anti_arm=id(j) in anti_arms
-            )
-            survivors = self._joined_in_survivors(
-                j, left_keys=combined, resolved=resolved, by_alias=by_alias
-            )
-            combined = (combined if preserved else frozenset[_QKey]()) | survivors
-            joins_preserve = joins_preserve and preserved
-
-        group = sg.group_of(sel)
-        grouped = group is not None and bool(group.expressions)
-        if group is not None and grouped:
-            gk = _group_key(sel, from_alias=from_alias)
-            combined = gk if gk is not None else frozenset[_QKey]()
-
-        combined |= rn_postjoin
-
-        projection = _Projection.build(sel, from_alias=from_alias)
-        keys = _project(sel, combined, projection)
-        conditional: frozenset[ConditionalKey] = frozenset()
-        # Conditional keys ride through only where the row set is not multiplied and
-        # their columns stay disambiguated: a single source, or a non-multiplying join
-        # under a star-free projection (every output column then resolves to one
-        # source by alias). A star over a join could blur a from-side column with the
-        # joined-in side, so it drops, matching the predicate flow's own caution.
-        star_free = not (projection.unrestricted or projection.star_aliases)
-        if not grouped and (not joins or (joins_preserve and star_free)):
-            conditional = _carry_conditional(from_carried.conditional, projection, from_alias)
-        return _Carried(keys, conditional)
-
-    def _union(self, u: exp.Union, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
-        left = u.this
-        right = u.args.get("expression")
-        if isinstance(left, Expr):
-            self.scope_keys(left, cte_scope=cte_scope)
-        if isinstance(right, Expr):
-            self.scope_keys(right, cte_scope=cte_scope)
-        # UNION ALL concatenates, so a key on both arms still need not hold on the
-        # result (the same value can appear in both). UNION (distinct) dedupes the
-        # full projected tuple, which is therefore a key. Conditional keys drop: the
-        # arms may carry different predicates.
-        if not bool(u.args.get("distinct")) or not isinstance(left, exp.Select):
-            return _EMPTY
-        names = _output_names(left)
-        return _Carried(frozenset({frozenset(names)}) if names else frozenset())
-
-    def _resolve_source(
-        self, node: Expr, *, cte_scope: Mapping[str, _Carried]
-    ) -> tuple[str, _Carried] | None:
-        if isinstance(node, exp.Table):
-            alias = node.alias_or_name
-            name = node.name
-            if name in cte_scope:
-                return alias, cte_scope[name]
-            return alias, self._base_resolve(node)
-        if isinstance(node, exp.Subquery):
-            inner = node.this
-            alias = node.alias_or_name
-            if not isinstance(inner, Expr) or not alias:
-                return None
-            return alias, self.scope_keys(inner, cte_scope=cte_scope)
-        # UNNEST explodes one row per array element, so it multiplies the row set
-        # and carries no candidate key of its own. Left unresolved on purpose: a
-        # FROM-position UNNEST then yields no keys, and a joined UNNEST fails
-        # ``_join_preserves`` (its target resolves to nothing), so a parent key
-        # correctly does not survive the explosion. Recovering ``(parent_key,
-        # offset)`` when ``WITH OFFSET`` is present is a later precision refinement.
-        return None
-
-    def _join_preserves(
-        self,
-        j: exp.Join,
-        *,
-        resolved: tuple[str, _Carried] | None,
-        by_alias: dict[str, frozenset[str]] | None,
-        anti_arm: bool,
-    ) -> bool:
-        """Whether ``j`` neither multiplies nor NULL-pads the probe side's rows, so the
-        probe side's keys (and any conditional keys riding with them) carry through unchanged.
-
-        A SEMI or ANTI join, and the ``LEFT JOIN ... IS NULL`` anti-join idiom (``anti_arm``),
-        filter the probe side and project nothing from the matched side, so they keep each probe
-        row at most once and preserve the probe's keys unconditionally, whether or not the matched
-        side has a key. For an ordinary join the joined-in side cannot multiply probe rows exactly
-        when its join columns cover one of its keys. A CROSS join always multiplies, and a RIGHT or
-        FULL join NULL-pads the probe columns on unmatched rows (so a probe key no longer identifies
-        them); all three drop the probe keys. An unresolved target, a keyless joined-in side, or a
-        missing / non-covering ON also leave fanout possible. ``by_alias`` is the ON predicate's
-        per-alias equality columns, parsed once by the caller.
-        """
-        if anti_arm or sg.join_side_of(j) in (JoinSide.SEMI, JoinSide.ANTI):
-            return True  # a filter over the probe side: row-removing, never multiplying
-        if sg.join_side_of(j) in (JoinSide.CROSS, JoinSide.RIGHT, JoinSide.FULL):
-            return False  # multiplies (CROSS) or NULL-pads the probe side (RIGHT/FULL)
-        if resolved is None:
-            return False
-        r_alias, r_carried = resolved
-        if not r_carried.keys:
-            return False  # joined-in side has no known key: can't rule out fanout
-        if by_alias is None:
-            return False  # ON is missing or not a clean conjunction of column equalities
-        right_join_cols = by_alias.get(r_alias)
-        if right_join_cols is None:
-            return False
-        return any(k <= right_join_cols for k in r_carried.keys)
-
-    def _joined_in_survivors(
-        self,
-        j: exp.Join,
-        *,
-        left_keys: frozenset[_QKey],
-        resolved: tuple[str, _Carried] | None,
-        by_alias: dict[str, frozenset[str]] | None,
-    ) -> frozenset[_QKey]:
-        """The keys the joined-in side contributes to an INNER join's result.
-
-        The mirror of :meth:`_join_preserves`: when the left side is unique on the join columns
-        (one of its surviving keys is covered by the left-side join columns), each joined-in row
-        matches at most one left row, so the joined-in side's keys hold on the result. Only an
-        INNER join qualifies, since an outer join NULL-pads the joined-in columns on unmatched
-        rows and the key no longer identifies them. ``left_keys`` are the keys of the result
-        built so far, so the rule composes across a chain of joins. ``by_alias`` is the ON
-        predicate's per-alias equality columns, parsed once by the caller.
-        """
-        if sg.join_side_of(j) is not JoinSide.INNER:
-            return frozenset()
-        if resolved is None:
-            return frozenset()
-        t_alias, t_carried = resolved
-        if not t_carried.keys:
-            return frozenset()
-        if by_alias is None:
-            return frozenset()
-        left_join_cols: set[_QCol] = {
-            (alias, col) for alias, cols in by_alias.items() if alias != t_alias for col in cols
-        }
-        if not any(k <= left_join_cols for k in left_keys):
-            return frozenset()
-        return _qualify(t_alias, t_carried.keys)
-
-
-def _qualify(alias: str, keys: frozenset[Key]) -> frozenset[_QKey]:
-    """Lift a source's bare keys into alias-qualified keys for the working scope."""
-    return frozenset(frozenset((alias, col) for col in key) for key in keys)
-
-
-def _bare_column_key(exprs: Collection[Expr], *, from_alias: str) -> _QKey | None:
-    """A key over a list of bare output columns, qualified to ``from_alias`` where a
-    column is unqualified. ``None`` for a shape with no nameable key: an empty list (no
-    columns to key on) or an entry that is not a plain column (positional or computed).
-    Column names stay in their source case, matching the projection's own key of
-    ``(table, name)``; case-folding of the output name is the projection's job."""
-    if not exprs:
-        return None
-    cols: list[_QCol] = []
-    for e in exprs:
-        if not isinstance(e, exp.Column):
-            return None
-        cols.append((sg.column_table(e) or from_alias, sg.column_name(e)))
-    return frozenset(cols)
-
-
-def _group_key(sel: exp.Select, *, from_alias: str) -> frozenset[_QKey] | None:
-    """The key ``sel``'s GROUP BY introduces, or ``None`` for a shape we cannot size
-    (an expression group key), which drops tracked keys.
-
-    Targets are read through :attr:`sg.GroupTarget.grounded_expression`, so ``GROUP BY 1``
-    grounds the key its spelled-out form would. That fallback matters here rather than in a
-    detector: this key is read downstream to clear hazards, so resolving a target the AST
-    cannot decide would silence findings rather than add one.
-    """
-    key = _bare_column_key(
-        [t.grounded_expression for t in sg.group_targets(sel)], from_alias=from_alias
-    )
-    return None if key is None else frozenset({key})
-
-
-def _rownumber_keys(
-    sel: exp.Select, *, from_node: Expr, from_alias: str
-) -> tuple[frozenset[_QKey], frozenset[_QKey]]:
-    """Keys the ``ROW_NUMBER() ... = 1`` dedup idiom introduces, split by where the window is
-    evaluated: ``(post_join, from_side)``.
-
-    A relation filtered to the first row per ``PARTITION BY c1..cn`` keeps one row per
-    partition, so ``{c1..cn}`` is a candidate key. The dedup guard lives in ``QUALIFY`` or an
-    outer ``WHERE``; the window is inline in that guard (``QUALIFY ROW_NUMBER() OVER (...) = 1``),
-    named by a projection of this SELECT (``QUALIFY rn = 1``), or named by a projection of the
-    FROM subquery the guard filters (``FROM (SELECT ..., ROW_NUMBER() ... AS rn FROM t) WHERE rn
-    = 1``). The first two see the post-join rows and land in ``post_join``; the subquery window
-    is computed before the outer join, so its key is only a key of the from relation and lands
-    in ``from_side`` for the caller to carry through join preservation. A window projected but
-    never filtered, and a partition-less window (the empty key), ground nothing.
-    """
-    guards: list[Expr] = []
-    qualify = sg.qualify_of(sel)
-    if qualify is not None and isinstance(qualify.this, Expr):
-        guards.extend(sg.conjunctive_leaves(qualify.this))
-    where = sg.where_of(sel)
-    if where is not None and isinstance(where.this, Expr):
-        guards.extend(sg.conjunctive_leaves(where.this))
-
-    post_join: set[_QKey] = set()
-    from_side: set[_QKey] = set()
-    for leaf in guards:
-        operand = sg.rank_one_guard_operand(leaf)
-        if operand is None:
-            continue
-        inline = sg.row_number_window(operand)
-        if inline is not None:
-            key = _bare_column_key(sg.partition_of(inline), from_alias=from_alias)
-            if key is not None:
-                post_join.add(key)
-        elif isinstance(operand, exp.Column):
-            own = _same_select_rownumber_key(operand, sel=sel, from_alias=from_alias)
-            if own is not None:
-                post_join.add(own)
-            else:
-                sub = _subquery_rownumber_key(operand, from_node=from_node, from_alias=from_alias)
-                if sub is not None:
-                    from_side.add(sub)
-    return frozenset(post_join), frozenset(from_side)
-
-
-def _same_select_rownumber_key(
-    ref: exp.Column, *, sel: exp.Select, from_alias: str
-) -> _QKey | None:
-    """Partition key of a ``ROW_NUMBER()`` window this SELECT projects as ``ref`` (``QUALIFY rn =
-    1`` naming a select alias). The window is evaluated over this scope's own (post-join) rows, so
-    its partition qualifies to ``from_alias``. ``None`` if ``ref`` is qualified or names no such
-    window."""
-    if sg.column_table(ref) is not None:
-        return None
-    own = _output_projections(sel)
-    name = sg.column_name(ref).lower()
-    window = sg.row_number_window(own[name]) if own is not None and name in own else None
-    return _bare_column_key(sg.partition_of(window), from_alias=from_alias) if window else None
-
-
-def _subquery_rownumber_key(ref: exp.Column, *, from_node: Expr, from_alias: str) -> _QKey | None:
-    """Partition key of a ``ROW_NUMBER()`` window the FROM subquery projects as ``ref``, filtered
-    by an outer guard. The window runs inside the subquery, so the key is only a key of the from
-    relation. ``None`` if ``from_node`` is not that subquery, ``ref`` names no such window, or a
-    partition column it does not expose."""
-    qualifier = sg.column_table(ref)
-    if not isinstance(from_node, exp.Subquery) or qualifier not in (None, from_alias):
-        return None
-    inner = from_node.this
-    if not isinstance(inner, exp.Select):
-        return None
-    projs = _output_projections(inner)
-    name = sg.column_name(ref).lower()
-    window = sg.row_number_window(projs[name]) if projs is not None and name in projs else None
-    return _subquery_partition_key(window, inner=inner, sub_alias=from_alias) if window else None
-
-
-def _subquery_partition_key(
-    window: exp.Window, *, inner: exp.Select, sub_alias: str
-) -> _QKey | None:
-    """A subquery-aliased window's partition columns, lifted to the outer scope by mapping each
-    through ``inner``'s projection onto the output name (qualified by the subquery alias) the
-    outer scope references. ``None`` if a partition column is not a bare column or ``inner`` does
-    not project it, so the outer scope cannot name it and no key holds."""
-    inner_from = sg.from_of(inner)
-    if inner_from is None or not isinstance(inner_from.this, exp.Table | exp.Subquery):
-        return None
-    inner_alias = inner_from.this.alias_or_name
-    inner_proj = _Projection.build(inner, from_alias=inner_alias)
-    partition = sg.partition_of(window)
-    if not partition:
-        return None
-    cols: list[_QCol] = []
-    for p in partition:
-        if not isinstance(p, exp.Column):
-            return None
-        names = inner_proj.names_for((sg.column_table(p) or inner_alias, sg.column_name(p)))
-        if not names:
-            return None
-        cols.append((sub_alias, min(names)))
-    return frozenset(cols)
-
-
-def _output_names(sel: exp.Select) -> list[str]:
-    """Output column names from a projection list, for sizing DISTINCT / UNION keys.
-
-    Counts only projections resolving to a named output column: bare columns and
-    aliases. A computed projection without a name is skipped.
-    """
-    names: list[str] = []
-    for proj in sel.expressions:
-        if isinstance(proj, exp.Alias):
-            names.append(proj.alias_or_name.lower())
-        elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
-            names.append(sg.column_name(proj).lower())
-    return names
-
-
-def _project(
-    sel: exp.Select, combined: frozenset[_QKey], projection: _Projection
-) -> frozenset[Key]:
-    """Map the scope's qualified keys onto bare output-column names, then add the
-    DISTINCT full-tuple key when present."""
-    out: set[Key] = set()
-    for qkey in combined:
-        mapped = projection.map_key(qkey)
-        if mapped is not None:
-            out.add(mapped)
-    if sel.args.get("distinct") is not None:
-        names = _output_names(sel)
-        if names:
-            out.add(frozenset(names))
-    return frozenset(out)
-
-
-def _qualify_key(alias: str, key: Key) -> _QKey:
-    """Lift one bare key into an alias-qualified key for the working scope."""
-    return frozenset((alias, col) for col in key)
-
-
-def _carry_conditional(
-    conditional: frozenset[ConditionalKey], projection: _Projection, from_alias: str
-) -> frozenset[ConditionalKey]:
-    """Carry the source's conditional keys onto this scope's output columns.
-
-    Both the key columns and the predicate columns rename through the same
-    projection, so the carried predicate stays in the same column space the predicate
-    flow uses; activation can then match them. A conditional key whose key column or
-    any predicate column does not survive the projection is dropped.
-    """
-    out: set[ConditionalKey] = set()
-    for ck in conditional:
-        mapped_key = projection.map_key(_qualify_key(from_alias, ck.key))
-        if mapped_key is None:
-            continue
-        mapped_predicate = _carry_predicate(ck.predicate, projection, from_alias)
-        if mapped_predicate is None:
-            continue
-        out.add(ConditionalKey(mapped_key, mapped_predicate))
-    return frozenset(out)
-
-
-def _carry_predicate(
-    predicate: frozenset[Canon], projection: _Projection, from_alias: str
-) -> frozenset[Canon] | None:
-    """Rename a conditional key's predicate through the projection, or ``None`` if any
-    atom cannot be carried (its column is dropped, or it is opaque under an explicit
-    projection). All-or-nothing: dropping an atom would weaken the predicate and let
-    the key activate too readily, so the whole conditional key drops instead."""
-    if projection.unrestricted or from_alias in projection.star_aliases:
-        return predicate  # full passthrough: every column survives under its own name
-    out: set[Canon] = set()
-    for atom in predicate:
-        if not isinstance(atom, CmpAtom | InAtom):
-            return None  # opaque: its column is unknown, so it cannot be tracked
-        col = atom_column(atom)
-        if col is None:
-            return None
-        names = projection.names_for((from_alias, col))
-        if not names:
-            return None
-        # A column may project to several output names. The predicate flow emits the
-        # renamed atom under *every* one of them, so a single representative here is
-        # always a member of the flow's atom set and activation's entailment matches
-        # it regardless of which we pick; ``min`` just keeps the choice deterministic.
-        out.add(rename_atom(atom, min(names)))
-    return frozenset(out)
-
-
-@dataclass(frozen=True, slots=True)
-class _Projection:
-    """The output-name mapping a SELECT projection induces.
-
-    ``aliased`` maps each input qualified column to the output names it appears
-    under. ``star_aliases`` are aliases whose ``alias.*`` appears; ``unrestricted``
-    is set when a bare ``*`` appears; both let columns pass through under their
-    base name. ``ambiguous`` are output names that resolve to more than one input
-    column, so a key using them cannot be projected safely.
-    """
-
-    aliased: Mapping[_QCol, tuple[str, ...]]
-    star_aliases: frozenset[str]
-    unrestricted: bool
-    ambiguous: frozenset[str]
-
-    @staticmethod
-    def build(sel: exp.Select, *, from_alias: str) -> _Projection:
-        aliased: dict[_QCol, list[str]] = {}
-        star_aliases: set[str] = set()
-        unrestricted = False
-        seen: dict[str, _QCol] = {}
-        ambiguous: set[str] = set()
-
-        def note(name: str, qc: _QCol) -> None:
-            prior = seen.get(name)
-            if prior is None:
-                seen[name] = qc
-            elif prior != qc:
-                ambiguous.add(name)
-
-        for proj in sel.expressions:
-            if isinstance(proj, exp.Star):
-                unrestricted = True
-            elif isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star):
-                star_aliases.add(proj.table or from_alias)
-            elif isinstance(proj, exp.Alias) and isinstance(proj.this, exp.Column):
-                qc: _QCol = (sg.column_table(proj.this) or from_alias, sg.column_name(proj.this))
-                name = proj.alias_or_name.lower()
-                aliased.setdefault(qc, []).append(name)
-                note(name, qc)
-            elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
-                qc = (sg.column_table(proj) or from_alias, sg.column_name(proj))
-                name = sg.column_name(proj).lower()
-                aliased.setdefault(qc, []).append(name)
-                note(name, qc)
-            # Other shapes (unaliased computed expressions, windows) produce no
-            # tractable output name; a key resting on them simply will not map.
-
-        return _Projection(
-            aliased={qc: tuple(names) for qc, names in aliased.items()},
-            star_aliases=frozenset(star_aliases),
-            unrestricted=unrestricted,
-            ambiguous=frozenset(ambiguous),
-        )
-
-    def map_key(self, key: _QKey) -> Key | None:
-        """The output key a qualified key projects to, or ``None`` if any of its
-        columns does not survive the projection."""
-        out: set[str] = set()
-        for qc in key:
-            names = self.names_for(qc)
-            if not names:
-                return None
-            out.add(min(names))  # one occurrence suffices; pick a stable representative
-        return frozenset(out)
-
-    def names_for(self, qc: _QCol) -> list[str]:
-        out: list[str] = []
-        if qc in self.aliased:
-            out.extend(n for n in self.aliased[qc] if n not in self.ambiguous)
-        if (self.unrestricted or qc[0] in self.star_aliases) and qc[1] not in self.ambiguous:
-            out.append(qc[1])
-        return out
 
 
 # --- the property ------------------------------------------------------------

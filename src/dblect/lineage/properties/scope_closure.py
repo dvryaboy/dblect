@@ -27,6 +27,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.lineage.graph import SourceRef
+from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
 
@@ -161,16 +162,40 @@ Key = frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
+class ConditionalKey:
+    """A candidate key that holds only over the rows matching ``predicate``.
+
+    Grounded from a filtered declaration (a ``where``-scoped uniqueness test, or
+    nullability's one-column NON_NULL claim riding the same carrier), captured
+    rather than folded into a relation's unconditional keys until a scope's
+    flowed row filter implies ``predicate``, at which point activation promotes
+    it. ``predicate`` is the declaration's filter parsed to the engine's atoms,
+    so it feeds :func:`~dblect.lineage.predicate.entails_atoms` directly.
+
+    Carried through the relation algebra alongside the scope's other facts: an
+    input's conditional key survives a scope when the closure shows its row is
+    not multiplied (``closure({r_a})`` reaches the scope's output token) and
+    both the key's columns and the predicate's columns rename to exactly one
+    output name each.
+    """
+
+    key: Key
+    predicate: frozenset[Canon]
+
+
+@dataclass(frozen=True, slots=True)
 class Input:
     """What a resolved FROM/JOIN source contributes to a scope: its candidate
-    keys, its plain dependencies, and its declared dependency instances, each in
-    the source's own output column names. A base table resolves through the
-    caller's ``base_resolve``; a CTE or inline subquery resolves to its own
-    nested scope's projected facts, which are exactly this shape."""
+    keys, its plain dependencies, its declared dependency instances, and its
+    carried conditional keys, each in the source's own output column names. A
+    base table resolves through the caller's ``base_resolve``; a CTE or inline
+    subquery resolves to its own nested scope's projected facts, which are
+    exactly this shape."""
 
     keys: frozenset[Key] = frozenset()
     fds: frozenset[FD] = frozenset()
     declared: frozenset[DeclaredFD] = frozenset()
+    conditional: frozenset[ConditionalKey] = frozenset()
 
 
 EMPTY_INPUT: Input = Input()
@@ -185,31 +210,55 @@ _CANDIDATE_CAP = 32
 # --- one SELECT/UNION scope --------------------------------------------------
 
 
-def scope_facts(node: Expr, *, cte_scope: Mapping[str, Input], base_resolve: BaseResolve) -> Input:
+def scope_facts(
+    node: Expr,
+    *,
+    cte_scope: Mapping[str, Input],
+    base_resolve: BaseResolve,
+    record: dict[int, Input] | None = None,
+) -> Input:
     """The closure-derived ``Input`` a SELECT or UNION scope projects.
 
     Dispatches on shape: a SELECT mints the join algebra's qualified facts and
     projects them; a UNION keeps the declared instances every arm shares (see
     :func:`_union_facts`) plus a DISTINCT full-tuple key. INTERSECT, EXCEPT, and
     every other shape prove nothing, the conservative default.
+
+    ``record``, when given, collects every SELECT/UNION scope's projected
+    ``Input`` keyed by ``id(node)`` as the walk reaches it, so a caller (a
+    detector needing a CTE's or inline subquery's own keys) can read an
+    intermediate scope's facts without a second walk over the same tree.
     """
     if isinstance(node, exp.Select):
-        return _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve)
-    if isinstance(node, exp.Union):
-        return _union_facts(node, cte_scope=cte_scope, base_resolve=base_resolve)
-    return EMPTY_INPUT
+        result = _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
+    elif isinstance(node, exp.Union):
+        result = _union_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
+    else:
+        return EMPTY_INPUT
+    if record is not None:
+        record[id(node)] = result
+    return result
 
 
 def _with_scope(
-    node: Expr, cte_scope: Mapping[str, Input], base_resolve: BaseResolve
+    node: Expr,
+    cte_scope: Mapping[str, Input],
+    base_resolve: BaseResolve,
+    record: dict[int, Input] | None,
 ) -> dict[str, Input]:
     return sg.with_scope(
-        node, cte_scope, lambda n, s: scope_facts(n, cte_scope=s, base_resolve=base_resolve)
+        node,
+        cte_scope,
+        lambda n, s: scope_facts(n, cte_scope=s, base_resolve=base_resolve, record=record),
     )
 
 
 def _resolve_source(
-    node: Expr, *, cte_scope: Mapping[str, Input], base_resolve: BaseResolve
+    node: Expr,
+    *,
+    cte_scope: Mapping[str, Input],
+    base_resolve: BaseResolve,
+    record: dict[int, Input] | None,
 ) -> tuple[str, Input] | None:
     if isinstance(node, exp.Table):
         alias = node.alias_or_name.lower()
@@ -221,7 +270,9 @@ def _resolve_source(
         alias = node.alias_or_name
         if not isinstance(inner, Expr) or not alias:
             return None
-        return alias.lower(), scope_facts(inner, cte_scope=cte_scope, base_resolve=base_resolve)
+        return alias.lower(), scope_facts(
+            inner, cte_scope=cte_scope, base_resolve=base_resolve, record=record
+        )
     return None
 
 
@@ -360,24 +411,46 @@ def _is_reference_mint(fact: QFD, aliases: frozenset[str]) -> bool:
 
 
 def _select_facts(
-    sel: exp.Select, *, cte_scope: Mapping[str, Input], base_resolve: BaseResolve
+    sel: exp.Select,
+    *,
+    cte_scope: Mapping[str, Input],
+    base_resolve: BaseResolve,
+    record: dict[int, Input] | None,
 ) -> Input:
-    local = _with_scope(sel, cte_scope, base_resolve)
+    local = _with_scope(sel, cte_scope, base_resolve, record)
 
     from_ = sg.from_of(sel)
     if from_ is None or not isinstance(from_.this, Expr):
         return EMPTY_INPUT
-    from_resolved = _resolve_source(from_.this, cte_scope=local, base_resolve=base_resolve)
+    from_resolved = _resolve_source(
+        from_.this, cte_scope=local, base_resolve=base_resolve, record=record
+    )
     if from_resolved is None:
         return EMPTY_INPUT
     from_alias = from_resolved[0]
+
+    # A ``ROW_NUMBER() ... = 1`` dedup keys the output on its partition columns. Where the
+    # window is evaluated decides when the key holds: one computed inside the FROM subquery
+    # (filtered by an outer guard) is a key of the from relation, in the from relation's own
+    # output names, so it folds into the from input's keys and rides join preservation like any
+    # other from-side key; one this SELECT computes (inline in the guard or a projected alias)
+    # is evaluated over the post-join, post-group rows, so it mints directly against this
+    # scope's own output token once that token is known.
+    rn_postjoin, rn_fromside = _rownumber_facts(sel, from_node=from_.this, from_alias=from_alias)
+    if rn_fromside:
+        from_resolved = (
+            from_alias,
+            replace(from_resolved[1], keys=from_resolved[1].keys | rn_fromside),
+        )
 
     joins = sg.joins_of(sel)
     join_sources: list[tuple[str, Input]] = []
     for j in joins:
         if not isinstance(j.this, Expr):
             return EMPTY_INPUT
-        resolved = _resolve_source(j.this, cte_scope=local, base_resolve=base_resolve)
+        resolved = _resolve_source(
+            j.this, cte_scope=local, base_resolve=base_resolve, record=record
+        )
         if resolved is None:
             return EMPTY_INPUT
         join_sources.append(resolved)
@@ -392,6 +465,7 @@ def _select_facts(
     # rewrite fall back to a provably-equal column's output name.
     predicate_pairs: set[QFD] = set()
     declared_by_alias: dict[str, frozenset[DeclaredFD]] = {}
+    conditional_by_alias: dict[str, frozenset[ConditionalKey]] = {}
     active_aliases: list[str] = []
 
     def mint(
@@ -414,6 +488,7 @@ def _select_facts(
                     (frozenset(QCol(alias, d) for d in fd.determinant), QCol(alias, fd.dependent))
                 )
             declared_by_alias[alias] = inp.declared
+            conditional_by_alias[alias] = inp.conditional
         active_aliases.append(alias)
 
     mint(from_alias, from_resolved[1])
@@ -443,6 +518,7 @@ def _select_facts(
             predicate_pairs = {f for f in predicate_pairs if not _touches(f, accumulated)}
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
+                conditional_by_alias.pop(a2, None)
             mint(alias, inp)
         elif side is sg.JoinSide.FULL:
             accumulated = frozenset(active_aliases)
@@ -454,6 +530,7 @@ def _select_facts(
             predicate_pairs = {f for f in predicate_pairs if not _touches(f, accumulated)}
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
+                conditional_by_alias.pop(a2, None)
             mint(alias, inp, keep_fds=False, key_filter=lambda _k: False)
         else:  # INNER, CROSS
             mint(alias, inp)
@@ -490,6 +567,10 @@ def _select_facts(
     else:
         candidate_aliases = list(active_aliases)
 
+    for p in rn_postjoin:
+        facts.add((p, r_out))
+        extra_candidates.append(p)
+
     proj = _build_projection(sel, from_alias=from_alias, active_aliases=active_aliases)
     if proj.blocked:
         return EMPTY_INPUT
@@ -515,6 +596,7 @@ def _select_facts(
         r_out=r_out,
         proj=proj,
         classes=classes,
+        conditional_by_alias=conditional_by_alias,
     )
 
 
@@ -541,16 +623,145 @@ def _rename_declared(
     return frozenset(out)
 
 
+def _qcol_set(exprs: Collection[Expr], *, default_alias: str) -> frozenset[QCol] | None:
+    """A set of qualified columns from a list of expressions, or ``None`` for a shape we cannot
+    name outright: an empty list, or any entry that is not a bare column (an expression, a
+    star). Shared by the GROUP BY key and a ``ROW_NUMBER`` partition, both of which need exactly
+    this reading of a column list."""
+    if not exprs:
+        return None
+    out: set[QCol] = set()
+    for e in exprs:
+        if not isinstance(e, exp.Column) or isinstance(e.this, exp.Star):
+            return None
+        out.add(_qcol(e, default_alias=default_alias))
+    return frozenset(out)
+
+
 def _group_qcols(sel: exp.Select, *, from_alias: str) -> frozenset[QCol] | None:
     """The GROUP BY key as qualified columns, or ``None`` for a shape we cannot
     name (an expression group key), which proves nothing scope-wide."""
-    out: set[QCol] = set()
-    for target in sg.group_targets(sel):
-        g = target.grounded_expression
-        if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
+    targets = [t.grounded_expression for t in sg.group_targets(sel)]
+    return _qcol_set(targets, default_alias=from_alias)
+
+
+def _projection_by_name(sel: exp.Select, name: str) -> Expr | None:
+    """The expression projected under output name ``name`` (case-folded), or ``None`` if no
+    projection of ``sel`` produces it (a star, or no matching alias/bare column)."""
+    for proj in sel.expressions:
+        if isinstance(proj, exp.Alias) and proj.alias_or_name.lower() == name:
+            inner = proj.this
+            return inner if isinstance(inner, Expr) else None
+        if (
+            isinstance(proj, exp.Column)
+            and not isinstance(proj.this, exp.Star)
+            and sg.column_name(proj).lower() == name
+        ):
+            return proj
+    return None
+
+
+def _rownumber_facts(
+    sel: exp.Select, *, from_node: Expr, from_alias: str
+) -> tuple[frozenset[frozenset[QCol]], frozenset[Key]]:
+    """Keys the ``ROW_NUMBER() ... = 1`` dedup idiom introduces, split by where the window is
+    evaluated: ``(post_join, from_side)``.
+
+    A relation filtered to the first row per ``PARTITION BY c1..cn`` keeps one row per
+    partition, so ``{c1..cn}`` is a candidate key. The dedup guard lives in ``QUALIFY`` or an
+    outer ``WHERE``; the window is inline in that guard (``QUALIFY ROW_NUMBER() OVER (...) = 1``),
+    named by a projection of this SELECT (``QUALIFY rn = 1``), or named by a projection of the
+    FROM subquery the guard filters (``FROM (SELECT ..., ROW_NUMBER() ... AS rn FROM t) WHERE rn
+    = 1``). The first two see the post-join rows and land in ``post_join``, qualified to this
+    scope's own aliases; the subquery window is computed before the outer join, so its key is
+    only a key of the from relation and lands in ``from_side``, in the from relation's own
+    output names, for the caller to fold into the from input's keys and carry through join
+    preservation. A window projected but never filtered, and a partition-less window (the empty
+    key), ground nothing.
+    """
+    guards: list[Expr] = []
+    qualify = sg.qualify_of(sel)
+    if qualify is not None and isinstance(qualify.this, Expr):
+        guards.extend(sg.conjunctive_leaves(qualify.this))
+    where = sg.where_of(sel)
+    if where is not None and isinstance(where.this, Expr):
+        guards.extend(sg.conjunctive_leaves(where.this))
+
+    post_join: set[frozenset[QCol]] = set()
+    from_side: set[Key] = set()
+    for leaf in guards:
+        operand = sg.rank_one_guard_operand(leaf)
+        if operand is None:
+            continue
+        inline = sg.row_number_window(operand)
+        if inline is not None:
+            key = _qcol_set(sg.partition_of(inline), default_alias=from_alias)
+            if key is not None:
+                post_join.add(key)
+        elif isinstance(operand, exp.Column):
+            own = _same_select_rownumber_key(operand, sel=sel, from_alias=from_alias)
+            if own is not None:
+                post_join.add(own)
+            else:
+                sub = _subquery_rownumber_key(operand, from_node=from_node, from_alias=from_alias)
+                if sub is not None:
+                    from_side.add(sub)
+    return frozenset(post_join), frozenset(from_side)
+
+
+def _same_select_rownumber_key(
+    ref: exp.Column, *, sel: exp.Select, from_alias: str
+) -> frozenset[QCol] | None:
+    """Partition key of a ``ROW_NUMBER()`` window this SELECT projects as ``ref`` (``QUALIFY rn =
+    1`` naming a select alias). The window is evaluated over this scope's own (post-join) rows, so
+    its partition qualifies to ``from_alias``. ``None`` if ``ref`` is qualified or names no such
+    window."""
+    if sg.column_table(ref) is not None:
+        return None
+    name = sg.column_name(ref).lower()
+    window_expr = _projection_by_name(sel, name)
+    window = sg.row_number_window(window_expr) if window_expr is not None else None
+    return _qcol_set(sg.partition_of(window), default_alias=from_alias) if window else None
+
+
+def _subquery_rownumber_key(ref: exp.Column, *, from_node: Expr, from_alias: str) -> Key | None:
+    """Partition key of a ``ROW_NUMBER()`` window the FROM subquery projects as ``ref``, filtered
+    by an outer guard, in the subquery's own output names. The window runs inside the subquery,
+    so the key is only a key of the from relation. ``None`` if ``from_node`` is not that
+    subquery, ``ref`` names no such window, or a partition column it does not expose."""
+    qualifier = sg.column_table(ref)
+    if not isinstance(from_node, exp.Subquery) or qualifier not in (None, from_alias):
+        return None
+    inner = from_node.this
+    if not isinstance(inner, exp.Select):
+        return None
+    name = sg.column_name(ref).lower()
+    window_expr = _projection_by_name(inner, name)
+    window = sg.row_number_window(window_expr) if window_expr is not None else None
+    return _subquery_partition_key(window, inner=inner) if window else None
+
+
+def _subquery_partition_key(window: exp.Window, *, inner: exp.Select) -> Key | None:
+    """A subquery window's partition columns, lifted to the subquery's own output names by
+    mapping each through ``inner``'s projection. ``None`` if a partition column is not a bare
+    column or ``inner`` does not project it, so no output name exists for it and no key holds."""
+    inner_from = sg.from_of(inner)
+    if inner_from is None or not isinstance(inner_from.this, exp.Table | exp.Subquery):
+        return None
+    inner_alias = inner_from.this.alias_or_name.lower()
+    inner_proj = _build_projection(inner, from_alias=inner_alias, active_aliases=(inner_alias,))
+    partition = sg.partition_of(window)
+    if not partition:
+        return None
+    names: set[str] = set()
+    for p in partition:
+        if not isinstance(p, exp.Column):
             return None
-        out.add(QCol((sg.column_table(g) or from_alias).lower(), sg.column_name(g).lower()))
-    return frozenset(out)
+        direct = _direct_name(_qcol(p, default_alias=inner_alias), inner_proj)
+        if not direct:
+            return None
+        names.add(min(direct))
+    return frozenset(names)
 
 
 def _apply_group_by(
@@ -590,13 +801,19 @@ def _apply_group_by(
 
 
 def _union_facts(
-    u: exp.Union, *, cte_scope: Mapping[str, Input], base_resolve: BaseResolve
+    u: exp.Union,
+    *,
+    cte_scope: Mapping[str, Input],
+    base_resolve: BaseResolve,
+    record: dict[int, Input] | None,
 ) -> Input:
     """The union merge: keep exactly the declared instances every arm shares
     after positional alignment (a union adds only cross pairs, so an arm-local
     derived witness dies while a shared declared instance's grounding covers
     them and survives). The DISTINCT key is computed independently, from the
-    first arm alone, so it survives even when nothing is shared to align."""
+    first arm alone, so it survives even when nothing is shared to align.
+    Conditional keys drop: the arms may carry different predicates, so no
+    single carried key is sound across the merge."""
     keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
@@ -605,13 +822,14 @@ def _union_facts(
     first = names[0] if names else None
     if first is None or any(n is None or len(n) != len(first) for n in names):
         return Input(keys)
-    local = _with_scope(u, cte_scope, base_resolve)
+    local = _with_scope(u, cte_scope, base_resolve, record)
     shared: frozenset[DeclaredFD] | None = None
     for arm_names, arm in zip(names, arms, strict=True):
         assert arm_names is not None
         rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
         aligned = _remap_declared(
-            scope_facts(arm, cte_scope=local, base_resolve=base_resolve).declared, rename
+            scope_facts(arm, cte_scope=local, base_resolve=base_resolve, record=record).declared,
+            rename,
         )
         shared = aligned if shared is None else shared & aligned
         if not shared:
@@ -834,6 +1052,70 @@ def _validate_and_minimize(
     return frozenset(kept)
 
 
+def _carry_predicate(
+    predicate: frozenset[Canon],
+    *,
+    alias: str,
+    classes: Mapping[Attr, frozenset[Attr]],
+    proj: _Projection,
+) -> frozenset[Canon] | None:
+    """Rename a conditional key's predicate through the scope's projection, or ``None`` if any
+    atom cannot be carried (its column does not survive, or the atom is opaque). All-or-nothing:
+    dropping one atom would weaken the predicate and let the key activate too readily, so the
+    whole conditional key drops instead.
+
+    A bare ``*`` over ``alias`` alone passes every column through under its own name, opaque
+    atoms included (an opaque atom has no column to look up, but its meaning is untouched by an
+    identity rename), so that case short-circuits the per-atom walk."""
+    if proj.star_alias == alias:
+        return predicate
+    out: set[Canon] = set()
+    for atom in predicate:
+        if not isinstance(atom, CmpAtom | InAtom):
+            return None  # opaque: its column is unknown, so it cannot be tracked
+        col = atom_column(atom)
+        if col is None:
+            return None
+        name = _output_name(QCol(alias, col), classes, proj)
+        if name is None:
+            return None
+        out.add(rename_atom(atom, name))
+    return frozenset(out)
+
+
+def _carry_conditional(
+    conditional_by_alias: Mapping[str, frozenset[ConditionalKey]],
+    pairs: Sequence[QFD],
+    r_out: RowToken,
+    classes: Mapping[Attr, frozenset[Attr]],
+    proj: _Projection,
+) -> frozenset[ConditionalKey]:
+    """Conditional keys carried through this scope, input by input.
+
+    An input's row is not multiplied into the output exactly when its row token's closure
+    reaches ``r_out`` (the same test a candidate key answers), so that is the soundness bar a
+    conditional key must clear too; a GROUP BY, a UNION, or a fanning-out join all fail it,
+    since none of them let a single input row determine the output row. The key's own columns
+    and the predicate's columns then have to survive the projection under one output name each,
+    reusing the same lookup a declared dependency renames through.
+    """
+    out: set[ConditionalKey] = set()
+    for alias, cks in conditional_by_alias.items():
+        if not cks or r_out not in closure(pairs, frozenset({RowToken(alias)})):
+            continue
+        for ck in cks:
+            mapped_key = _rewrite(frozenset(QCol(alias, c) for c in ck.key), classes, proj)
+            if mapped_key is None:
+                continue
+            mapped_predicate = _carry_predicate(
+                ck.predicate, alias=alias, classes=classes, proj=proj
+            )
+            if mapped_predicate is None:
+                continue
+            out.add(ConditionalKey(mapped_key, mapped_predicate))
+    return frozenset(out)
+
+
 def _project(
     facts: set[QFD],
     declared: frozenset[DeclaredFD],
@@ -843,6 +1125,7 @@ def _project(
     r_out: RowToken,
     proj: _Projection,
     classes: Mapping[Attr, frozenset[Attr]],
+    conditional_by_alias: Mapping[str, frozenset[ConditionalKey]],
 ) -> Input:
     pairs = tuple(facts)
 
@@ -894,4 +1177,5 @@ def _project(
                 if n1 != n2:
                     fds.add(FD(frozenset({n1}), n2))
 
-    return Input(frozenset(keys), frozenset(fds), declared)
+    conditional = _carry_conditional(conditional_by_alias, pairs, r_out, classes, proj)
+    return Input(frozenset(keys), frozenset(fds), declared, conditional)
