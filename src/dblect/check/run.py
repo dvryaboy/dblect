@@ -20,7 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -93,6 +93,7 @@ class CheckGraphs:
     enumerates. Do not mutate the graphs or their trees per world."""
 
     manifest: Manifest
+    profile: AdapterProfile
     resolved: ResolvedContracts
     relation_build: RelationBuildResult
     column_build: BuildResult
@@ -114,7 +115,7 @@ class CheckGraphs:
     """Every key declared for a relation, however it was declared: dbt tests, native
     constraints, incremental config, and the keys resolved from Python contracts. The
     same values feed the uniqueness propagation and the grain check, so the two cannot
-    disagree about what a user claimed. Does not vary by world."""
+    disagree about what a user claimed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,14 +130,6 @@ class WorldFacts:
     tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
 
 
-def _no_fd_annotations() -> dict[SourceRef, Annotation[FDSet]]:
-    return {}
-
-
-def _no_key_annotations() -> dict[SourceRef, Annotation[CandidateKeySet]]:
-    return {}
-
-
 @dataclass(frozen=True, slots=True)
 class WorldAnnotations:
     """One world's propagation result, keyed by the world it holds under. A bundle
@@ -145,20 +138,20 @@ class WorldAnnotations:
 
     ``coherence_clears`` are the aggregate-guard clears the domain-type walk emitted in
     this world: the structured reason a sum cleared its tag, which the aggregation
-    finding reads instead of re-inferring the event from the cleared output."""
+    finding reads instead of re-inferring the event from the cleared output.
+
+    Every field is required: ``propagate_world`` is the only constructor, and a
+    default here would let some future constructor silently turn the grain check
+    into a no-op instead of failing to build."""
 
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
-    coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
-    functional_dependency: Mapping[SourceRef, Annotation[FDSet]] = field(
-        default_factory=_no_fd_annotations
-    )
+    coherence_clears: tuple[CoherenceClear[DomainTag], ...]
+    functional_dependency: Mapping[SourceRef, Annotation[FDSet]]
     """What each relation's functional dependencies came out as, kept so a consumer
     that needs them (the grain check reads them to widen what a declared grain
     covers) does not propagate the property a second time."""
-    uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]] = field(
-        default_factory=_no_key_annotations
-    )
+    uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]]
     """The candidate keys each relation's SQL implies on its own, recorded before the
     declared keys were folded in. This is what the grain check compares a declaration
     against; the combined value cannot serve, because the declaration is part of it
@@ -195,6 +188,7 @@ def build_check_graphs(
     parsed = {uid: tree for uid, tree in trees.items() if uid not in unbuilt}
     return CheckGraphs(
         manifest=manifest,
+        profile=profile,
         resolved=resolved,
         relation_build=relation_build,
         column_build=column_build,
@@ -370,6 +364,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     findings.extend(
         declared_grain_findings(
             graphs.manifest,
+            graphs.profile,
             graphs.uniqueness_facts,
             world.uniqueness_inferred,
             world.functional_dependency,

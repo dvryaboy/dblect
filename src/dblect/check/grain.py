@@ -37,6 +37,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import assert_never
 
+from dblect.adapters import AdapterProfile
 from dblect.check.findings import CheckFinding, CheckFindingKind
 from dblect.lineage.facts.model import (
     Annotation,
@@ -48,7 +49,7 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.graph import SourceRef
 from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, determines
-from dblect.lineage.properties.uniqueness import CandidateKeySet, Key
+from dblect.lineage.properties.uniqueness import CandidateKeySet, Key, model_dedups_on_write
 from dblect.manifest import Manifest
 
 
@@ -81,6 +82,7 @@ def grain_witness(declared: Key, inferred: frozenset[Key]) -> Key | None:
 
 def declared_grain_findings(
     manifest: Manifest,
+    profile: AdapterProfile,
     key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
     inferred: Mapping[SourceRef, Annotation[CandidateKeySet]],
     fd: Mapping[SourceRef, Annotation[FDSet]],
@@ -96,11 +98,16 @@ def declared_grain_findings(
     model that failed to build, and is passed over; the coverage report is what
     surfaces the ones that failed to build. We also stay quiet when the keys we
     derived rest on contradictory upstream declarations, since evidence drawn from a
-    known contradiction is not worth reporting.
+    known contradiction is not worth reporting. A model whose write path dedups on
+    its own (:func:`model_dedups_on_write`) is passed over entirely: its SELECT is
+    expected to carry finer rows than any key claimed on it, whoever claimed it.
     """
     out: list[CheckFinding] = []
     judged: set[tuple[SourceRef, Key]] = set()
     for scope, bucket in sorted(key_facts.items(), key=lambda kv: kv[0].unique_id):
+        node = manifest.nodes.get(scope.unique_id)
+        if node is not None and model_dedups_on_write(node.config, profile):
+            continue
         inferred_ann = inferred.get(scope)
         if inferred_ann is None or inferred_ann.provisional:
             continue
@@ -135,9 +142,9 @@ def _judged_provenance(provenance: Provenance) -> bool:
     A key someone wrote down, in a contract or a dbt test, is such a claim, so we
     check it. A native warehouse constraint is enforced when the table is written
     rather than by the query, and whether the warehouse really enforces it is #48's
-    question. An incremental model's ``unique_key`` under a merge strategy is the
-    same story: the merge collapses duplicates on write, so its SELECT is expected to
-    produce finer rows and flagging that would be wrong (#7 covers the write path)."""
+    question. A compile-time value is not an assertion about the query either; the
+    incremental-write exemption is decided per model, not by this provenance switch
+    (see ``model_dedups_on_write``)."""
     match provenance:
         case Declared():
             return True

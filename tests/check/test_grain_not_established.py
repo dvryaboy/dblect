@@ -213,6 +213,37 @@ def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
     assert _grain_findings(report) == []
 
 
+# --- a collapse the walk cannot yet see: expected failure --------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="the emitter needs the walk's exactness record")
+def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
+    # A correlated subquery picking each order's max line collapses the per-line
+    # relation to one row per order just as surely as a GROUP BY would, but the walk
+    # has no exactness record for this shape yet, so the finer key still looks like
+    # it survives. This pins the gap rather than hiding it.
+    _declare_order_lines_key()
+
+    class TopLine(ModelContract):
+        dbt_model = "top_line"
+
+        @contract
+        def one_row_per_order(self: ContractSelf) -> object:
+            return self.grain(per=self.order_id)
+
+    top_line = _node(
+        "model.shop.top_line",
+        sql=(
+            "select order_id, line_number, amount from order_lines "
+            "where line_number = (select max(x.line_number) from order_lines x "
+            "where x.order_id = order_lines.order_id)"
+        ),
+        columns=_LINE_COLS,
+    )
+    report = run_check(_manifest(_ORDER_LINES, top_line), _DUCKDB)
+    assert _grain_findings(report) == []
+
+
 # --- declaration channels: every case of the closed provenance type decided ---------
 #
 # The contract channel's fire case is the drift test above; the table here covers the
@@ -223,7 +254,8 @@ def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
 # warehouse's write path; the advisory-unenforced case is the unenforced-constraint
 # finding's (#48). A deduplicating incremental's ``unique_key`` is enforced by the merge
 # on write, so the SELECT is expected to carry finer rows (the incremental-grain
-# stream, #7).
+# stream, #7); a ``unique`` test riding on that same model is exempt too, since the
+# exemption is a property of the model's write path, not of which channel stated the key.
 
 
 def _unique_test_node(*, where: str | None) -> Node:
@@ -259,6 +291,14 @@ _CHANNELS = (
     _Channel(
         "incremental_unique_key",
         False,
+        config=ModelConfig(
+            materialized="incremental", incremental_strategy="merge", unique_key=("order_id",)
+        ),
+    ),
+    _Channel(
+        "incremental_unique_key_with_unique_test",
+        False,
+        test_node=_unique_test_node(where=None),
         config=ModelConfig(
             materialized="incremental", incremental_strategy="merge", unique_key=("order_id",)
         ),

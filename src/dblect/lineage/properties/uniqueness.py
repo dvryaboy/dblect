@@ -66,6 +66,7 @@ from dblect.manifest import (
     ConstraintType,
     Manifest,
     Materialization,
+    ModelConfig,
     ResourceType,
     generic_test_target_uid,
 )
@@ -371,6 +372,21 @@ def native_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKe
 # to catch.
 
 
+def model_dedups_on_write(config: ModelConfig | None, profile: AdapterProfile) -> bool:
+    """Whether this model's write path collapses duplicates on ``unique_key`` on its
+    own, independent of whatever a key declaration on the model claims.
+
+    True only for an incremental materialization whose effective strategy is one
+    that dedups: the write does the collapsing, so the SELECT is expected to carry
+    finer rows than the key, and no declaration channel on this model (a dbt test,
+    a contract, the config itself) is evidence the SELECT establishes the grain."""
+    if config is None or not config.unique_key:
+        return False
+    if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
+        return False
+    return profile.effective_strategy(config.incremental_strategy) in DEDUP_STRATEGIES
+
+
 class _ConfigKeyDiscoverer:
     """Grounds a candidate key from the ``unique_key`` / ``incremental_strategy``
     config pair, but only when the materialization actually deduplicates on write.
@@ -390,13 +406,9 @@ class _ConfigKeyDiscoverer:
             if node.resource_type is not ResourceType.MODEL:
                 continue
             config = node.config
-            if config is None or not config.unique_key:
-                continue
-            if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
+            if config is None or not model_dedups_on_write(config, self._profile):
                 continue
             strategy = self._profile.effective_strategy(config.incremental_strategy)
-            if strategy not in DEDUP_STRATEGIES:
-                continue
             out.append(
                 Fact(
                     scope=SourceRef(SourceKind.MODEL, node.unique_id),
