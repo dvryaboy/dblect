@@ -50,6 +50,19 @@ def _unique(uid: str, *, column: str, target: str) -> Node:
     )
 
 
+def _unique_combination(uid: str, *, columns: tuple[str, ...], target: str) -> Node:
+    return _node(
+        uid,
+        kind=ResourceType.OTHER,
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(
+            name="dbt_utils.unique_combination_of_columns",
+            kwargs={"combination_of_columns": list(columns)},
+        ),
+        attached_node=target,
+    )
+
+
 def _key(*cols: str) -> Key:
     return frozenset(cols)
 
@@ -447,3 +460,81 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
     assert keys["model.shop.d"] == CandidateKeySet.of(
         _key("customer_id"), _key("customer_id", "region")
     )
+
+
+# --- shapes the FD-closure key engine will newly derive (not yet from this walk) ----
+#
+# `lines` is keyed on the composite pair (order_id, line_number), never on order_id
+# alone: a fact table where an order spans many lines. Each shape below has a real key
+# that a walk over the FD closure can justify but this structural walk cannot yet see.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys from the FD closure: the walk cannot tie a projected column to "
+    "another relation's key through an ON equality",
+)
+def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
+    """The ON equates ``o.order_id`` with ``l.order_id``, and the output projects
+    ``o.order_id`` rather than ``l.order_id``, so this walk cannot tie the projected
+    column to ``lines``' declared pair key even though the values agree row for row."""
+    orders = _source("source.shop.raw.orders")
+    lines = _source("source.shop.raw.lines")
+    keys = _keys(
+        orders,
+        lines,
+        _unique("test.shop.o", column="order_id", target=orders.unique_id),
+        _unique_combination(
+            "test.shop.l", columns=("order_id", "line_number"), target=lines.unique_id
+        ),
+        _node(
+            "model.shop.m",
+            "SELECT o.order_id, l.line_number FROM orders o "
+            "JOIN lines l ON o.order_id = l.order_id",
+        ),
+    )
+    assert _key("order_id", "line_number") in keys["model.shop.m"].keys
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys from the FD closure: the walk does not track the self-join-to-group-max idiom",
+)
+def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
+    """Self-joining to the per-order max line number keeps one row per order, so
+    ``order_id`` alone is a key, not just the declared pair: the walk would need
+    ``order_id -> line_number`` at the output to shrink the pair key to it."""
+    lines = _source("source.shop.raw.lines")
+    keys = _keys(
+        lines,
+        _unique_combination(
+            "test.shop.l", columns=("order_id", "line_number"), target=lines.unique_id
+        ),
+        _node(
+            "model.shop.m",
+            "SELECT l.order_id, l.line_number, l.amount FROM lines l "
+            "JOIN (SELECT order_id, MAX(line_number) AS line_number "
+            "FROM lines GROUP BY 1) m "
+            "ON l.order_id = m.order_id AND l.line_number = m.line_number",
+        ),
+    )
+    assert _key("order_id") in keys["model.shop.m"].keys
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys from the FD closure: the walk does not collapse a composite key "
+    "when a filter pins one of its columns constant",
+)
+def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> None:
+    """Pinning ``line_number`` constant makes the declared pair key redundant in its
+    second column, so ``order_id`` alone is a key of the filtered output."""
+    lines = _source("source.shop.raw.lines")
+    keys = _keys(
+        lines,
+        _unique_combination(
+            "test.shop.l", columns=("order_id", "line_number"), target=lines.unique_id
+        ),
+        _node("model.shop.m", "SELECT order_id, line_number FROM lines WHERE line_number = 1"),
+    )
+    assert _key("order_id") in keys["model.shop.m"].keys

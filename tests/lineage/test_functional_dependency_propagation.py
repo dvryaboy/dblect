@@ -47,6 +47,7 @@ from dblect.lineage.properties.functional_dependency import (
     NO_FDS,
     DeclaredFD,
     FDSet,
+    determines,
     functional_dependency_grounding,
     functional_dependency_property,
 )
@@ -670,3 +671,49 @@ def test_set_operation_merges(facts: _FdFacts, sql: str, expected: FDSet) -> Non
 def test_only_a_declaration_grounds_an_instance(provenance: Provenance, expected: FDSet) -> None:
     fact = Fact(scope=_PAYMENTS, value=FDSet.of(_CC), provenance=provenance)
     assert functional_dependency_grounding({_PAYMENTS: (fact,)})(_PAYMENTS).value == expected
+
+
+# --- shapes the FD-closure key engine will newly derive (not yet from this walk) ----
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys from the FD closure: the walk does not track the self-join-to-group-max idiom",
+)
+def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
+    """``m.line_number`` is the per-order max, single-valued per ``order_id`` by
+    construction, and every surviving ``l`` row equals it, so ``order_id`` determines
+    ``line_number`` at the output. The walk does not follow the self-join-to-max idiom."""
+    out = _fds(
+        _declared(),
+        _source("source.shop.raw.lines"),
+        _node(
+            "model.shop.m",
+            "SELECT l.order_id, l.line_number, l.amount FROM lines l "
+            "JOIN (SELECT order_id, MAX(line_number) AS line_number "
+            "FROM lines GROUP BY 1) m "
+            "ON l.order_id = m.order_id AND l.line_number = m.line_number",
+        ),
+    )
+    assert determines(out["model.shop.m"], frozenset({"order_id"}), "line_number")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="keys from the FD closure: the group-by rule does not yet reach through a join",
+)
+def test_group_by_over_a_join_determines_the_aggregate() -> None:
+    """The group key determines every other output regardless of whether the grouped
+    relation is a base table or a join; the walk's group-by rule does not yet reach
+    through a join in the FROM."""
+    out = _fds(
+        _declared(),
+        _source("source.shop.raw.orders"),
+        _source("source.shop.raw.lines"),
+        _node(
+            "model.shop.m",
+            "SELECT o.order_id, SUM(l.amount) AS total FROM orders o "
+            "JOIN lines l ON o.order_id = l.order_id GROUP BY o.order_id",
+        ),
+    )
+    assert determines(out["model.shop.m"], frozenset({"order_id"}), "total")
