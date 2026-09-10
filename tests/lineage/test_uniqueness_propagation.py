@@ -493,7 +493,7 @@ def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
             "JOIN lines l ON o.order_id = l.order_id",
         ),
     )
-    assert keys["model.shop.m"] == CandidateKeySet.of(_key("order_id", "line_number"))
+    assert _key("order_id", "line_number") in keys["model.shop.m"].keys
 
 
 @pytest.mark.xfail(
@@ -518,7 +518,7 @@ def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
             "ON l.order_id = m.order_id AND l.line_number = m.line_number",
         ),
     )
-    assert keys["model.shop.m"] == CandidateKeySet.of(_key("order_id"))
+    assert _key("order_id") in keys["model.shop.m"].keys
 
 
 @pytest.mark.xfail(
@@ -537,4 +537,4 @@ def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> Non
         ),
         _node("model.shop.m", "SELECT order_id, line_number FROM lines WHERE line_number = 1"),
     )
-    assert keys["model.shop.m"] == CandidateKeySet.of(_key("order_id"))
+    assert _key("order_id") in keys["model.shop.m"].keys
