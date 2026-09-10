@@ -1,35 +1,27 @@
-"""The scope-closure engine: one relation-algebra walk that reasons over a SQL
-scope's qualified attributes with row-identity tokens, so a key or a functional
-dependency is a closure question rather than a literal-mint question.
-
-Two hand-written walks (the old FD walk in ``functional_dependency.py``, the old
-key walk in ``uniqueness.py``) each held half of one algebra, and both lost
-derived facts at the projection boundary: an FD whose determinant column was not
-itself projected died even when an equal projected column existed, and a key
-qualified to one join side died when the output selected the other side's copy
-of the same column. This engine fixes both by working over qualified attributes
-(:class:`QCol`, a column qualified by its FROM/JOIN alias; :class:`RowToken`, the
-identity of one input's row or the scope's own output; :class:`Computed`, a
-projected expression) and asking the closure question directly: "does K
-determine the output row" is exactly what "K is a key" means, and the same
-closure decides which functional dependencies survive a projection.
+"""The scope-closure engine: one relation-algebra walk over a SQL scope's
+qualified attributes and row-identity tokens, so a key or a functional
+dependency is a closure question ("does K determine the output row") rather
+than a literal-mint question. Tokens (:class:`RowToken`) give row identity
+its own attribute, alongside a column's qualified identity (:class:`QCol`)
+and a projected expression's (:class:`Computed`), so both keys and
+dependencies fall out of one Armstrong closure over the same fact set instead
+of two separately hand-mangled rename maps.
 
 A resolved FROM/JOIN source contributes an :class:`Input`: its keys, its plain
-dependencies, and its declared dependency instances (:class:`~dblect.lineage.
-properties.functional_dependency.DeclaredFD`), each in the source's own output
-column names. :func:`scope_facts` mints qualified facts for one SELECT or UNION,
-combining sources through the join algebra (predicates, join sides, GROUP BY,
-DISTINCT), then the projection step reduces that qualified fact set back down to an
-``Input`` in the scope's own output names, closure-aware: a key or dependency
-survives whenever the closure reaches it, however indirectly the columns that
-witness it are named.
+dependencies, and its declared dependency instances, each in the source's own
+output column names. :func:`scope_facts` mints qualified facts for one SELECT
+or UNION, combining sources through the join algebra (predicates, join sides,
+GROUP BY, DISTINCT), then projects that fact set back down to an ``Input`` in
+the scope's own output names, closure-aware: a key or dependency survives
+whenever the closure reaches it, however indirectly the columns that witness
+it are named.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TypeVar, cast
+from typing import TypeVar
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -100,16 +92,6 @@ def closure(fds: Collection[tuple[frozenset[_A], _A]], attrs: frozenset[_A]) -> 
     return frozenset(out)
 
 
-# --- the FD value types (moved from functional_dependency.py) --------------
-#
-# These describe one dependency over a relation's OWN output column names
-# (unqualified), the shape every ``Input`` carries and the shape the engine's
-# projection step produces. They live here, not in functional_dependency.py,
-# because the engine (and, from its uniqueness reducer on, the key walk too)
-# builds and carries them directly; functional_dependency.py imports them back
-# for its lattice, its ``FDSet``, and its public API.
-
-
 @dataclass(frozen=True, slots=True)
 class FD:
     """One dependency over a relation's output column names, in canonical
@@ -174,10 +156,7 @@ class DeclaredFD:
         return replace(self, binding=frozenset(bound))
 
 
-# A candidate key is a set of case-folded column names, matching
-# ``dblect.lineage.properties.uniqueness.Key`` (kept as a plain alias here, not
-# imported, so this module carries no dependency on the uniqueness property;
-# uniqueness's own ``Key`` and this one are structurally the same type).
+# A candidate key: a set of case-folded column names.
 Key = frozenset[str]
 
 
@@ -316,55 +295,46 @@ def _left_join_breakdown(
     return frozenset(on_a), frozenset(on_l)
 
 
+def _within_nested_select(col: exp.Column, boundary: Expr) -> bool:
+    """Whether ``col`` sits inside a SELECT nested somewhere below ``boundary``
+    (that nested SELECT is its own scope, so its columns are not this one's)."""
+    node: Expr | None = col.parent
+    while node is not None and node is not boundary:
+        if isinstance(node, exp.Select):
+            return True
+        node = node.parent
+    return False
+
+
 def _referenced_columns(sel: exp.Select, *, alias: str, from_alias: str) -> frozenset[str]:
     """Every column of ``alias`` referenced anywhere in ``sel``'s own scope
     (projections, ON, WHERE, GROUP BY, HAVING, QUALIFY, ORDER BY), never
-    descending into a nested SELECT (that is its own scope)."""
-    cols: set[str] = set()
-
-    def walk(node: Expr) -> None:
-        for raw in node.args.values():
-            value = cast("object", raw)
-            items: list[object] = (
-                cast("list[object]", value) if isinstance(value, list) else [value]
-            )
-            for item in items:
-                if not isinstance(item, Expr):
-                    continue
-                if isinstance(item, exp.Select):
-                    continue
-                if isinstance(item, exp.Column):
-                    if (
-                        not isinstance(item.this, exp.Star)
-                        and (sg.column_table(item) or from_alias).lower() == alias
-                    ):
-                        cols.add(sg.column_name(item).lower())
-                    continue
-                walk(item)
-
-    for proj in sel.expressions:
-        walk(proj)
-    for j in sg.joins_of(sel):
-        on = sg.on_of(j)
-        if on is not None:
-            walk(on)
+    counting one that lies inside a nested SELECT (that is its own scope)."""
+    clauses: list[Expr] = list(sel.expressions)
+    clauses.extend(on for j in sg.joins_of(sel) if (on := sg.on_of(j)) is not None)
     where = sg.where_of(sel)
     if where is not None and isinstance(where.this, Expr):
-        walk(where.this)
+        clauses.append(where.this)
     group = sg.group_of(sel)
     if group is not None:
-        for e in group.expressions:
-            walk(e)
+        clauses.extend(group.expressions)
     having = sel.args.get("having")
     if isinstance(having, exp.Having) and isinstance(having.this, Expr):
-        walk(having.this)
+        clauses.append(having.this)
     qualify = sg.qualify_of(sel)
     if qualify is not None and isinstance(qualify.this, Expr):
-        walk(qualify.this)
+        clauses.append(qualify.this)
     order = sel.args.get("order")
     if isinstance(order, exp.Order):
-        for e in order.expressions:
-            walk(e)
+        clauses.extend(order.expressions)
+
+    cols: set[str] = set()
+    for clause in clauses:
+        for col in sg.find_columns(clause):
+            if isinstance(col.this, exp.Star) or _within_nested_select(col, clause):
+                continue
+            if (sg.column_table(col) or from_alias).lower() == alias:
+                cols.add(sg.column_name(col).lower())
     return frozenset(cols)
 
 
@@ -454,6 +424,8 @@ def _select_facts(
             continue  # a filters the accumulated side; mint nothing, exclude from r_out
         if side is sg.JoinSide.LEFT:
             breakdown = _left_join_breakdown(sg.on_of(j), alias=alias, default_alias=from_alias)
+            on_a: frozenset[str]
+            on_l: frozenset[QCol]
             on_a, on_l = breakdown if breakdown is not None else (frozenset(), frozenset())
             clean = breakdown is not None and bool(on_l)
             mint(
@@ -552,11 +524,9 @@ def _rename_declared(
     proj: _Projection,
 ) -> frozenset[DeclaredFD]:
     """Each alias's declared instances renamed through the scope's own
-    projection, through the same equivalence classes a plain dependency
-    rewrites through: a declared instance's ``fd`` must always be one of the
-    plain dependencies :func:`_project` derives (an ``FDSet`` invariant), so
-    the two have to agree on which name represents a provably-equal qualified
-    column. An instance whose columns do not all survive drops with them."""
+    projection and equivalence classes, matching :func:`_project`'s plain-FD
+    rewrite so an instance's ``fd`` stays a member of that ``FDSet``. An
+    instance whose columns do not all survive drops with them."""
 
     def lookup(cur: str, alias: str) -> tuple[str, ...] | None:
         name = _output_name(QCol(alias, cur), classes, proj)
@@ -622,17 +592,11 @@ def _apply_group_by(
 def _union_facts(
     u: exp.Union, *, cte_scope: Mapping[str, Input], base_resolve: BaseResolve
 ) -> Input:
-    """The union merge: keep exactly the declared instances every arm shares,
-    after positional alignment (a union adds only cross pairs, one row per arm;
-    a derived dependency's witness is arm-local and dies, a shared declared
-    instance's grounding covers the cross pairs too and survives whole). A
-    distinct union additionally keys on its full output column set; UNION ALL
-    mints no key.
-
-    The key is computed independently of the declared-instance alignment (it
-    reads only the union's own first arm, not every arm's positional lineup),
-    so a union with no declared instances to share, or one whose arms cannot
-    be lined up by name at all, still gets its DISTINCT key."""
+    """The union merge: keep exactly the declared instances every arm shares
+    after positional alignment (a union adds only cross pairs, so an arm-local
+    derived witness dies while a shared declared instance's grounding covers
+    them and survives). The DISTINCT key is computed independently, from the
+    first arm alone, so it survives even when nothing is shared to align."""
     keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
@@ -781,14 +745,11 @@ def _attr_set_sort_key(attrs: frozenset[Attr]) -> tuple[tuple[int, str, str], ..
 
 
 def _equivalence_classes(pairs: Sequence[QFD]) -> dict[Attr, frozenset[Attr]]:
-    """Attributes provably carrying the same value, from value-equality pairs
-    only (a caller passes the predicate mints, never the full fact set): a
+    """Attributes provably carrying the same value: symmetric single-attribute
+    pairs (``a -> b`` and ``b -> a`` both present) partition into classes.
+    ``pairs`` must be value-equality mints only, never the full fact set: a
     mutual *functional* dependency (a declared bijection) is not a value
-    equality, so it must not merge two columns that can honestly differ.
-    Symmetric single-attribute pairs (``a -> b`` and ``b -> a`` both present)
-    partition into classes; this is what lets a key or dependency qualified to
-    one join side survive when the output projects the other side's equal
-    copy."""
+    equality and must not merge two columns that can honestly differ."""
     singles = {(next(iter(det)), dep) for det, dep in pairs if len(det) == 1}
     symmetric = {(a, b) for (a, b) in singles if (b, a) in singles}
 
@@ -841,10 +802,9 @@ def _rewrite(
 def _cross_product_keys(
     per_alias: Mapping[str, Sequence[frozenset[Attr]]], aliases: Sequence[str]
 ) -> list[frozenset[Attr]]:
-    """One key-determinant choice per non-semi input, unioned, capped at a
-    small fixed bound and built in sorted alias/attribute order for a
-    deterministic result. An input with no known key rules out every
-    combination (its rows are not provably not multiplied)."""
+    """One key-determinant choice per non-semi input, unioned; sorted order
+    keeps the result deterministic and the cap bounds the combinatorics. An
+    input with no known key rules out every combination."""
     if not aliases:
         return []
     combos: list[frozenset[Attr]] = [frozenset()]
@@ -923,12 +883,10 @@ def _project(
         for c in output_names - key:
             fds.add(FD(key, c))
 
-    # An equivalence class can carry several distinct output names at once (a
-    # join ON equality projected from both sides, ``p.k AS o2, d.k AS o1``):
-    # rewriting always picks one representative, so without this, a class
-    # member's *other* names never appear in any determinant or dependent and
-    # the mutual fact between them is lost. Mint it directly, for every pair
-    # of distinct names one class carries.
+    # Rewriting always picks one representative name per class, so a class
+    # with several distinct output names (an ON equality projected from both
+    # sides) loses the mutual fact between the names it didn't pick. Mint it
+    # directly.
     for group in {frozenset(g) for g in classes.values()}:
         names = frozenset(n for m in group for n in _direct_name(m, proj))
         for n1 in names:
