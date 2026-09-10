@@ -164,8 +164,17 @@ class Annotation(Generic[K]):
     grounded value, propagated as the logical OR of a transfer's inputs, and cleared
     when a node is freshly anchored by a consistent fact. It never licenses a more
     precise value; detectors may downgrade a finding that rests on it.
+
+    ``exact`` is a taint on the derivation, not information in ``value``: whether
+    every operator the reducer walked to reach this value is one it models
+    completely, so an absent fact is a proven absence rather than a give-up. A
+    relation-scoped reducer sets it from its own walk; everywhere else it is the
+    identity ``True``, so a property that never touches it sees no change in
+    behavior. Combined by AND on reconciliation: one inexact contributor taints
+    the whole flow value.
     """
 
     value: K
     opacity: Opacity = Opacity.CONCRETE
     provisional: bool = False
+    exact: bool = True

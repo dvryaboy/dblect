@@ -29,7 +29,7 @@ from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_
 _COLS = ("a", "b", "c")
 
 _keys = st.frozensets(st.sampled_from(_COLS), max_size=3)
-_key_sets = st.builds(CandidateKeySet, keys=st.frozensets(_keys, max_size=4), exact=st.booleans())
+_key_sets = st.frozensets(_keys, max_size=4).map(CandidateKeySet)
 # Mostly real key sets, occasionally the bottom sentinel, so the law arms that
 # touch bottom are exercised without swamping the normal cases.
 _values = st.one_of(_key_sets, st.just(ALL_KEYS))
@@ -94,8 +94,6 @@ def test_resolution_never_contradicts(values: list[CandidateKeySet]) -> None:
     value, is_contradiction = resolve(UNIQUENESS_LATTICE, facts)
     assert not is_contradiction
     expected: frozenset[Key] = frozenset()
-    expected_exact = True
     for v in values:
         expected = expected | v.keys
-        expected_exact = expected_exact and v.exact
-    assert value == CandidateKeySet(expected, exact=expected_exact)
+    assert value == CandidateKeySet(expected)

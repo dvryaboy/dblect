@@ -17,6 +17,7 @@ import sqlglot.expressions as exp
 # The relation-graph builder lives next to the column builder.
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
+from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
@@ -67,14 +68,20 @@ def _key(*cols: str) -> Key:
     return frozenset(cols)
 
 
-def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
+def _annotations(*nodes: Node) -> dict[str, Annotation[CandidateKeySet]]:
     """Build a manifest from the nodes, propagate uniqueness, and return each
-    model's candidate-key set keyed by unique_id."""
+    model's flow annotation keyed by unique_id."""
     manifest = _manifest(*nodes)
     result = build_relation_graph(manifest)
     prop = uniqueness_property(manifest, _DUCKDB)
     anns = propagate(result.graph, prop)
-    return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
+    return {ref.unique_id: ann for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
+
+
+def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
+    """Like :func:`_annotations`, but keeps each model's candidate-key set alone,
+    for the tests whose subject is the value rather than the annotation's bits."""
+    return {uid: ann.value for uid, ann in _annotations(*nodes).items()}
 
 
 def test_passthrough_carries_the_source_key() -> None:
@@ -552,12 +559,9 @@ _CUSTOMERS = _source("source.shop.raw.customers")
 
 
 def _exact(sql: str) -> bool:
-    """The ``exact`` bit of one model's inferred candidate-key set, over a manifest
-    carrying keyless ``orders`` and ``customers`` sources the model's SQL can draw on."""
-    man = _manifest(_ORDERS, _CUSTOMERS, _node("model.shop.x", sql))
-    result = build_relation_graph(man)
-    anns = propagate(result.graph, uniqueness_property(man, _DUCKDB))
-    return next(ann.value.exact for ref, ann in anns.items() if ref.unique_id == "model.shop.x")
+    """The ``exact`` bit of one model's flow annotation, over a manifest carrying
+    keyless ``orders`` and ``customers`` sources the model's SQL can draw on."""
+    return _annotations(_ORDERS, _CUSTOMERS, _node("model.shop.x", sql))["model.shop.x"].exact
 
 
 _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
@@ -665,6 +669,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
         "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id HAVING COUNT(*) > 1",
         False,
     ),
+    # A hole in the graph, not a shape in the engine's own fragment: a FROM naming
+    # a relation the manifest never stamped a SourceRef for. base_resolve reads it
+    # as an input the reducer cannot see into, so the model comes back inexact even
+    # though its own SQL is a plain passthrough.
+    ("unresolvable_base_table", "SELECT id FROM untracked", False),
 ]
 
 
@@ -681,7 +690,7 @@ def test_inexact_upstream_makes_downstream_inexact() -> None:
     """An inexact upstream model taints the downstream flow value even though the
     downstream SQL is entirely within the modelled fragment."""
     src = _source("source.shop.raw.orders")
-    keys = _keys(
+    anns = _annotations(
         src,
         _node(
             "model.shop.upstream",
@@ -689,5 +698,5 @@ def test_inexact_upstream_makes_downstream_inexact() -> None:
         ),
         _node("model.shop.downstream", "SELECT id FROM upstream"),
     )
-    assert not keys["model.shop.upstream"].exact
-    assert not keys["model.shop.downstream"].exact
+    assert not anns["model.shop.upstream"].exact
+    assert not anns["model.shop.downstream"].exact
