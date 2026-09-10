@@ -280,6 +280,42 @@ def _predicate_qfds(predicate: Expr, *, default_alias: str) -> set[QFD]:
     return out
 
 
+def _left_join_breakdown(
+    on: Expr | None, *, alias: str, default_alias: str
+) -> tuple[frozenset[str], frozenset[QCol]] | None:
+    """A LEFT join's ON decoded around the joined-in side ``alias``: its own
+    column names (``on_a``) and the qualified columns of everything it is
+    equated to (``on_l``), or ``None`` when the ON is not a pure conjunction of
+    column equalities each touching ``alias`` exactly once.
+
+    Built leaf by leaf from every equality directly (unlike
+    ``equality_cols_by_alias``, which requires one alias to appear in *every*
+    leaf), so the accumulated side's columns can be spread across several of
+    its own aliases (``ON l1.x = a.d1 AND l2.y = a.d2``): each leaf touches
+    ``a`` exactly once, so both contribute to ``on_l``, even though neither
+    ``l1`` nor ``l2`` is present in the other's leaf.
+    """
+    if on is None:
+        return None
+    leaves = sg.conjunctive_leaves(on)
+    pairs = sg.equality_column_pairs(on)
+    if len(pairs) != len(leaves):
+        return None
+    on_a: set[str] = set()
+    on_l: set[QCol] = set()
+    for left, right in pairs:
+        left_qc = _qcol(left, default_alias=default_alias)
+        right_qc = _qcol(right, default_alias=default_alias)
+        left_is_a = left_qc.alias == alias
+        right_is_a = right_qc.alias == alias
+        if left_is_a == right_is_a:
+            return None
+        a_qc, other_qc = (left_qc, right_qc) if left_is_a else (right_qc, left_qc)
+        on_a.add(a_qc.column)
+        on_l.add(other_qc)
+    return frozenset(on_a), frozenset(on_l)
+
+
 def _referenced_columns(sel: exp.Select, *, alias: str, from_alias: str) -> frozenset[str]:
     """Every column of ``alias`` referenced anywhere in ``sel``'s own scope
     (projections, ON, WHERE, GROUP BY, HAVING, QUALIFY, ORDER BY), never
@@ -378,6 +414,13 @@ def _select_facts(
 
     anti_arms = anti_join.anti_arm_ids(sel)
     facts: set[QFD] = set()
+    # The subset of ``facts`` that are real value equalities (from an INNER
+    # join's ON or the WHERE), as opposed to key mints, carried FDs, or a
+    # mutual *functional* dependency: two columns can determine each other
+    # (a declared bijection) without ever carrying the same value. Only value
+    # equalities are safe grounds for the equivalence classes that let a name
+    # rewrite fall back to a provably-equal column's output name.
+    predicate_pairs: set[QFD] = set()
     declared_by_alias: dict[str, frozenset[DeclaredFD]] = {}
     active_aliases: list[str] = []
 
@@ -410,12 +453,9 @@ def _select_facts(
         if side in (sg.JoinSide.SEMI, sg.JoinSide.ANTI) or id(j) in anti_arms:
             continue  # a filters the accumulated side; mint nothing, exclude from r_out
         if side is sg.JoinSide.LEFT:
-            on = sg.on_of(j)
-            by_alias = sg.equality_cols_by_alias(on) if on is not None else None
-            on_a: frozenset[str] = (
-                by_alias.get(alias, frozenset()) if by_alias is not None else frozenset()
-            )
-            clean = by_alias is not None and bool(on_a)
+            breakdown = _left_join_breakdown(sg.on_of(j), alias=alias, default_alias=from_alias)
+            on_a, on_l = breakdown if breakdown is not None else (frozenset(), frozenset())
+            clean = breakdown is not None and bool(on_l)
             mint(
                 alias,
                 inp,
@@ -423,15 +463,12 @@ def _select_facts(
                 key_filter=(lambda k, on_a=on_a: k <= on_a) if clean else (lambda _k: False),
             )
             if clean:
-                assert by_alias is not None
-                on_l = frozenset(
-                    QCol(a2, c2) for a2, cols in by_alias.items() if a2 != alias for c2 in cols
-                )
                 for c in on_a:
                     facts.add((on_l, QCol(alias, c)))
         elif side is sg.JoinSide.RIGHT:
             accumulated = frozenset(active_aliases)
             facts = {f for f in facts if not _touches(f, accumulated)}
+            predicate_pairs = {f for f in predicate_pairs if not _touches(f, accumulated)}
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
             mint(alias, inp)
@@ -442,6 +479,7 @@ def _select_facts(
                 for f in facts
                 if not (_touches(f, accumulated) and not _is_reference_mint(f, accumulated))
             }
+            predicate_pairs = {f for f in predicate_pairs if not _touches(f, accumulated)}
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
             mint(alias, inp, keep_fds=False, key_filter=lambda _k: False)
@@ -450,11 +488,15 @@ def _select_facts(
             if side is sg.JoinSide.INNER:
                 on = sg.on_of(j)
                 if on is not None:
-                    facts |= _predicate_qfds(on, default_alias=from_alias)
+                    minted = _predicate_qfds(on, default_alias=from_alias)
+                    facts |= minted
+                    predicate_pairs |= minted
 
     where = sg.where_of(sel)
     if where is not None and isinstance(where.this, Expr):
-        facts |= _predicate_qfds(where.this, default_alias=from_alias)
+        minted = _predicate_qfds(where.this, default_alias=from_alias)
+        facts |= minted
+        predicate_pairs |= minted
 
     if active_aliases:
         facts.add((frozenset(RowToken(a) for a in active_aliases), _OUTPUT_TOKEN))
@@ -491,10 +533,16 @@ def _select_facts(
             facts.add((distinct_attrs, r_out))
             extra_candidates.append(distinct_attrs)
 
-    classes = _equivalence_classes(tuple(facts))
+    classes = _equivalence_classes(tuple(predicate_pairs))
     declared_final = _rename_declared(declared_by_alias, classes, proj)
     return _project(
-        facts, declared_final, candidate_aliases, extra_candidates, r_out=r_out, proj=proj
+        facts,
+        declared_final,
+        candidate_aliases,
+        extra_candidates,
+        r_out=r_out,
+        proj=proj,
+        classes=classes,
     )
 
 
@@ -609,18 +657,22 @@ def _union_facts(
 
 
 def _union_key(u: exp.Union) -> frozenset[Key]:
-    """The DISTINCT full-output-tuple key, read off the union's own first arm
-    (matching ``uniqueness.py``'s own union key rule): a plain SELECT's named
-    and bare-column projections, star projections skipped rather than voiding
-    the whole tuple. UNION ALL, or a first arm that is itself a nested set
-    operation (an unflattened chain), mints no key."""
+    """The DISTINCT full-output-tuple key, read off the union's own first arm.
+    A star anywhere leaves the full tuple unnamed, so it voids the key rather
+    than being skipped: DISTINCT dedups every column, and a named subset is
+    not a key of that wider tuple. UNION ALL, or a first arm that is itself a
+    nested set operation (an unflattened chain), mints no key."""
     if not bool(u.args.get("distinct")) or not isinstance(u.this, exp.Select):
         return frozenset()
     names: list[str] = []
     for proj in u.this.expressions:
+        if isinstance(proj, exp.Star):
+            return frozenset()
         if isinstance(proj, exp.Alias):
             names.append(proj.alias_or_name.lower())
-        elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
+        elif isinstance(proj, exp.Column):
+            if isinstance(proj.this, exp.Star):
+                return frozenset()
             names.append(sg.column_name(proj).lower())
     return frozenset({frozenset(names)}) if names else frozenset()
 
@@ -729,23 +781,15 @@ def _attr_set_sort_key(attrs: frozenset[Attr]) -> tuple[tuple[int, str, str], ..
 
 
 def _equivalence_classes(pairs: Sequence[QFD]) -> dict[Attr, frozenset[Attr]]:
-    """Attributes provably equal everywhere in the scope: the symmetric
-    single-attribute pairs (``a -> b`` and ``b -> a`` both present) partition
-    into classes. This is what lets a key or dependency qualified to one join
-    side survive when the output projects the other side's equal copy.
-
-    A pinned (constant) attribute is excluded from either side of a pair: a
-    constant is trivially entailed by anything and trivially entails nothing
-    on its own, so two independently-pinned attributes always look mutually
-    determining without carrying the same value (``WHERE g = 0`` and a
-    declared ``g -> x`` both pin ``x`` too, but ``x`` need not equal ``g``).
-    """
-    pinned = frozenset(dep for det, dep in pairs if not det)
-    singles = {
-        (only, dep)
-        for det, dep in pairs
-        if len(det) == 1 and dep not in pinned and (only := next(iter(det))) not in pinned
-    }
+    """Attributes provably carrying the same value, from value-equality pairs
+    only (a caller passes the predicate mints, never the full fact set): a
+    mutual *functional* dependency (a declared bijection) is not a value
+    equality, so it must not merge two columns that can honestly differ.
+    Symmetric single-attribute pairs (``a -> b`` and ``b -> a`` both present)
+    partition into classes; this is what lets a key or dependency qualified to
+    one join side survive when the output projects the other side's equal
+    copy."""
+    singles = {(next(iter(det)), dep) for det, dep in pairs if len(det) == 1}
     symmetric = {(a, b) for (a, b) in singles if (b, a) in singles}
 
     parent: dict[Attr, Attr] = {}
@@ -838,13 +882,17 @@ def _project(
     *,
     r_out: RowToken,
     proj: _Projection,
+    classes: Mapping[Attr, frozenset[Attr]],
 ) -> Input:
     pairs = tuple(facts)
-    classes = _equivalence_classes(pairs)
 
     per_alias_dets: dict[str, list[frozenset[Attr]]] = {}
     for det, dep in pairs:
-        if isinstance(dep, RowToken) and dep.alias in candidate_aliases:
+        if (
+            isinstance(dep, RowToken)
+            and dep.alias in candidate_aliases
+            and all(isinstance(a, QCol) for a in det)
+        ):
             per_alias_dets.setdefault(dep.alias, []).append(det)
     candidates = _cross_product_keys(per_alias_dets, candidate_aliases) + list(extra_candidates)
 

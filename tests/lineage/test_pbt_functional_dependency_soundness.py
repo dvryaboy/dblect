@@ -241,36 +241,78 @@ _KEPT: Mapping[str, frozenset[str]] = {
 }
 
 
+_EXTRA = SourceRef(SourceKind.SOURCE, "source.test.raw.extra")
+
+
 @dataclass(frozen=True)
 class JoinScenario:
     side: str  # key into _JOIN_KINDS
     rows_pay: tuple[tuple[int, int], ...]  # (k, a), with a a function of k (k -> a holds)
     rows_dim: tuple[tuple[int, int, int], ...]  # (k, g, v), with v a function of g (g -> v holds)
     projection: tuple[tuple[tuple[str, str], str], ...]  # ((alias, column), output name)
+    left_two_sides: bool  # a LEFT join whose ON equates two already-accumulated aliases
+    rows_extra: tuple[tuple[int, int], ...]  # (k2, g2), independent of pay/dim
 
 
 @st.composite
 def _join_scenario(draw: st.DrawFn) -> JoinScenario:
     side = draw(st.sampled_from(sorted(_JOIN_KINDS)))
-    amap = {k: draw(st.integers(min_value=0, max_value=9)) for k in range(3)}
-    vmap = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
-    rows_pay: list[tuple[int, int]] = []
-    for _ in range(draw(st.integers(min_value=0, max_value=6))):
-        k = draw(st.integers(min_value=0, max_value=2))
-        rows_pay.append((k, amap[k]))  # a determined by k, so k -> a holds in the data
-    rows_dim: list[tuple[int, int, int]] = []
-    for _ in range(draw(st.integers(min_value=0, max_value=6))):
-        k = draw(st.integers(min_value=0, max_value=2))
-        g = draw(st.integers(min_value=0, max_value=2))
-        rows_dim.append((k, g, vmap[g]))  # v determined by g, so g -> v holds in the data
-    chosen = draw(st.lists(st.sampled_from(_QCOLS), min_size=1, max_size=5, unique=True))
-    projection = tuple((qc, f"o{i}") for i, qc in enumerate(chosen))
+    left_two_sides = draw(st.booleans())
+    if left_two_sides:
+        # A small, overlapping value range for p.a, d.g and extra's (k2, g2), so the
+        # LEFT join's matches and non-matches are both common: the false constant the
+        # buggy mint would invent for e.k2/e.g2 then has a real chance to vary within
+        # one materialized dataset (a matched row alongside a NULL-padded one).
+        small = st.integers(min_value=0, max_value=2)
+        rows_pay = tuple(
+            (k, draw(small)) for k in range(draw(st.integers(min_value=1, max_value=3)))
+        )
+        rows_dim = tuple(
+            (k, draw(small), 0) for k in range(draw(st.integers(min_value=1, max_value=3)))
+        )
+        rows_extra = tuple(
+            (draw(small), draw(small)) for _ in range(draw(st.integers(min_value=1, max_value=3)))
+        )
+        projection: tuple[tuple[tuple[str, str], str], ...] = ()
+    else:
+        amap = {k: draw(st.integers(min_value=0, max_value=9)) for k in range(3)}
+        vmap = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
+        rows_pay_list: list[tuple[int, int]] = []
+        for _ in range(draw(st.integers(min_value=0, max_value=6))):
+            k = draw(st.integers(min_value=0, max_value=2))
+            rows_pay_list.append((k, amap[k]))  # a determined by k, so k -> a holds in the data
+        rows_dim_list: list[tuple[int, int, int]] = []
+        for _ in range(draw(st.integers(min_value=0, max_value=6))):
+            k = draw(st.integers(min_value=0, max_value=2))
+            g = draw(st.integers(min_value=0, max_value=2))
+            rows_dim_list.append((k, g, vmap[g]))  # v determined by g, so g -> v holds
+        chosen = draw(st.lists(st.sampled_from(_QCOLS), min_size=1, max_size=5, unique=True))
+        projection = tuple((qc, f"o{i}") for i, qc in enumerate(chosen))
+        rows_pay = tuple(rows_pay_list)
+        rows_dim = tuple(rows_dim_list)
+        rows_extra = ()
     return JoinScenario(
-        side=side, rows_pay=tuple(rows_pay), rows_dim=tuple(rows_dim), projection=projection
+        side=side,
+        rows_pay=rows_pay,
+        rows_dim=rows_dim,
+        projection=projection,
+        left_two_sides=left_two_sides,
+        rows_extra=rows_extra,
     )
 
 
+# A LEFT join whose ON spans two accumulated aliases, neither of which is the join
+# key that ties pay and dim together: p.a and d.g are otherwise unrelated to e.k2/e.g2,
+# so any false constant the mint invents for them is very likely violated on the data.
+_LEFT_TWO_SIDES_SQL = (
+    "SELECT p.k AS o0, d.g AS o1, e.k2 AS o2, e.g2 AS o3 FROM pay p CROSS JOIN dim d "
+    "LEFT JOIN extra e ON p.a = e.k2 AND d.g = e.g2"
+)
+
+
 def _join_sql(s: JoinScenario) -> str:
+    if s.left_two_sides:
+        return _LEFT_TWO_SIDES_SQL
     cols = ", ".join(f"{alias}.{col} AS {name}" for (alias, col), name in s.projection)
     return f"SELECT {cols} FROM pay p {_JOIN_KINDS[s.side]}"
 
@@ -284,31 +326,33 @@ def test_every_claimed_join_fd_holds_on_the_data(
         _PAY: (_declared_fact(_PAY, FD(frozenset({"k"}), "a")),),
         _DIM: (_declared_fact(_DIM, FD(frozenset({"g"}), "v")),),
     }
-    claimed = _claimed_fds(_join_sql(s), {_PAY: "pay", _DIM: "dim"}, facts)
+    claimed = _claimed_fds(_join_sql(s), {_PAY: "pay", _DIM: "dim", _EXTRA: "extra"}, facts)
     assert not claimed.is_bottom
-    selected = dict(s.projection)
-    declared = {"p": (("p", "k"), ("p", "a")), "d": (("d", "g"), ("d", "v"))}
-    for alias, (det, dep) in declared.items():
-        if det not in selected or dep not in selected:
-            continue
-        # Entailment, not exact-tuple membership: the closure engine may qualify
-        # a determinant through the join partner's equal column, so it can name
-        # this dependency under either side's output alias.
-        holds = determines(claimed, frozenset({selected[det]}), selected[dep])
-        if alias in _KEPT[s.side]:
-            # Anti-vacuity: a kept side's declared dependency must be carried through
-            # the join (a silent walk cannot pass on silence alone).
-            assert holds, f"kept-side FD dropped for sql={_join_sql(s)!r}"
-        else:
-            # The padded side's drop is the contract: NULL padding can break the
-            # dependency, so the walk must stay silent about it.
-            assert not holds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
+    if not s.left_two_sides:
+        selected = dict(s.projection)
+        declared = {"p": (("p", "k"), ("p", "a")), "d": (("d", "g"), ("d", "v"))}
+        for alias, (det, dep) in declared.items():
+            if det not in selected or dep not in selected:
+                continue
+            # Entailment, not exact-tuple membership: the closure engine may qualify
+            # a determinant through the join partner's equal column, so it can name
+            # this dependency under either side's output alias.
+            holds = determines(claimed, frozenset({selected[det]}), selected[dep])
+            if alias in _KEPT[s.side]:
+                # Anti-vacuity: a kept side's declared dependency must be carried through
+                # the join (a silent walk cannot pass on silence alone).
+                assert holds, f"kept-side FD dropped for sql={_join_sql(s)!r}"
+            else:
+                # The padded side's drop is the contract: NULL padding can break the
+                # dependency, so the walk must stay silent about it.
+                assert not holds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
     names, rows = _materialize(
         oracle_con,
         _join_sql(s),
         {
             "pay": ("k INTEGER, a INTEGER", s.rows_pay),
             "dim": ("k INTEGER, g INTEGER, v INTEGER", s.rows_dim),
+            "extra": ("k2 INTEGER, g2 INTEGER", s.rows_extra),
         },
     )
     _assert_claims_hold(claimed, names, rows, _join_sql(s))

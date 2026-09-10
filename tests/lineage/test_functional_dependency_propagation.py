@@ -164,6 +164,21 @@ def test_star_carries_everything() -> None:
     assert out["model.shop.stg"] == _carried(_inst(_fd("currency", "country")))
 
 
+def test_declared_bijection_does_not_let_instances_rebind_across_each_other() -> None:
+    """``a -> b`` and ``b -> a`` declared together are a bijection, not a value
+    equality: each instance must still bind through its own column's output
+    name, not the other's, even though the two mutually determine each other."""
+    out = _fds(
+        _declared(_fd("b", "a"), _fd("a", "b")),
+        _source(_PAYMENTS.unique_id),
+        _node("model.shop.stg", "SELECT a AS zzz, b AS aaa FROM payments"),
+    )
+    assert out["model.shop.stg"] == _carried(
+        _inst(_fd("b", "a"), renames={"a": "zzz", "b": "aaa"}),
+        _inst(_fd("a", "b"), renames={"a": "zzz", "b": "aaa"}),
+    )
+
+
 # --- WHERE ----------------------------------------------------------------------
 
 
