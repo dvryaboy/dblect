@@ -524,3 +524,17 @@ def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> Non
         _node("model.shop.m", "SELECT order_id, line_number FROM lines WHERE line_number = 1"),
     )
     assert _key("order_id") in keys["model.shop.m"].keys
+
+
+def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
+    """Pinning the key column constant makes the whole relation collapse to at most
+    one row, so minimization can talk the closure into dropping the key down to the
+    empty set. No consumer reads an empty key as "at most one row"; the key a filter
+    on its own column leaves behind is still ``{id}``."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _unique("test.shop.u", column="id", target=src.unique_id),
+        _node("model.shop.m", "SELECT id, amount FROM orders WHERE id = 5"),
+    )
+    assert keys["model.shop.m"] == CandidateKeySet.of(_key("id"))

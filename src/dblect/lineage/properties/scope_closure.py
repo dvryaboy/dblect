@@ -1036,7 +1036,16 @@ def _validate_and_minimize(
     by dropping attributes (sorted, for a deterministic result) while the
     closure still reaches it. Every emitted key is checked against the closure
     before rewriting, so the candidate search is sound regardless of which
-    candidates it happens to try."""
+    candidates it happens to try.
+
+    Minimization never empties the candidate: a pin on the candidate's own
+    column (``WHERE id = 5`` over a relation already keyed on ``id``) lets the
+    closure reach ``r_out`` from nothing at all, since the pin plus the key
+    chain to it either way. That is a real fact about *this* candidate, not a
+    grant to claim the relation has at most one row from every candidate
+    simultaneously; no consumer reads an empty key, so a candidate that would
+    minimize there keeps its original, unminimized form instead.
+    """
     if r_out not in closure(pairs, candidate):
         return None
     kept = set(candidate)
@@ -1044,7 +1053,7 @@ def _validate_and_minimize(
         trial = frozenset(kept - {attr})
         if r_out in closure(pairs, trial):
             kept.discard(attr)
-    return frozenset(kept)
+    return frozenset(kept) if kept else candidate
 
 
 def _carry_predicate(
