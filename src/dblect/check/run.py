@@ -138,11 +138,7 @@ class WorldAnnotations:
 
     ``coherence_clears`` are the aggregate-guard clears the domain-type walk emitted in
     this world: the structured reason a sum cleared its tag, which the aggregation
-    finding reads instead of re-inferring the event from the cleared output.
-
-    Every field is required: ``propagate_world`` is the only constructor, and a
-    default here would let some future constructor silently turn the grain check
-    into a no-op instead of failing to build."""
+    finding reads instead of re-inferring the event from the cleared output."""
 
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
