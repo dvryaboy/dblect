@@ -347,14 +347,9 @@ def _predicate_qfds(predicate: Expr, *, default_alias: str) -> set[QFD]:
 
 # --- exactness ---------------------------------------------------------------
 #
-# A WHERE, ON, HAVING, or QUALIFY stays in the modelled fragment only when every
-# leaf is one of a closed set of row-local shapes; everything else (an aggregate,
-# a subquery, an unrecognized window) is a shape the engine does not understand
-# well enough to call the resulting absence a proof. This is a stricter fragment
-# than a projection's: a projection may carry an arbitrary opaque expression
-# through by name without the engine needing to reason about its value, but a
-# predicate's shape decides whether rows can be filtered without breaking a
-# key or dependency claim, so only recognized comparisons qualify.
+# Predicates get a stricter fragment than projections: a projection carries an
+# opaque expression through by name, but a predicate decides which rows survive,
+# so only recognized row-local comparisons count as understood.
 
 _COMPARISONS: tuple[type[Expr], ...] = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)
 
@@ -386,7 +381,14 @@ def _leaf_is_exact(leaf: Expr) -> bool:
     if isinstance(leaf, exp.Like | exp.ILike):
         return isinstance(leaf.this, exp.Column) and isinstance(leaf.expression, exp.Literal)
     if isinstance(leaf, exp.Between):
-        return isinstance(leaf.this, exp.Column)
+        low, high = leaf.args.get("low"), leaf.args.get("high")
+        return (
+            isinstance(leaf.this, exp.Column)
+            and isinstance(low, Expr)
+            and isinstance(high, Expr)
+            and _row_local(low)
+            and _row_local(high)
+        )
     return False
 
 
