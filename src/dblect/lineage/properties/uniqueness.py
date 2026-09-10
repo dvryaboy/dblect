@@ -77,10 +77,6 @@ from dblect.sql import (
 )
 from dblect.sql import _sqlglot as sg
 
-# ``Key`` and ``ConditionalKey`` live in the scope-closure engine: they describe
-# what the engine's relation-algebra walk carries and projects, and this module
-# imports them back for its lattice and public API.
-
 
 @dataclass(frozen=True, slots=True)
 class CandidateKeySet:
@@ -611,13 +607,6 @@ def surrogate_key_discoverer(
 
 # --- the relation reducer ----------------------------------------------------
 #
-# The relation reducer runs the scope-closure engine (``scope_facts``) over a
-# model's parsed tree: a base table resolves through ``recurse`` (or, for the
-# detector's per-tree index, by name against an already-propagated map), and
-# the engine's own relation algebra (join sides, GROUP BY, DISTINCT, the
-# ROW_NUMBER dedup idiom, conditional-key carriage) derives the keys and
-# carried conditional keys the SQL proves. CTEs and inline subqueries resolve
-# structurally within the engine's own walk.
 
 
 def relation_reduce(
