@@ -469,17 +469,14 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
     )
 
 
-# --- shapes the FD-closure key engine derives -------------------------------------
+# --- keys that need the closure, not a literal match ------------------------------
 #
-# `lines` is keyed on the composite pair (order_id, line_number), never on order_id
-# alone: a fact table where an order spans many lines. Each shape below has a real key
-# that a walk over the FD closure can justify.
+# `lines` is keyed on (order_id, line_number), never on order_id alone.
 
 
 def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
-    """The ON equates ``o.order_id`` with ``l.order_id``, and the output projects
-    ``o.order_id`` rather than ``l.order_id``, so this walk cannot tie the projected
-    column to ``lines``' declared pair key even though the values agree row for row."""
+    """The output projects ``o.order_id``, equal to ``l.order_id`` by the ON, so the
+    pair key of ``lines`` survives under the other alias's name."""
     orders = _source("source.shop.raw.orders")
     lines = _source("source.shop.raw.lines")
     keys = _keys(
@@ -499,9 +496,8 @@ def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
 
 
 def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
-    """Self-joining to the per-order max line number keeps one row per order, so
-    ``order_id`` alone is a key, not just the declared pair: the walk would need
-    ``order_id -> line_number`` at the output to shrink the pair key to it."""
+    """Joining back to the per-order max line keeps one row per order: the grouped
+    side's ``order_id -> line_number`` shrinks the pair key to ``order_id``."""
     lines = _source("source.shop.raw.lines")
     keys = _keys(
         lines,
@@ -520,8 +516,7 @@ def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
 
 
 def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> None:
-    """Pinning ``line_number`` constant makes the declared pair key redundant in its
-    second column, so ``order_id`` alone is a key of the filtered output."""
+    """A pinned ``line_number`` drops out of the pair key."""
     lines = _source("source.shop.raw.lines")
     keys = _keys(
         lines,
@@ -534,10 +529,8 @@ def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> Non
 
 
 def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
-    """Pinning the key column constant makes the whole relation collapse to at most
-    one row, so minimization can talk the closure into dropping the key down to the
-    empty set. No consumer reads an empty key as "at most one row"; the key a filter
-    on its own column leaves behind is still ``{id}``."""
+    """Pinning the key column itself must not minimize the key to the empty set;
+    no consumer reads an empty key."""
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
@@ -549,10 +542,8 @@ def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
 
 # --- exactness -----------------------------------------------------------------
 #
-# The engine's fragment is exact for a closed set of shapes (see scope_closure's
-# module docstring); everything outside it makes the engine give up on the whole
-# scope. One row per shape family, one row per give-up trigger: the closed input
-# space the bit decides over.
+# One row per exact shape family and one per give-up trigger, the closed input space
+# of the bit (the fragment is listed in scope_closure's module docstring).
 
 _ORDERS = _source("source.shop.raw.orders")
 _CUSTOMERS = _source("source.shop.raw.customers")
@@ -669,9 +660,7 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
         "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id HAVING COUNT(*) > 1",
         False,
     ),
-    # A hole in the graph, not a shape in the engine's own fragment: a FROM naming
-    # a relation the manifest never stamped a SourceRef for. base_resolve reads it
-    # as an input the reducer cannot see into, so the model comes back inexact even
+    # A FROM the manifest never resolved is a hole, so the model is inexact even
     # though its own SQL is a plain passthrough.
     ("unresolvable_base_table", "SELECT id FROM untracked", False),
 ]

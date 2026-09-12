@@ -259,10 +259,7 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
     side = draw(st.sampled_from(sorted(_JOIN_KINDS)))
     left_two_sides = draw(st.booleans())
     if left_two_sides:
-        # A small, overlapping value range for p.a, d.g and extra's (k2, g2), so the
-        # LEFT join's matches and non-matches are both common: the false constant the
-        # buggy mint would invent for e.k2/e.g2 then has a real chance to vary within
-        # one materialized dataset (a matched row alongside a NULL-padded one).
+        # A small value range so LEFT-join matches and non-matches are both common.
         small = st.integers(min_value=0, max_value=2)
         rows_pay = tuple(
             (k, draw(small)) for k in range(draw(st.integers(min_value=1, max_value=3)))
@@ -301,9 +298,8 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
     )
 
 
-# A LEFT join whose ON spans two accumulated aliases, neither of which is the join
-# key that ties pay and dim together: p.a and d.g are otherwise unrelated to e.k2/e.g2,
-# so any false constant the mint invents for them is very likely violated on the data.
+# A LEFT join whose ON spans two accumulated aliases; a mint that read only one of
+# them would invent a constant the data violates.
 _LEFT_TWO_SIDES_SQL = (
     "SELECT p.k AS o0, d.g AS o1, e.k2 AS o2, e.g2 AS o3 FROM pay p CROSS JOIN dim d "
     "LEFT JOIN extra e ON p.a = e.k2 AND d.g = e.g2"
