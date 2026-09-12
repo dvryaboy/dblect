@@ -60,7 +60,6 @@ from dblect.lineage.facts.model import (
 from dblect.lineage.facts.property import DepContext, Property, PropertyRef, relation_property
 from dblect.lineage.graph import SourceRef, source_ref_meta
 from dblect.lineage.properties.scope_closure import (
-    EMPTY_INPUT,
     FD,
     DeclaredFD,
     Input,
@@ -242,11 +241,8 @@ def functional_dependency_property(
     uniqueness property's ref switches on the key-derived source and declares the
     dependency edge the registry orders by.
 
-    The reducer builds the scope-closure engine's ``Input`` for each base table
-    (its dependencies from ``recurse``, its keys from the uniqueness edge when
-    it is wired) and reads the engine's projected dependencies back; the engine
-    also derives keys, which the uniqueness reducer reads once it carries its
-    own walk on the same engine."""
+    The reducer runs the scope-closure engine with each base table's dependencies
+    from ``recurse`` and its keys from the uniqueness edge when wired."""
 
     def reduce_(
         deriv: Expr,
@@ -262,17 +258,20 @@ def functional_dependency_property(
             nonlocal provisional
             ref = source_ref_meta(table)
             if ref is None:
-                return EMPTY_INPUT
+                return Input(exact=False)  # a table the graph could not resolve: a hole
             ann = recurse(ref)
             provisional = provisional or ann.provisional
             keys: frozenset[Key] = frozenset()
+            keys_exact = True
             if uniqueness is not None:
                 key_ann = ctx.annotation(uniqueness, ref)
                 if key_ann is not None:
                     keys = key_ann.value.keys
+                    keys_exact = key_ann.exact
             # The bottom sentinel carries no dependencies to walk with; strip it to
             # the plain sets here, exactly as the walk always has.
-            return Input(keys, ann.value.fds, ann.value.declared)
+            exact = ann.exact and keys_exact
+            return Input(keys, ann.value.fds, ann.value.declared, exact=exact)
 
         resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
         # A declared instance's own dependency joins the plain set explicitly: the
@@ -283,7 +282,7 @@ def functional_dependency_property(
         fds = resolved.fds | {inst.fd for inst in resolved.declared}
         value = FDSet(fds, resolved.declared)
         opacity = Opacity.CONCRETE if value.fds else Opacity.IMPLICIT
-        return Annotation(value, opacity, provisional=provisional)
+        return Annotation(value, opacity, provisional=provisional, exact=resolved.exact)
 
     return relation_property(
         name="functional_dependency",
