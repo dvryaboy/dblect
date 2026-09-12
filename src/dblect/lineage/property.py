@@ -207,11 +207,7 @@ def _reconcile(
     grounded value as the contract but taints it provisional, so one upstream
     regression does not blank analysis of every consumer.
 
-    ``exact`` is the AND of both sides on every path, a declaration's own taint
-    (always ``True`` today) combined with the inference's: one inexact contributor
-    taints the flow value regardless of which branch below decides it. A grounded
-    opt-out never reaches here (``propagate`` short-circuits on it before calling),
-    so that channel's exactness is untouched.
+    ``exact`` is the AND of both sides on every path.
     """
     exact = grounded.exact and inferred.exact
     if grounded.opacity is Opacity.IMPLICIT:

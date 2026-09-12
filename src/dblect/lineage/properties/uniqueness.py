@@ -650,12 +650,9 @@ def relation_scope_keys(
     """Per-scope candidate keys for every SELECT/UNION node in ``tree``, keyed by
     ``id(node)``.
 
-    The same engine the reducer runs, but for one already-parsed tree and with base
-    tables resolved by name against ``model_keys`` (the per-model keys propagation
-    produced) rather than by stamp. This is what an audit detector consults to get a
-    CTE's or inline subquery's keys, since those intermediate scopes are not
-    relations the propagator annotates. The returned map is valid only for the
-    lifetime of ``tree``.
+    Base tables resolve by name against ``model_keys`` rather than by stamp. This is
+    how a detector reads a CTE's or subquery's keys, which the propagator does not
+    annotate. Valid only for the lifetime of ``tree``.
 
     Base keys here are already activated (the per-model map is built after
     activation), so this walk carries no conditional payload of its own.
@@ -678,12 +675,9 @@ def activated_scope_keys(
     """Per-scope candidate keys with conditional keys activated against each scope's
     own row filter, keyed by ``id(node)``.
 
-    Like :func:`relation_scope_keys`, but base tables resolve to both their keys and
-    their conditional keys, so the engine carries conditional keys into each
-    intermediate scope, and each scope promotes the ones its flow (``scope_flow``,
-    from :func:`~dblect.lineage.properties.predicate_flow.relation_scope_filters`)
-    implies. This lets a window or join over a CTE that filters an upstream see the
-    key the filter activates.
+    Like :func:`relation_scope_keys`, but conditional keys are carried into each
+    scope and promoted where that scope's flow (``scope_flow``) implies them, so a
+    window or join over a filtering CTE sees the key the filter activates.
     """
 
     def base_resolve(table: exp.Table) -> Input:

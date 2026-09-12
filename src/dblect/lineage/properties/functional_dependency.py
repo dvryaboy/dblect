@@ -241,11 +241,8 @@ def functional_dependency_property(
     uniqueness property's ref switches on the key-derived source and declares the
     dependency edge the registry orders by.
 
-    The reducer builds the scope-closure engine's ``Input`` for each base table
-    (its dependencies from ``recurse``, its keys from the uniqueness edge when
-    it is wired) and reads the engine's projected dependencies back; the engine
-    also derives keys, which the uniqueness reducer reads once it carries its
-    own walk on the same engine."""
+    The reducer runs the scope-closure engine with each base table's dependencies
+    from ``recurse`` and its keys from the uniqueness edge when wired."""
 
     def reduce_(
         deriv: Expr,
