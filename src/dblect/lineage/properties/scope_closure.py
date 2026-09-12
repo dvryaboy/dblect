@@ -1,44 +1,24 @@
-"""The scope-closure engine: one relation-algebra walk over a SQL scope's
-qualified attributes and row-identity tokens, so a key or a functional
-dependency is a closure question ("does K determine the output row") rather
-than a literal-mint question. Tokens (:class:`RowToken`) give row identity
-its own attribute, alongside a column's qualified identity (:class:`QCol`)
-and a projected expression's (:class:`Computed`), so both keys and
-dependencies fall out of one Armstrong closure over the same fact set instead
-of two separately hand-mangled rename maps.
+"""The scope-closure engine: keys and functional dependencies of one SQL scope,
+both read off a single Armstrong closure.
 
-A resolved FROM/JOIN source contributes an :class:`Input`: its keys, its plain
-dependencies, and its declared dependency instances, each in the source's own
-output column names. :func:`scope_facts` mints qualified facts for one SELECT
-or UNION, combining sources through the join algebra (predicates, join sides,
-GROUP BY, DISTINCT), then projects that fact set back down to an ``Input`` in
-the scope's own output names, closure-aware: a key or dependency survives
-whenever the closure reaches it, however indirectly the columns that witness
-it are named.
+Attributes are a column qualified by its alias (:class:`QCol`), a projected
+expression (:class:`Computed`), or the identity of one input's row
+(:class:`RowToken`). A key is then a set of attributes whose closure reaches the
+output row token. Each FROM/JOIN source contributes an :class:`Input`;
+:func:`scope_facts` mints the scope's qualified facts (join sides, predicates,
+GROUP BY, DISTINCT) and projects them back to an ``Input`` in the output names,
+so a fact survives projection whenever the closure reaches it through any equal
+column.
 
-Every key and dependency the engine derives is a sound under-approximation: a
-shape it cannot model yields nothing rather than a guess. ``Input.exact``
-records whether that "yields nothing" was a proven absence or a give-up, so a
-consumer wanting a negative claim (a key is not derivable, a grain does not
-hold) can tell the two apart. The fragment the engine models exactly:
-
-Exact: a FROM that is a table, CTE, or subquery; INNER, CROSS, LEFT, RIGHT,
-FULL, SEMI, ANTI joins and the ``LEFT JOIN ... IS NULL`` idiom; a WHERE, ON,
-HAVING, or QUALIFY whose every conjunctive leaf is a column equality, a
-literal equality, the recognized ``ROW_NUMBER`` guard, or a row-local
-comparison over this scope's own columns (``a > 1``, ``a <> b``, ``a IN (1,
-2)``, ``a IS NULL``, ``LIKE``, ``BETWEEN``, and AND/OR/NOT over these); a
-GROUP BY over bare columns; DISTINCT; UNION and UNION ALL; a projection of
-bare columns, or expressions with no subquery and no window other than the
-recognized ``ROW_NUMBER`` dedup.
-
-Inexact: any subquery, EXISTS, IN-with-subquery, or window reference inside a
-predicate; a projection containing a subquery or an unrecognized window; a
-group target that is not a bare column; a star over a join; a FROM that is
-anything else (a function, UNNEST, VALUES); INTERSECT and EXCEPT; and every
-site where the engine gives up on a shape it does not recognize. A row-local
-comparison is exact because such a filter cannot guarantee a collapse, so a
-coarser key being absent after it is real evidence.
+Every derived fact is a sound under-approximation. ``Input.exact`` records
+whether an absent fact is a proven absence or a give-up, for consumers making a
+negative claim. The exact fragment: FROM a table, CTE or subquery; every join
+kind; predicates whose leaves are column or literal equalities, the ROW_NUMBER
+guard, or row-local comparisons (``a > 1``, ``IN`` a literal list, ``IS NULL``,
+``LIKE``, ``BETWEEN``, and AND/OR/NOT over these); GROUP BY over bare columns;
+DISTINCT; UNION. Inexact: a subquery or window anywhere in a predicate, an
+unrecognized window or a subquery in a projection, an expression group target,
+a star over a join, any other FROM shape, INTERSECT and EXCEPT.
 """
 
 from __future__ import annotations
@@ -98,14 +78,8 @@ _A = TypeVar("_A", bound=Hashable)
 
 
 def closure(fds: Collection[tuple[frozenset[_A], _A]], attrs: frozenset[_A]) -> frozenset[_A]:
-    """Attribute closure of ``attrs`` under ``fds``, Armstrong's axioms applied
-    to a fixed point: sound and complete for functional-dependency entailment
-    over any hashable attribute type.
-
-    Shared by :func:`~dblect.lineage.properties.functional_dependency.determines`
-    (over plain column names) and this engine (over qualified attributes), so a
-    key or a dependency is decided by the same one implementation everywhere.
-    """
+    """Armstrong attribute closure of ``attrs`` under ``fds``, over any hashable
+    attribute type. ``determines`` and this engine share it."""
     out = set(attrs)
     changed = True
     while changed:
@@ -130,18 +104,11 @@ class FD:
 
 @dataclass(frozen=True, slots=True)
 class DeclaredFD:
-    """A declared dependency's live instance in one relation.
-
-    ``origin`` and ``declared`` name the axiom: the relation the dependency was
-    declared about, and the dependency in that relation's column names.
-    ``binding`` maps each declared column to the output column now carrying its
-    value, one pair per declared column, maintained as the walk climbs. The
-    per-column form is what a union merge compares: origin alone is not enough
-    (one relation can declare two dependencies that arms rename onto the same
-    output columns), and a renamed dependency is not either, because it forgets
-    which declared column feeds which output, so arms crossing the columns of a
-    multi-column determinant would look identical while running the axiom two
-    different ways."""
+    """A declared dependency's live instance in one relation: the axiom
+    (``origin``, ``declared``) plus ``binding``, each declared column mapped to
+    the output column now carrying its value. A union merge compares bindings,
+    since two arms can rename the same axiom onto the same output columns with the
+    determinant's columns crossed."""
 
     origin: SourceRef
     declared: FD
@@ -187,21 +154,10 @@ Key = frozenset[str]
 
 @dataclass(frozen=True, slots=True)
 class ConditionalKey:
-    """A candidate key that holds only over the rows matching ``predicate``.
-
-    Grounded from a filtered declaration (a ``where``-scoped uniqueness test, or
-    nullability's one-column NON_NULL claim riding the same carrier), captured
-    rather than folded into a relation's unconditional keys until a scope's
-    flowed row filter implies ``predicate``, at which point activation promotes
-    it. ``predicate`` is the declaration's filter parsed to the engine's atoms,
-    so it feeds :func:`~dblect.lineage.predicate.entails_atoms` directly.
-
-    Carried through the relation algebra alongside the scope's other facts: an
-    input's conditional key survives a scope when the closure shows its row is
-    not multiplied (``closure({r_a})`` reaches the scope's output token) and
-    both the key's columns and the predicate's columns rename to exactly one
-    output name each.
-    """
+    """A candidate key that holds only over rows matching ``predicate`` (a
+    ``where``-scoped uniqueness test, or nullability's one-column NON_NULL claim).
+    Activation promotes it once a scope's row filter implies the predicate.
+    ``predicate`` is the filter parsed to atoms, as ``entails_atoms`` takes it."""
 
     key: Key
     predicate: frozenset[Canon]
@@ -209,20 +165,11 @@ class ConditionalKey:
 
 @dataclass(frozen=True, slots=True)
 class Input:
-    """What a resolved FROM/JOIN source contributes to a scope: its candidate
-    keys, its plain dependencies, its declared dependency instances, and its
-    carried conditional keys, each in the source's own output column names. A
-    base table resolves through the caller's ``base_resolve``; a CTE or inline
-    subquery resolves to its own nested scope's projected facts, which are
-    exactly this shape.
-
-    ``exact`` says whether this input's own derivation passed only through
-    operators the engine models exactly (see the module docstring for the
-    fragment) and every input *it* read was itself exact. A scope that mints
-    from an inexact input, or that itself contains an operator outside the
-    fragment, is inexact; the bit is the identity ``True`` everywhere else, so
-    a caller that never touches exactness sees no change in behavior.
-    """
+    """What one FROM/JOIN source contributes: keys, dependencies, declared
+    instances and conditional keys, in the source's own output names. A base table
+    comes from ``base_resolve``; a CTE or subquery is its nested scope's result.
+    ``exact`` is False if the derivation left the exact fragment anywhere
+    upstream."""
 
     keys: frozenset[Key] = frozenset()
     fds: frozenset[FD] = frozenset()
@@ -252,18 +199,9 @@ def scope_facts(
     base_resolve: BaseResolve,
     record: dict[int, Input] | None = None,
 ) -> Input:
-    """The closure-derived ``Input`` a SELECT or UNION scope projects.
-
-    Dispatches on shape: a SELECT mints the join algebra's qualified facts and
-    projects them; a UNION keeps the declared instances every arm shares (see
-    :func:`_union_facts`) plus a DISTINCT full-tuple key. INTERSECT, EXCEPT, and
-    every other shape prove nothing, the conservative default.
-
-    ``record``, when given, collects every SELECT/UNION scope's projected
-    ``Input`` keyed by ``id(node)`` as the walk reaches it, so a caller (a
-    detector needing a CTE's or inline subquery's own keys) can read an
-    intermediate scope's facts without a second walk over the same tree.
-    """
+    """The ``Input`` a SELECT or UNION scope projects. ``record``, when given,
+    collects every nested scope's result by ``id(node)`` for callers that need a
+    CTE's or subquery's own keys."""
     if isinstance(node, exp.Select):
         result = _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
     elif isinstance(node, exp.Union):
@@ -431,18 +369,11 @@ def _projection_is_exact(sel: exp.Select) -> bool:
 def _left_join_breakdown(
     on: Expr | None, *, alias: str, default_alias: str
 ) -> tuple[frozenset[str], frozenset[QCol]] | None:
-    """A LEFT join's ON decoded around the joined-in side ``alias``: its own
-    column names (``on_a``) and the qualified columns of everything it is
-    equated to (``on_l``), or ``None`` when the ON is not a pure conjunction of
-    column equalities each touching ``alias`` exactly once.
-
-    Built leaf by leaf from every equality directly (unlike
-    ``equality_cols_by_alias``, which requires one alias to appear in *every*
-    leaf), so the accumulated side's columns can be spread across several of
-    its own aliases (``ON l1.x = a.d1 AND l2.y = a.d2``): each leaf touches
-    ``a`` exactly once, so both contribute to ``on_l``, even though neither
-    ``l1`` nor ``l2`` is present in the other's leaf.
-    """
+    """A LEFT join's ON split around the joined-in ``alias``: its own columns
+    (``on_a``) and the qualified columns they are equated to (``on_l``). ``None``
+    unless every leaf is a column equality touching ``alias`` exactly once. Built
+    leaf by leaf so ``on_l`` may span several accumulated aliases
+    (``ON l1.x = a.d1 AND l2.y = a.d2``)."""
     if on is None:
         return None
     leaves = sg.conjunctive_leaves(on)
@@ -806,21 +737,11 @@ def _projection_by_name(sel: exp.Select, name: str) -> Expr | None:
 def _rownumber_facts(
     sel: exp.Select, *, from_node: Expr, from_alias: str
 ) -> tuple[frozenset[frozenset[QCol]], frozenset[Key]]:
-    """Keys the ``ROW_NUMBER() ... = 1`` dedup idiom introduces, split by where the window is
-    evaluated: ``(post_join, from_side)``.
-
-    A relation filtered to the first row per ``PARTITION BY c1..cn`` keeps one row per
-    partition, so ``{c1..cn}`` is a candidate key. The dedup guard lives in ``QUALIFY`` or an
-    outer ``WHERE``; the window is inline in that guard (``QUALIFY ROW_NUMBER() OVER (...) = 1``),
-    named by a projection of this SELECT (``QUALIFY rn = 1``), or named by a projection of the
-    FROM subquery the guard filters (``FROM (SELECT ..., ROW_NUMBER() ... AS rn FROM t) WHERE rn
-    = 1``). The first two see the post-join rows and land in ``post_join``, qualified to this
-    scope's own aliases; the subquery window is computed before the outer join, so its key is
-    only a key of the from relation and lands in ``from_side``, in the from relation's own
-    output names, for the caller to fold into the from input's keys and carry through join
-    preservation. A window projected but never filtered, and a partition-less window (the empty
-    key), ground nothing.
-    """
+    """Partition keys of ``ROW_NUMBER() ... = 1`` dedup guards in QUALIFY or WHERE,
+    as ``(post_join, from_side)``. A window inline in the guard or projected by this
+    SELECT ranks the post-join rows; one projected by the FROM subquery ranks that
+    subquery, so its key belongs to the from input. An unfiltered or
+    partition-less window grounds nothing."""
     guards: list[Expr] = []
     qualify = sg.qualify_of(sel)
     if qualify is not None and isinstance(qualify.this, Expr):
@@ -911,12 +832,10 @@ def _apply_group_by(
     declared_by_alias: Mapping[str, frozenset[DeclaredFD]],
     g_attrs: frozenset[Attr],
 ) -> tuple[set[QFD], dict[str, frozenset[DeclaredFD]], RowToken]:
-    """Replace the scope's fact set with the group-by algebra: FDs among the
-    group columns, constants for pinned group members, and a fresh token
-    ``r_g`` the group key determines and that determines each group column.
-    GROUP BY discards input row identity, so nothing else survives; a declared
-    instance survives only when every one of its (qualified) columns lies
-    within the group key."""
+    """The fact set after GROUP BY: dependencies and pins among the group columns,
+    plus a fresh group token the group key determines. Input row identity is gone,
+    so nothing else survives; a declared instance survives only inside the group
+    key."""
     pairs = tuple(facts)
     within: set[QFD] = {(det, dep) for det, dep in pairs if dep in g_attrs and det <= g_attrs}
     for g in g_attrs:
@@ -949,13 +868,9 @@ def _union_facts(
     base_resolve: BaseResolve,
     record: dict[int, Input] | None,
 ) -> Input:
-    """The union merge: keep exactly the declared instances every arm shares
-    after positional alignment (a union adds only cross pairs, so an arm-local
-    derived witness dies while a shared declared instance's grounding covers
-    them and survives). The DISTINCT key is computed independently, from the
-    first arm alone, so it survives even when nothing is shared to align.
-    Conditional keys drop: the arms may carry different predicates, so no
-    single carried key is sound across the merge."""
+    """The union merge: the declared instances every arm shares after positional
+    alignment (derived facts are arm-local and die), plus the DISTINCT full-tuple
+    key. Conditional keys drop, since arms may carry different predicates."""
     keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
@@ -1032,13 +947,9 @@ def _remap_declared(
 
 @dataclass(frozen=True, slots=True)
 class _Projection:
-    """The output-name mapping a SELECT projection induces. ``named`` maps a
-    bare-column projection's qualified source to the output name(s) it appears
-    under; ``computed`` are the names of expression projections; ``star_alias``
-    is set when a star appears over exactly one contributing input (the
-    identity rename); ``blocked`` when a star appears over more than one (a
-    join's output universe is then ambiguous, so the whole scope proves
-    nothing)."""
+    """A SELECT projection's output names: ``named`` per bare-column source,
+    ``computed`` for expressions, ``star_alias`` for a star over a single input,
+    ``blocked`` for a star over a join (ambiguous output universe)."""
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
@@ -1177,13 +1088,10 @@ def _cross_product_keys(
 def _validate_and_minimize(
     candidate: frozenset[Attr], pairs: Sequence[QFD], r_out: RowToken
 ) -> frozenset[Attr] | None:
-    """``candidate`` kept only if its closure reaches ``r_out``, then minimized
-    by dropping attributes (sorted, for a deterministic result) while the
-    closure still reaches it. Every emitted key is checked against the closure
-    before rewriting, so the candidate search is sound regardless of which
-    candidates it happens to try. A candidate whose columns are all pinned
-    (``WHERE id = 5`` on a relation keyed on ``id``) would minimize to nothing;
-    no consumer reads an empty key, so it keeps its unminimized form."""
+    """``candidate`` if its closure reaches ``r_out``, minimized by dropping
+    attributes in sorted order while it still does. A candidate whose columns are
+    all pinned would minimize to nothing; it keeps its unminimized form instead,
+    since no consumer reads an empty key."""
     if r_out not in closure(pairs, candidate):
         return None
     kept = set(candidate)
@@ -1201,14 +1109,10 @@ def _carry_predicate(
     classes: Mapping[Attr, frozenset[Attr]],
     proj: _Projection,
 ) -> frozenset[Canon] | None:
-    """Rename a conditional key's predicate through the scope's projection, or ``None`` if any
-    atom cannot be carried (its column does not survive, or the atom is opaque). All-or-nothing:
-    dropping one atom would weaken the predicate and let the key activate too readily, so the
-    whole conditional key drops instead.
-
-    A bare ``*`` over ``alias`` alone passes every column through under its own name, opaque
-    atoms included (an opaque atom has no column to look up, but its meaning is untouched by an
-    identity rename), so that case short-circuits the per-atom walk."""
+    """The predicate renamed through the projection, or ``None`` if any atom cannot
+    be (its column does not survive, or it is opaque); dropping an atom would weaken
+    the predicate. A star over ``alias`` alone is an identity rename, opaque atoms
+    included."""
     if proj.star_alias == alias:
         return predicate
     out: set[Canon] = set()
@@ -1232,15 +1136,9 @@ def _carry_conditional(
     classes: Mapping[Attr, frozenset[Attr]],
     proj: _Projection,
 ) -> frozenset[ConditionalKey]:
-    """Conditional keys carried through this scope, input by input.
-
-    An input's row is not multiplied into the output exactly when its row token's closure
-    reaches ``r_out`` (the same test a candidate key answers), so that is the soundness bar a
-    conditional key must clear too; a GROUP BY, a UNION, or a fanning-out join all fail it,
-    since none of them let a single input row determine the output row. The key's own columns
-    and the predicate's columns then have to survive the projection under one output name each,
-    reusing the same lookup a declared dependency renames through.
-    """
+    """Conditional keys carried through this scope. An input's key survives when
+    its row token's closure reaches ``r_out`` (its rows are not multiplied) and both
+    the key's and the predicate's columns survive the projection."""
     out: set[ConditionalKey] = set()
     for alias, cks in conditional_by_alias.items():
         if not cks or r_out not in closure(pairs, frozenset({RowToken(alias)})):
