@@ -1,35 +1,16 @@
-"""Checking a declared grain against the SQL that is supposed to produce it.
+"""Check a declared grain against the SQL that is supposed to produce it.
 
-A user who writes ``grain(per=order_id)`` is telling us the model has one row per
-order. Everything downstream takes that at its word. This module asks the one
-question nobody else asks: does this model's own SQL actually produce it?
+Downstream checks trust a declared grain. This one asks whether the model's own
+SQL establishes it. The comparison runs against the keys the SQL alone derives,
+recorded before the declaration is merged in; the merged set always contains the
+declaration, so comparing against it would let the declaration vouch for itself.
 
-Comparing against the keys we store for the model would answer yes every time,
-because a declared key is merged into what we know about a model as soon as it is
-read, so the declaration ends up checking itself. What we compare against instead
-is the set of keys the SQL alone implies, which the propagator records separately
-before the merge.
-
-Two rules keep the answer honest.
-
-*We report only when we can point at a specific finer key.* Failing to find the
-declared key among the derived ones is weak evidence, because key derivation gives
-up on SQL it cannot model and returns nothing rather than guessing. Treating "we
-found nothing" as "the grain is wrong" would flag a large share of real models. So
-we speak up only when the SQL demonstrably carries a *finer* key all the way to the
-output, one that keeps the rows the declared grain says are collapsed.
-
-*The SQL is allowed to be stricter than the declaration.* Unique per order is also
-unique per (order, region), and a declared dependency can close a gap the columns
-alone leave open, so we ask whether the declared columns cover a derived key through
-the functional-dependency closure rather than looking for an exact match. This is the
-same reasoning ``detect_join_fanout`` uses to decide a join key covers a key.
-
-Even when we do report, the SQL failing to guarantee the grain is not proof that the
-data breaks it: every order may happen to have exactly one line. So the finding says
-the grain is not established rather than violated, and it warns rather than errors.
-``docs/design/refutation-and-verdicts.md`` works through why that distinction holds
-for claims about rows.
+The finding fires only on positive evidence: a strictly finer key survives to the
+output. A declared key that is merely absent from the derived set is not evidence,
+because key derivation returns nothing for SQL it cannot model. Even when it fires,
+the data may still satisfy the grain (every order might have exactly one line), so
+the finding says "not established" rather than "violated" and warns rather than
+errors. ``docs/design/refutation-and-verdicts.md`` has the vocabulary.
 """
 
 from __future__ import annotations
@@ -54,26 +35,16 @@ from dblect.manifest import Manifest
 
 
 def grain_established(declared: Key, inferred: frozenset[Key], fds: FDSet) -> bool:
-    """Whether the SQL already gives us the declared grain.
-
-    It does when one of the keys it derives sits inside the declared columns, since
-    a table unique on some columns is also unique on any larger set of them: unique
-    per order means unique per (order, region). Declared dependencies widen what the
-    declared columns reach, so unique on (order_id, region) plus ``order_id ->
-    region`` counts as unique on (order_id) too. With no dependencies in play this
-    is plain containment."""
+    """True if the SQL establishes the declared grain: some derived key is a subset
+    of the declared columns, closed under ``fds``. Unique per order is also unique
+    per (order, region)."""
     return any(all(determines(fds, declared, col) for col in key) for key in inferred)
 
 
 def grain_witness(declared: Key, inferred: frozenset[Key]) -> Key | None:
-    """The finer key we can point at as evidence the grain is not met, if there is one.
-
-    A key counts as evidence only when it contains every declared column and at
-    least one more: the SQL is keeping rows apart that the declared grain says are
-    one row. A key that is merely different, say a key on ``line_id`` against a grain
-    of ``order_id``, tells us nothing about how many rows an order gets, so it is not
-    evidence. Returns the smallest such key, so the finding reads the same on every
-    run."""
+    """The smallest derived key that is a strict superset of the declared grain, or
+    ``None``. A disjoint key (``line_id`` against a grain of ``order_id``) says
+    nothing about rows per order, so it is not a witness."""
     finer = [key for key in inferred if declared < key]
     if not finer:
         return None
@@ -87,20 +58,13 @@ def declared_grain_findings(
     inferred: Mapping[SourceRef, Annotation[CandidateKeySet]],
     fd: Mapping[SourceRef, Annotation[FDSet]],
 ) -> list[CheckFinding]:
-    """One finding per declared grain this model's SQL does not deliver.
+    """One finding per declared grain the model's SQL does not establish.
 
-    ``key_facts`` holds every key a user declared, read from the same place the
-    propagation reads them so the two cannot disagree about what was claimed.
-    ``inferred`` holds the keys each model's SQL implies on its own, recorded before
-    declared keys were merged in.
-
-    A model missing from ``inferred`` has no SQL of its own to judge, a source or a
-    model that failed to build, and is passed over; the coverage report is what
-    surfaces the ones that failed to build. We also stay quiet when the keys we
-    derived rest on contradictory upstream declarations, since evidence drawn from a
-    known contradiction is not worth reporting. A model whose write path dedups on
-    its own (:func:`model_dedups_on_write`) is passed over entirely: its SELECT is
-    expected to carry finer rows than any key claimed on it, whoever claimed it.
+    ``key_facts`` is every declared key, from the same source propagation grounds
+    on. ``inferred`` is the pre-merge derived key set per relation. Skipped: models
+    absent from ``inferred`` (no SQL to judge), provisional derivations (they rest
+    on a contradiction), and models whose write path dedups on its own
+    (:func:`model_dedups_on_write`), whose SELECT is expected to carry finer rows.
     """
     out: list[CheckFinding] = []
     judged: set[tuple[SourceRef, Key]] = set()
@@ -136,15 +100,9 @@ def declared_grain_findings(
 
 
 def _judged_provenance(provenance: Provenance) -> bool:
-    """Whether a key from this source is a claim about what the SELECT itself
-    produces, deciding every kind we can receive.
-
-    A key someone wrote down, in a contract or a dbt test, is such a claim, so we
-    check it. A native warehouse constraint is enforced when the table is written
-    rather than by the query, and whether the warehouse really enforces it is #48's
-    question. A compile-time value is not an assertion about the query either; the
-    incremental-write exemption is decided per model, not by this provenance switch
-    (see ``model_dedups_on_write``)."""
+    """Whether a key from this source claims something about the SELECT itself. A
+    native constraint is enforced on write, not by the query (#48 covers the
+    unenforced case); a compile-time value is config, not an assertion."""
     match provenance:
         case Declared():
             return True

@@ -2,17 +2,11 @@
 # A contract method's ``self`` is a ContractSelf proxy at capture, not a real
 # instance; annotating it that way trips pyright's self-supertype rule while keeping
 # the proxy usage checked. Typed ``self`` in authored contracts is the stubs concern.
-"""Declaring a grain and running the real check over SQL that does or does not meet it.
+"""The grain check end to end, from a declared contract to the finding. The decision
+itself is checked against brute force in ``test_pbt_grain_established.py``.
 
-These follow a declared grain the whole way, from the contract a user writes to the
-finding that comes out, so they catch a break anywhere along that path. Whether the
-underlying decision is correct is settled separately, against brute force, in
-``test_pbt_grain_established.py``.
-
-The case worth protecting hardest is the first one. A declared key is merged into
-what we know about a model as soon as it is read, so an implementation that compares
-a declaration against the merged keys finds the declaration sitting there and reports
-nothing. That test fails against any such implementation.
+The first test is the one that matters most: an implementation that compares the
+declaration against the merged key set finds the declaration there and never fires.
 """
 
 from __future__ import annotations
@@ -43,8 +37,7 @@ _DUCKDB = profile_for_adapter("duckdb")
 
 _LINE_COLS = _cols(order_id="INT", line_number="INT", amount="DECIMAL")
 
-# A per-line leaf model: no FROM, so the relation walk infers nothing and its
-# declared compound key grounds it.
+# A per-line leaf model: no FROM, so only its declared compound key grounds it.
 _ORDER_LINES = _node(
     "model.shop.order_lines",
     sql="select 1 as order_id, 1 as line_number, 1.0 as amount",
@@ -70,10 +63,8 @@ def _grain_findings(report: CheckReport) -> list[CheckFinding]:
 
 def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None:
     # fct_orders declares one row per order but selects from the per-line model
-    # without collapsing, so the finer key (order_id, line_number) survives to its
-    # output: the witnessed defeater, and the case an emitter reading the flow value
-    # would miss. The downstream consumer pins where the finding lands: at the model
-    # whose grain is unestablished, not at the sum that eventually trips over it.
+    # without collapsing. The consumer pins where the finding lands: at fct_orders,
+    # not at the sum downstream.
     _declare_order_lines_key()
 
     class FctOrders(ModelContract):
@@ -101,8 +92,7 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
     assert "not established" in message
     assert "order_id" in message
     assert "line_number" in message
-    # Honesty of grade: the construction fails to establish the grain; the data may
-    # still satisfy it, so the finding never claims a violation.
+    # The data may still satisfy the grain, so the finding never claims a violation.
     assert "violat" not in message.lower()
 
 
@@ -110,8 +100,7 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
 
 
 def test_a_collapse_to_the_declared_grain_is_established_and_silent() -> None:
-    # The same declaration over SQL that aggregates to the declared grain: the
-    # GROUP BY re-derives the key, so the entailment holds and nothing fires.
+    # The GROUP BY re-derives the declared key.
     _declare_order_lines_key()
 
     class FctOrders(ModelContract):
@@ -131,10 +120,8 @@ def test_a_collapse_to_the_declared_grain_is_established_and_silent() -> None:
 
 
 def test_coverage_runs_through_the_fd_closure() -> None:
-    # The surviving key is (order_id, region), strictly finer than the declared
-    # grain (order_id); but a declared ``order_id determines region`` closes the
-    # gap: unique on (order_id, region) plus the dependency is unique on (order_id),
-    # so the grain is established and nothing fires.
+    # The derived key is (order_id, region); the declared ``order_id -> region``
+    # closes it to (order_id).
     class OrderRegions(ModelContract):
         dbt_model = "order_regions"
 
@@ -171,10 +158,8 @@ def test_coverage_runs_through_the_fd_closure() -> None:
 
 
 def test_absence_of_any_inferred_key_is_not_a_witness() -> None:
-    # The upstream relation declares no key, so the walk infers nothing for
-    # fct_orders: the declared grain is neither re-derived nor defeated. Firing here
-    # would flag every model whose upstream declares nothing; the emitter must
-    # require a witnessed defeater, not an absent proof.
+    # No upstream key, so nothing is derived for fct_orders: neither established
+    # nor defeated. Firing here would flag every model whose upstream declares nothing.
     class FctOrders(ModelContract):
         dbt_model = "fct_orders"
 
@@ -192,11 +177,8 @@ def test_absence_of_any_inferred_key_is_not_a_witness() -> None:
 
 
 def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
-    # A source carries no SQL of its own, so the walk derives nothing for it and it
-    # is absent from the record entirely. There is no entailment to judge, and the
-    # emitter has to pass over it rather than reach for a value never recorded. A
-    # ``unique`` test on a source is ordinary in a dbt project, so this is the shape
-    # that would crash a whole run.
+    # A source has no SQL, so it is absent from the derived record. A ``unique`` test
+    # on a source is ordinary, so this shape must not crash the run.
     orders = _source("source.shop.raw.orders", columns=_cols(order_id="INT", amount="DECIMAL"))
     unique_test = _node(
         "test.shop.unique_orders_order_id",
@@ -218,10 +200,8 @@ def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
 
 @pytest.mark.xfail(strict=True, reason="the emitter needs the walk's exactness record")
 def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
-    # A correlated subquery picking each order's max line collapses the per-line
-    # relation to one row per order just as surely as a GROUP BY would, but the walk
-    # has no exactness record for this shape yet, so the finer key still looks like
-    # it survives. This pins the gap rather than hiding it.
+    # The correlated subquery collapses to one row per order, but the derivation is
+    # not exact for this shape, so the finer key still appears to survive.
     _declare_order_lines_key()
 
     class TopLine(ModelContract):
@@ -246,16 +226,11 @@ def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
 
 # --- declaration channels: every case of the closed provenance type decided ---------
 #
-# The contract channel's fire case is the drift test above; the table here covers the
-# rest. A dbt ``unique`` test is judged like a contract grain (provenance carries no
-# authority ordering), and it is the only other channel that fires. A ``where``-filtered
-# test claims uniqueness only over a row filter, so it is activation's business, not a
-# grain claim about the whole output. A native constraint is discharged (or not) by the
-# warehouse's write path; the advisory-unenforced case is the unenforced-constraint
-# finding's (#48). A deduplicating incremental's ``unique_key`` is enforced by the merge
-# on write, so the SELECT is expected to carry finer rows (the incremental-grain
-# stream, #7); a ``unique`` test riding on that same model is exempt too, since the
-# exemption is a property of the model's write path, not of which channel stated the key.
+# The contract channel fires in the first test; this table covers the rest. A dbt
+# ``unique`` test is judged like a contract grain. A ``where``-filtered test is a claim
+# over a row filter, owned by activation. A native constraint is the warehouse's to
+# enforce (#48). A deduplicating incremental's ``unique_key`` is enforced on write (#7),
+# and so is any other key declared on that model.
 
 
 def _unique_test_node(*, where: str | None) -> Node:

@@ -373,13 +373,9 @@ def native_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKe
 
 
 def model_dedups_on_write(config: ModelConfig | None, profile: AdapterProfile) -> bool:
-    """Whether this model's write path collapses duplicates on ``unique_key`` on its
-    own, independent of whatever a key declaration on the model claims.
-
-    True only for an incremental materialization whose effective strategy is one
-    that dedups: the write does the collapsing, so the SELECT is expected to carry
-    finer rows than the key, and no declaration channel on this model (a dbt test,
-    a contract, the config itself) is evidence the SELECT establishes the grain."""
+    """True if the model's write path dedups on ``unique_key``: an incremental
+    materialization under a deduplicating strategy. Its SELECT is expected to carry
+    finer rows than the key."""
     if config is None or not config.unique_key:
         return False
     if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
@@ -1309,15 +1305,10 @@ def uniqueness_facts(
     extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
 ) -> Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]:
-    """Every key the project declares, collected per relation.
-
-    Reads each way a dbt project can state one: ``unique`` and
-    ``unique_combination_of_columns`` tests, native PRIMARY KEY and UNIQUE
-    constraints, the ``unique_key`` of an incremental model whose strategy actually
-    deduplicates, and a key stated on a surrogate hash (which also tells us the
-    columns hashed into it). ``extra`` adds more readers. ``extra_facts`` takes keys
-    the caller already has in hand, which is how the check passes in keys declared in
-    Python contracts without resolving those contracts a second time."""
+    """Every declared key, collected per relation: ``unique`` and
+    ``unique_combination_of_columns`` tests, native constraints, a deduplicating
+    incremental's ``unique_key``, and surrogate-hash keys. ``extra`` adds readers;
+    ``extra_facts`` adds keys the caller already resolved (Python contracts)."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
@@ -1343,10 +1334,7 @@ def uniqueness_property_from_facts(
     facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
 ) -> Property[CandidateKeySet, SourceRef]:
     """The uniqueness property grounded from ``facts``. Declared and inferred keys
-    both hold, so they compose by meet (``reconcile_by_meet``); no opaque opt-out
-    reader is wired yet, so the opaque set is empty. The property carries its
-    relation-algebra walk as ``reducer`` so the propagator dispatches it without a
-    global registry."""
+    both hold, so they compose by meet."""
     return relation_property(
         name="uniqueness",
         lattice=UNIQUENESS_LATTICE,
@@ -1366,11 +1354,8 @@ def uniqueness_property(
     parsed: Mapping[str, Expr] | None = None,
 ) -> Property[CandidateKeySet, SourceRef]:
     """The manifest-backed uniqueness property: :func:`uniqueness_facts` grounds
-    each relation and the relation reducer infers more from the SQL.
-
-    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
-    and dedup semantics, and carries any ``--dialect`` override so grammar and
-    semantics stay coherent."""
+    each relation and the reducer infers more from the SQL. ``profile`` fixes the
+    adapter's enforcement and dedup semantics."""
     return uniqueness_property_from_facts(
         uniqueness_facts(manifest, profile, extra=extra, parsed=parsed)
     )

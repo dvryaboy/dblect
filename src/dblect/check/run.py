@@ -112,10 +112,8 @@ class CheckGraphs:
     the graph build keeps it in step with the graph instead of resting on the assumption
     that successive worlds share one."""
     uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
-    """Every key declared for a relation, however it was declared: dbt tests, native
-    constraints, incremental config, and the keys resolved from Python contracts. The
-    same values feed the uniqueness propagation and the grain check, so the two cannot
-    disagree about what a user claimed."""
+    """Every declared key per relation, from every channel. Feeds both the uniqueness
+    propagation and the grain check, so the two agree on what was claimed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,14 +142,12 @@ class WorldAnnotations:
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
     coherence_clears: tuple[CoherenceClear[DomainTag], ...]
     functional_dependency: Mapping[SourceRef, Annotation[FDSet]]
-    """What each relation's functional dependencies came out as, kept so a consumer
-    that needs them (the grain check reads them to widen what a declared grain
-    covers) does not propagate the property a second time."""
+    """Per-relation functional dependencies, kept so the grain check need not
+    propagate them again."""
     uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]]
-    """The candidate keys each relation's SQL implies on its own, recorded before the
-    declared keys were folded in. This is what the grain check compares a declaration
-    against; the combined value cannot serve, because the declaration is part of it
-    and would end up vouching for itself."""
+    """Per-relation keys derived from the SQL alone, before declared keys are merged
+    in. The grain check compares declarations against this; the merged value would
+    contain the declaration itself."""
 
 
 def build_check_graphs(

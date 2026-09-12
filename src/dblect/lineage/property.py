@@ -120,16 +120,10 @@ def propagate(
     the shared graph, so one ``sink`` belongs to one world's run. ``None`` skips
     that bookkeeping and just returns the computed value.
 
-    ``inferred_sink``, when supplied, keeps what the SQL alone implied about each
-    node, before anything the user declared was folded in. Normally the two are
-    combined and only the combined value is kept, which is right for propagation but
-    leaves no way to ask whether the SQL supports a declaration: for a property whose
-    declared and derived values are both true and simply accumulate (candidate keys
-    are the case in hand), the declaration is part of the combined value, so checking
-    a declaration against it always succeeds. Keeping the derived value separately is
-    what lets a caller ask the question. Nodes with nothing to derive from, a source
-    or a node the modeller marked opaque, are absent rather than recorded empty.
-    ``refutation-and-verdicts.md`` covers what a caller can then conclude.
+    ``inferred_sink``, when supplied, records each node's inferred annotation before
+    reconciliation with the grounded one. Under ``reconcile_by_meet`` the flow value
+    contains the declaration, so this is the only way to ask whether the SQL supports
+    it. Leaves and opted-out nodes are absent, not recorded empty.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
