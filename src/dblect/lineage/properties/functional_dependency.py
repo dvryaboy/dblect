@@ -59,75 +59,23 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.facts.property import DepContext, Property, PropertyRef, relation_property
 from dblect.lineage.graph import SourceRef, source_ref_meta
-from dblect.lineage.properties.predicate_flow import explicit_rename, has_star
-from dblect.lineage.properties.uniqueness import CandidateKeySet, Key
-from dblect.sql import _sqlglot as sg
+from dblect.lineage.properties.scope_closure import (
+    EMPTY_INPUT,
+    FD,
+    DeclaredFD,
+    Input,
+    Key,
+    closure,
+    scope_facts,
+)
+from dblect.lineage.properties.uniqueness import CandidateKeySet
 
 # --- the value type ------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class FD:
-    """One dependency over a relation's output column names, in canonical
-    single-dependent form (``X -> yz`` splits into ``X -> y`` and ``X -> z``).
-    Names are case-folded to match the graph. An empty determinant says the
-    dependent is constant over the whole relation, the strongest claim."""
-
-    determinant: frozenset[str]
-    dependent: str
-
-
-@dataclass(frozen=True, slots=True)
-class DeclaredFD:
-    """A declared dependency's live instance in one relation.
-
-    ``origin`` and ``declared`` name the axiom: the relation the dependency was
-    declared about, and the dependency in that relation's column names.
-    ``binding`` maps each declared column to the output column now carrying its
-    value, one pair per declared column, maintained as the walk climbs. The
-    per-column form is what a union merge compares: origin alone is not enough
-    (one relation can declare two dependencies that arms rename onto the same
-    output columns), and a renamed dependency is not either, because it forgets
-    which declared column feeds which output, so arms crossing the columns of a
-    multi-column determinant would look identical while running the axiom two
-    different ways."""
-
-    origin: SourceRef
-    declared: FD
-    binding: frozenset[tuple[str, str]]
-
-    def __post_init__(self) -> None:
-        cols = self.declared.determinant | {self.declared.dependent}
-        if frozenset(c for c, _ in self.binding) != cols or len(self.binding) != len(cols):
-            raise ValueError(f"binding must map exactly the declared columns {sorted(cols)}")
-
-    @staticmethod
-    def identity(origin: SourceRef, declared: FD) -> DeclaredFD:
-        """The instance at its declaring relation: every column bound to itself."""
-        cols = declared.determinant | {declared.dependent}
-        return DeclaredFD(origin, declared, frozenset((c, c) for c in cols))
-
-    @property
-    def fd(self) -> FD:
-        """The dependency under the current relation's output names."""
-        current = dict(self.binding)
-        return FD(
-            frozenset(current[c] for c in self.declared.determinant),
-            current[self.declared.dependent],
-        )
-
-    def renamed(self, lookup: Callable[[str], tuple[str, ...] | None]) -> DeclaredFD | None:
-        """The instance carried through a projection: each bound column renamed to
-        one of the output names ``lookup`` gives it, or ``None`` when a column does
-        not survive. One output name per column suffices (copies of a column carry
-        equal values), picked stably."""
-        bound: set[tuple[str, str]] = set()
-        for declared_col, current in self.binding:
-            names = lookup(current)
-            if not names:
-                return None
-            bound.add((declared_col, min(names)))
-        return replace(self, binding=frozenset(bound))
+#
+# ``FD`` and ``DeclaredFD`` live in ``scope_closure.py``: the engine builds and
+# carries them directly (they describe one resolved input's own dependencies,
+# the shape its projection step produces), and this module imports them back
+# for its lattice and public API.
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,21 +145,15 @@ FUNCTIONAL_DEPENDENCY_LATTICE: Lattice[FDSet] = Lattice(
 
 def determines(value: FDSet, given: frozenset[str], target: str) -> bool:
     """Whether ``value`` entails ``given -> target``: attribute closure under
-    Armstrong's axioms (sound and complete for FD entailment). The bottom sentinel
-    entails everything, and a target inside ``given`` holds by reflexivity."""
+    Armstrong's axioms (sound and complete for FD entailment), the same generic
+    closure the scope-closure engine runs. The bottom sentinel entails
+    everything, and a target inside ``given`` holds by reflexivity."""
     if target in given:
         return True
     if value.is_bottom:
         return True
-    closure = set(given)
-    changed = True
-    while changed:
-        changed = False
-        for fd in value.fds:
-            if fd.dependent not in closure and fd.determinant <= closure:
-                closure.add(fd.dependent)
-                changed = True
-    return target in closure
+    pairs = tuple((fd.determinant, fd.dependent) for fd in value.fds)
+    return target in closure(pairs, given)
 
 
 def minimal_cover(value: FDSet, cols: frozenset[str]) -> frozenset[str]:
@@ -285,425 +227,6 @@ def functional_dependency_grounded_scopes(
     return grounded_scopes(_lifted(facts), opaque, FUNCTIONAL_DEPENDENCY_LATTICE)
 
 
-# --- the relation reducer --------------------------------------------------------
-#
-# The relation-algebra walk for dependencies, the same shape as the predicate-flow
-# walk: single-source scopes carry, rename through the projection, and every shape
-# outside the modelled fragment drops to the empty set rather than over-claiming.
-# The walk's value is an FDSet whose declared instances ride along under exactly
-# the same renames and cuts as the plain dependencies, so the two can never drift.
-
-
-@dataclass(frozen=True, slots=True)
-class _Base:
-    """What a resolved FROM source contributes: its dependency value (in its
-    output column names) and, for a base table with the uniqueness edge live, its
-    candidate keys (each of which determines the columns read alongside it)."""
-
-    value: FDSet
-    keys: frozenset[Key] = frozenset()
-
-
-_NOTHING: _Base = _Base(NO_FDS)
-
-# Resolves a base (non-CTE) table reference to what it contributes. The reducer's
-# implementation recurses through the shared propagator via the table's stamped
-# SourceRef, so declarations and the provisional taint flow across models.
-_BaseResolve = Callable[["exp.Table"], _Base]
-
-
-class _FdWalk:
-    """Bottom-up dependency inference over one relational tree.
-
-    ``base_resolve`` resolves a base table; CTEs and inline subqueries are
-    resolved structurally within the walk. Single-source scopes carry fully; a
-    join carries its kept sides (see :meth:`_join_select`); a UNION keeps the
-    declared instances every arm shares and nothing else (see :meth:`_union`);
-    and an unmodellable group shape (positional or computed group keys) drops the
-    scope's dependencies entirely.
-    """
-
-    def __init__(self, base_resolve: _BaseResolve) -> None:
-        self._base_resolve = base_resolve
-
-    def scope_fds(self, node: Expr, *, cte_scope: Mapping[str, FDSet]) -> FDSet:
-        if isinstance(node, exp.Select):
-            return self._select(node, cte_scope=cte_scope)
-        if isinstance(node, exp.Union):
-            return self._union(node, cte_scope=cte_scope)
-        # INTERSECT and EXCEPT keep a subset of one arm's rows, which cannot break
-        # a dependency; they still claim nothing (carrying the covering arm is a
-        # possible refinement, not the current contract), and so does every other
-        # unmodelled shape.
-        return NO_FDS
-
-    def _with_scope(self, node: Expr, cte_scope: Mapping[str, FDSet]) -> dict[str, FDSet]:
-        return sg.with_scope(node, cte_scope, lambda n, s: self.scope_fds(n, cte_scope=s))
-
-    def _union(self, u: exp.Union, *, cte_scope: Mapping[str, FDSet]) -> FDSet:
-        """The union merge: keep exactly the declared instances every arm shares.
-
-        A union adds the cross pairs, one row from each arm, so survival is a
-        coverage question. Every derived dependency's witness is arm-local and
-        dies. A declared instance carried by every arm from one declaration, with
-        the same column binding once the arms are lined up by position under the
-        first arm's names (as SQL merges them), draws every merged row's pair from
-        that one world, so the cross pairs are covered and the instance survives
-        whole. UNION and UNION ALL merge alike (the dedup only removes rows). A
-        merge by name, or an arm without positionally nameable outputs (a star, a
-        duplicated name, not a plain SELECT), leaves nothing to line up. The arms'
-        names are checked before any arm is walked, and the walk stops at the
-        first empty intersection, so a merge that cannot keep anything skips the
-        recursion it would not use."""
-        arms = sg.union_arms(u)
-        if arms is None:
-            return NO_FDS
-        names = [_positional_outputs(arm) for arm in arms]
-        first = names[0] if names else None
-        if first is None or any(n is None or len(n) != len(first) for n in names):
-            return NO_FDS
-        local = self._with_scope(u, cte_scope)
-        shared: frozenset[DeclaredFD] | None = None
-        for arm_names, arm in zip(names, arms, strict=True):
-            assert arm_names is not None
-            rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
-            aligned = _remap_declared(self.scope_fds(arm, cte_scope=local).declared, rename)
-            shared = aligned if shared is None else shared & aligned
-            if not shared:
-                return NO_FDS
-        assert shared is not None
-        return FDSet(frozenset(inst.fd for inst in shared), shared)
-
-    def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, FDSet]) -> FDSet:
-        local = self._with_scope(sel, cte_scope)
-
-        from_ = sg.from_of(sel)
-        if from_ is None or not isinstance(from_.this, Expr):
-            return NO_FDS
-        joins = sg.joins_of(sel)
-        if joins:
-            return self._join_select(sel, from_.this, joins, cte_scope=local)
-        base = self._resolve_source(from_.this, cte_scope=local)
-        if base is None:
-            return NO_FDS
-        carried = base.value.fds
-        declared = base.value.declared
-
-        # A dependency is universally quantified over row pairs, and a WHERE only
-        # removes pairs, so everything carries; an equality filter additionally pins
-        # its column constant, the empty-determinant dependency.
-        where = sg.where_of(sel)
-        if where is not None and isinstance(where.this, Expr):
-            carried = carried | {
-                FD(frozenset(), sg.column_name(col).lower())
-                for col in sg.equality_literal_columns(where.this)
-            }
-
-        star = has_star(sel)
-        rename = explicit_rename(sel)
-
-        # A relation unique on K admits one row per K value, so K determines every
-        # column this scope reads from it. Minted only over named projections: under
-        # a bare star the column universe is unknown.
-        for key in base.keys:
-            carried = carried | {FD(key, dep) for dep in rename if dep not in key}
-
-        group = sg.group_of(sel)
-        group_names: frozenset[str] | None = None
-        if group is not None and group.expressions:
-            group_names = _group_columns(sel)
-            if group_names is None:
-                return NO_FDS  # unmodellable group shape: prove nothing
-            # Grouping aggregates everything outside the group key away, so only a
-            # dependency lying entirely within it still describes the output rows.
-            # The group rows' pairs are a subset of the input's, so an instance
-            # inside the key keeps its grounding: one survival rule, applied to the
-            # plain set and then read back for the instances.
-            carried = _within(carried, group_names)
-            declared = frozenset(inst for inst in declared if inst.fd in carried)
-
-        out = carried if star else _remap(carried, rename)
-        out_declared = declared if star else _remap_declared(declared, rename)
-        if group_names is not None:
-            group_out = group_names if star else _remap_columns(group_names, rename)
-            if group_out is not None:
-                # The group key is a key of the grouped result (one row per group),
-                # so it determines every named output.
-                out = out | {
-                    FD(group_out, name) for name in _named_outputs(sel) if name not in group_out
-                }
-        return FDSet(out, out_declared)
-
-    def _resolve_source(self, node: Expr, *, cte_scope: Mapping[str, FDSet]) -> _Base | None:
-        if isinstance(node, exp.Table):
-            if node.name in cte_scope:
-                return _Base(cte_scope[node.name])
-            return self._base_resolve(node)
-        if isinstance(node, exp.Subquery):
-            inner = node.this
-            if not isinstance(inner, Expr):
-                return None
-            return _Base(self.scope_fds(inner, cte_scope=cte_scope))
-        return None
-
-    def _join_select(
-        self,
-        sel: exp.Select,
-        from_node: Expr,
-        joins: list[exp.Join],
-        *,
-        cte_scope: Mapping[str, FDSet],
-    ) -> FDSet:
-        """Dependencies a join carries to the projection.
-
-        An FD that holds on a joined relation holds on the join wherever that side's
-        rows come through un-padded: two output rows agreeing on its determinant come
-        from that relation's rows agreeing on it, and a join only filters or duplicates
-        such rows (a duplicate still agrees on the dependent). So each kept side's
-        dependencies carry, an inner join's ``ON`` equalities add a mutual determination
-        between the joined columns, and an equality filter pins its column. A kept
-        side's declared instances carry the same way, since its pairs are still the
-        declared world's pairs, at worst duplicated. Everything is tracked qualified
-        by source alias (a join can expose two ``country`` columns), then projected
-        onto the output names.
-
-        Padding is what breaks an FD: an outer join fills its optional side with NULL
-        on unmatched rows, so a padded side's dependencies are dropped (until the NULL
-        semantics are worked through) and an ``ON`` equality is minted only while both
-        its columns stay on kept sides. The padded sides mirror nullability's taint:
-        LEFT pads the joined-in side, RIGHT pads the accumulated left, FULL pads both,
-        INNER and CROSS pad nothing (a cross join only duplicates rows). Aggregation
-        over a join is deferred (the FD scope a downstream guard would read is not a
-        single source), and a candidate-key-derived dependency is not minted across a
-        join (sound to omit; the key path stays single-source for now)."""
-        group = sg.group_of(sel)
-        if group is not None and group.expressions:
-            return NO_FDS
-
-        sources: list[tuple[str, _Base]] = []
-        for node in (from_node, *(j.this for j in joins)):
-            if not isinstance(node, Expr):
-                return NO_FDS
-            base = self._resolve_source(node, cte_scope=cte_scope)
-            if base is None:
-                return NO_FDS
-            sources.append((node.alias_or_name.lower(), base))
-
-        aliases = [alias for alias, _ in sources]
-        padded: set[str] = set()
-        for i, j in enumerate(joins, start=1):
-            side = sg.join_side_of(j)
-            if side is sg.JoinSide.LEFT:
-                padded.add(aliases[i])
-            elif side is sg.JoinSide.RIGHT:
-                padded.update(aliases[:i])
-            elif side is sg.JoinSide.FULL:
-                padded.add(aliases[i])
-                padded.update(aliases[:i])
-
-        qrename, star = _qualified_rename(sel)
-        if star:
-            return NO_FDS  # a star over a join leaves the output universe ambiguous
-
-        qfds: set[tuple[frozenset[_QCol], _QCol]] = set()
-        declared_out: set[DeclaredFD] = set()
-        for alias, base in sources:
-            if alias in padded:
-                continue
-            for fd in base.value.fds:
-                qfds.add((frozenset((alias, d) for d in fd.determinant), (alias, fd.dependent)))
-            for inst in base.value.declared:
-                carried = inst.renamed(lambda cur, alias=alias: qrename.get((alias, cur)))
-                if carried is not None:
-                    declared_out.add(carried)
-        for j in joins:
-            if sg.join_side_of(j) is not sg.JoinSide.INNER:
-                continue
-            on = sg.on_of(j)
-            if on is None:
-                continue
-            for left, right in sg.equality_column_pairs(on):
-                ql, qr = _qcol(left), _qcol(right)
-                if ql is None or qr is None or ql[0] in padded or qr[0] in padded:
-                    continue
-                qfds.add((frozenset({ql}), qr))
-                qfds.add((frozenset({qr}), ql))
-        where = sg.where_of(sel)
-        if where is not None and isinstance(where.this, Expr):
-            for col in sg.equality_literal_columns(where.this):
-                qc = _qcol(col)
-                if qc is not None:
-                    qfds.add((frozenset(), qc))
-
-        return FDSet(_project_qualified(qfds, qrename), frozenset(declared_out))
-
-
-def _group_columns(sel: exp.Select) -> frozenset[str] | None:
-    """The group key as case-folded input column names, or ``None`` for a shape we cannot name
-    (an expression group key).
-
-    Targets are read through :attr:`sg.GroupTarget.grounded_expression`, so ``GROUP BY 1`` names
-    the same columns its spelled-out form would. The dependencies minted below say the group key
-    determines every output, which is a key claim in FD clothing, so the same fallback applies:
-    a binding the AST cannot decide stays at the column name the query wrote.
-    """
-    out: set[str] = set()
-    for target in sg.group_targets(sel):
-        g = target.grounded_expression
-        if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
-            return None
-        out.add(sg.column_name(g).lower())
-    return frozenset(out)
-
-
-def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
-    """An arm's output column names in projection order, or ``None`` when they
-    cannot be lined up positionally (a star, a duplicated name, not a SELECT)."""
-    if not isinstance(arm, exp.Select):
-        return None
-    names: list[str] = []
-    for proj in arm.expressions:
-        if isinstance(proj, exp.Star):
-            return None
-        inner = proj.this if isinstance(proj, exp.Alias) else proj
-        if isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star):
-            return None
-        names.append(proj.alias_or_name.lower())
-    if len(set(names)) != len(names):
-        return None
-    return tuple(names)
-
-
-def _within(fds: frozenset[FD], columns: frozenset[str]) -> frozenset[FD]:
-    """The dependencies mentioning only ``columns``."""
-    return frozenset(fd for fd in fds if fd.determinant | {fd.dependent} <= columns)
-
-
-def _remap(fds: frozenset[FD], rename: Mapping[str, tuple[str, ...]]) -> frozenset[FD]:
-    """Rename each dependency onto the projection's output names, dropping any whose
-    columns do not all survive."""
-    out: set[FD] = set()
-    for fd in fds:
-        renamed = _remap_one(fd, rename)
-        if renamed is not None:
-            out.add(renamed)
-    return frozenset(out)
-
-
-def _remap_declared(
-    instances: frozenset[DeclaredFD], rename: Mapping[str, tuple[str, ...]]
-) -> frozenset[DeclaredFD]:
-    """Rename each instance's binding by the same survival rules as
-    :func:`_remap`, keeping its grounding; an instance whose columns do not all
-    survive drops with them."""
-    return frozenset(
-        carried for inst in instances if (carried := inst.renamed(rename.get)) is not None
-    )
-
-
-def _remap_one(fd: FD, rename: Mapping[str, tuple[str, ...]]) -> FD | None:
-    """One dependency renamed onto the projection's output names, or ``None`` when
-    a column does not survive. One output name per input column suffices (copies of
-    a column carry equal values), picked stably."""
-    determinant = _remap_columns(fd.determinant, rename)
-    dependent = rename.get(fd.dependent)
-    if determinant is None or not dependent:
-        return None
-    return FD(determinant, min(dependent))
-
-
-def _remap_columns(
-    columns: frozenset[str], rename: Mapping[str, tuple[str, ...]]
-) -> frozenset[str] | None:
-    out: set[str] = set()
-    for col in columns:
-        names = rename.get(col)
-        if not names:
-            return None
-        out.add(min(names))
-    return frozenset(out)
-
-
-def _named_outputs(sel: exp.Select) -> frozenset[str]:
-    """Every output column the projection names: bare columns and aliases, computed
-    projections included (an aggregate's alias is exactly what a group key
-    determines). Unnamed shapes contribute nothing."""
-    names: set[str] = set()
-    for proj in sel.expressions:
-        if isinstance(proj, exp.Alias):
-            names.add(proj.alias_or_name.lower())
-        elif isinstance(proj, exp.Column) and not isinstance(proj.this, exp.Star):
-            names.add(sg.column_name(proj).lower())
-    return frozenset(names)
-
-
-# --- qualified projection (the join case) ----------------------------------------
-#
-# A join can expose two columns of the same name (``payments.country`` and
-# ``customers.country``), so dependencies under a join are tracked qualified by source
-# alias, ``(alias, column)``, and projected onto bare output names only at the end.
-
-_QCol = tuple[str, str]
-
-
-def _qcol(col: exp.Column) -> _QCol | None:
-    """A column as ``(alias, name)``, or ``None`` when it carries no table qualifier
-    (ambiguous under a join, so not attributable to a side)."""
-    table = sg.column_table(col)
-    if not table:
-        return None
-    return (table.lower(), sg.column_name(col).lower())
-
-
-def _qualified_rename(sel: exp.Select) -> tuple[dict[_QCol, tuple[str, ...]], bool]:
-    """Map each qualified input column to the output names it appears under, plus a flag
-    for a star (which leaves the output universe ambiguous over a join). Computed
-    projections carry no source column through and contribute nothing."""
-    out: dict[_QCol, list[str]] = {}
-    star = False
-    for proj in sel.expressions:
-        if isinstance(proj, exp.Star):
-            star = True
-            continue
-        inner = proj.this if isinstance(proj, exp.Alias) else proj
-        if isinstance(inner, exp.Column):
-            if isinstance(inner.this, exp.Star):  # ``alias.*``
-                star = True
-                continue
-            qc = _qcol(inner)
-            if qc is not None:
-                out.setdefault(qc, []).append(proj.alias_or_name.lower())
-    return {qc: tuple(names) for qc, names in out.items()}, star
-
-
-def _project_one(
-    determinant: frozenset[_QCol], dependent: _QCol, rename: Mapping[_QCol, tuple[str, ...]]
-) -> FD | None:
-    """One qualified dependency projected onto the output names, or ``None`` when a
-    column does not survive. One output name per column suffices (copies carry
-    equal values), picked stably."""
-    dep_names = rename.get(dependent)
-    if not dep_names:
-        return None
-    det_names = [rename.get(d) for d in determinant]
-    if any(names is None for names in det_names):
-        return None
-    return FD(frozenset(min(names) for names in det_names if names is not None), min(dep_names))
-
-
-def _project_qualified(
-    qfds: set[tuple[frozenset[_QCol], _QCol]], rename: Mapping[_QCol, tuple[str, ...]]
-) -> frozenset[FD]:
-    """Rename each qualified dependency onto the projection's output names, dropping any
-    whose columns do not all survive."""
-    out: set[FD] = set()
-    for determinant, dependent in qfds:
-        fd = _project_one(determinant, dependent, rename)
-        if fd is not None:
-            out.add(fd)
-    return frozenset(out)
-
-
 # --- the property ------------------------------------------------------------
 
 
@@ -717,7 +240,13 @@ def functional_dependency_property(
     source). Declared and inferred dependencies both hold, so they compose by meet
     (``reconcile_by_meet``), exactly as uniqueness composes keys. Passing the
     uniqueness property's ref switches on the key-derived source and declares the
-    dependency edge the registry orders by."""
+    dependency edge the registry orders by.
+
+    The reducer builds the scope-closure engine's ``Input`` for each base table
+    (its dependencies from ``recurse``, its keys from the uniqueness edge when
+    it is wired) and reads the engine's projected dependencies back; the engine
+    also derives keys, which the uniqueness reducer reads once it carries its
+    own walk on the same engine."""
 
     def reduce_(
         deriv: Expr,
@@ -729,11 +258,11 @@ def functional_dependency_property(
     ) -> Annotation[FDSet]:
         provisional = False
 
-        def base_resolve(table: exp.Table) -> _Base:
+        def base_resolve(table: exp.Table) -> Input:
             nonlocal provisional
             ref = source_ref_meta(table)
             if ref is None:
-                return _NOTHING
+                return EMPTY_INPUT
             ann = recurse(ref)
             provisional = provisional or ann.provisional
             keys: frozenset[Key] = frozenset()
@@ -742,10 +271,17 @@ def functional_dependency_property(
                 if key_ann is not None:
                     keys = key_ann.value.keys
             # The bottom sentinel carries no dependencies to walk with; strip it to
-            # the plain sets here, exactly as the set-valued walk always has.
-            return _Base(FDSet(ann.value.fds, ann.value.declared), keys)
+            # the plain sets here, exactly as the walk always has.
+            return Input(keys, ann.value.fds, ann.value.declared)
 
-        value = _FdWalk(base_resolve).scope_fds(deriv, cte_scope={})
+        resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
+        # A declared instance's own dependency joins the plain set explicitly: the
+        # engine may separately derive a strictly stronger simplification (a
+        # constant determinant stripped to the empty one), which leaves the
+        # instance's own, unsimplified form absent from ``fds`` on its own. Both
+        # are sound; ``FDSet`` requires every instance's ``fd`` to be a member.
+        fds = resolved.fds | {inst.fd for inst in resolved.declared}
+        value = FDSet(fds, resolved.declared)
         opacity = Opacity.CONCRETE if value.fds else Opacity.IMPLICIT
         return Annotation(value, opacity, provisional=provisional)
 
