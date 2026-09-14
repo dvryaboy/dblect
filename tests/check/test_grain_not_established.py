@@ -37,9 +37,8 @@ _DUCKDB = profile_for_adapter("duckdb")
 
 _LINE_COLS = _cols(order_id="INT", line_number="INT", amount="DECIMAL")
 
-# A per-line leaf model: its SQL derives no key of its own (a source has no
-# uniqueness facts), so only its declared compound key grounds it. FROM a source
-# rather than a literal row, so the walk resolves it exactly instead of giving up.
+# A per-line leaf model over a keyless source, so only its declared compound key
+# grounds it. A FROM-less literal row would count as an inexact derivation.
 _ORDER_LINES_SOURCE = _source("source.shop.raw.order_lines_raw")
 _ORDER_LINES = _node(
     "model.shop.order_lines",
@@ -201,10 +200,9 @@ def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
 # --- an inexact derivation is not evidence -----------------------------------------
 
 
-def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
-    # The correlated subquery collapses to one row per order, but the walk cannot
-    # model this shape, so the derivation is inexact and the emitter stays quiet
-    # rather than reporting the finer key as a witness.
+def test_a_collapse_outside_the_exact_fragment_is_not_a_witness() -> None:
+    # The correlated subquery collapses to one row per order. The walk cannot model
+    # it, so the derivation is inexact and the surviving finer key is not evidence.
     _declare_order_lines_key()
 
     class TopLine(ModelContract):
