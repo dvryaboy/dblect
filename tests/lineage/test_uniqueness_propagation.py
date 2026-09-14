@@ -17,6 +17,7 @@ import sqlglot.expressions as exp
 # The relation-graph builder lives next to the column builder.
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
+from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
@@ -67,14 +68,20 @@ def _key(*cols: str) -> Key:
     return frozenset(cols)
 
 
-def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
+def _annotations(*nodes: Node) -> dict[str, Annotation[CandidateKeySet]]:
     """Build a manifest from the nodes, propagate uniqueness, and return each
-    model's candidate-key set keyed by unique_id."""
+    model's flow annotation keyed by unique_id."""
     manifest = _manifest(*nodes)
     result = build_relation_graph(manifest)
     prop = uniqueness_property(manifest, _DUCKDB)
     anns = propagate(result.graph, prop)
-    return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
+    return {ref.unique_id: ann for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
+
+
+def _keys(*nodes: Node) -> dict[str, CandidateKeySet]:
+    """Like :func:`_annotations`, but keeps each model's candidate-key set alone,
+    for the tests whose subject is the value rather than the annotation's bits."""
+    return {uid: ann.value for uid, ann in _annotations(*nodes).items()}
 
 
 def test_passthrough_carries_the_source_key() -> None:
@@ -462,17 +469,14 @@ def test_declared_model_key_unions_with_sql_derived_key() -> None:
     )
 
 
-# --- shapes the FD-closure key engine derives -------------------------------------
+# --- keys that need the closure, not a literal match ------------------------------
 #
-# `lines` is keyed on the composite pair (order_id, line_number), never on order_id
-# alone: a fact table where an order spans many lines. Each shape below has a real key
-# that a walk over the FD closure can justify.
+# `lines` is keyed on (order_id, line_number), never on order_id alone.
 
 
 def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
-    """The ON equates ``o.order_id`` with ``l.order_id``, and the output projects
-    ``o.order_id`` rather than ``l.order_id``, so this walk cannot tie the projected
-    column to ``lines``' declared pair key even though the values agree row for row."""
+    """The output projects ``o.order_id``, equal to ``l.order_id`` by the ON, so the
+    pair key of ``lines`` survives under the other alias's name."""
     orders = _source("source.shop.raw.orders")
     lines = _source("source.shop.raw.lines")
     keys = _keys(
@@ -492,9 +496,8 @@ def test_fan_out_join_derives_the_pair_key_through_the_other_alias() -> None:
 
 
 def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
-    """Self-joining to the per-order max line number keeps one row per order, so
-    ``order_id`` alone is a key, not just the declared pair: the walk would need
-    ``order_id -> line_number`` at the output to shrink the pair key to it."""
+    """Joining back to the per-order max line keeps one row per order: the grouped
+    side's ``order_id -> line_number`` shrinks the pair key to ``order_id``."""
     lines = _source("source.shop.raw.lines")
     keys = _keys(
         lines,
@@ -513,8 +516,7 @@ def test_join_back_to_a_grouped_subquery_derives_the_group_key() -> None:
 
 
 def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> None:
-    """Pinning ``line_number`` constant makes the declared pair key redundant in its
-    second column, so ``order_id`` alone is a key of the filtered output."""
+    """A pinned ``line_number`` drops out of the pair key."""
     lines = _source("source.shop.raw.lines")
     keys = _keys(
         lines,
@@ -527,10 +529,8 @@ def test_constant_filter_collapses_the_pair_key_to_the_remaining_column() -> Non
 
 
 def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
-    """Pinning the key column constant makes the whole relation collapse to at most
-    one row, so minimization can talk the closure into dropping the key down to the
-    empty set. No consumer reads an empty key as "at most one row"; the key a filter
-    on its own column leaves behind is still ``{id}``."""
+    """Pinning the key column itself must not minimize the key to the empty set;
+    no consumer reads an empty key."""
     src = _source("source.shop.raw.orders")
     keys = _keys(
         src,
@@ -538,3 +538,154 @@ def test_equality_filter_on_the_key_column_itself_keeps_the_key() -> None:
         _node("model.shop.m", "SELECT id, amount FROM orders WHERE id = 5"),
     )
     assert keys["model.shop.m"] == CandidateKeySet.of(_key("id"))
+
+
+# --- exactness -----------------------------------------------------------------
+#
+# One row per exact shape family and one per give-up trigger, the closed input space
+# of the bit (the fragment is listed in scope_closure's module docstring).
+
+_ORDERS = _source("source.shop.raw.orders")
+_CUSTOMERS = _source("source.shop.raw.customers")
+
+
+def _exact(sql: str) -> bool:
+    """The ``exact`` bit of one model's flow annotation, over a manifest carrying
+    keyless ``orders`` and ``customers`` sources the model's SQL can draw on."""
+    return _annotations(_ORDERS, _CUSTOMERS, _node("model.shop.x", sql))["model.shop.x"].exact
+
+
+_EXACTNESS_CASES: list[tuple[str, str, bool]] = [
+    # --- exact: the modelled fragment --------------------------------------------
+    ("from_table", "SELECT id FROM orders", True),
+    ("from_cte", "WITH s AS (SELECT id FROM orders) SELECT id FROM s", True),
+    ("from_subquery", "SELECT id FROM (SELECT id FROM orders) s", True),
+    ("inner_join", "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id", True),
+    ("cross_join", "SELECT o.id FROM orders o CROSS JOIN customers c", True),
+    (
+        "left_join",
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "right_join",
+        "SELECT o.id FROM orders o RIGHT JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "full_join",
+        "SELECT o.id FROM orders o FULL JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "semi_join",
+        "SELECT o.id FROM orders o SEMI JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "anti_join",
+        "SELECT o.id FROM orders o ANTI JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
+    (
+        "left_join_is_null_idiom",
+        "SELECT o.id FROM orders o LEFT JOIN customers c ON o.customer_id = c.id "
+        "WHERE c.id IS NULL",
+        True,
+    ),
+    ("where_column_equality", "SELECT id FROM orders WHERE id = customer_id", True),
+    ("where_literal_equality", "SELECT id FROM orders WHERE region = 'US'", True),
+    (
+        "rownumber_guard",
+        "SELECT id FROM orders "
+        "QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) = 1",
+        True,
+    ),
+    ("where_gt_literal", "SELECT id FROM orders WHERE amount > 1", True),
+    ("where_neq_columns", "SELECT id FROM orders WHERE customer_id <> amount", True),
+    ("where_in_literals", "SELECT id FROM orders WHERE amount IN (1, 2)", True),
+    ("where_is_null", "SELECT id FROM orders WHERE region IS NULL", True),
+    ("where_like", "SELECT id FROM orders WHERE region LIKE 'U%'", True),
+    ("where_between", "SELECT id FROM orders WHERE amount BETWEEN 1 AND 10", True),
+    (
+        "where_and_or_not",
+        "SELECT id FROM orders WHERE (amount > 1 AND region = 'US') OR NOT (customer_id = 5)",
+        True,
+    ),
+    (
+        "group_by_bare_column",
+        "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id",
+        True,
+    ),
+    ("distinct", "SELECT DISTINCT customer_id FROM orders", True),
+    ("union_all", "SELECT id FROM orders UNION ALL SELECT id FROM customers", True),
+    ("union_distinct", "SELECT id FROM orders UNION SELECT id FROM customers", True),
+    ("projection_bare_columns", "SELECT id, customer_id FROM orders", True),
+    ("projection_expression", "SELECT id, amount * 2 AS doubled FROM orders", True),
+    # --- inexact: the engine gives up --------------------------------------------
+    (
+        "where_exists",
+        "SELECT id FROM orders o "
+        "WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)",
+        False,
+    ),
+    ("where_in_subquery", "SELECT id FROM orders WHERE id IN (SELECT id FROM customers)", False),
+    (
+        "where_scalar_subquery",
+        "SELECT id FROM orders WHERE amount > (SELECT avg(amount) FROM orders)",
+        False,
+    ),
+    (
+        "predicate_unrecognized_window",
+        "SELECT id FROM orders QUALIFY RANK() OVER (ORDER BY amount) = 1",
+        False,
+    ),
+    ("projection_subquery", "SELECT id, (SELECT count(*) FROM customers) AS n FROM orders", False),
+    (
+        "projection_unrecognized_window",
+        "SELECT id, SUM(amount) OVER (PARTITION BY customer_id) AS running FROM orders",
+        False,
+    ),
+    (
+        "group_by_expression",
+        "SELECT customer_id + 1 AS grp, COUNT(*) AS n FROM orders GROUP BY customer_id + 1",
+        False,
+    ),
+    ("star_over_join", "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id", False),
+    ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
+    ("intersect", "SELECT id FROM orders INTERSECT SELECT id FROM customers", False),
+    ("except_", "SELECT id FROM orders EXCEPT SELECT id FROM customers", False),
+    (
+        "having_aggregate_comparison",
+        "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id HAVING COUNT(*) > 1",
+        False,
+    ),
+    # A FROM the manifest never resolved is a hole, so the model is inexact even
+    # though its own SQL is a plain passthrough.
+    ("unresolvable_base_table", "SELECT id FROM untracked", False),
+]
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [(sql, expected) for _id, sql, expected in _EXACTNESS_CASES],
+    ids=[case_id for case_id, _sql, _expected in _EXACTNESS_CASES],
+)
+def test_scope_exactness(sql: str, expected: bool) -> None:
+    assert _exact(sql) is expected
+
+
+def test_inexact_upstream_makes_downstream_inexact() -> None:
+    """An inexact upstream model taints the downstream flow value even though the
+    downstream SQL is entirely within the modelled fragment."""
+    src = _source("source.shop.raw.orders")
+    anns = _annotations(
+        src,
+        _node(
+            "model.shop.upstream",
+            "SELECT id FROM orders WHERE id IN (SELECT id FROM orders)",
+        ),
+        _node("model.shop.downstream", "SELECT id FROM upstream"),
+    )
+    assert not anns["model.shop.upstream"].exact
+    assert not anns["model.shop.downstream"].exact

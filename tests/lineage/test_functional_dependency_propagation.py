@@ -165,9 +165,8 @@ def test_star_carries_everything() -> None:
 
 
 def test_declared_bijection_does_not_let_instances_rebind_across_each_other() -> None:
-    """``a -> b`` and ``b -> a`` declared together are a bijection, not a value
-    equality: each instance must still bind through its own column's output
-    name, not the other's, even though the two mutually determine each other."""
+    """A declared bijection is not a value equality: each instance binds through
+    its own column's output name, never the other's."""
     out = _fds(
         _declared(_fd("b", "a"), _fd("a", "b")),
         _source(_PAYMENTS.unique_id),
@@ -261,10 +260,7 @@ def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
 
 
 def test_group_by_keeps_fds_among_the_group_columns() -> None:
-    """``country -> currency`` also makes ``country`` alone a minimal group key
-    (``currency`` is redundant, since it is already determined), so the closure
-    engine keys the aggregate off ``country`` alone rather than the full,
-    reducible group-column pair."""
+    """``country -> currency`` makes ``country`` alone the minimal group key."""
     out = _fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
@@ -448,12 +444,9 @@ def test_left_join_carries_the_kept_sides_fds() -> None:
 
 
 def test_left_join_mints_only_the_accumulated_to_joined_in_direction() -> None:
-    """The ON equality's reverse direction (the joined-in column determining the
-    accumulated side's) does not survive: two padded rows can share the NULL
-    ``c.id`` while differing on ``p.customer_id``. The forward direction does
-    survive: a matched row's ``c.id`` equals ``p.customer_id`` by the join
-    predicate itself, and an unmatched row's is NULL either way, so fixing
-    ``p.customer_id`` fixes ``c.id`` on every output row."""
+    """Fixing ``p.customer_id`` fixes ``c.id`` on every row (matched or NULL), so
+    the forward direction holds. Two padded rows share a NULL ``c.id`` while
+    differing on ``p.customer_id``, so the reverse does not."""
     out = _fds(
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
@@ -696,13 +689,12 @@ def test_only_a_declaration_grounds_an_instance(provenance: Provenance, expected
     assert functional_dependency_grounding({_PAYMENTS: (fact,)})(_PAYMENTS).value == expected
 
 
-# --- shapes the FD-closure key engine will newly derive (not yet from this walk) ----
+# --- dependencies that need the closure, not a literal match ---------------------
 
 
 def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
-    """``m.line_number`` is the per-order max, single-valued per ``order_id`` by
-    construction, and every surviving ``l`` row equals it, so ``order_id`` determines
-    ``line_number`` at the output. The walk does not follow the self-join-to-max idiom."""
+    """``m.line_number`` is single-valued per ``order_id`` and every surviving ``l``
+    row equals it, so ``order_id`` determines ``line_number`` at the output."""
     out = _fds(
         _declared(),
         _source("source.shop.raw.lines"),
@@ -718,9 +710,7 @@ def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
 
 
 def test_group_by_over_a_join_determines_the_aggregate() -> None:
-    """The group key determines every other output regardless of whether the grouped
-    relation is a base table or a join; the walk's group-by rule does not yet reach
-    through a join in the FROM."""
+    """The group key determines every other output, over a join as over a table."""
     out = _fds(
         _declared(),
         _source("source.shop.raw.orders"),
