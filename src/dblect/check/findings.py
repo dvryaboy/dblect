@@ -41,6 +41,12 @@ class CheckFindingKind(StrEnum):
     conflict (a ``MoneyUSD`` key against a ``MoneyEUR`` one, an ISO-2 country against an
     ISO-3), so the equated values cannot mean the same thing."""
 
+    GRAIN_NOT_ESTABLISHED = auto()
+    """A model's SQL carries a strictly finer key than its declared grain (one row
+    per order declared; one row per order line produced). The data may still satisfy
+    the grain, so this is "not established", not "violated"; see
+    ``docs/design/refutation-and-verdicts.md``."""
+
     RESOLUTION_BELOW_FLOOR = auto()
     """Lineage resolution across the project sits below the configured floor, so
     the analysis covers only a fraction of columns and a clean report would

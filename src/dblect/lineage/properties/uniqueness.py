@@ -66,6 +66,7 @@ from dblect.manifest import (
     ConstraintType,
     Manifest,
     Materialization,
+    ModelConfig,
     ResourceType,
     generic_test_target_uid,
 )
@@ -371,6 +372,17 @@ def native_key_discoverer(profile: AdapterProfile) -> FactDiscoverer[CandidateKe
 # to catch.
 
 
+def model_dedups_on_write(config: ModelConfig | None, profile: AdapterProfile) -> bool:
+    """True if the model's write path dedups on ``unique_key``: an incremental
+    materialization under a deduplicating strategy. Its SELECT is expected to carry
+    finer rows than the key."""
+    if config is None or not config.unique_key:
+        return False
+    if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
+        return False
+    return profile.effective_strategy(config.incremental_strategy) in DEDUP_STRATEGIES
+
+
 class _ConfigKeyDiscoverer:
     """Grounds a candidate key from the ``unique_key`` / ``incremental_strategy``
     config pair, but only when the materialization actually deduplicates on write.
@@ -390,13 +402,9 @@ class _ConfigKeyDiscoverer:
             if node.resource_type is not ResourceType.MODEL:
                 continue
             config = node.config
-            if config is None or not config.unique_key:
-                continue
-            if Materialization.from_raw(config.materialized) is not Materialization.INCREMENTAL:
+            if config is None or not model_dedups_on_write(config, self._profile):
                 continue
             strategy = self._profile.effective_strategy(config.incremental_strategy)
-            if strategy not in DEDUP_STRATEGIES:
-                continue
             out.append(
                 Fact(
                     scope=SourceRef(SourceKind.MODEL, node.unique_id),
@@ -1284,25 +1292,18 @@ class _Projection:
 # --- the property ------------------------------------------------------------
 
 
-def uniqueness_property(
+def uniqueness_facts(
     manifest: Manifest,
     profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
-) -> Property[CandidateKeySet, SourceRef]:
-    """The manifest-backed uniqueness property: declared keys (unique tests,
-    ``unique_combination_of_columns``, native PRIMARY KEY / UNIQUE, the
-    config ``unique_key`` of a deduplicating incremental model, plus any
-    ``extra``) ground each relation, and the relation reducer infers more from the
-    SQL. Declared and inferred keys both hold, so they compose by meet
-    (``reconcile_by_meet``); no opaque opt-out reader is wired yet, so the opaque
-    set is empty. The property carries its relation-algebra walk as ``reducer`` so
-    the propagator dispatches it without a global registry.
-
-    ``profile`` is the run's resolved target: it fixes the adapter's enforcement
-    and dedup semantics, and carries any ``--dialect`` override so grammar and
-    semantics stay coherent."""
+) -> Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]:
+    """Every declared key, collected per relation: ``unique`` and
+    ``unique_combination_of_columns`` tests, native constraints, a deduplicating
+    incremental's ``unique_key``, and surrogate-hash keys. ``extra`` adds readers;
+    ``extra_facts`` adds keys the caller already resolved (Python contracts)."""
     discoverers = (
         unique_test_discoverer(),
         unique_combination_discoverer(),
@@ -1313,7 +1314,22 @@ def uniqueness_property(
     )
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
-    facts = collect(manifest, discoverers, name_to_source={})
+    collected = collect(manifest, discoverers, name_to_source={})
+    if not extra_facts:
+        return collected
+    merged: dict[SourceRef, list[Fact[CandidateKeySet, SourceRef]]] = {
+        scope: list(bucket) for scope, bucket in collected.items()
+    }
+    for fact in extra_facts:
+        merged.setdefault(fact.scope, []).append(fact)
+    return {scope: tuple(bucket) for scope, bucket in merged.items()}
+
+
+def uniqueness_property_from_facts(
+    facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> Property[CandidateKeySet, SourceRef]:
+    """The uniqueness property grounded from ``facts``. Declared and inferred keys
+    both hold, so they compose by meet."""
     return relation_property(
         name="uniqueness",
         lattice=UNIQUENESS_LATTICE,
@@ -1322,6 +1338,21 @@ def uniqueness_property(
         ground=_grounding_with_conditional(facts),
         reconcile_by_meet=True,
         reducer=relation_reduce,
+    )
+
+
+def uniqueness_property(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    *,
+    extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    parsed: Mapping[str, Expr] | None = None,
+) -> Property[CandidateKeySet, SourceRef]:
+    """The manifest-backed uniqueness property: :func:`uniqueness_facts` grounds
+    each relation and the reducer infers more from the SQL. ``profile`` fixes the
+    adapter's enforcement and dedup semantics."""
+    return uniqueness_property_from_facts(
+        uniqueness_facts(manifest, profile, extra=extra, parsed=parsed)
     )
 
 

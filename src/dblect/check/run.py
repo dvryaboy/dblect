@@ -37,6 +37,7 @@ from dblect.check.findings import (
     SuppressedCheckFinding,
     UnbuiltModel,
 )
+from dblect.check.grain import declared_grain_findings
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -69,6 +70,11 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
+from dblect.lineage.properties.uniqueness import (
+    CandidateKeySet,
+    uniqueness_facts,
+    uniqueness_property_from_facts,
+)
 from dblect.lineage.property import propagate, resolved_column_ref
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
@@ -88,6 +94,7 @@ class CheckGraphs:
     enumerates. Do not mutate the graphs or their trees per world."""
 
     manifest: Manifest
+    profile: AdapterProfile
     resolved: ResolvedContracts
     relation_build: RelationBuildResult
     column_build: BuildResult
@@ -105,6 +112,9 @@ class CheckGraphs:
     it comes from the facts that do not change across worlds, so keeping it with the
     graph build keeps the two in sync instead of assuming every world reuses the same
     graph."""
+    uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
+    """Every declared key per relation, from every channel. Feeds both the uniqueness
+    propagation and the grain check, so the two agree on what was claimed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +141,14 @@ class WorldAnnotations:
 
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
-    coherence_clears: tuple[CoherenceClear[DomainTag], ...] = ()
+    coherence_clears: tuple[CoherenceClear[DomainTag], ...]
+    functional_dependency: Mapping[SourceRef, Annotation[FDSet]]
+    """Per-relation functional dependencies, kept so the grain check need not
+    propagate them again."""
+    uniqueness_inferred: Mapping[SourceRef, Annotation[CandidateKeySet]]
+    """Per-relation keys derived from the SQL alone, before declared keys are merged
+    in. The grain check compares declarations against this; the merged value would
+    contain the declaration itself."""
 
 
 def build_check_graphs(
@@ -164,12 +181,16 @@ def build_check_graphs(
     parsed = {uid: tree for uid, tree in trees.items() if uid not in unbuilt}
     return CheckGraphs(
         manifest=manifest,
+        profile=profile,
         resolved=resolved,
         relation_build=relation_build,
         column_build=column_build,
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
         join_key_ground=domain_type_grounding(by_scope(resolved.tag_facts)),
+        uniqueness_facts=uniqueness_facts(
+            manifest, profile, extra_facts=resolved.key_facts, parsed=trees
+        ),
     )
 
 
@@ -188,7 +209,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         functional_dependency_grounding(by_scope(facts.fd_facts))
     )
     store = AnnotationStore()
-    for scope, ann in propagate(graphs.relation_build.graph, fd_prop).items():
+    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop))
+    for scope, ann in fd_anns.items():
         store.record(fd_prop.name, scope, ann)
 
     dt_prop = domain_type_property(
@@ -198,8 +220,16 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
     clears: list[CoherenceClear[DomainTag]] = []
     domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx, sink=clears)
+
+    uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
+    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
+    propagate(graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred)
     return WorldAnnotations(
-        world=facts.world, domain_type=domain_type, coherence_clears=tuple(clears)
+        world=facts.world,
+        domain_type=domain_type,
+        coherence_clears=tuple(clears),
+        functional_dependency=fd_anns,
+        uniqueness_inferred=uniqueness_inferred,
     )
 
 
@@ -322,6 +352,15 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             world.domain_type,
             graphs.join_key_ground,
             line_maps,
+        )
+    )
+    findings.extend(
+        declared_grain_findings(
+            graphs.manifest,
+            graphs.profile,
+            graphs.uniqueness_facts,
+            world.uniqueness_inferred,
+            world.functional_dependency,
         )
     )
     return findings

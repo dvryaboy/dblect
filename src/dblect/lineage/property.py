@@ -28,7 +28,7 @@ property's :class:`~dblect.lineage.facts.DepContext` reads.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from functools import reduce
 from typing import Any, TypeVar, cast
 
@@ -87,11 +87,13 @@ def propagate(
     dep_context: DepContext = _NULL_DEP_CONTEXT,
     subjects: Iterable[S] | None = None,
     sink: CoherenceSink[K] | None = None,
+    inferred_sink: MutableMapping[S, Annotation[K]] | None = None,
 ) -> Mapping[S, Annotation[K]]:
     """Compute ``prop``'s flow annotation for every subject in ``graph``.
 
-    This is the one propagation engine: a memoised grounded fixpoint over the
-    lineage DAG. For each subject it grounds a declared annotation, short-circuits
+    This is the one propagation engine: one walk over the lineage graph, caching
+    each subject's result so a value read by many downstream columns is computed
+    once. For each subject it grounds a declared annotation, short-circuits
     on a declared opt-out, reduces the subject's derivation to an inferred
     annotation, and reconciles the two. The scope-specific part is the *reducer*:
     how a derivation reduces, and how recursion into referenced subjects is
@@ -117,6 +119,11 @@ def propagate(
     than re-inferring it from the output. It is per-call: the propagator never mutates
     the shared graph, so one ``sink`` belongs to one world's run. ``None`` clears
     silently, for a caller that only wants the annotation values, not the reasons.
+
+    ``inferred_sink``, when supplied, records each node's inferred annotation before
+    reconciliation with the grounded one. Under ``reconcile_by_meet`` the flow value
+    contains the declaration, so this is the only way to ask whether the SQL supports
+    it. Leaves and opted-out nodes are absent, not recorded empty.
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
@@ -145,6 +152,8 @@ def propagate(
                     result = grounded  # a leaf anchors on its grounded value
                 else:
                     inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
+                    if inferred_sink is not None:
+                        inferred_sink[subject] = inferred
                     result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
             annotations[subject] = result
             return result
