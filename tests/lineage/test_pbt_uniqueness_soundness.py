@@ -39,7 +39,7 @@ later). Multi-model chains are the next extension.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import duckdb
 from hypothesis import HealthCheck, given, settings
@@ -114,6 +114,22 @@ def _unique_test(source_name: str, *, column: str, where: str | None = None) -> 
     )
 
 
+def _unique_combination_test(source_name: str, *, columns: tuple[str, str]) -> Node:
+    target = f"source.test.raw.{source_name}"
+    suffix = "_".join(columns)
+    return _node(
+        f"test.test.{source_name}_{suffix}_unique_combo",
+        kind=ResourceType.OTHER,
+        name=f"{source_name}_{suffix}_unique_combo",
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(
+            name="dbt_utils.unique_combination_of_columns",
+            kwargs={"combination_of_columns": list(columns)},
+        ),
+        attached_node=target,
+    )
+
+
 def _model_node(sql: str, *, depends_on: frozenset[str]) -> Node:
     return _node(_MODEL_UID, sql, raw=sql, name="m", depends_on=depends_on)
 
@@ -126,6 +142,9 @@ class SourceSpec:
     name: str
     key_col: str  # declared unique, generated distinct + non-null
     plain_cols: tuple[str, ...]
+    # When set, the source declares unique_combination_of_columns(key_col, composite_with)
+    # instead of unique(key_col); rows are then distinct on that pair alone.
+    composite_with: str | None = None
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -134,12 +153,18 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify | anti/semi shapes
+    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify
+    # | anti/semi shapes | join_grouped
     select_cols: tuple[str, ...]
     left_join_col: str | None = None
     right_join_col: str | None = None
+    # An inner join may project the joined-in side's own join column, aliased under
+    # the probe's usual output name, instead of the probe's column: the shape where
+    # the current walk loses the key.
+    project_other_side: bool = False
     filter_col: str | None = None
     filter_threshold: int | None = None
+    filter_op: str = ">="
     group_cols: tuple[str, ...] | None = None
     group_spelling: GroupSpelling | None = None
     partition_cols: tuple[str, ...] | None = None
@@ -156,25 +181,57 @@ _S0 = SourceSpec(name="s0", key_col="k0", plain_cols=("a0", "b0"))
 _S1 = SourceSpec(name="s1", key_col="k1", plain_cols=("a1", "b1"))
 _KEY_DOMAIN = 64
 _PLAIN_DOMAIN = 4
+_COMPOSITE_DOMAIN = 4  # small enough that each column repeats while the pair stays unique
 
 
 @st.composite
 def _rows(draw: st.DrawFn, source: SourceSpec) -> tuple[tuple[int, ...], ...]:
-    """Rows for a source: the key column is distinct non-null (so ``unique`` is a true
-    key), every other column a small-domain int (to force join matches and duplicates)."""
+    """Rows for a source. With no composite key, the key column is distinct non-null
+    (so ``unique`` is a true key), every other column a small-domain int (to force
+    join matches and duplicates). With a composite key, the (key_col, composite_with)
+    pair is distinct as a tuple while each of the two columns is free to repeat alone,
+    so ``unique_combination_of_columns`` is a true key but neither column is by itself."""
     n = draw(st.integers(min_value=0, max_value=8))
-    keys = draw(
+    if source.composite_with is None:
+        keys = draw(
+            st.lists(
+                st.integers(min_value=0, max_value=_KEY_DOMAIN - 1),
+                min_size=n,
+                max_size=n,
+                unique=True,
+            )
+        )
+        rows: list[tuple[int, ...]] = []
+        for key in keys:
+            plain = tuple(
+                draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN - 1))
+                for _ in source.plain_cols
+            )
+            rows.append((key, *plain))
+        return tuple(rows)
+
+    extra_index = source.plain_cols.index(source.composite_with)
+    pairs = draw(
         st.lists(
-            st.integers(min_value=0, max_value=_KEY_DOMAIN - 1), min_size=n, max_size=n, unique=True
+            st.tuples(
+                st.integers(min_value=0, max_value=_COMPOSITE_DOMAIN - 1),
+                st.integers(min_value=0, max_value=_COMPOSITE_DOMAIN - 1),
+            ),
+            min_size=n,
+            max_size=n,
+            unique=True,
         )
     )
-    rows: list[tuple[int, ...]] = []
-    for key in keys:
+    composite_rows: list[tuple[int, ...]] = []
+    for key, extra in pairs:
         plain = tuple(
-            draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN - 1)) for _ in source.plain_cols
+            extra
+            if i == extra_index
+            else draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN - 1))
+            for i in range(len(source.plain_cols))
         )
-        rows.append((key, *plain))
-    return tuple(rows)
+        composite_rows.append((key, *plain))
+    return tuple(composite_rows)
 
 
 def _column_subset(draw: st.DrawFn) -> tuple[str, ...]:
@@ -198,6 +255,7 @@ def _scenario(draw: st.DrawFn) -> Scenario:
                 "anti_join",
                 "semi_join",
                 "left_is_null",
+                "join_grouped",
             )
         )
     )
@@ -206,7 +264,23 @@ def _scenario(draw: st.DrawFn) -> Scenario:
     is_join = shape in ("inner_join", "left_join")
     sources = (_S0, _S1) if is_join or shape in anti_shapes else (_S0,)
 
-    if shape in anti_shapes:
+    # s0 always participates, so it carries the choice of a composite declared key
+    # (unique_combination_of_columns over k0 and a second column) instead of a plain
+    # unique(k0); the pair is distinct while either column alone is free to repeat.
+    if draw(st.booleans()):
+        second = draw(st.sampled_from(_S0.plain_cols))
+        sources = tuple(
+            replace(src, composite_with=second) if src.name == _S0.name else src for src in sources
+        )
+
+    if shape == "join_grouped":
+        # A self-join back to s0 grouped by one column with MAX() of another; the
+        # walk derives no coarse key here, so the oracle must still see none promoted.
+        gcol, other = draw(
+            st.lists(st.sampled_from(_S0.columns), min_size=2, max_size=2, unique=True)
+        )
+        model = ModelSpec(shape=shape, select_cols=_S0.columns, group_cols=(gcol, other))
+    elif shape in anti_shapes:
         # An anti/semi filter preserves s0's declared key {k0}; the oracle proves it over rows.
         model = ModelSpec(
             shape=shape,
@@ -223,11 +297,15 @@ def _scenario(draw: st.DrawFn) -> Scenario:
         )
         model = ModelSpec(shape=shape, select_cols=_S0.columns, partition_cols=part)
     elif is_join:
+        # An inner join may project s1's own join column, aliased as ``k0``, instead of
+        # s0's: the ON equates them, so the oracle must still see no unsound key.
+        project_other_side = shape == "inner_join" and draw(st.booleans())
         model = ModelSpec(
             shape=shape,
             select_cols=("k0", "a1"),
-            left_join_col=draw(st.sampled_from(_S0.columns)),
+            left_join_col="k0" if project_other_side else draw(st.sampled_from(_S0.columns)),
             right_join_col=draw(st.sampled_from(_S1.columns)),
+            project_other_side=project_other_side,
         )
     elif shape == "filter":
         model = ModelSpec(
@@ -235,6 +313,7 @@ def _scenario(draw: st.DrawFn) -> Scenario:
             select_cols=("k0", "a0"),
             filter_col=draw(st.sampled_from(_S0.columns)),
             filter_threshold=draw(st.integers(min_value=0, max_value=_PLAIN_DOMAIN)),
+            filter_op=draw(st.sampled_from((">=", "="))),
         )
     elif shape == "group_by":
         spelling = draw(st.sampled_from(tuple(GroupSpelling)))
@@ -267,9 +346,19 @@ def _scenario(draw: st.DrawFn) -> Scenario:
 def _scenario_sql(m: ModelSpec) -> str:
     if m.shape in ("inner_join", "left_join"):
         join = "INNER JOIN" if m.shape == "inner_join" else "LEFT JOIN"
+        first = f"s1.{m.right_join_col} AS k0" if m.project_other_side else "s0.k0 AS k0"
         return (
-            f"SELECT s0.k0 AS k0, s1.a1 AS a1 "
+            f"SELECT {first}, s1.a1 AS a1 "
             f"FROM s0 {join} s1 ON s0.{m.left_join_col} = s1.{m.right_join_col}"
+        )
+    if m.shape == "join_grouped":
+        assert m.group_cols is not None
+        gcol, other = m.group_cols
+        cols = ", ".join(f"l.{c} AS {c}" for c in m.select_cols)
+        return (
+            f"SELECT {cols} FROM s0 l JOIN "
+            f"(SELECT {gcol}, MAX({other}) AS {other} FROM s0 GROUP BY {gcol}) m "
+            f"ON l.{gcol} = m.{gcol} AND l.{other} = m.{other}"
         )
     if m.shape in ("anti_join", "semi_join", "left_is_null"):
         base = "SELECT s0.k0 AS k0, s0.a0 AS a0 FROM s0"
@@ -281,7 +370,7 @@ def _scenario_sql(m: ModelSpec) -> str:
         # left_is_null: the IS NULL sits on s1's join-key column, the recognised anti-join idiom.
         return f"{base} LEFT JOIN s1 {on} WHERE s1.{m.right_join_col} IS NULL"
     if m.shape == "filter":
-        return f"SELECT k0, a0 FROM s0 WHERE {m.filter_col} >= {m.filter_threshold}"
+        return f"SELECT k0, a0 FROM s0 WHERE {m.filter_col} {m.filter_op} {m.filter_threshold}"
     if m.shape == "qualify":
         assert m.partition_cols is not None
         cols = ", ".join(m.select_cols)
@@ -311,7 +400,12 @@ def _scenario_manifest(s: Scenario) -> Manifest:
     nodes: list[Node] = []
     for src in s.sources:
         nodes.append(_source_node(src.name))
-        nodes.append(_unique_test(src.name, column=src.key_col))
+        if src.composite_with is not None:
+            nodes.append(
+                _unique_combination_test(src.name, columns=(src.key_col, src.composite_with))
+            )
+        else:
+            nodes.append(_unique_test(src.name, column=src.key_col))
     nodes.append(
         _model_node(
             _scenario_sql(s.model),
