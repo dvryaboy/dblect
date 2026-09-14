@@ -63,7 +63,8 @@ def declared_grain_findings(
     ``key_facts`` is every declared key, from the same source propagation grounds
     on. ``inferred`` is the pre-merge derived key set per relation. Skipped: models
     absent from ``inferred`` (no SQL to judge), provisional derivations (they rest
-    on a contradiction), and models whose write path dedups on its own
+    on a contradiction), inexact derivations (the walk gave up rather than proved
+    the finer key survives), and models whose write path dedups on its own
     (:func:`model_dedups_on_write`), whose SELECT is expected to carry finer rows.
     """
     out: list[CheckFinding] = []
@@ -73,7 +74,7 @@ def declared_grain_findings(
         if node is not None and model_dedups_on_write(node.config, profile):
             continue
         inferred_ann = inferred.get(scope)
-        if inferred_ann is None or inferred_ann.provisional:
+        if inferred_ann is None or inferred_ann.provisional or not inferred_ann.exact:
             continue
         derived = inferred_ann.value
         if derived.is_bottom:

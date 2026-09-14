@@ -37,10 +37,13 @@ _DUCKDB = profile_for_adapter("duckdb")
 
 _LINE_COLS = _cols(order_id="INT", line_number="INT", amount="DECIMAL")
 
-# A per-line leaf model: no FROM, so only its declared compound key grounds it.
+# A per-line leaf model: its SQL derives no key of its own (a source has no
+# uniqueness facts), so only its declared compound key grounds it. FROM a source
+# rather than a literal row, so the walk resolves it exactly instead of giving up.
+_ORDER_LINES_SOURCE = _source("source.shop.raw.order_lines_raw")
 _ORDER_LINES = _node(
     "model.shop.order_lines",
-    sql="select 1 as order_id, 1 as line_number, 1.0 as amount",
+    sql="select 1 as order_id, 1 as line_number, 1.0 as amount from order_lines_raw",
     columns=_LINE_COLS,
 )
 
@@ -84,7 +87,7 @@ def test_declared_grain_defeated_by_a_surviving_finer_key_is_a_finding() -> None
         sql="select order_id, sum(amount) as total from fct_orders group by order_id",
         columns=_cols(order_id="INT", total="DECIMAL"),
     )
-    report = run_check(_manifest(_ORDER_LINES, fct, consumer), _DUCKDB)
+    report = run_check(_manifest(_ORDER_LINES_SOURCE, _ORDER_LINES, fct, consumer), _DUCKDB)
 
     findings = _grain_findings(report)
     assert [f.model_unique_id for f in findings] == ["model.shop.fct_orders"]
@@ -115,7 +118,7 @@ def test_a_collapse_to_the_declared_grain_is_established_and_silent() -> None:
         sql="select order_id, sum(amount) as amount from order_lines group by order_id",
         columns=_cols(order_id="INT", amount="DECIMAL"),
     )
-    report = run_check(_manifest(_ORDER_LINES, fct), _DUCKDB)
+    report = run_check(_manifest(_ORDER_LINES_SOURCE, _ORDER_LINES, fct), _DUCKDB)
     assert _grain_findings(report) == []
 
 
@@ -172,7 +175,7 @@ def test_absence_of_any_inferred_key_is_not_a_witness() -> None:
         sql="select order_id, line_number, amount from order_lines",
         columns=_LINE_COLS,
     )
-    report = run_check(_manifest(_ORDER_LINES, fct), _DUCKDB)
+    report = run_check(_manifest(_ORDER_LINES_SOURCE, _ORDER_LINES, fct), _DUCKDB)
     assert _grain_findings(report) == []
 
 
@@ -195,13 +198,13 @@ def test_a_declared_key_on_a_source_has_no_construction_to_judge() -> None:
     assert _grain_findings(report) == []
 
 
-# --- a collapse the walk cannot yet see: expected failure --------------------------
+# --- an inexact derivation is not evidence -----------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="the emitter needs the walk's exactness record")
 def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
-    # The correlated subquery collapses to one row per order, but the derivation is
-    # not exact for this shape, so the finer key still appears to survive.
+    # The correlated subquery collapses to one row per order, but the walk cannot
+    # model this shape, so the derivation is inexact and the emitter stays quiet
+    # rather than reporting the finer key as a witness.
     _declare_order_lines_key()
 
     class TopLine(ModelContract):
@@ -220,7 +223,7 @@ def test_correlated_subquery_collapse_is_not_yet_recognized() -> None:
         ),
         columns=_LINE_COLS,
     )
-    report = run_check(_manifest(_ORDER_LINES, top_line), _DUCKDB)
+    report = run_check(_manifest(_ORDER_LINES_SOURCE, _ORDER_LINES, top_line), _DUCKDB)
     assert _grain_findings(report) == []
 
 
@@ -292,7 +295,7 @@ def test_declaration_channels_decide_what_is_judged(channel: _Channel) -> None:
         constraints=channel.constraints,
     )
     extra = (channel.test_node,) if channel.test_node is not None else ()
-    report = run_check(_manifest(_ORDER_LINES, fct, *extra), _DUCKDB)
+    report = run_check(_manifest(_ORDER_LINES_SOURCE, _ORDER_LINES, fct, *extra), _DUCKDB)
 
     findings = _grain_findings(report)
     expected = ["model.shop.fct_orders"] if channel.fires else []
