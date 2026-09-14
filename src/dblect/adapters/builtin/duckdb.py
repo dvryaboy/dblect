@@ -18,7 +18,7 @@ register(
         validated=True,
         not_null_enforced=True,
         key_enforced=True,
-        default_incremental_strategy=None,  # left unset pending validation
+        default_incremental_strategy=None,  # dbt-duckdb's actual default is unconfirmed
         non_deterministic_builtins=_DUCKDB_NON_DETERMINISTIC_BUILTINS,
     )
 )

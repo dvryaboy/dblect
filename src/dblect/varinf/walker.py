@@ -9,10 +9,10 @@ control-flow versus value-substitution signal the world enumerator depends on is
 read straight off the resulting :data:`UsageContext` variant, with no text
 heuristics.
 
-Direct usage only. A ``var`` reached through a macro is the macro-following
-stream's concern, so a ``var`` passed to another call is recorded as a
-:class:`MacroArg` here and followed there. A body the environment cannot parse
-degrades to one :class:`OpaqueNode` diagnostic rather than raising.
+Direct usage only. A ``var`` reached through a macro is left for a later pass
+that follows ``var`` calls through macro bodies: this walker records it as a
+:class:`MacroArg` rather than following the call. A body the environment
+cannot parse degrades to one :class:`OpaqueNode` diagnostic rather than raising.
 """
 
 from __future__ import annotations
@@ -67,7 +67,8 @@ _COMPARISON_OP_VALUES: frozenset[str] = frozenset(op.value for op in ComparisonO
 
 # How each comparison flips when the literal is written on the left
 # (``100 < var('x')`` is ``var('x') > 100``). Equality is symmetric, so eq/ne map
-# to themselves. Total over ComparisonOp and its own inverse.
+# to themselves. Every ComparisonOp member has an entry here, so the flip lookup
+# never raises.
 _FLIPPED_COMPARISON: dict[ComparisonOp, ComparisonOp] = {
     ComparisonOp.EQ: ComparisonOp.EQ,
     ComparisonOp.NE: ComparisonOp.NE,
@@ -251,7 +252,7 @@ class _Walker:
         Every classified emission funnels through here, so the inline-default walk
         lives in one place: ``var('x', <default>)`` can carry another var whatever
         the outer var's position. The default is walked even when the outer name is
-        dynamic and its own usage skipped, the inner var being real either way.
+        dynamic and its own usage is skipped, because the inner var is real either way.
         """
         name = _string_arg0(call)
         if name is not None:

@@ -1,5 +1,5 @@
-"""The dblect declaration layer: domain types, model contracts, and the bridge
-that turns them into substrate facts.
+"""The dblect declaration layer: domain types, model contracts, and the fact
+bridge that turns them into lineage facts.
 
 A project declares meaning here, in Python beside its dbt project: domain types
 built from SQL primitives, bound to models by contracts. The framework reads the

@@ -16,10 +16,10 @@ contradicts (two key declarations always union cleanly), so it is unreachable in
 resolution and exists only so ``meet`` / ``join`` have their annihilator and
 identity.
 
-Confluence and the cross at a ``JOIN`` are not a plain semiring: the ``JOIN``
-combine reads which columns the ON predicate equates, so it is an operator rule
-over :class:`~sqlglot.expressions.Join` rather than a value-only ``times``. The
-transfer catalogs and the relation walk land with the propagator's
+Confluence and the times-combine at a ``JOIN`` are not a plain semiring: the
+``JOIN`` combine reads which columns the ON predicate equates, so it is an
+operator rule over :class:`~sqlglot.expressions.Join` rather than a value-only
+``times``. The transfer catalogs and the relation walk land with the propagator's
 relation-scoped dispatch; this module defines the value type, its lattice, and
 the discoverers that ground it.
 """
@@ -177,7 +177,7 @@ def grain_preserved(keys: CandidateKeySet, origin_key: Key) -> bool:
     keyed only on a different key (the fan trap, where a join to a many-side replicates the
     magnitude), or with no key known, is not provably single-counted: the fan-out signal a
     downstream ``sum`` rests on. The user-facing finding is the finding pipeline's job; this
-    is the substrate predicate."""
+    is the predicate underneath it."""
     if keys.is_bottom:
         return True
     return any(key <= origin_key for key in keys.keys)
@@ -811,12 +811,7 @@ class _RelationWalk:
         return carried
 
     def _select(self, sel: exp.Select, *, cte_scope: Mapping[str, _Carried]) -> _Carried:
-        local = dict(cte_scope)
-        with_ = sel.args.get("with_")
-        if isinstance(with_, exp.With):
-            for cte in with_.expressions:
-                if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
-                    local[cte.alias_or_name] = self.scope_keys(cte.this, cte_scope=local)
+        local = sg.with_scope(sel, cte_scope, lambda n, s: self.scope_keys(n, cte_scope=s))
 
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):

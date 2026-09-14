@@ -11,9 +11,6 @@ comment can address both a lint rule and a dblect finding::
     -- only silence one dblect detector:
     select b.k, sum(amount) from a left join b on a.k = b.k group by b.k  -- noqa: DBLECT_NULL_GROUP_AFTER_OUTER_JOIN
 
-    -- one directive, two audiences (the lint rule is dbt lint's, the DBLECT_ code is ours):
-    select b.k, sum(amount) from a left join b on a.k = b.k group by b.k  -- noqa: RF01, DBLECT_JOIN_FANOUT
-
 Two rules govern the codes after the colon:
 
 * A bare ``-- noqa`` (no codes) silences every dblect finding on the line.
@@ -67,15 +64,9 @@ if TYPE_CHECKING:
 
 class Suppressible(Protocol):
     """What a directive needs to decide whether it silences a finding: the kind it carries
-    and the two coordinates it can occupy. Both finding families satisfy this, so matching
-    is written once over the protocol rather than per family.
-
-    ``located_span`` is the back-mapped span the report shows; ``compiled_span`` is the raw
-    compiled coordinate the parser observed. They differ only for a macro-emitted construct,
-    where ``located_span`` names the ``{{ ... }}`` call site in the template and
-    ``compiled_span`` names the emitted line in the compiled SQL. Matching consults each
-    frame against the coordinate that indexes it (:func:`apply`), so a ``-- noqa`` on the
-    call line and one in the macro body both reach the finding, each in its own text."""
+    and the ``located_span``/``compiled_span`` pair described at module level and matched
+    in :func:`apply`. Both finding families expose this, so matching is written once over
+    the protocol instead of once per family."""
 
     @property
     def kind(self) -> SuppressibleKind: ...

@@ -10,7 +10,7 @@ Each annotated field becomes one declaration: a domain type (the column carries
 that meaning), a ``PrimaryKey`` / ``ForeignKey`` marker (a key the grain
 analysis reads), or a scalar type. ``Field(...)`` carries the Pydantic-style
 constraint vocabulary and inline fixings at one binding site. Resolution against
-the manifest happens later in the bridge, so a misspelled model is a finding,
+the manifest happens later, in the fact bridge, so a misspelled model is a finding,
 not an ``ImportError`` that blinds the audit. See
 ``docs/design/declaration-dsl.md``.
 """
@@ -60,9 +60,9 @@ _CONSTRAINT_ALIASES: Mapping[str, tuple[str, float]] = {
 
 @dataclass(frozen=True, slots=True)
 class _FieldSpec:
-    """What a ``Field(...)`` call captured: checkable constraints and inline
-    fixings (the vouched-meaning half, applied as a refinement of the column's
-    declared type)."""
+    """What a ``Field(...)`` call captured: checkable constraints (proved against
+    data) and inline fixings (the author's own assertion, applied as a
+    refinement of the column's declared type)."""
 
     constraints: Constraints | None
     fixings: Mapping[str, object]
@@ -123,7 +123,7 @@ class PrimaryKey:
 class ForeignKey:
     """Marker annotation naming another model's column: ``ForeignKey("dim.col")``.
 
-    Doubles as the grain edge the fan-out analysis reads. An existing dbt
+    Doubles as an edge the grain analysis reads. An existing dbt
     ``relationships`` test is read as the same fact, so a project need not
     restate it.
     """

@@ -2,7 +2,7 @@
 
 ``dblect check --base-manifest`` analyses the base revision's manifest the same way
 as HEAD and keeps the findings whose identity is new. The diff is over finding sets,
-not edited source lines: a finding is computed over compiled SQL grounded against
+not edited source lines: a finding is computed over compiled SQL resolved against
 upstream models, so a changed macro or an upstream column can introduce one with the
 model's own source file unchanged, which a source-line diff would not see.
 """

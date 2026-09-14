@@ -38,16 +38,16 @@ S = TypeVar("S", "ColumnRef", "SourceRef")
 
 
 class LineageView(Protocol[S]):
-    """The minimal view the propagator's grounded-fixpoint driver needs of a
-    lineage graph, independent of scope.
+    """The minimal view ``propagate`` (in ``property.py``) needs of a lineage
+    graph, independent of scope.
 
-    A *subject* is a node the propagator annotates (a column for column-scoped
+    A *subject* is a node the walk annotates (a column for column-scoped
     properties, a relation for relation-scoped ones). ``derivation`` returns the
     sqlglot expression that produced a subject, or ``None`` when the subject is a
-    leaf (a source or seed) that grounds from facts. The scope-specific reducer
-    is what walks a derivation; the driver only needs to enumerate subjects and
-    fetch each one's derivation, so both the column and relation graphs satisfy
-    this same protocol.
+    leaf (a source or seed) whose value comes only from what was declared. The
+    scope-specific reducer is what walks a derivation; the walk itself only needs
+    to enumerate subjects and fetch each one's derivation, so both the column and
+    relation graphs satisfy this same protocol.
     """
 
     def subjects(self) -> Iterable[S]: ...
@@ -88,9 +88,9 @@ class SourceRef:
     * ``CTE``: ``cte.<model_uid>.<scope_path>``, where ``scope_path`` is a
       dot-joined chain of CTE / derived-table aliases from outermost to
       innermost. Disambiguates same-named CTEs in different scopes.
-    * ``UNION``: ``union.<model_uid>.<scope_path>.<col>`` — the combined
+    * ``UNION``: ``union.<model_uid>.<scope_path>.<col>``, the combined
       output node for a UNION ALL's column.
-    * ``UNION_ARM``: ``union.<model_uid>.<scope_path>#<arm_index>`` —
+    * ``UNION_ARM``: ``union.<model_uid>.<scope_path>#<arm_index>``, the
       individual arm projection, indexed in source order.
     """
 
@@ -214,17 +214,21 @@ def source_ref_meta(table: exp.Table) -> SourceRef | None:
 
 @dataclass(frozen=True, slots=True)
 class AggregationSite:
-    """The scope context an aggregate's coherence obligation is judged in.
+    """What a guard needs to know to decide whether an aggregate's result can be
+    trusted: which relation it aggregates over, what it groups by, and what the
+    query's own WHERE clause already pins to a constant.
 
-    The column builder resolves it once per SELECT scope and stamps it onto each
-    aggregate call in that scope's projections, because the projection expression
-    alone (``Alias(Sum(Column))``) carries neither the GROUP BY nor the relation
-    being aggregated over. The guard then has the three things a discharge can
-    rest on, all resolved to graph identities rather than names:
+    An aggregate like ``SUM(amount)`` can carry a companion column (say,
+    ``currency``) whose value must stay constant within each group for the
+    aggregate to mean anything; a guard checks that here. The column builder
+    resolves this once per SELECT scope and stamps it onto each aggregate call in
+    that scope's projections, because the projection expression alone
+    (``Alias(Sum(Column))``) carries none of that context. Each field below is
+    already resolved to a graph identity rather than a name copied out of the SQL:
 
     * ``input_source``: the single FROM relation the scope aggregates over, when
-      it is one resolvable relation with no joins; ``None`` closes the dependency
-      read (the FD property has no scope to answer for).
+      it is one resolvable relation with no joins; ``None`` means there is no
+      relation to check a companion column's dependency against at all.
     * ``group_refs``: the GROUP BY columns; the empty set is the whole-relation
       fold (no GROUP BY, or the ``GROUP BY ()`` grand-total grouping set), and
       ``None`` marks a group shape the builder cannot resolve to plain columns

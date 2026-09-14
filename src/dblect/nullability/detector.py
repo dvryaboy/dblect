@@ -46,9 +46,9 @@ NullableByName = Mapping[str, frozenset[str]]
 
 
 class NullableCause(StrEnum):
-    """Why a column is nullable upstream, when the substrate can attribute it.
+    """Why a column is nullable upstream, when we can attribute it.
 
-    The ``*_JOIN`` causes are positive structural claims the nullability substrate already
+    The ``*_JOIN`` causes are positive structural claims the nullability property already
     derives (the column is drawn from an outer join's optional side), named by the join kind
     that padded it. ``UNKNOWN`` is the honest fallback: the column is proven NULLABLE, but
     the cause is not derivable here, so the finding names no cause rather than fabricating
@@ -60,8 +60,8 @@ class NullableCause(StrEnum):
     UNKNOWN = "unknown"
 
 
-# Per relation name, the column-to-cause map for proven-NULLABLE columns whose cause the
-# substrate attributes. A column absent from the inner map reads as ``UNKNOWN``.
+# Per relation name, the column-to-cause map for proven-NULLABLE columns whose cause we
+# can attribute. A column absent from the inner map reads as ``UNKNOWN``.
 CauseByName = Mapping[str, Mapping[str, NullableCause]]
 
 
@@ -354,7 +354,7 @@ def _finding(grp_expr: exp.Column, *, written_at: Expr, source: str, column: str
 
 
 def _cause_clause(cause: NullableCause) -> str:
-    """The ``why nullable`` clause, when the substrate attributes a cause. Returns an empty
+    """The ``why nullable`` clause, when we can attribute a cause. Returns an empty
     string for ``UNKNOWN`` so the message degrades honestly rather than fabricating one."""
     match cause:
         case NullableCause.LEFT_JOIN:
@@ -557,9 +557,9 @@ def _cause_by_name(
     """Index, by relation name, the attributable ``why nullable`` cause per column.
 
     Only the outer-join cause is attributable today, read from the same structural
-    analysis the nullability taint uses (:func:`outer_join_nullable_columns`). A column
-    the substrate cannot attribute is simply absent, so the finding reads it as
-    ``UNKNOWN`` and names no cause."""
+    analysis that flags outer-join-nullable columns (:func:`outer_join_nullable_columns`).
+    A column we cannot attribute is simply absent, so the finding reads it as ``UNKNOWN``
+    and names no cause."""
     out: dict[str, dict[str, NullableCause]] = {}
     for name, columns in outer_join_nullable_columns(manifest, parsed=parsed).items():
         out[name] = {col: _CAUSE_OF_SIDE[side] for col, side in columns.items()}
@@ -576,10 +576,11 @@ def make_nullability_detectors(
 ) -> tuple[Detector, ...]:
     """Curry the nullability-consuming detectors against the propagated annotations.
 
-    Runs one cross-model nullability propagation (outer-join taint plus conditional
-    activation, via ``activated_nullability``), indexes the proven-NULLABLE columns by
-    relation name, and curries the GROUP BY, join-key, and NOT-IN detectors against that
-    index. ``profile`` is the run's resolved target (its dialect parses, its semantics
+    Runs one cross-model nullability propagation via ``activated_nullability`` (it marks
+    a column nullable when an outer join can pad it, and activates a NON_NULL fact only
+    once the query establishes the guarding condition), indexes the proven-NULLABLE
+    columns by relation name, and curries the GROUP BY, join-key, and NOT-IN detectors
+    against that index. ``profile`` is the run's resolved target (its dialect parses, its semantics
     ground); ``parsed`` lets the walker share its pre-parsed trees. ``column_graph`` lets the
     audit pass the manifest column graph it already built, so the qualify-and-resolve walk is
     not repeated per fact family. ``fd_by_name`` is the propagated functional-dependency map

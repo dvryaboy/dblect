@@ -1,14 +1,18 @@
-"""Check a project across its incremental worlds: compile both ways, run the
-project's detectors over each, and difference the findings.
+"""Check a project both ways an incremental dbt model can compile, and diff the
+findings.
 
-These are control-flow worlds, so each is built independently from its own manifest
-(the shared-build enumerator in :mod:`dblect.check.worlds` serves value-substitution
-worlds, where the SQL is identical). Each world's findings come through the single
-analysis door, :func:`dblect.analysis.analyze`, so both detector families are present
-by construction rather than by this module remembering to call each. Because the SQL
-differs, a finding's message and line span drift between worlds even when the issue is
-the same, so the diff keys on a stable :data:`~dblect.analysis.FindingIdentity` rather
-than whole-finding equality. Issue #107 weighs unifying the finding representations.
+A ``{% if is_incremental() %}`` block means a model's SQL can be genuinely
+different text on a full refresh versus a steady-state incremental run, not just
+the same SQL with a different value substituted in (that case is what
+:mod:`dblect.check.worlds` handles, and each of its worlds is built independently
+from its own manifest). This module compiles the project both ways and runs every
+detector over each compile through the one shared entry point,
+:func:`dblect.analysis.analyze`, so both detector families are present by
+construction rather than by this module remembering to call each. Because the SQL
+text differs between the two compiles, a finding's message and line span can drift
+even when it is the same underlying issue, so the diff matches on the stable
+:data:`~dblect.analysis.FindingIdentity` rather than comparing findings for exact
+equality. Issue #107 weighs unifying the finding representations.
 """
 
 from __future__ import annotations
@@ -30,12 +34,13 @@ from dblect.types import ContractRegistry
 
 @dataclass(frozen=True, slots=True)
 class CrossWorldFinding:
-    """A finding that holds in a strict subset of the analyzed worlds.
+    """A finding that holds in some of the checked worlds but not all of them (for
+    example, only on a full refresh, not on steady state).
 
     ``worlds`` are the worlds the finding holds under, and ``representative`` is one
     world's instance of it for display (the message and span are that world's). A
-    finding present in every analyzed world is world-invariant and is not a
-    ``CrossWorldFinding``; the single-manifest analysis already reports it.
+    finding present in every checked world is not a ``CrossWorldFinding``; the
+    ordinary single-manifest analysis already reports it.
     """
 
     identity: FindingIdentity
@@ -46,7 +51,7 @@ class CrossWorldFinding:
 def cross_world_findings(
     per_world: Mapping[WorldRef, Sequence[AnalysisFinding]],
 ) -> tuple[CrossWorldFinding, ...]:
-    """The findings holding in a strict subset of ``per_world``'s worlds.
+    """The findings that hold in some of ``per_world``'s worlds but not all of them.
 
     Findings are grouped by :func:`~dblect.analysis.cross_world_identity` so a message
     or line span that drifts between the two compiled SQLs is not mistaken for a
@@ -106,7 +111,8 @@ def check_incremental_worlds(
     registry: ContractRegistry | None = None,
     dbt_executable: str = "dbt",
 ) -> IncrementalWorldCheck:
-    """Compile ``project_dir`` into its incremental worlds and check each.
+    """Compile ``project_dir`` both ways an incremental model can build (full
+    refresh and steady state) and check each.
 
     ``profile`` is the resolved target whose dialect parses every model, and
     ``registry`` the contracts to resolve (defaulting to the active one), the same

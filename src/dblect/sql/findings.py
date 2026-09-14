@@ -2,7 +2,7 @@
 
 A ``Finding`` is a single structural observation about one SQL statement, located
 by a line span. Every detector layer emits these: the structural pattern detectors
-in :mod:`dblect.sql.patterns`, the lineage-grounded detectors under
+in :mod:`dblect.sql.patterns`, and the lineage-based detectors under
 :mod:`dblect.nullability`, :mod:`dblect.uniqueness`, :mod:`dblect.snapshot`, and
 :mod:`dblect.flatten`. ``FindingKind`` is their shared vocabulary, so it lives here
 rather than in any one detector module.
@@ -68,16 +68,14 @@ def suppression_hint(kind: FindingKind | CheckFindingKind) -> str:
 class Finding:
     """A single static-analysis observation about a SQL statement.
 
-    ``line_start`` and ``line_end`` are 1-indexed line numbers in the SQL
-    the detector was given — the model's ``compiled_code``, which dbt
-    renders with refs and macro calls expanded inline. Line numbers
-    correspond to the compiled output; the reporter still surfaces the
+    ``line_start`` and ``line_end`` are 1-indexed line numbers in the SQL the detector was
+    given: the model's ``compiled_code``, which dbt renders with refs and macro calls expanded
+    inline. Line numbers correspond to the compiled output; the reporter still surfaces the
     model's source file path so navigation works as expected.
 
-    A value of ``0`` means we couldn't pin the finding to a line, which
-    happens when the offending AST node has no ``Identifier`` descendants
-    sqlglot stamped with position info. Callers can treat ``0`` as "model
-    scope, line unknown" and report it without a line number.
+    A value of ``0`` means we couldn't pin the finding to a line, which happens when no node
+    in the offending AST subtree carries a line number sqlglot stamped. Callers can treat ``0``
+    as "model scope, line unknown" and report it without a line number.
     """
 
     kind: FindingKind

@@ -59,8 +59,8 @@ from dblect.uniqueness.detector import (
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
 # The dialect-agnostic structural detectors. Context-bound detectors (non-determinism
-# from the resolved adapter, uniqueness and nullability grounded against declared
-# facts, inner-flatten grounded against propagated array non-emptiness) are built per
+# from the resolved adapter, uniqueness and nullability checked against declared
+# facts, inner-flatten checked against propagated array non-emptiness) are built per
 # run in `run_audit` and appended there, so they are not listed. The inner-flatten check
 # in particular is run only through its fact-grounded factory so it sees the cross-model
 # non-emptiness map; listing the structural form here too would double-report it.
@@ -161,9 +161,9 @@ def run_audit(
 ) -> AuditReport:
     """Run `detectors` over every model in `manifest`.
 
-    ``profile`` is the run's resolved target: its dialect parses every model and
-    its semantics ground the fact-based detectors, so parsing and enforcement read
-    the same adapter.
+    ``profile`` is the run's resolved target: its dialect parses every model, and
+    its semantics are what the fact-grounded detectors check against, so parsing
+    and enforcement read the same adapter.
 
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
     Models whose ``compiled_code`` is missing or unparseable are listed in
@@ -172,13 +172,13 @@ def run_audit(
     Context-bound detectors run alongside the configured `detectors` list, each
     built from the resolved profile and the pre-parsed trees: the non-determinism
     detector (its builtin names come from the profile), the uniqueness window
-    order-keys, join-fanout, and non-deterministic-``LIMIT`` detectors (grounded
+    order-keys, join-fanout, and non-deterministic-``LIMIT`` detectors (checked
     against declared keys, the last also against each model's materialization), the
     nullability hazard detectors (GROUP BY, join key, and NOT IN on an
-    inherited-nullable column, grounded against the propagated nullability
-    property), the inner-flatten row-drop detector (grounded against the
+    inherited-nullable column, checked against the propagated nullability
+    property), the inner-flatten row-drop detector (checked against the
     propagated array-non-emptiness property, so a rebuilt-then-unnested array is
-    not flagged), and the snapshot temporal-filter detector (grounded against the
+    not flagged), and the snapshot temporal-filter detector (checked against the
     manifest's snapshots and their validity columns). The fact-grounded ones are
     opportunistic, silent on projects that declare nothing, so they need no opt-in
     flag. They share the audit's pre-parsed trees, so the SQL is parsed once.
@@ -188,8 +188,9 @@ def run_audit(
     :func:`dblect.analysis.analyze` instead, which carries both families so a family
     is never dropped by being forgotten.
     """
-    # ``analyze`` shares the parse and both lineage graphs it already built (rebuilding them,
-    # the heavy substrate, dominates a run); omitted, this builds them, the standalone path.
+    # ``analyze`` already built the parse and both lineage graphs and passes them in here,
+    # skipping a rebuild of that heavy substrate (it dominates a run). Without them, this
+    # is the standalone path, and builds them itself.
     if parsed is None:
         parsed, trees = parse_manifest_models(manifest, dialect=profile.sqlglot_dialect)
     else:
@@ -274,15 +275,9 @@ def _scan_one(
     raw_findings: list[Finding] = []
     for detector in detectors:
         raw_findings.extend(detector(tree))
-    # Directives are read from both texts: the template for a finding the back-map placed on
-    # a source line, and the compiled SQL for one a macro emitted, whose guarding `-- noqa`
-    # renders only into the compiled output. Each finding is matched in the frame(s) it
-    # occupies.
     directives = FramedDirectives.for_node(node)
-    # Findings carry compiled-SQL spans; back-map them onto the source template once per
-    # model, then match directives against the located span. Locating before suppressing
-    # is what lets a `-- noqa` on the line the report shows silence a finding whose
-    # compiled line a macro expansion pushed away from its source line.
+    # Locate before suppressing: a `-- noqa` is matched against the line the report shows,
+    # which can differ from the compiled line a macro expansion produced.
     line_map = build_line_map(node.analysis_sql, node.raw_code)
     located = [_locate(node, f, line_map) for f in raw_findings]
     active, suppressed = apply(located, directives)

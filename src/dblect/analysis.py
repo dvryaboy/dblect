@@ -6,7 +6,7 @@ the declaration-level ones (contract resolution, domain-type contradictions acro
 the DAG, not-well-typed aggregations), located by model, column, and contract.
 :func:`~dblect.audit.run_audit` reports the SQL-structural ones (join fan-out,
 window order, the nullability hazards, the rest), located by a span in one compiled
-statement. The two stay distinct in representation and altitude; issue #107 weighs
+statement. The two stay distinct in representation and granularity; issue #107 weighs
 whether to merge the representations as well.
 
 What this module removes is the obligation to *know* there are two families. Asking
@@ -73,7 +73,7 @@ class AnalysisReport:
     """Every finding for one manifest, from every detector family, plus each family's
     own report so a caller that needs the family-specific extras (coverage blocks,
     suppressed directives) still has them. ``findings`` is the merged, sealed view the
-    finding-threading consumers read; the rest is there when an altitude matters."""
+    finding-threading consumers read; the rest is there when that granularity matters."""
 
     findings: tuple[AnalysisFinding, ...]
     check: CheckReport
@@ -102,7 +102,7 @@ def analyze(
     already carries the resolved contracts.
 
     The build's resolved ``determines`` facts are also threaded into the structural audit so
-    join-fanout grounds key coverage through functional dependencies (a declared ``wiki_id
+    join-fanout extends key coverage through functional dependencies (a declared ``wiki_id
     determines wiki_name`` lets a join on the determinant cover a key carrying the dependent).
     The declaration family already reads these off the shared build; this hands the same facts
     to the structural one.

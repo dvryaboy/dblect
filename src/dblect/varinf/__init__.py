@@ -3,8 +3,8 @@ project and infer enough about each to enumerate worlds.
 
 This package is the discovery half of the flag system. The Jinja front end
 (:mod:`dblect.templating`, :mod:`dblect.varinf.walker`) turns a node's source
-Jinja into :class:`~dblect.varinf.usage.VarUsage` records; later streams fold
-those into typed, domain-bearing flags.
+Jinja into :class:`~dblect.varinf.usage.VarUsage` records; a later pass folds
+those into flags with a known type and value domain.
 """
 
 from dblect.varinf.usage import (

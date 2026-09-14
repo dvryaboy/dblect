@@ -13,10 +13,10 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeGuard, cast
+from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -33,12 +33,8 @@ class JoinSide(StrEnum):
 
 
 def from_of(sel: exp.Select) -> exp.From | None:
-    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent.
-
-    sqlglot 30+ keys the arg ``"from_"``; older 25.x kept it as ``"from"``.
-    We try both so the static-analysis layer doesn't pin a minor version.
-    """
-    return cast("exp.From | None", sel.args.get("from_") or sel.args.get("from"))
+    """The ``FROM`` clause of a ``SELECT``, or ``None`` if absent."""
+    return cast("exp.From | None", sel.args.get("from_"))
 
 
 def where_of(sel: exp.Select) -> exp.Where | None:
@@ -63,6 +59,48 @@ def group_of(sel: exp.Select) -> exp.Group | None:
     return cast("exp.Group | None", sel.args.get("group"))
 
 
+_V = TypeVar("_V")
+
+
+def with_scope(
+    node: Expr, cte_scope: Mapping[str, _V], resolve: Callable[[Expr, Mapping[str, _V]], _V]
+) -> dict[str, _V]:
+    """``cte_scope`` extended with the CTEs ``node`` declares, each resolved by
+    ``resolve`` in the scope the ones before it built. The one CTE fold every
+    relation walk shares, whatever value it carries per scope."""
+    local = dict(cte_scope)
+    with_ = node.args.get("with_")
+    if isinstance(with_, exp.With):
+        for cte in with_.expressions:
+            if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
+                local[cte.alias_or_name] = resolve(cte.this, local)
+    return local
+
+
+def union_arms(u: exp.Union) -> list[Expr] | None:
+    """The arms of a union chain in order: same-operator nesting flattened and
+    parenthesized arms unwrapped, since parens change neither the merged rows nor
+    the arms' output names (dbt_utils-style generated unions parenthesize every
+    arm). Mixing UNION and UNION ALL is fine: the merged rows are drawn from the
+    arms' rows either way. ``None`` when any link merges by name (``BY NAME``,
+    ``CORRESPONDING``), where alignment is by alias rather than position."""
+    if u.args.get("by_name"):
+        return None
+    arms: list[Expr] = []
+    for side in (u.this, u.expression):
+        if not isinstance(side, Expr):
+            return None
+        node = side.unnest()
+        if isinstance(node, exp.Union):
+            inner = union_arms(node)
+            if inner is None:
+                return None
+            arms.extend(inner)
+        else:
+            arms.append(node)
+    return arms
+
+
 class GroupBinding(StrEnum):
     """How firmly a ``GROUP BY`` target is bound to the expression it denotes.
 
@@ -72,7 +110,7 @@ class GroupBinding(StrEnum):
     would bind an input column of that name first and the AST cannot rule one out.
 
     A detector may read all three, since over-reporting is its safe direction. A consumer that
-    *grounds* a fact from the group key stops at ``DECIDED`` (see
+    treats the group key as an established fact stops at ``DECIDED`` (see
     :attr:`GroupTarget.grounded_expression`): keys and dependencies are read downstream to
     clear hazards, so a wrong resolution there silences real findings instead of adding a
     spurious one.
@@ -91,8 +129,8 @@ class GroupTarget:
     A finding about the *grouping decision* belongs at ``written_at``, so ``GROUP BY 1`` is
     diagnosed at the clause an analyst reads. One about something written inside the target (a
     ``now()`` call) belongs at ``expression``, where that call is spelled out. The two nodes
-    coincide for a target written in full. ``binding`` decides whether a consumer may ground a
-    fact from ``expression``: see :attr:`grounded_expression`.
+    coincide for a target written in full. ``binding`` decides whether a consumer may treat
+    ``expression`` as an established fact: see :attr:`grounded_expression`.
     """
 
     expression: Expr
@@ -101,8 +139,8 @@ class GroupTarget:
 
     @property
     def grounded_expression(self) -> Expr:
-        """The reading a consumer may ground a fact from: the resolved expression where SQL's
-        own rules decide the binding, and the written node where they do not.
+        """The reading a consumer may treat as an established fact: the resolved expression
+        where SQL's own rules decide the binding, and the written node where they do not.
 
         Falling back to ``written_at`` on a ``PRESUMED`` binding is the conservative reading, and
         it is the one SQL takes whenever the name really is an input column. Two targets can also
@@ -363,9 +401,9 @@ def fn_of(w: exp.Window) -> Expr | None:
 
 
 def row_number_window(node: Expr) -> exp.Window | None:
-    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` grounds
-    a dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row, whereas
-    ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
+    """``node`` as a ``ROW_NUMBER() OVER (...)`` window, or ``None``. Only ``ROW_NUMBER`` gives a
+    working dedup key: it ranks distinctly within a partition, so ``= 1`` keeps exactly one row,
+    whereas ``RANK`` / ``DENSE_RANK`` share a rank across ties and can keep several."""
     if isinstance(node, exp.Window) and isinstance(node.this, exp.RowNumber):
         return node
     return None
@@ -379,7 +417,8 @@ def rank_one_guard_operand(leaf: Expr) -> Expr | None:
     """The operand a ``= 1`` / ``<= 1`` dedup guard constrains to the top rank, or ``None``.
     Recognises ``X = 1``, ``1 = X``, ``X <= 1`` and ``1 >= X`` with a literal integer ``1`` (a
     row number is ``>= 1``, so ``<= 1`` coincides with ``= 1``). Any other comparison keeps more
-    than the top row and grounds no key. ``X`` is returned unevaluated for the caller to test."""
+    than the top row and yields no usable dedup key. ``X`` is returned unevaluated for the
+    caller to test."""
     if isinstance(leaf, exp.EQ):
         if _is_literal_one(leaf.expression):
             return leaf.this

@@ -7,10 +7,10 @@ to it, and a projection renames the filter's columns (``country = 'US'`` becomes
 ``region = 'US'`` after ``country AS region``). CTEs and inline subqueries
 accumulate for free, since the relation walk recurses through them.
 
-The property is the shared substrate a later activation step reads to decide when a
-captured conditional fact applies: a conditional ``unique`` / ``not_null`` holds at
-any scope whose accumulated filter *implies* the test's predicate. Type refinement
-and contract validation are further consumers of the same flow.
+A later activation step reads this property to decide when a captured conditional
+fact applies: a conditional ``unique`` / ``not_null`` holds at any scope whose
+accumulated filter *implies* the test's predicate. Type refinement and contract
+validation read the same flow too.
 
 The value reuses the predicate engine's typed atoms (:data:`Canon`), so the filter
 is rigorously shaped and feeds the engine directly. Posture is silent-when-unproven:
@@ -160,12 +160,7 @@ class _FlowWalk:
     def _select(
         self, sel: exp.Select, *, cte_scope: Mapping[str, frozenset[Canon]]
     ) -> frozenset[Canon]:
-        local = dict(cte_scope)
-        with_ = sel.args.get("with_")
-        if isinstance(with_, exp.With):
-            for cte in with_.expressions:
-                if isinstance(cte, exp.CTE) and isinstance(cte.this, Expr):
-                    local[cte.alias_or_name] = self.scope_filter(cte.this, cte_scope=local)
+        local = sg.with_scope(sel, cte_scope, lambda n, s: self.scope_filter(n, cte_scope=s))
 
         from_ = sg.from_of(sel)
         if from_ is None or not isinstance(from_.this, Expr):

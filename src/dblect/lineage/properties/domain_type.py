@@ -4,10 +4,10 @@ A magnitude column (``amount``) carries a :class:`DomainTag`: a dimensional
 monomial (currency and units, which do exponent arithmetic under ``*`` and ``/``)
 plus categorical nominal tags (``contains_tax``, ``country``, carried by equality
 only). Each tag binds either to a literal (a pinned currency) or to a companion
-column travelling with the amount (a per-row currency column). This is the
-multi-column companion binding the substrate-readiness notes name as the first
-genuine build over the lineage engine: the property value is structured, so the
-work is a lattice and transfer rules rather than engine plumbing.
+column travelling with the amount (a per-row currency column). Unlike the other
+properties in this package, its value is a structured, multi-part tag rather
+than a single flat value, so the work here is a genuinely new lattice and set
+of transfer rules rather than reuse of existing plumbing.
 
 The lattice orders by tag knowledge. ``NAKED`` (no tag) is the top, the
 freely-summable magnitude making no claim; a known tagging refines it; two known
@@ -21,14 +21,15 @@ summarizability story (Lenz & Shoshani, SSDBM 1997); see
 
 Naked-amount taint falls out of lineage: when ``amount`` flows to a model where
 its companion ``currency`` column was projected away, the binding rides as a
-reference that no longer agrees at a confluence and widens to ``NAKED``; the
-coherence guard then blocks a downstream sum until a dependency discharges it.
+reference that no longer agrees at a UNION's confluence and widens to
+``NAKED``; the coherence guard then blocks a downstream sum until a dependency
+discharges it.
 The guard is armed by :func:`domain_type_property` when the caller passes the
 functional-dependency property's ref.
 
-Grounding for the first version comes from synthetic facts supplied by a caller
-(the same way the uniqueness and nullability tests ground their properties); the
-typed source is the contract bridge in the authoring layer.
+Today, grounding comes from synthetic facts a caller supplies directly (the same
+way the uniqueness and nullability tests ground their properties); the typed
+source will eventually be the contract bridge in the authoring layer.
 """
 
 from __future__ import annotations
@@ -157,11 +158,10 @@ class _Polymorphic:
     """The dimension of a bare numeric literal: no fixed unit, but not a no-claim
     unknown either. It adopts the other operand's unit under ``+``/``-`` (so
     ``amount + 5`` stays the amount's currency rather than conflicting on a scalar)
-    and acts as dimensionless under ``*``/``/`` (so ``amount * 0.9`` keeps it). This
-    is the "a literal sits at bottom, polymorphic, until context fixes it" reading of
-    the algebra doc, kept distinct from ``None`` (an unknown magnitude, which absorbs
-    under every operator) and from the empty monomial (a *certified* dimensionless
-    value, which conflicts when added to a unit). A singleton; carries no payload."""
+    and acts as dimensionless under ``*``/``/`` (so ``amount * 0.9`` keeps it).
+    Distinct from ``None`` (an unknown magnitude, which absorbs under every
+    operator) and from the empty monomial (a *certified* dimensionless value,
+    which conflicts when added to a unit). A singleton; carries no payload."""
 
 
 POLYMORPHIC: Final[_Polymorphic] = _Polymorphic()
@@ -442,9 +442,10 @@ def _dot_rule(
 def _comparison_rule(
     _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
-    """A comparison yields a boolean, which carries no magnitude tag. The operands'
-    tags must agree for the comparison to mean anything, but that obligation is a
-    seam concern; the produced value is always tag-free."""
+    """A comparison such as ``a = b`` yields a boolean, which carries no magnitude
+    tag regardless of the operands' tags. Whether those tags actually agree is
+    checked separately, where a declared tag meets an inferred one; this rule
+    only fixes the comparison's own tag-free result."""
     return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
 
 
@@ -537,9 +538,8 @@ def _aggregate_rules(
     companion is not held constant per group: for ``COMBINE`` that cleared result is the
     mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
     widen-to-top of a tag-blind selection (``min`` over mixed currencies), caught later
-    where a definite tag is required. The produce rule is the same for both; the finding
-    tells them apart. The classification (:data:`AGGREGATE_BEHAVIORS`) is the single
-    source of truth, in :mod:`dblect.sql.aggregates`."""
+    where a definite tag is required. The classification (:data:`AGGREGATE_BEHAVIORS`)
+    is the single source of truth, in :mod:`dblect.sql.aggregates`."""
     rules: dict[type[exp.AggFunc], AggregateRule[DomainTag]] = {}
     for agg_type, behavior in AGGREGATE_BEHAVIORS.items():
         # COMBINE and SELECT deliberately share one produce rule (the finding tells them
@@ -569,7 +569,7 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
     return frozenset(out)
 
 
-# --- the seam-diagnostic display ---------------------------------------------
+# --- naming a tag for the dropped-refinement warning --------------------------
 
 
 def _unit_label(unit: Unit) -> str:
@@ -593,13 +593,16 @@ def _dimension_label(dim: DimClaim) -> str | None:
 
 
 def domain_type_display(tag: DomainTag) -> AxisDisplay:
-    """The structural name the seam diagnostic renders a tag through: the dimensional
-    monomial and the nominal bindings the tag carries.
+    """The human-readable name for a tag, shown when the checker warns that a
+    magnitude's currency or category was silently dropped because it combined
+    with an untagged value: the dimensional monomial and the nominal bindings
+    the tag carries.
 
-    This is the fallback rendering the :class:`AxisDisplay` hook documents, off the tag
-    value alone. Naming the declared type the tag came from (``Money over (amount,
-    currency)``, with the contract's file) is the declaration-trace follow-on (#48);
-    the value here carries the structure, not the declaration."""
+    This is the fallback rendering the :class:`AxisDisplay` hook documents, built
+    from the tag value alone. Naming the declared type the tag came from
+    (``Money over (amount, currency)``, with the contract's file) is a follow-on
+    improvement (#48); the value here carries the structure, not the
+    declaration."""
     if isinstance(tag, _Conflict):
         return AxisDisplay(name="conflicting domain types")
     pieces: list[str] = []
@@ -615,7 +618,7 @@ def domain_type_display(tag: DomainTag) -> AxisDisplay:
     return AxisDisplay(name="a magnitude in " + ", ".join(pieces))
 
 
-# --- join-key type compatibility (substrate signal) -----------------------------
+# --- join-key type compatibility (a signal, not a finding) -----------------------
 
 
 def join_key_conflicts(

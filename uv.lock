@@ -498,7 +498,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.0" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "sqlglot", specifier = ">=25.0" },
+    { name = "sqlglot", specifier = ">=30.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["dbt-core"]

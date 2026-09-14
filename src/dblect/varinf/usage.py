@@ -3,8 +3,8 @@
 
 These are the contract between the source-Jinja walker and the inference layer
 that folds usages into a type and a domain. The walker produces them; nothing
-here interprets them. The position is carried as a :data:`UsageContext`, a sum
-of small frozen records (one per syntactic shape) rather than a string tag, so a
+here interprets them. The position is carried as a :data:`UsageContext`, a closed
+set of small frozen records (one per syntactic shape) rather than a string tag, so a
 consumer matches over real variants and the type checker enforces exhaustiveness.
 
 The control-flow versus value-substitution distinction the world enumerator
@@ -187,9 +187,10 @@ class SourceLocation:
 class VarUsage:
     """One ``var()`` / ``env_var()`` reference, with the position it was found in.
 
-    ``macro_trail`` is empty for a direct reference; the macro-following stream
-    fills it with the macros traversed to reach a usage. ``confidence`` carries
-    the walker's certainty (see :class:`Confidence`).
+    ``macro_trail`` is empty for a direct reference; a later pass that follows
+    ``var`` calls through macro bodies fills it with the macros traversed to
+    reach a usage. ``confidence`` carries the walker's certainty (see
+    :class:`Confidence`).
     """
 
     var_name: str

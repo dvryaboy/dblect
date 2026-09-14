@@ -1,11 +1,11 @@
 """``@contract``: mark a method whose body builds a symbolic expression.
 
-The marker is intentionally tiny. It tags the function so the model contract's
-metaclass finds it during the scan, then :func:`capture` runs the body once with
-a :class:`~dblect.contracts.proxy.ContractSelf` standing in for ``self`` and
-records the AST it returns. Dispatch on that AST decides what the contract does:
-a :data:`~dblect.contracts.ast.FactNode` feeds the substrate (read and trusted
-unless contradicted), a :data:`~dblect.contracts.ast.Pred` is checked by running.
+The marker is intentionally tiny. It tags the function so
+``ModelContract.__init_subclass__`` finds it during the scan, then :func:`capture`
+runs the body once with a :class:`~dblect.contracts.proxy.ContractSelf` standing
+in for ``self`` and records the AST it returns. Dispatch on that AST decides what
+the contract does: a :data:`~dblect.contracts.ast.FactNode` is trusted outright
+unless contradicted, a :data:`~dblect.contracts.ast.Pred` is checked by running.
 See ``docs/design/dsl-reference.md`` (Contracts).
 """
 
@@ -25,9 +25,8 @@ from dblect.contracts.proxy import (
 _MARKER = "_dblect_contract"
 
 # A contract body takes a self-proxy and returns a fact or predicate proxy. The
-# return is typed ``object`` because authors annotate it loosely (or not at all)
-# and the materialized escape hatch returns other shapes; :func:`capture` checks
-# the actual proxy kind at runtime.
+# return is typed ``object`` because authors annotate it loosely (or not at all);
+# :func:`capture` checks the actual proxy kind at runtime.
 ContractMethod = Callable[[ContractSelf], object]
 
 

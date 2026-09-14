@@ -114,7 +114,7 @@ class ConstraintType(StrEnum):
 class Materialization(StrEnum):
     """How dbt persists (or does not persist) a node's rows.
 
-    The vocabulary is closed, so a check that turns on whether a relation stores its rows can
+    The vocabulary is closed, so code that depends on whether a relation stores its rows can
     branch over these members exhaustively rather than test membership in a raw-string set.
     ``OTHER`` covers adapter-specific materializations (and the absence of a resolved value) so
     the parse stays total; comparisons go through the members to keep typos out of call sites.
@@ -191,11 +191,11 @@ class DbtTestMetadata:
 class ModelConfig:
     """The slice of a node's resolved ``config`` block dblect reasons about.
 
-    Carries only the keys a property currently consumes, not the whole config.
+    Carries only the keys a check currently reads, not the whole config.
     ``unique_key`` is normalized to a tuple of column names: dbt accepts it as a
     single string or a list, and both reduce to the same candidate-key shape.
     More keys (``on_schema_change``, ``cluster_by`` ...) land here as the
-    properties that read them are added.
+    checks that read them are added.
     """
 
     materialized: str | None = None
@@ -225,12 +225,11 @@ class Column:
 class Macro:
     """A macro definition as carried in the manifest's ``macros`` block.
 
-    The source body (`macro_sql`) is what the var-inference macro-following
-    engine expands to reach `var()` calls; `depends_on_macros` is the
-    macro-to-macro edge set that walk recurses through. This view is a faithful
-    transcription of the manifest entry; resolving a name to a definition (the
-    bare-name-then-package lookup) lands with macro-following, which defines what
-    that resolution must satisfy.
+    ``macro_sql`` is the macro's source body and ``depends_on_macros`` is the set
+    of other macros it calls; both matter for tracing a ``var()`` call through the
+    macros that reach it, work var-inference does elsewhere. This view is a plain
+    transcription of the manifest entry: it does not resolve a bare macro name to
+    a definition across packages.
     """
 
     unique_id: str
@@ -295,8 +294,8 @@ class Node:
 
         ``NOT_COMPILED`` when dbt's own flag says so. Otherwise ``STALE_OR_ABSENT``
         when there is a non-trivial source template but no compiled code (the
-        non-hermetic-compile gap), and ``COMPILED`` when there is compiled code or
-        nothing non-trivial to compile.
+        compile run didn't reach the warehouse), and ``COMPILED`` when there is
+        compiled code or nothing non-trivial to compile.
 
         Only SQL nodes carry this signal: a Python (or other non-SQL) model is not
         SQL-analysable, so an empty SQL ``compiled_code`` is not the compile gap and the
@@ -332,7 +331,7 @@ class Node:
 
 # The unique_id prefixes dbt gives the data-flow node kinds, derived from the
 # resource types so the two stay in lockstep ("model.", "source.", "seed.",
-# "snapshot."). ``OTHER`` (tests, analyses) never anchors a generic test.
+# "snapshot."). ``OTHER`` (tests, analyses) is never a generic test's target.
 DATA_FLOW_UID_PREFIXES: tuple[str, ...] = tuple(
     f"{rt.value}." for rt in ResourceType if rt is not ResourceType.OTHER
 )
@@ -346,7 +345,7 @@ def generic_test_target_uid(
     Prefer ``attached_node`` (the modern manifest shape); fall back to the first
     eligible entry in ``depends_on`` for older manifests where ``attached_node``
     isn't populated. ``eligible_prefixes`` narrows which target kinds count, so a
-    caller that grounds only models and sources can pass a subset of the
+    caller interested only in models and sources can pass a subset of the
     data-flow default.
     """
     if node.attached_node and node.attached_node.startswith(eligible_prefixes):
@@ -401,8 +400,8 @@ class Manifest:
             raise ValueError("manifest is missing metadata.adapter_type")
 
         # Macros live under their own top-level `macros` block, separate from
-        # the data-flow `nodes`. They carry no edges into the DAG; the registry
-        # is consumed by macro-following, not by lineage.
+        # the data-flow `nodes`. They carry no edges into the DAG; this registry
+        # is for future work tracing `var()` calls through macros, not for lineage.
         macros = {uid: _macro_from_parsed(uid, m) for uid, m in (parsed.macros or {}).items()}
         return cls(
             schema_version=schema_version,

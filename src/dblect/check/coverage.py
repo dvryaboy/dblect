@@ -2,19 +2,19 @@
 opposite things.
 
 **Resolution coverage** is the fraction of model output columns whose lineage the
-propagator could follow against the fraction it fell blind on (a column reading a
-reference qualify could not attach a source to, an unexpanded ``SELECT *``, a
+propagator could follow, against the fraction it fell blind on (a column whose
+reference sqlglot could not attach to a source, an unexpanded ``SELECT *``, a
 macro that escaped rendering). Counting model output columns rather than every
 reference in every nested scope keeps a deep CTE chain from inflating the
 denominator. Blindness is a capability gap, so a configurable floor turns
 sustained blindness into a finding, and the floor keys on resolution only.
 
-**Grounding coverage** is, among resolved columns, how many a fact grounded,
-reported per property. An ungrounded column is the expected case under "absence
-is silence", not a defect, so grounding never trips a floor on its own. Where it
-earns attention is scoped to declared intent: of the columns a contract names,
-how many resolved to a checkable annotation, which tells a partial adopter
-whether their declarations are actually being checked.
+**Grounding coverage** is, among resolved columns, how many a declared fact
+actually set a value for, reported per property. A column with no fact touching it
+is the expected, unremarkable case, not a defect, so grounding never trips a floor
+on its own. Where it earns attention is scoped to declared intent: of the columns
+a contract names, how many resolved to a checkable annotation, which tells a
+partial adopter whether their declarations are actually being checked.
 
 See ``docs/design/lineage-facts.md`` ("Coverage and degradation").
 """
@@ -112,9 +112,11 @@ class WorldCoverage:
     assumption that a clean report covers every configuration.
 
     Per-contract attribution (which worlds each contract was actually checked under)
-    awaits the flag-influence cone. Until it exists every enumerated contract is
-    checked under every enumerated world, so the honest report is the global count
-    and the axes swept, not a per-contract claim the analysis cannot yet back."""
+    needs dblect to first work out which flags can actually change a given
+    contract's outcome, as opposed to flags that never reach it. Until that exists,
+    every enumerated contract is checked under every enumerated world, so the
+    honest report is the global count and the axes swept, not a per-contract claim
+    the analysis cannot yet back."""
 
     worlds_enumerated: int
     axes_enumerated: tuple[str, ...]

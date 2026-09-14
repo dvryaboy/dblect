@@ -5,12 +5,13 @@ the propagator's aggregate dispatch already uses, dialect-neutral: bigquery
 ``min_by``/``max_by`` arrive as ``ArgMin``/``ArgMax``, duckdb ``median``/``quantile`` have
 dedicated nodes). They are recorded together rather than in two parallel tables.
 
-**Magnitude (result domain).** What domain the result lives in, which decides the
-currency-coherence obligation (``docs/design/domain-type-algebra.md``):
+**Magnitude (result domain).** What domain the result lives in, which decides whether every
+input must share the same tag (e.g. currency) for the result to be valid (see
+``docs/design/domain-type-algebra.md``):
 
 * **COMBINE** synthesizes a new value out of many (``sum``, ``avg``, a spread, a middle).
-  A per-row companion that varies within the group corrupts the result, so a combining
-  reduction carries the coherence obligation.
+  A per-row companion that varies within the group corrupts the result, so combining rows
+  only makes sense when they all share the same tag.
 * **SELECT** returns one of the input values (``min``, ``max``, ``arg_min``). The value is
   real, so the operation does not fail; only its tag is uncertain, because the comparison
   that chose it was tag-blind. The result widens to top.
@@ -110,7 +111,7 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     exp.Count: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=True),
     exp.CountIf: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=True),
     exp.ApproxDistinct: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=False),
-    # Non-magnitude folds (no coherence obligation), classified on the multiplicity axis.
+    # Non-magnitude folds (no magnitude obligation), classified on the multiplicity axis.
     # Boolean and bitwise-and/or have an idempotent combine (``x AND x = x``, ``x & x = x``),
     # so they are safe; bitwise xor cancels a duplicated row (``x ^ x = 0``) and collection
     # folds gather every row into a container, so both are sensitive.
@@ -161,13 +162,12 @@ def strips_duplicates(agg: exp.Func) -> bool:
 def duplicate_sensitive(agg: exp.Func, *, safe_builtins: frozenset[str] = frozenset()) -> bool:
     """True if a fan-out that duplicates ``agg``'s input rows would distort its result.
 
-    The duplicate-sensitivity predicate of the hazard algebra. A ``DISTINCT`` on the input
-    removes the duplicates before the fold, so any aggregate becomes safe
-    (``count(distinct x)``). Otherwise the answer is the aggregate type's registry fact;
-    a ``max`` or ``bool_or`` is safe, a ``sum`` or ``array_agg`` is sensitive. An
+    A ``DISTINCT`` on the input removes the duplicates before the fold, so any aggregate
+    becomes safe (``count(distinct x)``). Otherwise the answer is the aggregate type's registry
+    fact; a ``max`` or ``bool_or`` is safe, a ``sum`` or ``array_agg`` is sensitive. An
     ``exp.Anonymous`` UDF has no registry type, so it is sensitive unless the adapter names
-    it in ``safe_builtins`` (case-insensitive): the firewall posture keeps an unknown fold
-    firing rather than clearing a fan-out on a guess."""
+    it in ``safe_builtins`` (case-insensitive): treating an unknown fold as sensitive by
+    default keeps a fan-out finding firing rather than clearing it on a guess."""
     if strips_duplicates(agg):
         return False
     profile = _profile(agg)

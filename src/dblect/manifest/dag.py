@@ -1,8 +1,8 @@
 """Immutable directed acyclic graph keyed by node identifier.
 
 Used by the manifest module to represent dbt's project structure, and reused by
-downstream consumers (type propagation, change-impact) that need topological
-queries over the project DAG.
+downstream consumers (the lineage builder today, more later) that need
+topological queries over the project DAG.
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ class Dag:
         return frozenset(visited)
 
     def _find_cycle_from(self, start: str) -> tuple[str, ...]:
-        """DFS to recover a witness cycle for `CycleError`."""
+        """DFS that finds one cycle to report in `CycleError`."""
         path: list[str] = []
         on_path: set[str] = set()
 

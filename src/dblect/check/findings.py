@@ -1,8 +1,8 @@
 """The findings ``dblect check`` reports, and the report that carries them.
 
 These are declaration-level findings: a contract that does not line up with the
-manifest, a declared domain type contradicted by what the substrate propagates, a
-sum the algebra cannot call well typed. They are distinct from the SQL-structural
+manifest, a declared domain type contradicted by what propagation infers, a sum
+the algebra cannot call well typed. They are distinct from the SQL-structural
 findings the ``audit`` walker emits, so they carry their own kinds and their own
 small report shape rather than borrowing the SQL ``Finding`` (which is a span in
 one statement). See ``docs/design/declaration-dsl.md`` and
@@ -28,8 +28,9 @@ class CheckFindingKind(StrEnum):
     field, out-of-domain value, malformed declaration)."""
 
     DOMAIN_TYPE_CONTRADICTION = auto()
-    """A declared domain type is contradicted by the type the substrate inferred
-    for the same column, and the contradiction rides the DAG (currency creep)."""
+    """A declared domain type is contradicted by the type propagation inferred for
+    the same column, and the contradiction shows up at every downstream column it
+    reaches (currency creep)."""
 
     AGGREGATION_NOT_WELL_TYPED = auto()
     """A reduction over one field of a multi-field type whose other fields are not

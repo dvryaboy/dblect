@@ -21,8 +21,9 @@ K = TypeVar("K")
 @dataclass(frozen=True, slots=True)
 class Lattice(Generic[K]):
     """``meet`` is the greatest lower bound (the more precise value), ``join`` the
-    least upper bound (used at a confluence). ``top`` is 'no information'; ``bottom``
-    is 'contradiction', a value that no data can satisfy."""
+    least upper bound (used where two branches merge, e.g. a UNION). ``top`` is
+    'no information'; ``bottom`` is 'contradiction', a value that no data can
+    satisfy."""
 
     meet: Callable[[K, K], K]
     join: Callable[[K, K], K]
@@ -55,10 +56,11 @@ def consistent(lat: Lattice[K]) -> Callable[[K, K], bool]:
     declaration when the SQL revealed nothing (top) or proved something at least
     as precise.
 
-    ``top`` is checked before ``bottom`` so an opaque inference passes even on a
-    degenerate lattice (``top == bottom``). ``bottom`` is then handled explicitly:
-    it refines every value, so without its own arm an inferred contradiction would
-    pass vacuously, when it should be a finding.
+    ``top`` is checked before ``bottom`` so a value of top (nothing was
+    inferred) still passes even in a degenerate lattice where top and bottom
+    coincide. ``bottom`` is then handled explicitly: since bottom refines
+    every value, skipping this check would let an inferred contradiction pass
+    by default instead of being reported as a finding.
     """
 
     def check(declared: K, inferred: K) -> bool:

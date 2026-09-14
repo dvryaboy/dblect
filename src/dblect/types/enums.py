@@ -1,4 +1,4 @@
-"""Marker bases that classify a domain type's enum fields by how the substrate
+"""Marker bases that classify a domain type's enum fields by how a domain tag
 carries them.
 
 A :class:`UnitEnum` is a *dimensional* unit (a currency is the worked example),

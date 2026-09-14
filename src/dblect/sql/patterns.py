@@ -808,8 +808,8 @@ def _array_expr_nonempty(
 
     The intrinsic constructors the SQL vocabulary proves from the node alone are the always-on
     local cases: a literal ``ARRAY[...]``, a ``GENERATE_ARRAY`` over literal bounds. For a
-    column, the answer comes from ``column_is_nonempty``, the lineage-grounded predicate the
-    audit supplies; without it, a column is treated as opaque, so the detector module stays
+    column, the answer comes from ``column_is_nonempty``, the predicate the audit's lineage
+    analysis supplies; without it, a column is treated as opaque, so the detector module stays
     free of lineage types.
 
     Non-emptiness is proved where the array is *produced*. A column that arrives through the

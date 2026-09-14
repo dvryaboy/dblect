@@ -12,9 +12,9 @@ and calls :func:`register`. The built-ins under :mod:`dblect.adapters.builtin`
 are auto-discovered, so this package never enumerates them.
 
 An adapter is **validated** when dblect's detectors have been exercised against its
-SQL end-to-end (today, only duckdb). The others carry the runtime semantics dbt's
-adapter docs describe and route through the matching sqlglot dialect once the
-operator opts in via ``--dialect``.
+SQL end-to-end; :func:`validated_adapters` names the current set. The others carry
+the runtime semantics dbt's adapter docs describe and route through the matching
+sqlglot dialect once the operator opts in via ``--dialect``.
 """
 
 from __future__ import annotations

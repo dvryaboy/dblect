@@ -1,10 +1,10 @@
 """Fact-grounded audit detectors for uniqueness hazards.
 
 The uniqueness *facts* (candidate keys per relation, declared and propagated)
-live on the lineage.facts substrate as ``dblect.lineage.properties.uniqueness``.
-This package is the audit-facing consumer: detectors that read those keys and
-flag window order-key, join-fanout, and non-deterministic ``LIMIT`` hazards on a
-project's SQL.
+are computed in ``dblect.lineage.properties.uniqueness``. This package is the
+audit-facing consumer: detectors that read those keys and flag window
+order-key, join-fanout, and non-deterministic ``LIMIT`` hazards on a project's
+SQL.
 """
 
 from dblect.uniqueness.detector import (

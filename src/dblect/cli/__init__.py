@@ -170,8 +170,8 @@ def check(
 
     Both detector families run over the project. The structural family needs only the
     compiled SQL, so it reports on any project. The declaration family resolves the
-    contracts under ``<project_dir>/dblect/`` if present; with none declared it simply
-    reports zero contracts resolved rather than nothing to do.
+    contracts under ``<project_dir>/dblect/`` if present; with none declared it reports
+    zero contracts resolved instead of skipping the family outright.
     """
     from dataclasses import replace
 
@@ -359,8 +359,8 @@ def _analyze_base(
     """Analyse the base revision's manifest the same way HEAD was analysed.
 
     Same dialect resolution, same declarations (``registry``), and the same
-    resolution floor, so a finding's cross-world identity is comparable across the two
-    worlds. The base catalog defaults to a ``catalog.json`` beside ``base_manifest``,
+    resolution floor, so a finding found in one analysis matches the same finding found
+    in the other. The base catalog defaults to a ``catalog.json`` beside ``base_manifest``,
     matching the Slim CI layout where the stored manifest and catalog sit together.
     """
     from dblect.analysis import analyze

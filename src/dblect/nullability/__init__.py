@@ -1,7 +1,8 @@
 """Fact-grounded audit detectors for nullability hazards.
 
-The nullability *property* (per-column tri-state, with outer-join taint and conditional
-NON_NULL activation) lives on the lineage.facts substrate as
+The nullability property marks each column NON_NULL, NULLABLE, or unknown: NULLABLE
+covers a column an outer join can pad with NULLs, and NON_NULL can hold only once a
+condition the query establishes guards it. It is computed in
 ``dblect.lineage.properties.nullability``. This package is the audit-facing consumer:
 detectors that read the proven nullability and flag NULL-sensitive constructs where the
 null silently changes the result: a GROUP BY on an inherited-nullable key, a join keyed

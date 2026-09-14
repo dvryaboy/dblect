@@ -52,10 +52,11 @@ class AdapterProfile:
 
     ``adapter_type`` is the effective target's dbt name (the manifest's, or the one
     an override selects); ``sqlglot_dialect`` parses its compiled SQL. The two
-    enforcement flags are descriptive provenance, read by the unenforced-constraint
-    findings and never by fact resolution. ``default_incremental_strategy`` is the
-    strategy in force when a model leaves ``incremental_strategy`` unset, or
-    ``None`` where dblect does not know the adapter's default to deduplicate.
+    enforcement flags are metadata only: the unenforced-constraint finding reads
+    them, but nothing uses them to decide whether a native constraint actually
+    holds. ``default_incremental_strategy`` is the strategy in force when a model
+    leaves ``incremental_strategy`` unset, or ``None`` where dblect does not know
+    the adapter's default to deduplicate.
     ``non_deterministic_builtins`` is the complete name set (the portable baseline
     plus this adapter's own builtins) the non-determinism detector matches anonymous
     function calls against; a consumer reads it whole and unions nothing.
