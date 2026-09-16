@@ -559,16 +559,18 @@ def column_key(c: exp.Column) -> tuple[str | None, str]:
     return (column_table(c), column_name(c))
 
 
-def literal_constant(e: Expr) -> exp.Literal | None:
+def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
     """``e`` with ``CAST``/``TRY_CAST`` and parentheses unwrapped, if what remains is a
-    literal; ``None`` otherwise. ``NULL`` is not a literal here: it is the absence of a
-    value, not a constant one, so it never unwraps to one."""
+    literal or a boolean; ``None`` otherwise. sqlglot parses ``TRUE``/``FALSE`` as
+    ``exp.Boolean``, not a ``Literal`` subclass, but they are constants just the same.
+    ``NULL`` is not a literal here: it is the absence of a value, not a constant one,
+    so it never unwraps to one."""
     while isinstance(e, exp.Cast | exp.Paren):
         inner = e.this
         if not isinstance(inner, Expr):
             return None
         e = inner
-    return e if isinstance(e, exp.Literal) else None
+    return e if isinstance(e, exp.Literal | exp.Boolean) else None
 
 
 def find_columns(e: Expr) -> list[exp.Column]:

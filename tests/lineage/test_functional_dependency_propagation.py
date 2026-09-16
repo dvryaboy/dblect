@@ -222,16 +222,23 @@ def test_constancy_flows_through_a_cte_and_a_downstream_model() -> None:
 #
 # A projected literal is single-valued over the whole result exactly like a
 # ``WHERE col = 'lit'`` pin, the empty-determinant dependency. The closed input
-# space: a string literal, a numeric literal, a CAST of one (the dbt idiom for a
-# typed constant column), a NULL (not a literal dblect claims a value for), and an
-# opaque computed expression (no constant claim, since it is not literal-only).
+# space: a string literal, a numeric literal, a boolean literal, a CAST of a
+# literal and of a boolean (the dbt idiom for a typed constant column), a NULL
+# (not a literal dblect claims a value for), and an opaque computed expression
+# (no constant claim, since it is not literal-only).
 
 _LITERAL_PROJECTIONS: list[tuple[str, str, FD | None]] = [
     ("string_literal", "SELECT id, 'active' AS status FROM payments", _fd("status")),
     ("numeric_literal", "SELECT id, 1 AS status FROM payments", _fd("status")),
+    ("boolean_literal", "SELECT id, TRUE AS status FROM payments", _fd("status")),
     (
         "cast_of_literal",
         "SELECT id, CAST('2020-01-01' AS timestamp) AS status FROM payments",
+        _fd("status"),
+    ),
+    (
+        "cast_of_boolean_literal",
+        "SELECT id, CAST(TRUE AS BOOLEAN) AS status FROM payments",
         _fd("status"),
     ),
     ("null_projection", "SELECT id, NULL AS status FROM payments", None),
