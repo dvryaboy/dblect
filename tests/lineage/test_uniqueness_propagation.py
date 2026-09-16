@@ -22,7 +22,7 @@ from dblect.lineage.graph import SourceKind
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
-    relation_scope_keys,
+    relation_scope_facts,
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
@@ -444,10 +444,10 @@ def test_relation_scope_keys_exposes_cte_intermediate_keys() -> None:
     base tables by name against the per-model keys propagation produced."""
     tree = parse_sql("WITH s AS (SELECT id, amount FROM orders) SELECT id FROM s")
     model_keys = {"orders": frozenset({_key("id")})}
-    scopes = relation_scope_keys(tree, model_keys)
+    scopes = relation_scope_facts(tree, model_keys)
     cte_body = next(c.this for c in tree.find_all(exp.CTE))
-    assert scopes[id(cte_body)] == frozenset({_key("id")})
-    assert scopes[id(tree)] == frozenset({_key("id")})
+    assert scopes[id(cte_body)].keys == frozenset({_key("id")})
+    assert scopes[id(tree)].keys == frozenset({_key("id")})
 
 
 def test_declared_model_key_unions_with_sql_derived_key() -> None:

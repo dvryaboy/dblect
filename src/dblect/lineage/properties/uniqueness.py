@@ -27,7 +27,7 @@ the discoverers that ground it.
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import sqlglot.expressions as exp
@@ -54,7 +54,9 @@ from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
 from dblect.lineage.properties.activation import activate
 from dblect.lineage.properties.predicate_flow import RowFilter
 from dblect.lineage.properties.scope_closure import (
+    NO_FDS,
     ConditionalKey,
+    FDSet,
     Input,
     Key,
     scope_facts,
@@ -652,66 +654,68 @@ def relation_reduce(
     return Annotation(value, opacity, provisional=provisional, exact=resolved.exact)
 
 
-def relation_scope_keys(
-    tree: Expr, model_keys: Mapping[str, frozenset[Key]]
-) -> Mapping[int, frozenset[Key]]:
-    """Per-scope candidate keys for every SELECT/UNION node in ``tree``, keyed by
-    ``id(node)``.
-
-    Base tables resolve by name against ``model_keys`` rather than by stamp. This is
-    how a detector reads a CTE's or subquery's keys, which the propagator does not
-    annotate. Valid only for the lifetime of ``tree``.
-
-    Base keys here are already activated (the per-model map is built after
-    activation), so this walk carries no conditional payload of its own.
-    """
-
-    def base_resolve(table: exp.Table) -> Input:
-        return Input(model_keys.get(table.name, frozenset()))
-
-    record: dict[int, Input] = {}
-    scope_facts(tree, cte_scope={}, base_resolve=base_resolve, record=record)
-    return {node_id: inp.keys for node_id, inp in record.items()}
-
-
-def activated_scope_keys(
+def relation_scope_facts(
     tree: Expr,
     model_keys: Mapping[str, frozenset[Key]],
-    conditional_by_name: Mapping[str, frozenset[ConditionalKey]],
-    scope_flow: Mapping[int, frozenset[Canon]],
-) -> Mapping[int, frozenset[Key]]:
-    """Per-scope candidate keys with conditional keys activated against each scope's
-    own row filter, keyed by ``id(node)``.
+    *,
+    model_fds: Mapping[str, FDSet] = {},
+    conditional_by_name: Mapping[str, frozenset[ConditionalKey]] = {},
+    scope_flow: Mapping[int, frozenset[Canon]] = {},
+) -> Mapping[int, Input]:
+    """Per-scope resolved facts for every SELECT/UNION node in ``tree``, and for
+    every FROM/JOIN table reference (a CTE or a base table), keyed by ``id(node)``.
 
-    Like :func:`relation_scope_keys`, but conditional keys are carried into each
-    scope and promoted where that scope's flow (``scope_flow``) implies them, so a
-    window or join over a filtering CTE sees the key the filter activates.
+    Base tables resolve by name against ``model_keys``/``model_fds``/
+    ``conditional_by_name`` rather than by graph stamp. This is how a detector reads
+    the keys and dependencies of a CTE, a subquery, or a joined-in model alike,
+    none of which the cross-model propagator annotates as its own relation. Valid
+    only for the lifetime of ``tree``.
+
+    Each returned ``Input``'s keys are the activated ones: a conditional key is
+    carried into every scope and promoted where that scope's own flow
+    (``scope_flow``) implies its predicate, so a window or join over a filtering CTE
+    sees the key the filter activates. The flow walk does not record every scope
+    this engine does: it stops at a join rather than recursing into it, so a scope
+    nested inside a joined subquery has no recorded flow. ``scope_flow.get`` then
+    defaults to the empty filter, which implies nothing and so activates nothing,
+    the safe direction (a conditional key stays conditional) and consistent with
+    the flow's own posture of dropping at a join.
+
+    A CTE's own defining scope and every FROM/JOIN reference to it share the
+    identical ``Input`` object (``cte_scope`` hands out the same value at each
+    lookup), but ``scope_flow`` is keyed by SELECT/UNION scope, so only the
+    defining scope's id carries a real entry; a reference's own id would default
+    to the empty flow and under-promote. Promoting once per distinct ``Input``
+    object, and reusing that result for every id it is recorded under, routes
+    every reference through the defining scope's own promotion instead.
     """
 
     def base_resolve(table: exp.Table) -> Input:
         name = table.name
+        fd = model_fds.get(name, NO_FDS)
         return Input(
             model_keys.get(name, frozenset()),
+            fds=fd.fds,
+            declared=fd.declared,
             conditional=conditional_by_name.get(name, frozenset()),
         )
 
     record: dict[int, Input] = {}
     scope_facts(tree, cte_scope={}, base_resolve=base_resolve, record=record)
-    out: dict[int, frozenset[Key]] = {}
+    promoted_by_input: dict[int, Input] = {}
+    out: dict[int, Input] = {}
     for node_id, inp in record.items():
-        # The flow walk does not record every scope this engine does: it stops at a
-        # join rather than recursing into it, so a scope nested inside a joined
-        # subquery has no recorded flow. ``scope_flow.get`` defaults such a scope to
-        # the empty filter, which implies nothing and so activates nothing. That is
-        # the safe direction (a conditional key stays conditional), and it matches the
-        # flow's own posture of dropping at a join.
-        promoted = activate(
-            CandidateKeySet(inp.keys),
-            ((CandidateKeySet.of(ck.key), ck.predicate) for ck in inp.conditional),
-            scope_flow.get(node_id, frozenset()),
-            _meet,
-        )
-        out[node_id] = promoted.keys
+        cached = promoted_by_input.get(id(inp))
+        if cached is None:
+            promoted = activate(
+                CandidateKeySet(inp.keys),
+                ((CandidateKeySet.of(ck.key), ck.predicate) for ck in inp.conditional),
+                scope_flow.get(node_id, frozenset()),
+                _meet,
+            )
+            cached = replace(inp, keys=promoted.keys)
+            promoted_by_input[id(inp)] = cached
+        out[node_id] = cached
     return out
 
 
