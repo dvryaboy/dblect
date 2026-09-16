@@ -28,6 +28,7 @@ from hypothesis import strategies as st
 
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.facts.model import Declared, DeclaredSource, Fact
+from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import (
     FD,
@@ -36,6 +37,7 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
+from dblect.lineage.properties.uniqueness import CandidateKeySet, uniqueness_property_from_facts
 from dblect.lineage.property import propagate
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -58,12 +60,29 @@ def _claimed_fds(
     sql: str,
     sources: Mapping[SourceRef, str],
     facts: Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]],
+    *,
+    key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]] = {},
 ) -> FDSet:
-    """The model's FD set over ``sql``, exactly as the relation property derives it."""
+    """The model's FD set over ``sql``, exactly as the relation property derives it.
+
+    ``key_facts`` grounds a uniqueness declaration for a source, wiring the same
+    key-derived FD edge :func:`functional_dependency_property` exposes (a candidate
+    key determines every column selected alongside it), mirroring
+    ``test_functional_dependency_propagation.py``'s ``_fds(read_keys=True)``.
+    """
     tables = [_source(ref.unique_id, name=name) for ref, name in sources.items()]
     m = _manifest(*tables, _node(_MODEL.unique_id, sql, name="m"))
-    prop = functional_dependency_property(functional_dependency_grounding(facts))
-    return propagate(build_relation_graph(m).graph, prop)[_MODEL].value
+    graph = build_relation_graph(m).graph
+    ground = functional_dependency_grounding(facts)
+    if not key_facts:
+        return propagate(graph, functional_dependency_property(ground))[_MODEL].value
+    uniq = uniqueness_property_from_facts(key_facts)
+    store = AnnotationStore()
+    for scope, ann in propagate(graph, uniq).items():
+        store.record(uniq.name, scope, ann)
+    prop = functional_dependency_property(ground, uniqueness=uniq.ref)
+    ctx = PropertyRegistry((uniq, prop)).dep_context(store)
+    return propagate(graph, prop, dep_context=ctx)[_MODEL].value
 
 
 def _materialize(
@@ -265,12 +284,17 @@ class JoinScenario:
     # When set, this alias is projected wholesale with a qualified star instead of being
     # named in `projection`; the other side's columns (if any) still come from `projection`.
     star_alias: str | None = None
+    # `dim` is declared unique on `k`, its join column: the lookup-join case (#251),
+    # where `dim`'s own key determines every column of `dim`, not through a declared
+    # FD but through the key itself. `rows_dim` is generated unique on `k` to match.
+    dim_key: bool = False
 
 
 @st.composite
 def _join_scenario(draw: st.DrawFn) -> JoinScenario:
     side = draw(st.sampled_from(sorted(_JOIN_KINDS)))
     left_two_sides = draw(st.booleans())
+    dim_key = False
     if left_two_sides:
         # A small value range so LEFT-join matches and non-matches are both common.
         small = st.integers(min_value=0, max_value=2)
@@ -292,11 +316,21 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
         for _ in range(draw(st.integers(min_value=0, max_value=6))):
             k = draw(st.integers(min_value=0, max_value=2))
             rows_pay_list.append((k, amap[k]))  # a determined by k, so k -> a holds in the data
+        dim_key = draw(st.booleans())
         rows_dim_list: list[tuple[int, int, int]] = []
-        for _ in range(draw(st.integers(min_value=0, max_value=6))):
-            k = draw(st.integers(min_value=0, max_value=2))
-            g = draw(st.integers(min_value=0, max_value=2))
-            rows_dim_list.append((k, g, vmap[g]))  # v determined by g, so g -> v holds
+        if dim_key:
+            # One row per distinct k: dim is genuinely unique on its join column.
+            ks = draw(
+                st.lists(st.integers(min_value=0, max_value=2), min_size=0, max_size=3, unique=True)
+            )
+            for k in ks:
+                g = draw(st.integers(min_value=0, max_value=2))
+                rows_dim_list.append((k, g, vmap[g]))
+        else:
+            for _ in range(draw(st.integers(min_value=0, max_value=6))):
+                k = draw(st.integers(min_value=0, max_value=2))
+                g = draw(st.integers(min_value=0, max_value=2))
+                rows_dim_list.append((k, g, vmap[g]))  # v determined by g, so g -> v holds
         # A qualified star names one alias's own universe: the star's columns come through
         # under their own names, and the other side (if projected at all) still draws from
         # `_QCOLS` as usual, so the same generator judges both projection shapes.
@@ -306,6 +340,10 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
         chosen = draw(
             st.lists(st.sampled_from(pool), min_size=min_size, max_size=len(pool), unique=True)
         )
+        if dim_key and star_alias != "d":
+            # Force both dim's key and a non-key dim column into the projection, so the
+            # lookup-join dependency has an output name on either end to be claimed under.
+            chosen = sorted({*chosen, ("d", "k"), ("d", "g")})
         projection = tuple((qc, f"o{i}") for i, qc in enumerate(chosen))
         rows_pay = tuple(rows_pay_list)
         rows_dim = tuple(rows_dim_list)
@@ -318,6 +356,7 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
         left_two_sides=left_two_sides,
         rows_extra=rows_extra,
         star_alias=star_alias,
+        dim_key=dim_key,
     )
 
 
@@ -348,7 +387,22 @@ def test_every_claimed_join_fd_holds_on_the_data(
         _PAY: (_declared_fact(_PAY, FD(frozenset({"k"}), "a")),),
         _DIM: (_declared_fact(_DIM, FD(frozenset({"g"}), "v")),),
     }
-    claimed = _claimed_fds(_join_sql(s), {_PAY: "pay", _DIM: "dim", _EXTRA: "extra"}, facts)
+    key_facts = (
+        {
+            _DIM: (
+                Fact(
+                    scope=_DIM,
+                    value=CandidateKeySet.of(frozenset({"k"})),
+                    provenance=Declared(DeclaredSource.USER_ASSERTED),
+                ),
+            )
+        }
+        if s.dim_key
+        else {}
+    )
+    claimed = _claimed_fds(
+        _join_sql(s), {_PAY: "pay", _DIM: "dim", _EXTRA: "extra"}, facts, key_facts=key_facts
+    )
     assert not claimed.is_bottom
     if not s.left_two_sides:
         selected = dict(s.projection)
@@ -371,6 +425,17 @@ def test_every_claimed_join_fd_holds_on_the_data(
                 # The padded side's drop is the contract: NULL padding can break the
                 # dependency, so the walk must stay silent about it.
                 assert not holds, f"padded-side FD claimed for sql={_join_sql(s)!r}"
+        if s.dim_key and s.side != "full" and s.star_alias != "d":
+            # Anti-vacuity (#251): dim's own key determines its other columns
+            # regardless of the join predicate, unlike a declared FD there is no
+            # padded side to exempt here (a NULL-padded row still agrees with no
+            # other row on the (NULL) key), so every side but FULL keeps it. A
+            # `d.*` star is excluded: mint() names a star's columns without
+            # enumerating them (the star's own accepted risk, see `_Projection`),
+            # so it carries no reference fact the closure could reach them by.
+            assert determines(claimed, frozenset({selected[("d", "k")]}), selected[("d", "g")]), (
+                f"lookup-join key dependency dropped for sql={_join_sql(s)!r}"
+            )
     names, rows = _materialize(
         oracle_con,
         _join_sql(s),

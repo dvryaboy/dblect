@@ -164,6 +164,37 @@ def test_window_silent_when_fd_closure_covers_key() -> None:
     assert detect_non_unique_window_order_keys(parsed, model_keys=keys, model_fds=fds) == ()
 
 
+def test_window_covered_by_lookup_join_key_through_a_cte_chain() -> None:
+    # Mirrors #246's first tuva-core example: a terminology lookup joined on its
+    # own key determines the column it looks up, so the window's partition key
+    # (missing `bill_type_description`) still closes over `distinct_counts`'s
+    # full grouping key once the lookup's key is known.
+    sql = (
+        "with normalize_cte as ("
+        "  select c.claim_id, c.data_source, c.bill_type_code, bill.bill_type_description "
+        "  from claims c "
+        "  inner join terminology__bill_type as bill on c.bill_type_code = bill.bill_type_code"
+        "), distinct_counts as ("
+        "  select claim_id, data_source, bill_type_code, bill_type_description, count(*) as occ "
+        "  from normalize_cte "
+        "  group by claim_id, data_source, bill_type_code, bill_type_description"
+        ") "
+        "select claim_id, data_source, bill_type_code, bill_type_description, occ, "
+        "row_number() over (partition by claim_id, data_source "
+        "order by occ desc, bill_type_code) as rn "
+        "from distinct_counts"
+    )
+    parsed = _parse(sql)
+
+    keyed = detect_non_unique_window_order_keys(
+        parsed, model_keys=_model_keys(terminology__bill_type=(("bill_type_code",),))
+    )
+    assert keyed == ()
+
+    unkeyed = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys())
+    assert len(unkeyed) == 1
+
+
 # --- top-level LIMIT without a deterministic ORDER BY ------------------------
 #
 # A persisted model whose top scope has `LIMIT n` freezes an arbitrary slice of rows unless the
