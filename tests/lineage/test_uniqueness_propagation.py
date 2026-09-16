@@ -239,6 +239,22 @@ def test_qualified_star_over_a_join_keeps_the_starred_sides_key() -> None:
     assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
 
 
+def test_two_qualified_stars_claim_nothing() -> None:
+    """``o.*, c.*`` may project the same column name from both sides; the engine
+    cannot see which, and a cross-product key ``(o.id, c.id)`` would collapse to a
+    single ``id`` that repeats across the product. So the scope claims no key."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node("model.shop.product", "SELECT o.*, c.* FROM orders o CROSS JOIN customers c"),
+    )
+    assert keys["model.shop.product"] == CandidateKeySet.of()
+
+
 def test_right_join_does_not_preserve_probe_keys() -> None:
     """A RIGHT JOIN NULL-pads the probe (left) side on joined-in rows with no match, so the
     probe key can repeat as NULL and does not survive, even when the joined-in side is unique
@@ -680,6 +696,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
     (
         "qualified_star_names_an_alias_not_joined_in",
         "SELECT missing.* FROM orders o JOIN customers c ON o.customer_id = c.id",
+        False,
+    ),
+    (
+        "two_qualified_stars",
+        "SELECT o.*, c.* FROM orders o CROSS JOIN customers c",
         False,
     ),
     ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
