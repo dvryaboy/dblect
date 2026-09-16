@@ -290,10 +290,10 @@ def test_conditional_dropped_by_a_star_over_a_join() -> None:
 _CONSUMER = "SELECT f.x FROM events f JOIN dim d ON f.did = d.id"
 
 
-def _fanout_kinds(*nodes: Node) -> list[FindingKind]:
+def _fanout_kinds(*nodes: Node, sql: str = _CONSUMER) -> list[FindingKind]:
     manifest = _manifest(*nodes)
     _window, fanout, _limit, _agg = make_fact_grounded_detectors(manifest, _DUCKDB)
-    return [f.kind for f in fanout(parse_sql(_CONSUMER, dialect="duckdb"))]
+    return [f.kind for f in fanout(parse_sql(sql, dialect="duckdb"))]
 
 
 def test_activation_covers_a_join_and_suppresses_the_fanout_finding() -> None:
@@ -391,3 +391,64 @@ def test_intra_model_cte_without_filter_leaves_the_window_uncovered() -> None:
         _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+# --- a consumer's own WHERE activates a FROM source's conditional key ------------
+#
+# The CTE body or base table carries the conditional key itself, with no filter of
+# its own; the reference's *enclosing* SELECT carries the WHERE instead. For a
+# join-free, single-source scope that WHERE is already in the source's own namespace
+# (the atom parser drops qualifiers), so it activates the source's conditional key
+# there, without needing the source to repeat the filter itself. A reference that
+# shares its scope with a JOIN is left alone, matching the flow walk's own posture.
+
+
+def test_consumer_where_activates_a_cte_sources_conditional_key() -> None:
+    # ``c``'s own body carries no filter; the outer, join-free SELECT's WHERE does,
+    # and that is what activates ``c``'s conditional ``id`` key for the window.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM c WHERE active"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
+
+
+def test_consumer_where_activates_a_base_tables_conditional_key() -> None:
+    # No CTE at all: the base table's own reference sits directly in the join-free
+    # SELECT that carries the WHERE, so the same promotion applies to it.
+    sql = "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM events WHERE active"
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
+
+
+def test_consumer_where_does_not_activate_a_joined_sources_conditional_key() -> None:
+    # ``c``'s reference sits in a scope that also joins another source, so this
+    # scope's WHERE does not promote it; the fanout finding still stands. ``probe``
+    # gives ``events`` a real derivation so its key propagates onto the graph at all;
+    # the fanout check itself runs against ``sql`` directly, like the other
+    # ``_fanout_kinds`` cases.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT f.x FROM other f JOIN c ON f.eid = c.id WHERE active"
+    )
+    kinds = _fanout_kinds(
+        _source("source.shop.raw.events"),
+        _node("model.shop.probe", "SELECT * FROM events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        sql=sql,
+    )
+    assert FindingKind.JOIN_FANOUT in kinds
