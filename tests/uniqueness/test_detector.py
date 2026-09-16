@@ -1,11 +1,14 @@
 """Tests for the fact-grounded detectors (window order-keys, join fanout).
 
-The detectors consume substrate-derived keys: ``model_keys`` maps a relation name
-to its candidate keys (what cross-model propagation produced), and a per-tree
-scope index (computed on demand here) supplies CTE and inline-subquery keys.
+The detectors consume substrate-derived facts: ``model_keys`` (and optionally
+``model_fds``) map a relation name to its candidate keys and dependencies (what
+cross-model propagation produced), and a per-tree scope index (computed on demand
+here) supplies the same facts for CTE and inline-subquery sources.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import pytest
 from sqlglot import Expr
@@ -126,6 +129,46 @@ def test_window_against_cte_covered_via_propagation_is_silent() -> None:
     assert findings == ()
 
 
+# --- FD closure reaches a CTE's own key derivation (#246) --------------------
+#
+# The order-key checks read a source's keys from the scope index, the same index
+# join-fanout reads. Before #246 that index never carried a base model's FDs, so a
+# CTE's own GROUP BY key never minimized under them and a window over the CTE saw
+# the unminimized key even when the model's dependency would cover it.
+
+
+def test_window_over_cte_covered_by_model_fd_closure() -> None:
+    # `t` groups by (a, b), a bijective pair (a <-> b) on the base model `dim`, so
+    # `t`'s own key minimizes to whichever of the two the engine keeps. Partitioning
+    # by the other one checks out only through the dependency reaching `t`.
+    parsed = _parse(
+        "with t as (select a, b, sum(x) as total from dim group by a, b) "
+        "select row_number() over (partition by a order by total) from t"
+    )
+    keys = _model_keys(dim=(("a", "b"),))
+    fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"b"}), "a"))}
+
+    findings = detect_non_unique_window_order_keys(parsed, model_keys=keys)
+    assert len(findings) == 1
+
+    assert detect_non_unique_window_order_keys(parsed, model_keys=keys, model_fds=fds) == ()
+
+
+def test_window_silent_when_fd_closure_covers_key() -> None:
+    # `src` is unique on (a, b, c), but a determines b and c, so partitioning by a
+    # alone functionally determines the whole key: no two rows can share a's value
+    # while differing on (b, c). Mirrors `test_fanout_silent_when_fd_closure_covers_key`
+    # for a model source rather than a join target.
+    parsed = _parse("select row_number() over (partition by a order by ts) from src")
+    keys = _model_keys(src=(("a", "b", "c"),))
+    fds = {"src": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"a"}), "c"))}
+
+    findings = detect_non_unique_window_order_keys(parsed, model_keys=keys)
+    assert len(findings) == 1
+
+    assert detect_non_unique_window_order_keys(parsed, model_keys=keys, model_fds=fds) == ()
+
+
 # --- top-level LIMIT without a deterministic ORDER BY ------------------------
 #
 # A persisted model whose top scope has `LIMIT n` freezes an arbitrary slice of rows unless the
@@ -133,9 +176,11 @@ def test_window_against_cte_covered_via_propagation_is_silent() -> None:
 # case below is the minimal repro of one branch of that verdict.
 
 
-def _limit(sql: str, keys: _Keys, *, materialized: bool = True) -> tuple[Finding, ...]:
+def _limit(
+    sql: str, keys: _Keys, *, model_fds: Mapping[str, FDSet] = {}, materialized: bool = True
+) -> tuple[Finding, ...]:
     return detect_limit_without_deterministic_order(
-        _parse(sql), model_keys=keys, is_materialized=materialized
+        _parse(sql), model_keys=keys, model_fds=model_fds, is_materialized=materialized
     )
 
 
@@ -294,6 +339,17 @@ def test_limit_verdict(sql: str, keys: _Keys, materialized: bool, fires: bool) -
         assert findings == ()
 
 
+def test_limit_verdict_covered_by_model_fd_closure() -> None:
+    # #246: `orders` is keyed on (a, b), but a -> b, so ordering by `a` alone
+    # already totally orders the rows, covered only once the dependency is known.
+    sql = "select a, b from orders order by a limit 10"
+    keys = _model_keys(orders=(("a", "b"),))
+    fds = {"orders": FDSet.of(FD(frozenset({"a"}), "b"))}
+
+    assert len(_limit(sql, keys)) == 1
+    assert _limit(sql, keys, model_fds=fds) == ()
+
+
 # --- top-n aggregate (ARRAY_AGG/STRING_AGG ... ORDER BY k LIMIT n) -----------
 #
 # An ordered aggregate that keeps only some elements (`ARRAY_AGG(x ORDER BY k LIMIT n)`, the
@@ -303,8 +359,10 @@ def test_limit_verdict(sql: str, keys: _Keys, materialized: bool, fires: bool) -
 # columns play the partition's role. Each case is the minimal repro of one branch of the verdict.
 
 
-def _agg_order(sql: str, keys: _Keys) -> tuple[Finding, ...]:
-    return detect_non_unique_aggregate_order_keys(_parse(sql), model_keys=keys)
+def _agg_order(
+    sql: str, keys: _Keys, *, model_fds: Mapping[str, FDSet] = {}
+) -> tuple[Finding, ...]:
+    return detect_non_unique_aggregate_order_keys(_parse(sql), model_keys=keys, model_fds=model_fds)
 
 
 _SRC_ON_ID = _model_keys(src=(("id",),))
@@ -402,6 +460,17 @@ def test_aggregate_order_verdict(sql: str, keys: _Keys, fires: bool) -> None:
         assert findings[0].kind is FindingKind.NON_UNIQUE_AGGREGATE_ORDER_KEYS
     else:
         assert findings == ()
+
+
+def test_aggregate_order_verdict_covered_by_model_fd_closure() -> None:
+    # #246: `src` is keyed on (a, b), but a -> b, so a top-1 ordered by `a` alone is
+    # already totally ordered, covered only once the dependency is known.
+    sql = "select array_agg(x order by a limit 1) from src"
+    keys = _model_keys(src=(("a", "b"),))
+    fds = {"src": FDSet.of(FD(frozenset({"a"}), "b"))}
+
+    assert len(_agg_order(sql, keys)) == 1
+    assert _agg_order(sql, keys, model_fds=fds) == ()
 
 
 def test_aggregate_order_against_cte_inherits_keys_via_propagation() -> None:
@@ -512,7 +581,7 @@ def test_fanout_silent_when_fd_closure_covers_key() -> None:
     parsed = _parse("select * from facts f join dim d on f.a = d.a")
     fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"a"}), "c"))}
     findings = detect_join_fanout(
-        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), target_fds=fds
+        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), model_fds=fds
     )
     assert findings == ()
 
@@ -523,9 +592,28 @@ def test_fanout_flagged_when_fd_closure_insufficient() -> None:
     parsed = _parse("select * from facts f join dim d on f.a = d.a")
     fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"))}
     findings = detect_join_fanout(
-        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), target_fds=fds
+        parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), model_fds=fds
     )
     assert len(findings) == 1
+
+
+def test_fanout_cte_target_covered_by_model_fd_closure() -> None:
+    # #248: `t` passes `dim` through unchanged. `dim`'s declared key is (a, b), a
+    # bijective pair (a <-> b), so `t`'s own key minimizes to whichever of the two
+    # the engine keeps; joining on the other one only checks out through the
+    # dependency. Before #248 join-fanout forced NO_FDS for any CTE target, so a
+    # join on the column the minimization dropped always looked uncovered.
+    parsed = _parse(
+        "with t as (select * from dim) select o.foo, t.z from other_fact as o join t on o.a = t.a"
+    )
+    keys = _model_keys(dim=(("a", "b"),))
+    fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"b"}), "a"))}
+
+    findings = detect_join_fanout(parsed, model_keys=keys)
+    assert len(findings) == 1
+    assert findings[0].kind is FindingKind.JOIN_FANOUT
+
+    assert detect_join_fanout(parsed, model_keys=keys, model_fds=fds) == ()
 
 
 def test_fanout_silent_when_source_has_no_keys() -> None:
