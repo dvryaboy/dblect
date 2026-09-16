@@ -129,18 +129,13 @@ def test_window_against_cte_covered_via_propagation_is_silent() -> None:
     assert findings == ()
 
 
-# --- FD closure reaches a CTE's own key derivation (#246) --------------------
-#
-# The order-key checks read a source's keys from the scope index, the same index
-# join-fanout reads. Before #246 that index never carried a base model's FDs, so a
-# CTE's own GROUP BY key never minimized under them and a window over the CTE saw
-# the unminimized key even when the model's dependency would cover it.
+# --- FD closure through the scope index ---------------------------------------
 
 
 def test_window_over_cte_covered_by_model_fd_closure() -> None:
-    # `t` groups by (a, b), a bijective pair (a <-> b) on the base model `dim`, so
-    # `t`'s own key minimizes to whichever of the two the engine keeps. Partitioning
-    # by the other one checks out only through the dependency reaching `t`.
+    # `t` groups by (a, b), a bijective pair on `dim`, so the engine minimizes `t`'s
+    # key to (b) (it drops attributes in sorted order). Partitioning by `a` then
+    # checks out only through the dependency reaching `t`.
     parsed = _parse(
         "with t as (select a, b, sum(x) as total from dim group by a, b) "
         "select row_number() over (partition by a order by total) from t"
@@ -340,8 +335,8 @@ def test_limit_verdict(sql: str, keys: _Keys, materialized: bool, fires: bool) -
 
 
 def test_limit_verdict_covered_by_model_fd_closure() -> None:
-    # #246: `orders` is keyed on (a, b), but a -> b, so ordering by `a` alone
-    # already totally orders the rows, covered only once the dependency is known.
+    # `orders` is keyed on (a, b) with a -> b, so ordering by `a` alone is total,
+    # but only once the dependency is known.
     sql = "select a, b from orders order by a limit 10"
     keys = _model_keys(orders=(("a", "b"),))
     fds = {"orders": FDSet.of(FD(frozenset({"a"}), "b"))}
@@ -463,8 +458,8 @@ def test_aggregate_order_verdict(sql: str, keys: _Keys, fires: bool) -> None:
 
 
 def test_aggregate_order_verdict_covered_by_model_fd_closure() -> None:
-    # #246: `src` is keyed on (a, b), but a -> b, so a top-1 ordered by `a` alone is
-    # already totally ordered, covered only once the dependency is known.
+    # `src` is keyed on (a, b) with a -> b, so a top-1 ordered by `a` alone is total,
+    # but only once the dependency is known.
     sql = "select array_agg(x order by a limit 1) from src"
     keys = _model_keys(src=(("a", "b"),))
     fds = {"src": FDSet.of(FD(frozenset({"a"}), "b"))}
@@ -598,11 +593,9 @@ def test_fanout_flagged_when_fd_closure_insufficient() -> None:
 
 
 def test_fanout_cte_target_covered_by_model_fd_closure() -> None:
-    # #248: `t` passes `dim` through unchanged. `dim`'s declared key is (a, b), a
-    # bijective pair (a <-> b), so `t`'s own key minimizes to whichever of the two
-    # the engine keeps; joining on the other one only checks out through the
-    # dependency. Before #248 join-fanout forced NO_FDS for any CTE target, so a
-    # join on the column the minimization dropped always looked uncovered.
+    # `t` passes `dim` through unchanged. `dim` is keyed on (a, b), a bijective pair,
+    # so the engine minimizes `t`'s key to (b); joining on `a` checks out only
+    # through the dependency reaching `t`.
     parsed = _parse(
         "with t as (select * from dim) select o.foo, t.z from other_fact as o join t on o.a = t.a"
     )
