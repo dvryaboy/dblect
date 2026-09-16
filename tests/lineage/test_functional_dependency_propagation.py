@@ -370,6 +370,24 @@ def test_inner_join_carries_a_joined_relations_fd() -> None:
     assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
+def test_qualified_star_over_a_join_carries_the_joined_relations_fd() -> None:
+    """A star qualified to one join side names its universe, so it carries that
+    side's declared dependency exactly as the unqualified single-input star
+    already does. The join key ``id`` is only reachable through ``p.*`` here (it
+    is never named explicitly), so this also pins that a starred column's output
+    name still joins the equivalence class the ON equality builds."""
+    out = _fds(
+        _declared_on({_CUSTOMERS: (_fd("currency", "id"),)}),
+        _source(_PAYMENTS.unique_id),
+        _source(_CUSTOMERS.unique_id),
+        _node(
+            "model.shop.m",
+            "SELECT p.*, c.currency FROM payments p JOIN customers c ON p.id = c.id",
+        ),
+    )
+    assert out["model.shop.m"] == _carried(_inst(_fd("currency", "id"), origin=_CUSTOMERS))
+
+
 def test_inner_join_carries_both_sides_fds() -> None:
     out = _fds(
         _declared_on(

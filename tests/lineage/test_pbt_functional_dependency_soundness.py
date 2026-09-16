@@ -252,6 +252,9 @@ class JoinScenario:
     projection: tuple[tuple[tuple[str, str], str], ...]  # ((alias, column), output name)
     left_two_sides: bool  # a LEFT join whose ON equates two already-accumulated aliases
     rows_extra: tuple[tuple[int, int], ...]  # (k2, g2), independent of pay/dim
+    # When set, this alias is projected wholesale with a qualified star instead of being
+    # named in `projection`; the other side's columns (if any) still come from `projection`.
+    star_alias: str | None = None
 
 
 @st.composite
@@ -271,6 +274,7 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
             (draw(small), draw(small)) for _ in range(draw(st.integers(min_value=1, max_value=3)))
         )
         projection: tuple[tuple[tuple[str, str], str], ...] = ()
+        star_alias: str | None = None
     else:
         amap = {k: draw(st.integers(min_value=0, max_value=9)) for k in range(3)}
         vmap = {g: draw(st.integers(min_value=0, max_value=2)) for g in range(3)}
@@ -283,7 +287,15 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
             k = draw(st.integers(min_value=0, max_value=2))
             g = draw(st.integers(min_value=0, max_value=2))
             rows_dim_list.append((k, g, vmap[g]))  # v determined by g, so g -> v holds
-        chosen = draw(st.lists(st.sampled_from(_QCOLS), min_size=1, max_size=5, unique=True))
+        # A qualified star names one alias's own universe: the star's columns come through
+        # under their own names, and the other side (if projected at all) still draws from
+        # `_QCOLS` as usual, so the same generator judges both projection shapes.
+        star_alias = draw(st.none() | st.sampled_from(("p", "d")))
+        pool = _QCOLS if star_alias is None else tuple(qc for qc in _QCOLS if qc[0] != star_alias)
+        min_size = 1 if star_alias is None else 0  # a plain projection must select something
+        chosen = draw(
+            st.lists(st.sampled_from(pool), min_size=min_size, max_size=len(pool), unique=True)
+        )
         projection = tuple((qc, f"o{i}") for i, qc in enumerate(chosen))
         rows_pay = tuple(rows_pay_list)
         rows_dim = tuple(rows_dim_list)
@@ -295,6 +307,7 @@ def _join_scenario(draw: st.DrawFn) -> JoinScenario:
         projection=projection,
         left_two_sides=left_two_sides,
         rows_extra=rows_extra,
+        star_alias=star_alias,
     )
 
 
@@ -309,8 +322,11 @@ _LEFT_TWO_SIDES_SQL = (
 def _join_sql(s: JoinScenario) -> str:
     if s.left_two_sides:
         return _LEFT_TWO_SIDES_SQL
-    cols = ", ".join(f"{alias}.{col} AS {name}" for (alias, col), name in s.projection)
-    return f"SELECT {cols} FROM pay p {_JOIN_KINDS[s.side]}"
+    named = ", ".join(f"{alias}.{col} AS {name}" for (alias, col), name in s.projection)
+    if s.star_alias is None:
+        return f"SELECT {named} FROM pay p {_JOIN_KINDS[s.side]}"
+    parts = [f"{s.star_alias}.*"] + ([named] if named else [])
+    return f"SELECT {', '.join(parts)} FROM pay p {_JOIN_KINDS[s.side]}"
 
 
 @given(s=_join_scenario())
@@ -326,6 +342,9 @@ def test_every_claimed_join_fd_holds_on_the_data(
     assert not claimed.is_bottom
     if not s.left_two_sides:
         selected = dict(s.projection)
+        if s.star_alias is not None:
+            # A qualified star names each of its alias's columns after itself.
+            selected.update((qc, qc[1]) for qc in _QCOLS if qc[0] == s.star_alias)
         declared = {"p": (("p", "k"), ("p", "a")), "d": (("d", "g"), ("d", "v"))}
         for alias, (det, dep) in declared.items():
             if det not in selected or dep not in selected:

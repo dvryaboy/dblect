@@ -153,8 +153,8 @@ class SourceSpec:
 
 @dataclass(frozen=True)
 class ModelSpec:
-    shape: str  # filter | inner_join | left_join | group_by | distinct | qualify
-    # | anti/semi shapes | join_grouped
+    shape: str  # filter | inner_join | left_join | star_join | group_by | distinct
+    # | qualify | anti/semi shapes | join_grouped
     select_cols: tuple[str, ...]
     left_join_col: str | None = None
     right_join_col: str | None = None
@@ -249,6 +249,7 @@ def _scenario(draw: st.DrawFn) -> Scenario:
                 "filter",
                 "inner_join",
                 "left_join",
+                "star_join",
                 "group_by",
                 "distinct",
                 "qualify",
@@ -262,7 +263,7 @@ def _scenario(draw: st.DrawFn) -> Scenario:
     # The anti/semi shapes filter s0 by s1, so they project s0 alone but still need s1's data.
     anti_shapes = ("anti_join", "semi_join", "left_is_null")
     is_join = shape in ("inner_join", "left_join")
-    sources = (_S0, _S1) if is_join or shape in anti_shapes else (_S0,)
+    sources = (_S0, _S1) if is_join or shape == "star_join" or shape in anti_shapes else (_S0,)
 
     # s0 always participates, so it carries the choice of a composite declared key
     # (unique_combination_of_columns over k0 and a second column) instead of a plain
@@ -296,6 +297,17 @@ def _scenario(draw: st.DrawFn) -> Scenario:
             )
         )
         model = ModelSpec(shape=shape, select_cols=_S0.columns, partition_cols=part)
+    elif shape == "star_join":
+        # s0.* stands in for s0's own columns named out explicitly: the qualified
+        # star must carry the same declared key through the join as the bare-column
+        # inner_join shape does, judged by the same oracle over the same random
+        # join-column choices (so a fan-out risk is exercised just as often).
+        model = ModelSpec(
+            shape=shape,
+            select_cols=(*_S0.columns, "a1"),
+            left_join_col=draw(st.sampled_from(_S0.columns)),
+            right_join_col=draw(st.sampled_from(_S1.columns)),
+        )
     elif is_join:
         # An inner join may project s1's own join column, aliased as ``k0``, instead of
         # s0's: the ON equates them, so the oracle must still see no unsound key.
@@ -350,6 +362,11 @@ def _scenario_sql(m: ModelSpec) -> str:
         return (
             f"SELECT {first}, s1.a1 AS a1 "
             f"FROM s0 {join} s1 ON s0.{m.left_join_col} = s1.{m.right_join_col}"
+        )
+    if m.shape == "star_join":
+        return (
+            "SELECT s0.*, s1.a1 AS a1 "
+            f"FROM s0 INNER JOIN s1 ON s0.{m.left_join_col} = s1.{m.right_join_col}"
         )
     if m.shape == "join_grouped":
         assert m.group_cols is not None

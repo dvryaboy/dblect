@@ -133,3 +133,38 @@ def test_declared_dependency_quiets_a_grouped_cte_join_target() -> None:
         with_facts = _fanout_kinds(manifest, with_facts=True)
     assert "model.shop.report" in without
     assert "model.shop.report" not in with_facts
+
+
+def test_declared_dependency_reaches_through_a_qualified_star_cte() -> None:
+    # A join-widening CTE re-exposes one side wholesale with a qualified star, the
+    # tuva-core shape: `detail_values` selects `stg.*` alongside `cli`'s declared
+    # columns, and `tot` groups on them before `report` joins back on `a` alone.
+    # `cli`'s `a determines b` must cross the qualified star to reach `tot`'s key.
+    report_sql = (
+        "WITH detail_values AS ("
+        "SELECT stg.*, cli.a, cli.b FROM stg INNER JOIN cli ON stg.k = cli.k"
+        "), tot AS ("
+        "SELECT a, b, SUM(x) AS s FROM detail_values GROUP BY a, b"
+        ") "
+        "SELECT f.a, tot.s FROM fact_src AS f JOIN tot ON f.a = tot.a"
+    )
+    with isolated_registry():
+
+        class Cli(ModelContract):
+            dbt_model = "cli"
+
+            @contract
+            def a_determines_b(self: ContractSelf) -> object:
+                return self.a.determines(self.b)
+
+        nodes = (
+            _shop_model("stg", "SELECT k, x FROM stg_src"),
+            _shop_model("cli", "SELECT k, a, b FROM cli_src"),
+            _shop_model("report", report_sql),
+        )
+        manifest = _manifest(*nodes)
+        assert len(resolve_contracts(manifest).fd_facts) == 1
+        without = _fanout_kinds(manifest, with_facts=False)
+        with_facts = _fanout_kinds(manifest, with_facts=True)
+    assert "model.shop.report" in without
+    assert "model.shop.report" not in with_facts
