@@ -438,7 +438,12 @@ def _left_join_breakdown(
 
 def _within_nested_select(col: exp.Column, boundary: Expr) -> bool:
     """Whether ``col`` sits inside a SELECT nested somewhere below ``boundary``
-    (that nested SELECT is its own scope, so its columns are not this one's)."""
+    (that nested SELECT is its own scope, so its columns are not this one's).
+    ``col`` itself as ``boundary`` (a bare, unaliased column handed straight to
+    ``clauses``, as a top-level SELECT or GROUP BY target is) has no nested path
+    to walk and is never itself a SELECT, so it is never nested."""
+    if col is boundary:
+        return False
     node: Expr | None = col.parent
     while node is not None and node is not boundary:
         if isinstance(node, exp.Select):
@@ -1290,6 +1295,26 @@ def _project(
             continue  # reflexive (X -> x): true by Armstrong reflexivity, adds no closure power
         fds.add(FD(det_names, dep_name))
 
+    # An alias's own key determines every column of that alias, whatever the rest of the
+    # query does with it: two output rows agreeing on the key came from one row of that
+    # input (a join duplicates or drops rows, never merges two into one), and a LEFT-padded
+    # row carries NULL for the whole alias, key included, so it cannot witness a violation
+    # either. The closure, not just the direct token -> column hop, picks up everything the
+    # key reaches, the same walk key validation below relies on.
+    for dets in per_alias_dets.values():
+        for det in dets:
+            det_names = _rewrite(det, classes, proj)
+            if det_names is None:
+                continue
+            for attr in closure(pairs, det):
+                name = _output_name(attr, classes, proj)
+                if name is None or name in det_names:
+                    continue
+                fds.add(FD(det_names, name))
+
+    # Not redundant with the per-alias rule above: a validated key is already minimized
+    # (a smaller, stronger determinant than the raw per-alias mint) and covers the
+    # group and DISTINCT keys too, neither of which is a per-alias key mint.
     output_names = frozenset(n for ns in proj.named.values() for n in ns) | proj.computed
     for key in keys:
         for c in output_names - key:
