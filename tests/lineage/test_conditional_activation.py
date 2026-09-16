@@ -198,6 +198,23 @@ def test_conditional_carries_through_a_cte_consuming_an_upstream() -> None:
     assert _key("id") in res["model.shop.dim"].keys
 
 
+def test_conditional_key_activates_at_a_consumer_of_a_grouped_cte() -> None:
+    # The CTE groups by ``region`` and filters to it; the group-key atom survives
+    # the GROUP BY, so the consumer's flow implies the test's predicate. Before the
+    # group-by carry, the consumer's flow was empty and the key stayed conditional.
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _node(
+            "model.shop.dim",
+            "WITH c AS ("
+            "SELECT region, count(*) AS n FROM orders WHERE region = 'US' GROUP BY region"
+            ") SELECT * FROM c",
+        ),
+        _unique("test.shop.u", column="n", target="model.shop.dim", where="region = 'US'"),
+    )
+    assert _key("n") in res["model.shop.dim"].keys
+
+
 def test_conditional_dropped_when_a_predicate_column_is_not_projected() -> None:
     # ``region`` (the predicate column) is filtered but not projected, so neither the
     # carried predicate nor the flow can express it: the key stays unactivated and is
