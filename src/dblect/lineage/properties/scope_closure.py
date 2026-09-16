@@ -16,9 +16,11 @@ negative claim. The exact fragment: FROM a table, CTE or subquery; every join
 kind; predicates whose leaves are column or literal equalities, the ROW_NUMBER
 guard, or row-local comparisons (``a > 1``, ``IN`` a literal list, ``IS NULL``,
 ``LIKE``, ``BETWEEN``, and AND/OR/NOT over these); GROUP BY over bare columns;
-DISTINCT; UNION. Inexact: a subquery or window anywhere in a predicate, an
-unrecognized window or a subquery in a projection, an expression group target,
-a star over a join, any other FROM shape, INTERSECT and EXCEPT.
+DISTINCT; UNION; a star qualified to one alias, over a join or not. Inexact: a
+subquery or window anywhere in a predicate, an unrecognized window or a
+subquery in a projection, an expression group target, an unqualified star over
+a join, a star naming an alias outside the scope, any other FROM shape,
+INTERSECT and EXCEPT.
 """
 
 from __future__ import annotations
@@ -682,7 +684,9 @@ def _select_facts(
 
     proj = _build_projection(sel, from_alias=from_alias, active_aliases=active_aliases)
     if proj.blocked:
-        return _GIVE_UP  # a star projected over more than one input: an ambiguous output universe
+        return (
+            _GIVE_UP  # an unqualified star over several inputs, or a star naming an unknown alias
+        )
     if not _projection_is_exact(sel):
         scope_exact = False
 
@@ -987,12 +991,24 @@ def _remap_declared(
 @dataclass(frozen=True, slots=True)
 class _Projection:
     """A SELECT projection's output names: ``named`` per bare-column source,
-    ``computed`` for expressions, ``star_alias`` for a star over a single input,
-    ``blocked`` for a star over a join (ambiguous output universe)."""
+    ``computed`` for expressions, ``star_aliases`` for the aliases whose columns
+    pass through wholesale, ``blocked`` when a star's output universe cannot be
+    pinned down.
+
+    An alias in ``star_aliases`` (an unqualified star over the sole active input,
+    or a qualified star naming one alias among several) gives every column of
+    that alias its own column name as an output name, exactly as an explicit
+    ``alias.column`` projection would. The only risk either shape carries is a
+    name collision with another explicitly projected column, and that is the same
+    risk the single-input star already accepts: qualifying the star only narrows
+    which alias's columns pass through, so both sit at the same soundness level.
+    A star is ``blocked`` when it cannot be pinned to one active alias: an
+    unqualified star spanning several inputs, or a qualified star naming an alias
+    that is not one of them."""
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
-    star_alias: str | None
+    star_aliases: frozenset[str]
     blocked: bool
 
 
@@ -1001,15 +1017,20 @@ def _build_projection(
 ) -> _Projection:
     named: dict[QCol, list[str]] = {}
     computed: set[str] = set()
-    has_star = False
+    unqualified_star = False
+    qualified_stars: set[str] = set()
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
-            has_star = True
+            unqualified_star = True
             continue
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         if isinstance(inner, exp.Column):
             if isinstance(inner.this, exp.Star):
-                has_star = True
+                qualifier = sg.column_table(inner)
+                if qualifier is None:
+                    unqualified_star = True
+                else:
+                    qualified_stars.add(qualifier.lower())
                 continue
             qc = QCol((sg.column_table(inner) or from_alias).lower(), sg.column_name(inner).lower())
             named.setdefault(qc, []).append(proj.alias_or_name.lower())
@@ -1017,12 +1038,25 @@ def _build_projection(
         name = proj.alias_or_name
         if name:
             computed.add(name.lower())
-    star_alias = active_aliases[0] if (has_star and len(active_aliases) == 1) else None
-    blocked = has_star and len(active_aliases) != 1
+
+    active_set = set(active_aliases)
+    star_aliases: set[str] = set()
+    blocked = False
+    if unqualified_star:
+        if len(active_aliases) == 1:
+            star_aliases.add(active_aliases[0])
+        else:
+            blocked = True
+    for qualifier in qualified_stars:
+        if qualifier in active_set:
+            star_aliases.add(qualifier)
+        else:
+            blocked = True  # names an alias this scope never resolved: unknown universe
+
     return _Projection(
         named={qc: tuple(ns) for qc, ns in named.items()},
         computed=frozenset(computed),
-        star_alias=star_alias,
+        star_aliases=frozenset(star_aliases),
         blocked=blocked,
     )
 
@@ -1034,7 +1068,7 @@ def _direct_name(attr: Attr, proj: _Projection) -> tuple[str, ...]:
         names = proj.named.get(attr, ())
         if names:
             return names
-        if proj.star_alias is not None and attr.alias == proj.star_alias:
+        if attr.alias in proj.star_aliases:
             return (attr.column,)
         return ()
     return ()
@@ -1152,7 +1186,7 @@ def _carry_predicate(
     be (its column does not survive, or it is opaque); dropping an atom would weaken
     the predicate. A star over ``alias`` alone is an identity rename, opaque atoms
     included."""
-    if proj.star_alias == alias:
+    if alias in proj.star_aliases:
         return predicate
     out: set[Canon] = set()
     for atom in predicate:

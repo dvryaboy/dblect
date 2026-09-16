@@ -219,6 +219,26 @@ def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> No
     assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
 
 
+def test_qualified_star_over_a_join_keeps_the_starred_sides_key() -> None:
+    """A star qualified to one join side (``o.*``) is not the ambiguous
+    multi-input star: it names its universe, so the general JOIN rule applies to
+    it exactly as it would to a bare ``o.id``. Both sides keyed on ``id``, so the
+    probe's key survives the way it does when the columns are named explicitly."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node(
+            "model.shop.enriched",
+            "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id",
+        ),
+    )
+    assert keys["model.shop.enriched"] == CandidateKeySet.of(_key("id"))
+
+
 def test_right_join_does_not_preserve_probe_keys() -> None:
     """A RIGHT JOIN NULL-pads the probe (left) side on joined-in rows with no match, so the
     probe key can repeat as NULL and does not survive, even when the joined-in side is unique
@@ -561,6 +581,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
     ("from_cte", "WITH s AS (SELECT id FROM orders) SELECT id FROM s", True),
     ("from_subquery", "SELECT id FROM (SELECT id FROM orders) s", True),
     ("inner_join", "SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id", True),
+    (
+        "qualified_star_over_join",
+        "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id",
+        True,
+    ),
     ("cross_join", "SELECT o.id FROM orders o CROSS JOIN customers c", True),
     (
         "left_join",
@@ -652,6 +677,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
         False,
     ),
     ("star_over_join", "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id", False),
+    (
+        "qualified_star_names_an_alias_not_joined_in",
+        "SELECT missing.* FROM orders o JOIN customers c ON o.customer_id = c.id",
+        False,
+    ),
     ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
     ("intersect", "SELECT id FROM orders INTERSECT SELECT id FROM customers", False),
     ("except_", "SELECT id FROM orders EXCEPT SELECT id FROM customers", False),
