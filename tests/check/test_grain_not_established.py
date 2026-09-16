@@ -42,7 +42,7 @@ _LINE_COLS = _cols(order_id="INT", line_number="INT", amount="DECIMAL")
 _ORDER_LINES_SOURCE = _source("source.shop.raw.order_lines_raw")
 _ORDER_LINES = _node(
     "model.shop.order_lines",
-    sql="select 1 as order_id, 1 as line_number, 1.0 as amount from order_lines_raw",
+    sql="select order_id, line_number, amount from order_lines_raw",
     columns=_LINE_COLS,
 )
 
@@ -169,9 +169,10 @@ def test_coverage_runs_through_the_fd_closure() -> None:
         def one_row_per_order(self: ContractSelf) -> object:
             return self.grain(per=self.order_id)
 
+    raw = _source("source.shop.raw.order_regions_raw")
     regions = _node(
         "model.shop.order_regions",
-        sql="select 1 as order_id, 'emea' as region, 1.0 as amount",
+        sql="select order_id, region, amount from order_regions_raw",
         columns=_cols(order_id="INT", region="TEXT", amount="DECIMAL"),
     )
     fct = _node(
@@ -179,7 +180,7 @@ def test_coverage_runs_through_the_fd_closure() -> None:
         sql="select order_id, region, amount from order_regions",
         columns=_cols(order_id="INT", region="TEXT", amount="DECIMAL"),
     )
-    report = run_check(_manifest(regions, fct), _DUCKDB)
+    report = run_check(_manifest(raw, regions, fct), _DUCKDB)
     assert _grain_findings(report) == []
 
 
