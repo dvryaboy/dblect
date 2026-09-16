@@ -23,10 +23,11 @@ to make a claim, and stay silent otherwise):
   a magnitude: it counts the relation's rows, whose grain the relation preserves, so
   it stays silent (the ``SUM(qty)`` analog), unlike ``SUM(amount)``.
 
-The first two read keys from two places: cross-model propagation
+The first two read facts from two places: cross-model propagation
 (``uniqueness_property`` over the relation graph) supplies per-model keys, and a
-per-tree scope index (``relation_scope_keys``) supplies the keys of CTE and
-inline-subquery scopes, which the propagator does not annotate as relations.
+per-tree scope index (``relation_scope_facts``) supplies the facts (keys and
+dependencies) of every FROM/JOIN source, a CTE, a subquery, or a model alike, none
+of which the propagator annotates as its own relation.
 """
 
 from __future__ import annotations
@@ -43,9 +44,8 @@ from dblect.lineage.facts.model import Annotation, Fact, by_scope
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.functional_dependency import (
-    NO_FDS,
     FDSet,
-    determines,
+    covers,
     functional_dependency_grounding,
     functional_dependency_property,
 )
@@ -53,14 +53,14 @@ from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
 )
+from dblect.lineage.properties.scope_closure import Input
 from dblect.lineage.properties.uniqueness import (
     NO_KEYS,
     CandidateKeySet,
     Key,
     activate_conditional,
-    activated_scope_keys,
     grain_preserved,
-    relation_scope_keys,
+    relation_scope_facts,
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
@@ -80,16 +80,17 @@ from dblect.sql._sqlglot import JoinSide
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
 # Per-model (and per-source) candidate keys, addressed by relation name as it
-# appears in SQL. Per-scope keys are addressed by ``id(node)`` for the lifetime
+# appears in SQL. Per-scope facts are addressed by ``id(node)`` for the lifetime
 # of one parsed tree.
 ModelKeys = Mapping[str, frozenset[Key]]
-ScopeIndex = Mapping[int, frozenset[Key]]
+ScopeIndex = Mapping[int, Input]
 
 
 def detect_non_unique_window_order_keys(
     tree: Expr,
     *,
     model_keys: ModelKeys,
+    model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
 ) -> tuple[Finding, ...]:
     """Flag window ORDER BYs whose partition+order keys are not a unique tuple.
@@ -98,11 +99,11 @@ def detect_non_unique_window_order_keys(
     keys (a ref'd model or an in-scope CTE) and there are no joins. Multi-source
     scopes need column-level lineage and stay silent.
     """
-    scopes = _scope_index_for(tree, model_keys, scope_index)
+    scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        source_keys = _single_source_keys(sel, model_keys=model_keys, scope_index=scopes)
-        if source_keys is None:
+        source = _single_source(sel, scopes)
+        if source is None:
             continue
         for w in sg.find_all_windows(sel):
             if not _node_in_scope(w, sel):
@@ -110,7 +111,7 @@ def detect_non_unique_window_order_keys(
             order = sg.order_of(w)
             if order is None:
                 continue
-            uncovered = _uncovered_order_keys(order.expressions, sg.partition_of(w), source_keys)
+            uncovered = _uncovered_order_keys(order.expressions, sg.partition_of(w), source)
             if uncovered is None:
                 continue
             order_cols, partition_cols = uncovered
@@ -137,6 +138,7 @@ def detect_non_unique_aggregate_order_keys(
     tree: Expr,
     *,
     model_keys: ModelKeys,
+    model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
 ) -> tuple[Finding, ...]:
     """Flag a top-n ordered aggregate whose order key is not unique within its group.
@@ -168,11 +170,11 @@ def detect_non_unique_aggregate_order_keys(
     needs an equivalence we do not model), and silent when no source key is known (the firewall
     posture: with no grain to name, there is no positive fact to fire on).
     """
-    scopes = _scope_index_for(tree, model_keys, scope_index)
+    scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        source_keys = _single_source_keys(sel, model_keys=model_keys, scope_index=scopes)
-        if source_keys is None:
+        source = _single_source(sel, scopes)
+        if source is None:
             continue
         group = sg.group_of(sel)
         grouping = group.expressions if group is not None else []
@@ -183,7 +185,7 @@ def detect_non_unique_aggregate_order_keys(
             agg_limit = sg.aggregate_limit_of(agg)
             if order is None or agg_limit is None or sg.limit_keeps_no_rows(agg_limit):
                 continue
-            uncovered = _uncovered_order_keys(order.expressions, grouping, source_keys)
+            uncovered = _uncovered_order_keys(order.expressions, grouping, source)
             if uncovered is None:
                 continue
             order_cols, group_cols = uncovered
@@ -210,9 +212,9 @@ def detect_join_fanout(
     tree: Expr,
     *,
     model_keys: ModelKeys,
+    model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
-    target_fds: Mapping[str, FDSet] = {},
 ) -> tuple[Finding, ...]:
     """Flag JOINs whose joined-in side has keys that don't cover the join.
 
@@ -222,12 +224,13 @@ def detect_join_fanout(
 
     Coverage is closure-based, not raw containment: a known key ``K`` is covered when the
     join columns *functionally determine* every column of ``K`` under the joined-in side's
-    ``target_fds``. Where a relation has no FDs (``NO_FDS``), the closure test reduces to ``K``
-    being a subset of the join columns. The generalization removes a false positive on a
-    non-minimal key: a key carrying descriptive columns dependent on an id
-    (``(month, platform, project_family, wiki_id, wiki_name)`` with ``wiki_id`` determining
-    ``project_family`` and ``wiki_name``) is covered by a join on ``(month, platform,
-    wiki_id)``, since the closure of the join columns reaches the rest.
+    own dependencies, read off the scope index alongside its keys. Where a relation has no
+    known dependencies, the closure test reduces to ``K`` being a subset of the join columns.
+    The generalization removes a false positive on a non-minimal key: a key carrying
+    descriptive columns dependent on an id (``(month, platform, project_family, wiki_id,
+    wiki_name)`` with ``wiki_id`` determining ``project_family`` and ``wiki_name``) is covered
+    by a join on ``(month, platform, wiki_id)``, since the closure of the join columns reaches
+    the rest.
 
     The finding is suppressed when the fan-out is collapsed in the same query before
     any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
@@ -244,10 +247,7 @@ def detect_join_fanout(
     that filters rather than multiplies the probe rows (a SEMI or ANTI join, and the
     ``LEFT JOIN ... IS NULL`` anti-join idiom).
     """
-    scopes = _scope_index_for(tree, model_keys, scope_index)
-    cte_bodies: Mapping[str, Expr] = {
-        cte.alias_or_name: cte.this for cte in tree.find_all(exp.CTE) if isinstance(cte.this, Expr)
-    }
+    scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
         # A SEMI/ANTI join, and the LEFT JOIN ... IS NULL anti-join idiom, filter the probe
@@ -262,10 +262,8 @@ def detect_join_fanout(
             target = j.this
             if not isinstance(target, exp.Table):
                 continue
-            target_keys = _resolve_target_keys(
-                target.name, cte_bodies=cte_bodies, scope_index=scopes, model_keys=model_keys
-            )
-            if not target_keys:
+            facts = _source_facts(target, scopes)
+            if facts is None or not facts.keys:
                 continue
             on = sg.on_of(j)
             if on is None:
@@ -273,18 +271,12 @@ def detect_join_fanout(
             joined_cols = sg.equality_cols_on_alias(on, target.alias_or_name)
             if not joined_cols:
                 continue
-            # ``target_keys`` resolves a query-local CTE ahead of a same-named model, but
-            # ``target_fds`` only carries manifest relations. So for a CTE that shadows a model
-            # we must not read the model's FDs (they describe a different relation); fall back to
-            # NO_FDS, i.e. plain containment, which is always sound. A CTE genuinely unique on a
-            # subset already surfaces that subset as one of its structural keys.
-            fds = NO_FDS if target.name in cte_bodies else target_fds.get(target.name, NO_FDS)
-            if any(all(determines(fds, joined_cols, col) for col in k) for k in target_keys):
+            if covers(FDSet(facts.fds), joined_cols, facts.keys):
                 continue
             if _collapsed_before_sensitive_consumer(sel, safe_builtins=duplicate_safe_builtins):
                 continue
             sample_keys = ", ".join(sorted(joined_cols))
-            known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in target_keys)
+            known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in facts.keys)
             out.append(
                 Finding(
                     kind=FindingKind.JOIN_FANOUT,
@@ -306,6 +298,7 @@ def detect_limit_without_deterministic_order(
     tree: Expr,
     *,
     model_keys: ModelKeys,
+    model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
     is_materialized: bool,
 ) -> tuple[Finding, ...]:
@@ -351,10 +344,8 @@ def detect_limit_without_deterministic_order(
     order = tree.args.get("order")
     if not isinstance(order, exp.Order) or not order.expressions:
         return (_limit_finding(limit, ordered=False),)
-    source_keys = _single_source_keys(
-        tree, model_keys=model_keys, scope_index=_scope_index_for(tree, model_keys, scope_index)
-    )
-    if source_keys is None:
+    source = _single_source(tree, _scope_index_for(tree, model_keys, model_fds, scope_index))
+    if source is None:
         return ()
     targets = sg.statement_order_targets(tree)
     order_cols = _bare_column_names([t.expression for t in targets])
@@ -365,7 +356,7 @@ def detect_limit_without_deterministic_order(
         name if t.in_source_namespace else projection.get(name, name)
         for t, name in zip(targets, order_cols, strict=True)
     )
-    if any(k <= covered for k in source_keys):
+    if covers(FDSet(source.fds), covered, source.keys):
         return ()
     return (_limit_finding(limit, ordered=True, order_cols=order_cols),)
 
@@ -588,7 +579,13 @@ def make_fact_grounded_detectors(
         hit = cache.get(id(tree))
         if hit is None:
             scope_flow = relation_scope_filters(tree, flow_by_name)
-            hit = activated_scope_keys(tree, model_keys, conditional_by_name, scope_flow)
+            hit = relation_scope_facts(
+                tree,
+                model_keys,
+                model_fds=fd_by_name,
+                conditional_by_name=conditional_by_name,
+                scope_flow=scope_flow,
+            )
             cache[id(tree)] = hit
         return hit
 
@@ -607,7 +604,6 @@ def make_fact_grounded_detectors(
             tree,
             model_keys=model_keys,
             scope_index=scope_index(tree),
-            target_fds=fd_by_name,
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
         )
 
@@ -875,7 +871,10 @@ def _provenance_by_source(
 
 
 def _scope_index_for(
-    tree: Expr, model_keys: ModelKeys, scope_index: ScopeIndex | None
+    tree: Expr,
+    model_keys: ModelKeys,
+    model_fds: Mapping[str, FDSet],
+    scope_index: ScopeIndex | None,
 ) -> ScopeIndex:
     """Resolve a per-scope index, computing one if the caller didn't supply it.
 
@@ -884,55 +883,34 @@ def _scope_index_for(
     """
     if scope_index is not None:
         return scope_index
-    return relation_scope_keys(tree, model_keys)
+    return relation_scope_facts(tree, model_keys, model_fds=model_fds)
 
 
-def _single_source_keys(
-    sel: exp.Select, *, model_keys: ModelKeys, scope_index: ScopeIndex
-) -> frozenset[Key] | None:
-    """Keys for ``sel``'s single FROM source, or ``None`` if it is not a clean
+def _source_facts(node: Expr, scopes: ScopeIndex) -> Input | None:
+    """The resolved facts of one FROM/JOIN source node: a table (a CTE or a model
+    ref) reads its own recorded id, a subquery reads its inner SELECT's, which the
+    engine records directly. ``None`` when the scope index has nothing for this
+    node (the walk gave up on its shape)."""
+    key_node = node.this if isinstance(node, exp.Subquery) and isinstance(node.this, Expr) else node
+    return scopes.get(id(key_node))
+
+
+def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
+    """Facts for ``sel``'s single FROM source, or ``None`` if it is not a clean
     single-source scope with known keys.
 
     A scope qualifies when there are no JOINs and FROM is a single source: a bare
-    table (resolving to a CTE via the scope index, or a model ref via the per-model
-    map) or an inline subquery (its keys from the scope index, which records every
-    SELECT/UNION scope). Returns ``None`` when the shape doesn't qualify or no key
-    is known, so the window detector stays silent.
+    table (a CTE or a model ref, resolved the same way a join target is) or an
+    inline subquery. ``None`` when the shape doesn't qualify or no key is known, so
+    the order-key and LIMIT detectors stay silent.
     """
     from_ = sg.from_of(sel)
     if from_ is None or sg.joins_of(sel):
         return None
-    target = from_.this
-    if isinstance(target, exp.Table):
-        cte_body = _cte_body_for(target.name, sel)
-        if cte_body is not None:
-            keys = scope_index.get(id(cte_body), frozenset())
-            return keys or None
-        keys = model_keys.get(target.name, frozenset())
-        return keys or None
-    if isinstance(target, exp.Subquery) and isinstance(target.this, Expr):
-        keys = scope_index.get(id(target.this), frozenset())
-        return keys or None
-    return None
-
-
-def _resolve_target_keys(
-    name: str,
-    *,
-    cte_bodies: Mapping[str, Expr],
-    scope_index: ScopeIndex,
-    model_keys: ModelKeys,
-) -> frozenset[Key]:
-    """Keys for ``name``, looked up as an in-scope CTE first, then as a model ref.
-
-    An empty result means "no known keys", which the join-fanout detector reads as
-    "stay silent". A local CTE shadows a model of the same name, matching SQL's
-    resolution rules.
-    """
-    body = cte_bodies.get(name)
-    if body is not None:
-        return scope_index.get(id(body), frozenset())
-    return model_keys.get(name, frozenset())
+    facts = _source_facts(from_.this, scopes)
+    if facts is None or not facts.keys:
+        return None
+    return facts
 
 
 def _cte_body_for(name: str, sel: exp.Select) -> Expr | None:
@@ -1039,16 +1017,17 @@ def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
 
 
 def _uncovered_order_keys(
-    order: list[Expr], grouping: list[Expr], source_keys: frozenset[Key]
+    order: list[Expr], grouping: list[Expr], source: Input
 ) -> tuple[list[str], list[str]] | None:
     """The bare order and grouping column names when their combined key set is not covered by a
     known source key, signalling a non-total order; ``None`` when the order is provably total or
     we cannot judge it.
 
-    The window and top-n-aggregate checks share this decision: the order is total iff some
-    candidate key fits within the (grouping + order) column set. ``None`` folds the three silent
-    cases both share: an empty order, an order or grouping key that is not a bare column (an
-    expression we do not model an equivalence for), or a combined set a known key already covers.
+    The window and top-n-aggregate checks share this decision: the order is total iff the
+    combined (grouping + order) columns functionally determine some candidate key of the
+    source, under the source's own dependencies. ``None`` folds the three silent cases both
+    share: an empty order, an order or grouping key that is not a bare column (an expression
+    we do not model an equivalence for), or a combined set a known key is already covered by.
     """
     if not order:
         return None
@@ -1057,7 +1036,7 @@ def _uncovered_order_keys(
     if order_cols is None or grouping_cols is None:
         return None
     key_set = frozenset(order_cols) | frozenset(grouping_cols)
-    if any(k <= key_set for k in source_keys):
+    if covers(FDSet(source.fds), key_set, source.keys):
         return None
     return order_cols, grouping_cols
 

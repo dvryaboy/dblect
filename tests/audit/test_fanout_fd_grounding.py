@@ -100,3 +100,38 @@ def test_cte_shadowing_a_declared_model_does_not_inherit_its_fds() -> None:
         assert len(resolve_contracts(manifest).fd_facts) == 2  # the model's FDs exist...
         fired = _fanout_kinds(manifest, with_facts=True)
     assert "model.shop.report" in fired  # ...but do not silence the shadowing CTE's fanout
+
+
+def test_declared_dependency_quiets_a_grouped_cte_join_target() -> None:
+    # #248: `report` joins a query-local CTE `tot`, grouped on (a, b), rather than a
+    # bare model. `dim`'s `a` and `b` are declared as a bijective pair (a <-> b), so
+    # `tot`'s own key minimizes to whichever of the two the engine keeps; the join on
+    # `a` alone checks out only through the dependency reaching `tot`. Before #248
+    # join-fanout forced NO_FDS for any CTE target, so it never did.
+    report_sql = (
+        "WITH tot AS (SELECT a, b, SUM(x) AS s FROM dim GROUP BY a, b) "
+        "SELECT f.a, tot.s FROM fact_src AS f JOIN tot ON f.a = tot.a"
+    )
+    with isolated_registry():
+
+        class Dim(ModelContract):
+            dbt_model = "dim"
+
+            @contract
+            def a_determines_b(self: ContractSelf) -> object:
+                return self.a.determines(self.b)
+
+            @contract
+            def b_determines_a(self: ContractSelf) -> object:
+                return self.b.determines(self.a)
+
+        nodes = (
+            _shop_model("dim", "SELECT a, b FROM dim_src"),
+            _shop_model("report", report_sql),
+        )
+        manifest = _manifest(*nodes)
+        assert len(resolve_contracts(manifest).fd_facts) == 2
+        without = _fanout_kinds(manifest, with_facts=False)
+        with_facts = _fanout_kinds(manifest, with_facts=True)
+    assert "model.shop.report" in without
+    assert "model.shop.report" not in with_facts
