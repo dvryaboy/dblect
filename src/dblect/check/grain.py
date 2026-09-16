@@ -29,16 +29,9 @@ from dblect.lineage.facts.model import (
     Provenance,
 )
 from dblect.lineage.graph import SourceRef
-from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, determines
+from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, covers
 from dblect.lineage.properties.uniqueness import CandidateKeySet, Key, model_dedups_on_write
 from dblect.manifest import Manifest
-
-
-def grain_established(declared: Key, inferred: frozenset[Key], fds: FDSet) -> bool:
-    """True if the SQL establishes the declared grain: some derived key is a subset
-    of the declared columns, closed under ``fds``. Unique per order is also unique
-    per (order, region)."""
-    return any(all(determines(fds, declared, col) for col in key) for key in inferred)
 
 
 def grain_witness(declared: Key, inferred: frozenset[Key]) -> Key | None:
@@ -91,7 +84,7 @@ def declared_grain_findings(
                 if (scope, declared) in judged:
                     continue
                 judged.add((scope, declared))
-                if grain_established(declared, derived.keys, fds):
+                if covers(fds, declared, derived.keys):
                     continue
                 witness = grain_witness(declared, derived.keys)
                 if witness is None:
