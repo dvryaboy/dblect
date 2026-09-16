@@ -28,6 +28,7 @@ from sqlglot import Expr
 from dblect.adapters import AdapterProfile
 from dblect.lineage.facts.model import Annotation
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind
+from dblect.lineage.predicate import Canon, Column, NotNullAtom, atoms_of, entailment_checker
 from dblect.lineage.properties import Nullability
 from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, minimal_cover
 from dblect.lineage.properties.nullability import (
@@ -92,6 +93,9 @@ def detect_null_group_on_nullable_key(
     projection it names, so ``group by 1`` over a nullable column carries the same hazard as
     spelling the column out. The finding names that projection and lands on the GROUP BY, the
     decision site an analyst following the line number is looking for.
+
+    A local ``WHERE`` that proves the grouped column non-null clears it: no NULL can reach the
+    GROUP BY, so there is no phantom bucket to warn about.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -104,6 +108,13 @@ def detect_null_group_on_nullable_key(
         nullable = nullable_by_name.get(target.name)
         if not nullable:
             continue
+        where = sg.where_of(sel)
+        where_atoms: frozenset[Canon] = (
+            atoms_of(where.this)
+            if where is not None and isinstance(where.this, Expr)
+            else frozenset()
+        )
+        proves = entailment_checker(where_atoms)
         for grouped in sg.group_targets(sel):
             grp_expr = grouped.expression
             if not isinstance(grp_expr, exp.Column):
@@ -112,12 +123,13 @@ def detect_null_group_on_nullable_key(
             if qualifier is not None and qualifier.lower() != target.alias_or_name.lower():
                 continue
             column = sg.column_name(grp_expr).lower()
-            if column in nullable:
-                out.append(
-                    _finding(
-                        grp_expr, written_at=grouped.written_at, source=target.name, column=column
-                    )
-                )
+            if column not in nullable:
+                continue
+            if proves(frozenset({NotNullAtom(Column(column))})):
+                continue
+            out.append(
+                _finding(grp_expr, written_at=grouped.written_at, source=target.name, column=column)
+            )
     return tuple(out)
 
 

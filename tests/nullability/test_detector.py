@@ -131,6 +131,39 @@ _CASES: list[tuple[str, str, bool]] = [
         "SELECT b.tag AS tag, count(*) AS n FROM base a LEFT JOIN lkp b ON a.fk = b.id GROUP BY b.tag",
         False,
     ),
+    # A local WHERE that proves the grouped column non-null clears the finding: no
+    # NULL can reach the GROUP BY, so there is no phantom bucket to warn about.
+    (
+        "group-by/where-not-null-clears",
+        "SELECT tag, count(*) AS n FROM stg WHERE tag IS NOT NULL GROUP BY tag",
+        False,
+    ),
+    # Any comparison on the grouped column is just as sound a proof: a comparison
+    # never evaluates true against NULL.
+    (
+        "group-by/where-comparison-clears",
+        "SELECT tag, count(*) AS n FROM stg WHERE tag > 'a' GROUP BY tag",
+        False,
+    ),
+    # A NOT NULL on a *different* column proves nothing about the grouped one.
+    (
+        "group-by/where-other-column-not-null-does-not-clear",
+        "SELECT tag, count(*) AS n FROM stg WHERE id IS NOT NULL GROUP BY tag",
+        True,
+    ),
+    # Under OR, neither disjunct is guaranteed to hold, so the grouped column's
+    # non-null-ness is not proven and the finding still fires.
+    (
+        "group-by/where-or-does-not-clear",
+        "SELECT tag, count(*) AS n FROM stg WHERE tag IS NOT NULL OR id IS NOT NULL GROUP BY tag",
+        True,
+    ),
+    # Redundant parens around the NOT NULL predicate must not defeat recognition.
+    (
+        "group-by/where-parenthesised-not-null-clears",
+        "SELECT tag, count(*) AS n FROM stg WHERE (tag IS NOT NULL) GROUP BY tag",
+        False,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
