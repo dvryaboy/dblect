@@ -513,10 +513,8 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
-        # A model/seed/snapshot's `alias` is its relation name in compiled SQL, the
-        # same role `identifier` plays for a source. dbt sets it on every
-        # materializable node (defaulting to `name`); it is absent on a test or
-        # other non-data-flow node, which is where `_opt_str` reads `None`.
+        # `alias` is the relation name in compiled SQL, the role `identifier` plays
+        # for a source; a test or other non-data-flow node carries none.
         identifier=_opt_str(getattr(n, "alias", None)),
         compiled_flag=compiled_flag,
         language=language,

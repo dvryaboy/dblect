@@ -996,10 +996,8 @@ def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     the same relation-name concept, and dbt compiles ``ref``/``source`` calls to
     it. On a name collision, models win, matching the convention that ``ref('x')``
     refers to a model named ``x`` over a source that happens to share it. Aliases
-    make a bare-name collision across schemas or packages more likely than a plain
-    ``name`` collision would (two packages can each alias a staging model to
-    ``patient``); the same model-wins rule applies, so a rarer source/seed/snapshot
-    collision resolves the same way a name collision always did.
+    make such collisions likelier (two packages can each alias a model to
+    ``patient``); the same rule applies.
 
     This is the single owner of the compiled-SQL name resolution convention. The
     relation-graph builder keys the propagation on the ``SourceRef``s it returns,
