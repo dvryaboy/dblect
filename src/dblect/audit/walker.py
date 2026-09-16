@@ -203,8 +203,10 @@ def run_audit(
     # Propagate the functional-dependency property once over that same relation graph and share it
     # across the fanout and nullable-key detectors, so a declared ``determines`` reaches both
     # (fanout tests key coverage through it; the join-key detector folds a co-determined key column
-    # into its declared key) without re-running the fixpoint per factory.
-    fd_by_name = fd_annotations_by_name(manifest, rel_keys[0], fd_facts)
+    # into its declared key) without re-running the fixpoint per factory. Threading ``rel_keys``
+    # through also wires the FD property's uniqueness edge, so a candidate key read off the shared
+    # propagation determines the columns selected alongside it.
+    fd_by_name = fd_annotations_by_name(manifest, rel_keys[0], fd_facts, relation_keys=rel_keys)
     # The column graph is the heavy shared substrate: qualifying every model is also what stamps
     # the shared trees with their resolved column refs. A shared build (from ``analyze``) is
     # stamped on these same trees, so the detectors read the same resolution either way.
