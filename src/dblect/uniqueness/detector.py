@@ -461,10 +461,8 @@ def _projection_aliases(sel: exp.Select) -> dict[str, str]:
 
 
 # The relation graph, the uniqueness annotations propagated over it, and the property that
-# produced them. The fact-grounded and cross-model fan-out factories both rest on this triple, so
-# an audit computes it once and threads it into both rather than re-running the fixpoint per
-# factory; the property itself is threaded on to :func:`fd_annotations_by_name`, whose FD walk
-# reads these same keys through its uniqueness edge instead of re-propagating them.
+# produced them. An audit computes this once and threads it into every factory, and the FD
+# walk reads the same keys through its uniqueness edge rather than re-propagating them.
 RelationUniqueness = tuple[
     RelationLineageGraph,
     Mapping[SourceRef, Annotation[CandidateKeySet]],
@@ -512,11 +510,9 @@ def fd_annotations_by_name(
     read this map, so :func:`dblect.audit.walker.run_audit` computes it once over the shared
     graph and threads it into both factories rather than re-running the fixpoint per factory.
 
-    ``relation_keys``, when given, wires the FD property's uniqueness edge: a relation's
-    candidate key determines every column selected alongside it (the ``id -> name`` a
-    ``unique`` test on ``id`` licenses on a relation selecting ``id, name``). It must come from
-    an already-propagated :func:`relation_uniqueness` over this same ``graph``, so the FD walk
-    reads those keys rather than re-running the uniqueness fixpoint here."""
+    ``relation_keys`` (an already-propagated pass over this same ``graph``) wires the FD
+    property's uniqueness edge, so a candidate key determines the columns selected alongside
+    it."""
     ground = functional_dependency_grounding(by_scope(fd_facts))
     if relation_keys is None:
         fd_anns = propagate(graph, functional_dependency_property(ground))
