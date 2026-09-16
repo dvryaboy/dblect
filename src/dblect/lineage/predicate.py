@@ -8,12 +8,13 @@ entailment.
 
 It is deliberately partial. ``implies`` returns ``True`` only when it can prove
 ``strong ⟹ weak`` within a small, totally-decidable fragment: conjunctions of
-``term <op> literal`` and ``term IN (...)`` atoms, where ``term`` is a column or a
-recognised monotonic bucketing of one (``date_trunc``), and ``op`` is an order
-comparison. Reasoning is interval containment on the literals, so a narrower date
-bound implies a wider one. Anything outside the fragment (arithmetic, cross-column
-atoms, functions we do not model) yields ``False`` rather than a guess: we stay
-silent rather than over-claim, the same posture the rest of the audit takes.
+``term <op> literal``, ``term IN (...)``, and ``term IS NOT NULL`` atoms, where
+``term`` is a column or a recognised monotonic bucketing of one (``date_trunc``),
+and ``op`` is an order comparison. Reasoning is interval containment on the
+literals, so a narrower date bound implies a wider one. Anything outside the
+fragment (arithmetic, cross-column atoms, functions we do not model) yields
+``False`` rather than a guess: we stay silent rather than over-claim, the same
+posture the rest of the audit takes.
 
 The one invariant that must never break is soundness: a ``True`` verdict means
 every row satisfying ``strong`` satisfies ``weak``. ``test_predicate_implication``
@@ -120,6 +121,13 @@ class InAtom:
 
 
 @dataclass(frozen=True, slots=True)
+class NotNullAtom:
+    """``term IS NOT NULL``."""
+
+    term: Term
+
+
+@dataclass(frozen=True, slots=True)
 class OpaqueAtom:
     """Anything outside the fragment, keyed by its normalised SQL. It only ever
     matches itself (a bare boolean column against the same column)."""
@@ -128,7 +136,7 @@ class OpaqueAtom:
 
 
 # A conjunct canonicalised for syntactic matching against ``weak``.
-Canon = CmpAtom | InAtom | OpaqueAtom
+Canon = CmpAtom | InAtom | NotNullAtom | OpaqueAtom
 
 _OP_BY_TYPE: dict[type, Op] = {
     exp.GT: Op.GT,
@@ -174,8 +182,8 @@ def implies(strong: Expr, weak: Expr) -> bool:
     weak_canon = _canon(weak)
     if any(_canon(c) == weak_canon for c in conjuncts):
         return True
-    cmp_atoms, in_sets = _collect(conjuncts)
-    return _entails(cmp_atoms, in_sets, weak)
+    cmp_atoms, in_sets, not_null = _collect(conjuncts)
+    return _entails(cmp_atoms, in_sets, not_null, weak)
 
 
 def entailment_checker(strong_atoms: frozenset[Canon]) -> Callable[[frozenset[Canon]], bool]:
@@ -189,10 +197,12 @@ def entailment_checker(strong_atoms: frozenset[Canon]) -> Callable[[frozenset[Ca
     the only route for an :class:`OpaqueAtom`) or when the collected constraints on its
     term entail it.
     """
-    cmp_atoms, in_sets = _collect_canon(strong_atoms)
+    cmp_atoms, in_sets, not_null = _collect_canon(strong_atoms)
 
     def check(weak_atoms: frozenset[Canon]) -> bool:
-        return all(w in strong_atoms or _entails_atom(cmp_atoms, in_sets, w) for w in weak_atoms)
+        return all(
+            w in strong_atoms or _entails_atom(cmp_atoms, in_sets, not_null, w) for w in weak_atoms
+        )
 
     return check
 
@@ -225,18 +235,22 @@ def atoms_of(e: Expr) -> frozenset[Canon]:
 def atom_column(atom: Canon) -> str | None:
     """The single base column an atom constrains, or ``None`` for an
     :class:`OpaqueAtom` (whose columns the engine does not model)."""
-    if isinstance(atom, CmpAtom | InAtom):
+    if isinstance(atom, CmpAtom | InAtom | NotNullAtom):
         return _term_column(atom.term)
     return None
 
 
-def rename_atom(atom: CmpAtom | InAtom, new_column: str) -> CmpAtom | InAtom:
+def rename_atom(
+    atom: CmpAtom | InAtom | NotNullAtom, new_column: str
+) -> CmpAtom | InAtom | NotNullAtom:
     """``atom`` with its base column replaced by ``new_column`` (renaming the inner
     column of a truncation term), so a filter follows a projection's ``col AS x``."""
     term = _rename_term_column(atom.term, new_column)
     if isinstance(atom, CmpAtom):
         return CmpAtom(term, atom.op, atom.lit)
-    return InAtom(term, atom.values)
+    if isinstance(atom, InAtom):
+        return InAtom(term, atom.values)
+    return NotNullAtom(term)
 
 
 def _term_column(t: Term) -> str:
@@ -276,6 +290,9 @@ def _canon(e: Expr) -> Canon:
     in_atom = _as_in(e)
     if in_atom is not None:
         return in_atom
+    not_null_atom = _as_not_null(e)
+    if not_null_atom is not None:
+        return not_null_atom
     return OpaqueAtom(_unparen(e).sql(dialect="duckdb").lower())
 
 
@@ -317,6 +334,28 @@ def _as_in(e: Expr) -> InAtom | None:
             return None
         vals.add(v)
     return InAtom(term, frozenset(vals))
+
+
+def _as_not_null(e: Expr) -> NotNullAtom | None:
+    e = _unparen(e)
+    if not isinstance(e, exp.Not):
+        return None
+    inner = e.this
+    if not isinstance(inner, Expr):
+        return None
+    inner = _unparen(inner)
+    if not isinstance(inner, exp.Is):
+        return None
+    rhs = inner.args.get("expression")
+    if not isinstance(rhs, exp.Null):
+        return None
+    lhs = inner.args.get("this")
+    if not isinstance(lhs, Expr):
+        return None
+    term = _term(lhs)
+    if term is None:
+        return None
+    return NotNullAtom(term)
 
 
 def _term(e: Expr) -> Term | None:
@@ -365,9 +404,10 @@ def _lit(e: Expr) -> Lit | None:
 
 def _collect(
     conjuncts: list[Expr],
-) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]]]:
+) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]], set[Term]]:
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]] = {}
     in_sets: dict[Term, frozenset[Lit]] = {}
+    not_null: set[Term] = set()
     for c in conjuncts:
         atom = _as_atom(c)
         if atom is not None:
@@ -377,38 +417,47 @@ def _collect(
         if in_atom is not None:
             prior = in_sets.get(in_atom.term)
             in_sets[in_atom.term] = in_atom.values if prior is None else (prior & in_atom.values)
-    return cmp_atoms, in_sets
+            continue
+        not_null_atom = _as_not_null(c)
+        if not_null_atom is not None:
+            not_null.add(not_null_atom.term)
+    return cmp_atoms, in_sets, not_null
 
 
 def _collect_canon(
     atoms: frozenset[Canon],
-) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]]]:
+) -> tuple[dict[Term, list[tuple[Op, Lit]]], dict[Term, frozenset[Lit]], set[Term]]:
     """The same fold as :func:`_collect`, over already-canonicalised atoms. An
     :class:`OpaqueAtom` contributes nothing to interval reasoning; it is matched only
     syntactically by the caller."""
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]] = {}
     in_sets: dict[Term, frozenset[Lit]] = {}
+    not_null: set[Term] = set()
     for atom in atoms:
         if isinstance(atom, CmpAtom):
             cmp_atoms.setdefault(atom.term, []).append((atom.op, atom.lit))
         elif isinstance(atom, InAtom):
             prior = in_sets.get(atom.term)
             in_sets[atom.term] = atom.values if prior is None else (prior & atom.values)
-    return cmp_atoms, in_sets
+        elif isinstance(atom, NotNullAtom):
+            not_null.add(atom.term)
+    return cmp_atoms, in_sets, not_null
 
 
 def _entails(
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
     in_sets: dict[Term, frozenset[Lit]],
+    not_null: set[Term],
     weak: Expr,
 ) -> bool:
-    atom = _as_atom(weak) or _as_in(weak)
-    return atom is not None and _entails_atom(cmp_atoms, in_sets, atom)
+    atom = _as_atom(weak) or _as_in(weak) or _as_not_null(weak)
+    return atom is not None and _entails_atom(cmp_atoms, in_sets, not_null, atom)
 
 
 def _entails_atom(
     cmp_atoms: dict[Term, list[tuple[Op, Lit]]],
     in_sets: dict[Term, frozenset[Lit]],
+    not_null: set[Term],
     weak: Canon,
 ) -> bool:
     """Whether the collected constraints entail one canonical ``weak`` atom. An
@@ -429,6 +478,10 @@ def _entails_atom(
             and iv.lo is not None
             and Lit(iv.kind, iv.lo) in weak.values
         )
+    if isinstance(weak, NotNullAtom):
+        # A comparison or IN never evaluates true against NULL, so a row that passed
+        # it is provably non-null on that same term; ditto an explicit NOT NULL atom.
+        return weak.term in cmp_atoms or weak.term in in_sets or weak.term in not_null
     return False
 
 

@@ -108,6 +108,14 @@ def test_projection_renames_the_filter_columns() -> None:
     assert flow["model.shop.m"].atoms == _atoms("region = 'US'")
 
 
+def test_not_null_filter_survives_a_rename() -> None:
+    flow = _flow(
+        _source(_ORDERS),
+        _node("model.shop.m", "SELECT country AS region FROM orders WHERE country IS NOT NULL"),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("region IS NOT NULL")
+
+
 def test_filter_on_a_dropped_column_is_lost() -> None:
     # ``country`` is filtered but not projected (no star), so the atom has no image
     # in the output columns and drops.

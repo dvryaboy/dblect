@@ -164,6 +164,41 @@ def test_unparseable_or_empty_predicate_is_no_information() -> None:
     assert parse_predicate("???", dialect=_DIALECT) is None
 
 
+# --- IS NOT NULL -------------------------------------------------------------------
+
+
+def test_not_null_implies_itself() -> None:
+    assert _implies("a IS NOT NULL", "a IS NOT NULL")
+
+
+def test_comparison_implies_not_null() -> None:
+    # A SQL comparison never evaluates true against NULL, so a row that passed it is
+    # provably non-null on that column.
+    assert _implies("a > 1", "a IS NOT NULL")
+
+
+def test_in_implies_not_null() -> None:
+    assert _implies("a IN (1, 2)", "a IS NOT NULL")
+
+
+def test_comparison_on_other_column_does_not_imply_not_null() -> None:
+    assert not _implies("b > 1", "a IS NOT NULL")
+
+
+def test_disjunction_does_not_imply_not_null() -> None:
+    # Either arm alone would prove it, but the OR does not pin down which one held.
+    assert not _implies("a > 1 OR b > 1", "a IS NOT NULL")
+
+
+def test_not_null_does_not_imply_a_comparison() -> None:
+    assert not _implies("a IS NOT NULL", "a > 1")
+
+
+def test_date_trunc_bound_does_not_imply_column_not_null() -> None:
+    # Independent terms: the engine never relates a truncation back to its column.
+    assert not _implies("date_trunc('day', a) > '2020-01-01'", "a IS NOT NULL")
+
+
 # --- entails_atoms: the atom-set form, for activation ----------------------------
 
 
@@ -244,7 +279,16 @@ class _Or(Generic[_V]):
     right: _Cmp[_V] | _In[_V]
 
 
-_Clause = _Cmp[_V] | _In[_V] | _Or[_V]
+@dataclass(frozen=True)
+class _NotNull:
+    """``term IS NOT NULL``. Carries no literal, so it needs no ``_V`` and is shared
+    across both the numeric and lexical fragments."""
+
+    term: _TermSpec
+
+
+_Leaf = _Cmp[_V] | _In[_V]
+_Clause = _Leaf[_V] | _Or[_V] | _NotNull
 
 
 def _sql_lit(v: int | str) -> str:
@@ -258,12 +302,14 @@ def _render_leaf(leaf: _Cmp[_V] | _In[_V]) -> str:
 
 
 def _render(clauses: list[_Clause[_V]]) -> str:
-    parts = [
-        f"({_render_leaf(c.left)} OR {_render_leaf(c.right)})"
-        if isinstance(c, _Or)
-        else _render_leaf(c)
-        for c in clauses
-    ]
+    parts: list[str] = []
+    for c in clauses:
+        if isinstance(c, _Or):
+            parts.append(f"({_render_leaf(c.left)} OR {_render_leaf(c.right)})")
+        elif isinstance(c, _NotNull):
+            parts.append(f"{c.term.sql} IS NOT NULL")
+        else:
+            parts.append(_render_leaf(c))
     return " AND ".join(parts)
 
 
@@ -271,31 +317,38 @@ def _cmp(v: _V, op: str, lit: _V) -> bool:
     return {"<": v < lit, "<=": v <= lit, ">": v > lit, ">=": v >= lit, "=": v == lit}[op]
 
 
-def _holds_leaf(leaf: _Cmp[_V] | _In[_V], world: dict[str, _V]) -> bool:
+def _holds_leaf(leaf: _Leaf[_V], world: dict[str, _V | None]) -> bool:
+    # A comparison or IN never evaluates true against a NULL world value, the same
+    # three-valued-logic rule the engine's NotNullAtom entailment leans on.
+    v = world[leaf.term.key]
+    if v is None:
+        return False
     if isinstance(leaf, _Cmp):
-        return _cmp(world[leaf.term.key], leaf.op, leaf.lit)
-    return world[leaf.term.key] in leaf.members
+        return _cmp(v, leaf.op, leaf.lit)
+    return v in leaf.members
 
 
-def _holds(clauses: list[_Clause[_V]], world: dict[str, _V]) -> bool:
-    return all(
-        (_holds_leaf(c.left, world) or _holds_leaf(c.right, world))
-        if isinstance(c, _Or)
-        else _holds_leaf(c, world)
-        for c in clauses
-    )
+def _holds(clauses: list[_Clause[_V]], world: dict[str, _V | None]) -> bool:
+    def _clause_holds(c: _Clause[_V]) -> bool:
+        if isinstance(c, _Or):
+            return _holds_leaf(c.left, world) or _holds_leaf(c.right, world)
+        if isinstance(c, _NotNull):
+            return world[c.term.key] is not None
+        return _holds_leaf(c, world)
+
+    return all(_clause_holds(c) for c in clauses)
 
 
 def _keys(clauses: list[_Clause[_V]]) -> set[str]:
     ks: set[str] = set()
     for c in clauses:
-        leaves = (c.left, c.right) if isinstance(c, _Or) else (c,)
+        leaves: tuple[_Leaf[_V] | _NotNull, ...] = (c.left, c.right) if isinstance(c, _Or) else (c,)
         ks.update(leaf.term.key for leaf in leaves)
     return ks
 
 
 def _assert_sound(
-    strong: list[_Clause[_V]], weak: list[_Clause[_V]], domain: tuple[_V, ...]
+    strong: list[_Clause[_V]], weak: list[_Clause[_V]], domain: tuple[_V | None, ...]
 ) -> None:
     if not implies(_p(_render(strong)), _p(_render(weak))):
         return  # incompleteness is allowed; only a True verdict carries an obligation
@@ -312,7 +365,7 @@ def _leaves(leaf_st: st.SearchStrategy[_Cmp[_V] | _In[_V]]) -> st.SearchStrategy
     return st.one_of(leaf_st, st.builds(_Or, leaf_st, leaf_st))
 
 
-# Numeric fragment: columns, a monotonic truncation term, comparisons, IN, OR.
+# Numeric fragment: columns, a monotonic truncation term, comparisons, IN, OR, NOT NULL.
 _NUM_TERMS = (_TermSpec("a", "a"), _TermSpec("b", "b"), _TermSpec("date_trunc('day', a)", "td"))
 _INT = st.integers(-4, 4)
 _NUM_LEAF: st.SearchStrategy[_Cmp[int] | _In[int]] = st.one_of(
@@ -323,7 +376,8 @@ _NUM_LEAF: st.SearchStrategy[_Cmp[int] | _In[int]] = st.one_of(
         st.lists(_INT, min_size=1, max_size=3, unique=True).map(tuple),
     ),
 )
-_NUM_CLAUSE = _leaves(_NUM_LEAF)
+_NUM_NOT_NULL: st.SearchStrategy[_NotNull] = st.builds(_NotNull, st.sampled_from(_NUM_TERMS))
+_NUM_CLAUSE: st.SearchStrategy[_Clause[int]] = st.one_of(_leaves(_NUM_LEAF), _NUM_NOT_NULL)
 
 
 @given(
@@ -333,10 +387,11 @@ _NUM_CLAUSE = _leaves(_NUM_LEAF)
 def test_implies_is_sound_over_term_worlds(
     strong: list[_Clause[int]], weak: list[_Clause[int]]
 ) -> None:
-    """A certified ``strong ⟹ weak`` holds for every independent integer assignment
-    of the terms. Covers comparisons, ``IN``, ``OR``, and truncation terms; the cube
-    is sampled exhaustively so an unsound certification cannot hide."""
-    _assert_sound(strong, weak, tuple(range(-6, 7)))
+    """A certified ``strong ⟹ weak`` holds for every independent integer-or-NULL
+    assignment of the terms. Covers comparisons, ``IN``, ``OR``, truncation terms,
+    and ``IS NOT NULL``; the cube is sampled exhaustively so an unsound certification
+    cannot hide."""
+    _assert_sound(strong, weak, (*range(-6, 7), None))
 
 
 # Lexical fragment: one string column, so the literals exercise string ordering.
@@ -350,10 +405,11 @@ _STR_LEAF: st.SearchStrategy[_Cmp[str] | _In[str]] = st.one_of(
         st.lists(_STR_LIT, min_size=1, max_size=3, unique=True).map(tuple),
     ),
 )
-_STR_CLAUSE = _leaves(_STR_LEAF)
+_STR_NOT_NULL: st.SearchStrategy[_NotNull] = st.builds(_NotNull, st.sampled_from(_STR_COL))
+_STR_CLAUSE: st.SearchStrategy[_Clause[str]] = st.one_of(_leaves(_STR_LEAF), _STR_NOT_NULL)
 # Worlds straddle the literals, including a between-value and a lexical edge case
-# (``"bb"`` sorts after ``"b"`` but before ``"c"``).
-_STR_WORLD = ("a", "b", "bb", "c", "e", "g", "i")
+# (``"bb"`` sorts after ``"b"`` but before ``"c"``), plus NULL for IS NOT NULL.
+_STR_WORLD: tuple[str | None, ...] = ("a", "b", "bb", "c", "e", "g", "i", None)
 
 
 @given(
@@ -364,5 +420,6 @@ def test_implies_is_sound_over_string_worlds(
     strong: list[_Clause[str]], weak: list[_Clause[str]]
 ) -> None:
     """A certified ``strong ⟹ weak`` over string literals holds for every lexically
-    ordered world. This is the date-bound shape (ISO strings order lexically)."""
+    ordered world, NULL included. This is the date-bound shape (ISO strings order
+    lexically)."""
     _assert_sound(strong, weak, _STR_WORLD)

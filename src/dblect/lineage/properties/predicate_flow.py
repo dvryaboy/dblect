@@ -35,7 +35,15 @@ from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import DepContext, Property, relation_property
 from dblect.lineage.graph import SourceRef, source_ref_meta
-from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, atoms_of, rename_atom
+from dblect.lineage.predicate import (
+    Canon,
+    CmpAtom,
+    InAtom,
+    NotNullAtom,
+    atom_column,
+    atoms_of,
+    rename_atom,
+)
 from dblect.sql import _sqlglot as sg
 
 
@@ -203,16 +211,16 @@ def _project_filter(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon
 
     Under a ``*`` every column passes through unchanged, so every atom carries
     verbatim (a bare-boolean opaque atom included). Under an explicit projection a
-    comparison/``IN`` atom renames to the output name(s) its column appears under and
-    drops if its column has no image; an opaque atom drops, since its column is
-    unknown and cannot be tracked through the rename.
+    comparison/``IN``/``IS NOT NULL`` atom renames to the output name(s) its column
+    appears under and drops if its column has no image; an opaque atom drops, since
+    its column is unknown and cannot be tracked through the rename.
     """
     if has_star(sel):
         return atoms
     rename = explicit_rename(sel)
     out: set[Canon] = set()
     for atom in atoms:
-        if not isinstance(atom, CmpAtom | InAtom):
+        if not isinstance(atom, CmpAtom | InAtom | NotNullAtom):
             continue
         col = atom_column(atom)
         if col is None:
