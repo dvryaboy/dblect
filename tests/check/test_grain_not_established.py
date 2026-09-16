@@ -2,8 +2,8 @@
 # A contract method's ``self`` is a ContractSelf proxy at capture, not a real
 # instance; annotating it that way trips pyright's self-supertype rule while keeping
 # the proxy usage checked. Typed ``self`` in authored contracts is the stubs concern.
-"""The grain check end to end, from a declared contract to the finding. The decision
-itself is checked against brute force in ``test_pbt_grain_established.py``.
+"""The grain check end to end, from a declared contract to the finding. The coverage
+decision itself is checked against brute force in ``test_pbt_covers.py``.
 
 The first test is the one that matters most: an implementation that compares the
 declaration against the merged key set finds the declaration there and never fires.

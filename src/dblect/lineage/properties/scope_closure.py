@@ -178,6 +178,48 @@ class Input:
     exact: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class FDSet:
+    """The dependencies a relation is known to satisfy.
+
+    ``fds`` holds every known dependency; the empty set is the lattice ``top``
+    ("no dependency known"). ``declared`` holds the grounded instances among them,
+    each still tied to its declaration; every instance's current dependency is in
+    ``fds`` (enforced at construction), so a consumer reading ``fds`` alone sees
+    everything. ``is_bottom`` marks the formal universal element (the lattice
+    ``bottom``): it absorbs under ``meet`` and is the identity under ``join``, and
+    no resolution of real declarations reaches it, since dependency claims only
+    ever union. Equality is structural, so ``FDSet(frozenset())`` (top) and the
+    bottom sentinel are distinct values.
+
+    Lives beside ``FD``/``DeclaredFD`` rather than in ``functional_dependency.py``
+    so ``uniqueness.py`` can seed a base table's dependencies without importing a
+    module that itself imports ``uniqueness.py`` for ``CandidateKeySet``.
+    """
+
+    fds: frozenset[FD]
+    declared: frozenset[DeclaredFD] = frozenset()
+    is_bottom: bool = False
+
+    def __post_init__(self) -> None:
+        missing = {inst.fd for inst in self.declared} - self.fds
+        if missing:
+            raise ValueError(f"declared instances name dependencies outside fds: {missing}")
+
+    @staticmethod
+    def of(*fds: FD) -> FDSet:
+        return FDSet(frozenset(fds))
+
+
+# The empty dependency set: "we know of no dependency", the value every
+# undeclared relation grounds to and the meet identity.
+NO_FDS: FDSet = FDSet(frozenset())
+
+# The formal universal element. Unreachable when resolving real declarations
+# (they only union), present so the lattice is bounded.
+ALL_FDS: FDSet = FDSet(frozenset(), is_bottom=True)
+
+
 # The scope gave up: a shape outside the modelled fragment (see the module
 # docstring).
 _GIVE_UP: Input = Input(exact=False)

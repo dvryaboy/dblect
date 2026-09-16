@@ -1,14 +1,14 @@
-"""Checking the grain decision against brute force over small tables.
+"""Checking the coverage decision against brute force over small tables.
 
-``grain_established`` answers "given these keys and dependencies, is the table
-guaranteed unique on the declared columns?" Here we build an actual small table,
-work out which keys and dependencies genuinely hold over its rows, hand the decision
-some of those true facts, and require that any time it answers yes, the table really
-is unique on the declared columns.
+``covers`` answers "does this determinant functionally determine every column of
+some key, under these dependencies?" Here we build an actual small table, work out
+which keys and dependencies genuinely hold over its rows, hand the decision some of
+those true facts, and require that any time it answers yes, the table really is
+unique on the determinant.
 
 Only that direction is a bug. Answering no about a table that happens to be unique
-costs a missed finding; answering yes about one that is not would let a wrong grain
-through, which is what these rule out.
+on the determinant costs a missed finding; answering yes about one that is not would
+let a wrong claim through, which is what these rule out.
 """
 
 from __future__ import annotations
@@ -18,8 +18,7 @@ from itertools import combinations
 from hypothesis import given
 from hypothesis import strategies as st
 
-from dblect.check.grain import grain_established, grain_witness
-from dblect.lineage.properties.functional_dependency import FD, FDSet
+from dblect.lineage.properties.functional_dependency import FD, FDSet, covers
 
 _COLS = ("c0", "c1", "c2", "c3")
 
@@ -54,7 +53,7 @@ def _names(indices: tuple[int, ...]) -> frozenset[str]:
 
 
 @given(_ROWS, st.data())
-def test_established_implies_uniqueness_on_the_declared_grain(
+def test_covered_implies_uniqueness_on_the_determinant(
     relation: list[tuple[int, ...]], data: st.DataObject
 ) -> None:
     true_keys = [s for s in _INDEX_SUBSETS if _unique_on(relation, s)]
@@ -72,42 +71,33 @@ def test_established_implies_uniqueness_on_the_declared_grain(
     claimed_fds = (
         data.draw(st.lists(st.sampled_from(true_fds), max_size=4), label="fds") if true_fds else []
     )
-    grain = data.draw(st.sampled_from(_INDEX_SUBSETS), label="grain")
+    determinant = data.draw(st.sampled_from(_INDEX_SUBSETS), label="determinant")
 
-    inferred = frozenset(_names(k) for k in claimed_keys)
+    keys = frozenset(_names(k) for k in claimed_keys)
     fds = FDSet.of(*(FD(_names(det), _COLS[target]) for det, target in claimed_fds))
 
-    if grain_established(_names(grain), inferred, fds):
-        assert _unique_on(relation, grain)
+    if covers(fds, _names(determinant), keys):
+        assert _unique_on(relation, determinant)
 
 
 # --- the edges the closure marks, pinned as counterexamples -------------------------
 
 
 def test_coverage_is_containment_through_the_closure_not_an_exact_match() -> None:
-    # A key within the declared columns covers them: unique on (a) is unique on
-    # (a, b), so a non-minimal declaration is established.
-    assert grain_established(frozenset({"a", "b"}), frozenset({frozenset({"a"})}), FDSet.of())
+    # A key within the given columns is covered: unique on (a) is unique on
+    # (a, b), so a non-minimal given set is covered.
+    assert covers(FDSet.of(), frozenset({"a", "b"}), frozenset({frozenset({"a"})}))
     # The closure extends that reach: unique on (a, b) plus a -> b entails unique on
     # (a), where without the dependency the same key entails nothing about (a) (two
     # rows (1, 1) and (1, 2) separate them).
-    grain = frozenset({"a"})
-    inferred = frozenset({frozenset({"a", "b"})})
-    assert grain_established(grain, inferred, FDSet.of(FD(frozenset({"a"}), "b")))
-    assert not grain_established(grain, inferred, FDSet.of())
+    given = frozenset({"a"})
+    keys = frozenset({frozenset({"a", "b"})})
+    assert covers(FDSet.of(FD(frozenset({"a"}), "b")), given, keys)
+    assert not covers(FDSet.of(), given, keys)
 
 
-def test_no_inferred_key_never_establishes() -> None:
+def test_no_keys_never_covers() -> None:
     # FDs alone say nothing about row multiplicity: a -> b holds on a relation with
-    # duplicate (a, b) rows, so with no uniqueness claim at all nothing establishes.
-    grain = frozenset({"a"})
-    assert not grain_established(grain, frozenset(), FDSet.of(FD(frozenset({"a"}), "b")))
-
-
-def test_witness_requires_a_strictly_finer_key() -> None:
-    # (a, b) defeats a declared grain (a); a disjoint key (c) says nothing about
-    # rows per (a) and must not witness. The witness is the smallest finer key.
-    fine = frozenset({"a", "b"})
-    assert grain_witness(frozenset({"a"}), frozenset({fine})) == fine
-    assert grain_witness(frozenset({"a"}), frozenset({frozenset({"c"})})) is None
-    assert grain_witness(frozenset({"a"}), frozenset({frozenset({"a"})})) is None
+    # duplicate (a, b) rows, so with no key claim at all nothing is covered.
+    given = frozenset({"a"})
+    assert not covers(FDSet.of(FD(frozenset({"a"}), "b")), given, frozenset())

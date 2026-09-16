@@ -41,7 +41,7 @@ refinement).
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import assert_never
 
 import sqlglot.expressions as exp
@@ -60,8 +60,11 @@ from dblect.lineage.facts.model import (
 from dblect.lineage.facts.property import DepContext, Property, PropertyRef, relation_property
 from dblect.lineage.graph import SourceRef, source_ref_meta
 from dblect.lineage.properties.scope_closure import (
+    ALL_FDS,
     FD,
+    NO_FDS,
     DeclaredFD,
+    FDSet,
     Input,
     Key,
     closure,
@@ -69,50 +72,29 @@ from dblect.lineage.properties.scope_closure import (
 )
 from dblect.lineage.properties.uniqueness import CandidateKeySet
 
+__all__ = [
+    "ALL_FDS",
+    "FD",
+    "FUNCTIONAL_DEPENDENCY_LATTICE",
+    "NO_FDS",
+    "DeclaredFD",
+    "FDSet",
+    "covers",
+    "determines",
+    "functional_dependency_grounded_scopes",
+    "functional_dependency_grounding",
+    "functional_dependency_property",
+    "minimal_cover",
+]
+
 # --- the value type ------------------------------------------------------------
 #
-# ``FD`` and ``DeclaredFD`` live in ``scope_closure.py``: the engine builds and
-# carries them directly (they describe one resolved input's own dependencies,
-# the shape its projection step produces), and this module imports them back
+# ``FD``, ``DeclaredFD`` and ``FDSet`` live in ``scope_closure.py``: the engine
+# builds and carries the first two directly (they describe one resolved input's
+# own dependencies), and ``FDSet`` sits beside them so ``uniqueness.py`` can seed
+# base-table dependencies without a cycle back through this module (which needs
+# ``CandidateKeySet`` from ``uniqueness.py``). This module imports all three back
 # for its lattice and public API.
-
-
-@dataclass(frozen=True, slots=True)
-class FDSet:
-    """The dependencies a relation is known to satisfy.
-
-    ``fds`` holds every known dependency; the empty set is the lattice ``top``
-    ("no dependency known"). ``declared`` holds the grounded instances among them,
-    each still tied to its declaration; every instance's current dependency is in
-    ``fds`` (enforced at construction), so a consumer reading ``fds`` alone sees
-    everything. ``is_bottom`` marks the formal universal element (the lattice
-    ``bottom``): it absorbs under ``meet`` and is the identity under ``join``, and
-    no resolution of real declarations reaches it, since dependency claims only
-    ever union. Equality is structural, so ``FDSet(frozenset())`` (top) and the
-    bottom sentinel are distinct values.
-    """
-
-    fds: frozenset[FD]
-    declared: frozenset[DeclaredFD] = frozenset()
-    is_bottom: bool = False
-
-    def __post_init__(self) -> None:
-        missing = {inst.fd for inst in self.declared} - self.fds
-        if missing:
-            raise ValueError(f"declared instances name dependencies outside fds: {missing}")
-
-    @staticmethod
-    def of(*fds: FD) -> FDSet:
-        return FDSet(frozenset(fds))
-
-
-# The empty dependency set: "we know of no dependency", the value every
-# undeclared relation grounds to and the meet identity.
-NO_FDS: FDSet = FDSet(frozenset())
-
-# The formal universal element. Unreachable when resolving real declarations
-# (they only union), present so the lattice is bounded.
-ALL_FDS: FDSet = FDSet(frozenset(), is_bottom=True)
 
 
 def _meet(a: FDSet, b: FDSet) -> FDSet:
@@ -153,6 +135,13 @@ def determines(value: FDSet, given: frozenset[str], target: str) -> bool:
         return True
     pairs = tuple((fd.determinant, fd.dependent) for fd in value.fds)
     return target in closure(pairs, given)
+
+
+def covers(value: FDSet, given: frozenset[str], keys: Collection[Key]) -> bool:
+    """Whether ``given`` functionally determines every column of some key in
+    ``keys`` under ``value``. With ``NO_FDS`` this is plain containment: ``given``
+    covers a key exactly when the key is a subset of it."""
+    return any(all(determines(value, given, col) for col in key) for key in keys)
 
 
 def minimal_cover(value: FDSet, cols: frozenset[str]) -> frozenset[str]:
