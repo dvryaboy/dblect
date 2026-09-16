@@ -1003,8 +1003,9 @@ class _Projection:
     risk the single-input star already accepts: qualifying the star only narrows
     which alias's columns pass through, so both sit at the same soundness level.
     A star is ``blocked`` when it cannot be pinned to one active alias: an
-    unqualified star spanning several inputs, or a qualified star naming an alias
-    that is not one of them."""
+    unqualified star spanning several inputs, a qualified star naming an alias
+    that is not one of them, or more than one qualified star (two starred inputs
+    can share a column name, and a key drawn from both would collapse into it)."""
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
@@ -1047,6 +1048,10 @@ def _build_projection(
             star_aliases.add(active_aliases[0])
         else:
             blocked = True
+    if len(qualified_stars) > 1:
+        # Two starred inputs can share a column name; the output would carry both
+        # under one name and a key drawn from both sides would collapse into it.
+        blocked = True
     for qualifier in qualified_stars:
         if qualifier in active_set:
             star_aliases.add(qualifier)
