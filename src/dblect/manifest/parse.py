@@ -271,12 +271,11 @@ class Node:
     incremental keys); ``None`` for sources and for nodes with no config block.
     """
     identifier: str | None = None
-    """The relation name as it appears in compiled SQL.
-
-    Populated for sources (where it can diverge from ``name`` via the
-    ``identifier`` setting in ``schema.yml``). ``None`` for nodes that
-    don't have a separate identifier concept; callers that need a
-    SQL-level lookup name should prefer ``identifier or name``.
+    """The relation name as it appears in compiled SQL, for any node kind: a
+    source's ``identifier`` (``schema.yml``), or a model/seed/snapshot's
+    ``alias`` config. ``None`` when the node carries neither (an unaliased
+    node, or a non-data-flow node such as a test); callers that need a
+    SQL-level lookup name should prefer :attr:`relation_name`.
     """
     compiled_flag: bool | None = None
     """dbt's own ``compiled`` flag for the node, or ``None`` when the manifest
@@ -315,6 +314,13 @@ class Node:
     def is_data_flow(self) -> bool:
         """True for nodes that participate in lineage (models, sources, seeds, snapshots)."""
         return self.resource_type is not ResourceType.OTHER
+
+    @property
+    def relation_name(self) -> str:
+        """The name this node is addressed by in compiled SQL: ``identifier``
+        when set, else ``name``. The one lookup key every SQL-level name-keyed
+        map (``build_name_to_source`` and its composers) should index under."""
+        return self.identifier or self.name
 
     @property
     def analysis_sql(self) -> str | None:
@@ -507,6 +513,11 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
+        # A model/seed/snapshot's `alias` is its relation name in compiled SQL, the
+        # same role `identifier` plays for a source. dbt sets it on every
+        # materializable node (defaulting to `name`); it is absent on a test or
+        # other non-data-flow node, which is where `_opt_str` reads `None`.
+        identifier=_opt_str(getattr(n, "alias", None)),
         compiled_flag=compiled_flag,
         language=language,
     )
@@ -583,8 +594,6 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
     to in compiled SQL; it defaults to ``name`` in the v12 schema but may
     differ when the schema.yml sets it explicitly.
     """
-    raw_identifier = getattr(s, "identifier", None)
-    identifier = raw_identifier if isinstance(raw_identifier, str) and raw_identifier else None
     return Node(
         unique_id=uid,
         name=s.name,
@@ -597,7 +606,7 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
         original_file_path=getattr(s, "original_file_path", None),
         columns=_columns_from_parsed(getattr(s, "columns", {}) or {}),
         depends_on=frozenset(),
-        identifier=identifier,
+        identifier=_opt_str(getattr(s, "identifier", None)),
     )
 
 

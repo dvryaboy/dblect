@@ -222,13 +222,13 @@ def build_manifest_graph(
                 tree=parsed.get(uid) if parsed is not None else None,
             )
             per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
-            _record_output_columns(schema, model.name, uid, per_model)
+            _record_output_columns(schema, model.relation_name, uid, per_model)
             # Mirror this model's columns into the live Schema so its dependents qualify against
             # them. Inside the try so a schema-shape failure (e.g. a relation name `add_table`
             # parses to a mismatched depth) degrades this one model to a BuildIssue rather than
             # aborting the whole build.
             mapping_schema.add_table(
-                model.name, schema[model.name], dialect=dialect, normalize=True
+                model.relation_name, schema[model.relation_name], dialect=dialect, normalize=True
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -991,10 +991,15 @@ def _projection_leaves(expr: Expr) -> tuple[list[exp.Column], list[exp.Subquery]
 def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     """Map every name that can appear as a table qualifier to its ``SourceRef``.
 
-    Includes models (by ``name``), sources (by ``identifier or name`` since
-    dbt compiles ``{{ source(...) }}`` to ``identifier``), and seeds. On a
-    name collision, models win, matching the convention that ``ref('x')``
-    refers to a model named ``x`` over a source that happens to share it.
+    Every node kind indexes under :attr:`Node.relation_name` (``identifier or
+    name``): a source's ``identifier`` and a model/seed/snapshot's ``alias`` are
+    the same relation-name concept, and dbt compiles ``ref``/``source`` calls to
+    it. On a name collision, models win, matching the convention that ``ref('x')``
+    refers to a model named ``x`` over a source that happens to share it. Aliases
+    make a bare-name collision across schemas or packages more likely than a plain
+    ``name`` collision would (two packages can each alias a staging model to
+    ``patient``); the same model-wins rule applies, so a rarer source/seed/snapshot
+    collision resolves the same way a name collision always did.
 
     This is the single owner of the compiled-SQL name resolution convention. The
     relation-graph builder keys the propagation on the ``SourceRef``s it returns,
@@ -1003,14 +1008,14 @@ def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     """
     out: dict[str, SourceRef] = {}
     for uid, src in manifest.sources.items():
-        out.setdefault(src.identifier or src.name, SourceRef(SourceKind.SOURCE, uid))
+        out.setdefault(src.relation_name, SourceRef(SourceKind.SOURCE, uid))
     for uid, node in manifest.nodes.items():
         if node.resource_type is ResourceType.SEED:
-            out[node.name] = SourceRef(SourceKind.SEED, uid)
+            out[node.relation_name] = SourceRef(SourceKind.SEED, uid)
         elif node.resource_type is ResourceType.SNAPSHOT:
-            out[node.name] = SourceRef(SourceKind.SNAPSHOT, uid)
+            out[node.relation_name] = SourceRef(SourceKind.SNAPSHOT, uid)
     for uid, model in manifest.models.items():
-        out[model.name] = SourceRef(SourceKind.MODEL, uid)
+        out[model.relation_name] = SourceRef(SourceKind.MODEL, uid)
     return out
 
 
@@ -1045,12 +1050,11 @@ def _build_schema(manifest: Manifest) -> Mapping[str, Mapping[str, str]]:
     """
     out: dict[str, dict[str, str]] = {}
     for src in manifest.sources.values():
-        name = src.identifier or src.name
         for col_name, col in src.columns.items():
-            out.setdefault(name, {})[col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(src.relation_name, {})[col_name] = col.data_type or "UNKNOWN"
     for node in _models_seeds_snapshots(manifest):
         for col_name, col in node.columns.items():
-            out.setdefault(node.name, {})[col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(node.relation_name, {})[col_name] = col.data_type or "UNKNOWN"
     return out
 
 

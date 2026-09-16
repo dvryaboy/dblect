@@ -537,10 +537,10 @@ def _nullable_by_name(
     manifest: Manifest, anns: Mapping[ColumnRef, Annotation[Nullability]]
 ) -> dict[str, frozenset[str]]:
     """Index the proven-NULLABLE columns by the relation name as it appears in compiled
-    SQL, mirroring the uniqueness detector's name resolution: a source resolves under
-    ``identifier or name``, a model under ``name``, and a model wins on a name collision
-    (as a ``ref`` would). Column names are lowercased so the index matches the detectors'
-    lowercased AST keys on a dialect that case-folds bare identifiers."""
+    SQL, mirroring the uniqueness detector's name resolution: every node kind resolves
+    under :attr:`Node.relation_name` (``identifier or name``), and a model wins on a name
+    collision (as a ``ref`` would). Column names are lowercased so the index matches the
+    detectors' lowercased AST keys on a dialect that case-folds bare identifiers."""
     sources: dict[str, set[str]] = {}
     models: dict[str, set[str]] = {}
     for col_ref, ann in anns.items():
@@ -550,7 +550,7 @@ def _nullable_by_name(
         if node is None:
             continue
         bucket = models if col_ref.source.kind is SourceKind.MODEL else sources
-        bucket.setdefault(node.identifier or node.name, set()).add(col_ref.column.lower())
+        bucket.setdefault(node.relation_name, set()).add(col_ref.column.lower())
     merged: dict[str, set[str]] = {name: set(cols) for name, cols in sources.items()}
     merged.update(models)  # a model wins on a name collision, as a ref would
     return {name: frozenset(cols) for name, cols in merged.items()}
