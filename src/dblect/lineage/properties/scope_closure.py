@@ -242,8 +242,9 @@ def scope_facts(
     record: dict[int, Input] | None = None,
 ) -> Input:
     """The ``Input`` a SELECT or UNION scope projects. ``record``, when given,
-    collects every nested scope's result by ``id(node)`` for callers that need a
-    CTE's or subquery's own keys."""
+    collects every nested scope's result by ``id(node)``, and also every resolved
+    ``exp.Table`` reference (a CTE or a base table) by its own node id, so a caller
+    can read the facts of any FROM/JOIN source the same way regardless of shape."""
     if isinstance(node, exp.Select):
         result = _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
     elif isinstance(node, exp.Union):
@@ -277,9 +278,10 @@ def _resolve_source(
 ) -> tuple[str, Input] | None:
     if isinstance(node, exp.Table):
         alias = node.alias_or_name.lower()
-        if node.name in cte_scope:
-            return alias, cte_scope[node.name]
-        return alias, base_resolve(node)
+        resolved = cte_scope[node.name] if node.name in cte_scope else base_resolve(node)
+        if record is not None:
+            record[id(node)] = resolved
+        return alias, resolved
     if isinstance(node, exp.Subquery):
         inner = node.this
         alias = node.alias_or_name
