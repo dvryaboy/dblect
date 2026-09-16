@@ -201,6 +201,20 @@ def test_distinct_introduces_a_full_tuple_key() -> None:
     assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id", "region"))
 
 
+def test_distinct_drops_a_projected_literal_from_the_key() -> None:
+    """A projected literal is constant, so it adds nothing to distinguish rows;
+    the minimal key is the columns that actually vary."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node(
+            "model.shop.d",
+            "SELECT DISTINCT customer_id, region, CAST('x' AS TIMESTAMP) AS ts FROM orders",
+        ),
+    )
+    assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id", "region"))
+
+
 def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> None:
     """A LEFT JOIN to a dimension unique on the join key cannot fan out, so the
     probe side's key survives."""

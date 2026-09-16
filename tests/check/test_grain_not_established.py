@@ -121,6 +121,33 @@ def test_a_collapse_to_the_declared_grain_is_established_and_silent() -> None:
     assert _grain_findings(report) == []
 
 
+def test_distinct_with_a_projected_literal_establishes_the_declared_grain() -> None:
+    # The real-project shape: a DISTINCT alongside a projected literal (a CAST'd
+    # constant) must not inflate the derived key with that constant column.
+    class Claims(ModelContract):
+        dbt_model = "claims"
+
+        @contract
+        def per_claim_source(self: ContractSelf) -> object:
+            return self.grain(per=(self.claim_id, self.data_source))
+
+    raw = _node(
+        "model.shop.raw_claims",
+        sql="select 1 as claim_id, 'x' as data_source",
+        columns=_cols(claim_id="INT", data_source="TEXT"),
+    )
+    claims = _node(
+        "model.shop.claims",
+        sql=(
+            "select distinct claim_id, data_source, "
+            "cast('2020-01-01' as timestamp) as ts from raw_claims"
+        ),
+        columns=_cols(claim_id="INT", data_source="TEXT", ts="TIMESTAMP"),
+    )
+    report = run_check(_manifest(raw, claims), _DUCKDB)
+    assert _grain_findings(report) == []
+
+
 def test_coverage_runs_through_the_fd_closure() -> None:
     # The derived key is (order_id, region); the declared ``order_id -> region``
     # closes it to (order_id).

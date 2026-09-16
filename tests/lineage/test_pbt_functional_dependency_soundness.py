@@ -132,6 +132,7 @@ class Scenario:
     group_cols: tuple[str, ...]  # non-empty means GROUP BY these input columns
     group_spelling: GroupSpelling  # how that GROUP BY names them
     renames: Mapping[str, str]  # projected input column -> output name
+    literal_col: str | None  # name of an extra ``CAST('lit' AS ...) AS <name>`` projection
 
 
 @st.composite
@@ -164,6 +165,8 @@ def _scenario(draw: st.DrawFn) -> Scenario:
     # Every projection here renames, so an ordinal has to see through the AS binding to the
     # input column and then let the projection rename it back.
     spelling = draw(st.sampled_from((GroupSpelling.EXPRESSION, GroupSpelling.ORDINAL)))
+    # "z" never collides with a rename (drawn from {a, b, c}) or the aggregate alias "s".
+    literal_col = "z" if draw(st.booleans()) else None
     return Scenario(
         rows=tuple(rows),
         declared=declared,
@@ -171,11 +174,14 @@ def _scenario(draw: st.DrawFn) -> Scenario:
         group_cols=group_cols,
         group_spelling=spelling,
         renames=renames,
+        literal_col=literal_col,
     )
 
 
 def _model_sql(s: Scenario) -> str:
     projections = [f"{col} AS {name}" for col, name in s.renames.items()]
+    if s.literal_col is not None:
+        projections.append(f"CAST('lit' AS VARCHAR) AS {s.literal_col}")
     if s.group_cols:
         projections.append("SUM(y) AS s")
     sql = f"SELECT {', '.join(projections)} FROM t"
@@ -204,6 +210,10 @@ def test_every_claimed_fd_holds_on_the_data(
         # Anti-vacuity: a GROUP BY always yields at least the group-key dependency,
         # so a walk that silently claims nothing cannot pass on silence alone.
         assert claimed.fds
+    if s.literal_col is not None:
+        # Anti-vacuity: a projected literal is always single-valued, so silence
+        # here cannot pass either.
+        assert determines(claimed, frozenset(), s.literal_col)
     names, rows = _materialize(
         oracle_con, _model_sql(s), {"t": ("g INTEGER, x INTEGER, y INTEGER", s.rows)}
     )
