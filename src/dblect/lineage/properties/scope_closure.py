@@ -711,6 +711,8 @@ def _select_facts(
             extra_candidates.append(distinct_attrs)
 
     classes = _equivalence_classes(tuple(predicate_pairs))
+    if _ambiguous_output_name(proj, classes):
+        return _GIVE_UP  # two unrelated attributes share an output name: an unreliable universe
     declared_final = _rename_declared(declared_by_alias, classes, proj)
     result = _project(
         facts,
@@ -1012,6 +1014,10 @@ class _Projection:
     name collision with another explicitly projected column, and that is the same
     risk the single-input star already accepts: qualifying the star only narrows
     which alias's columns pass through, so both sit at the same soundness level.
+    A collision between two *explicit* names is caught separately
+    (``_ambiguous_output_name``, since it needs the scope's equivalence classes
+    too); a star's hidden columns colliding with one stays this accepted risk,
+    since the engine never enumerates what a star actually projects.
     A star is ``blocked`` when it cannot be pinned to one active alias: an
     unqualified star spanning several inputs, a qualified star naming an alias
     that is not one of them, or more than one qualified star (two starred inputs
@@ -1142,12 +1148,36 @@ def _equivalence_classes(pairs: Sequence[QFD]) -> dict[Attr, frozenset[Attr]]:
     return classes
 
 
+def _class_of(attr: Attr, classes: Mapping[Attr, frozenset[Attr]]) -> frozenset[Attr]:
+    """``attr``'s proven-equal-value group, or itself alone when it is in none."""
+    return classes.get(attr, frozenset({attr}))
+
+
 def _output_name(
     attr: Attr, classes: Mapping[Attr, frozenset[Attr]], proj: _Projection
 ) -> str | None:
-    members = classes.get(attr, frozenset({attr}))
+    members = _class_of(attr, classes)
     names = [n for m in members for n in _direct_name(m, proj)]
     return min(names) if names else None
+
+
+def _ambiguous_output_name(proj: _Projection, classes: Mapping[Attr, frozenset[Attr]]) -> bool:
+    """Whether an explicit output name is claimed by two attributes outside one
+    proven-equal class. DuckDB accepts the collision and resolves a downstream
+    reference to whichever attribute it parses first, silently hiding the other's
+    values, so a name two unrelated attributes share makes the scope's output
+    universe unreliable, the same posture as two qualified stars."""
+    by_name: dict[str, set[Attr]] = {}
+    for qc, names in proj.named.items():
+        for name in names:
+            by_name.setdefault(name, set()).add(qc)
+    for name in proj.computed:
+        by_name.setdefault(name, set()).add(Computed(name))
+    return any(
+        len({_class_of(a, classes) for a in claimants}) > 1
+        for claimants in by_name.values()
+        if len(claimants) > 1
+    )
 
 
 def _rewrite(

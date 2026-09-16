@@ -269,6 +269,45 @@ def test_two_qualified_stars_claim_nothing() -> None:
     assert keys["model.shop.product"] == CandidateKeySet.of()
 
 
+def test_duplicate_output_name_across_unrelated_columns_claims_no_key() -> None:
+    """``p.id AS id, d.id AS id`` collapses to one output name in DuckDB, which
+    resolves ``id`` to whichever column it parses first; the other's values are
+    invisible. A key built from both would claim uniqueness the engine cannot see,
+    so the ambiguous name blocks the scope the same way two qualified stars do."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node(
+            "model.shop.product",
+            "SELECT o.id AS id, c.id AS id FROM orders o CROSS JOIN customers c",
+        ),
+    )
+    assert keys["model.shop.product"] == CandidateKeySet.of()
+
+
+def test_duplicate_output_name_in_one_equivalence_class_still_claims_the_key() -> None:
+    """An equi-join proves ``o.id`` and ``c.id`` carry the same value, so DuckDB's
+    arbitrary pick between them reads a provably-equal column either way: the
+    shared name is safe, unlike the unrelated-columns case above."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node(
+            "model.shop.joined",
+            "SELECT o.id AS id, c.id AS id FROM orders o JOIN customers c ON o.id = c.id",
+        ),
+    )
+    assert keys["model.shop.joined"] == CandidateKeySet.of(_key("id"))
+
+
 def test_right_join_does_not_preserve_probe_keys() -> None:
     """A RIGHT JOIN NULL-pads the probe (left) side on joined-in rows with no match, so the
     probe key can repeat as NULL and does not survive, even when the joined-in side is unique
@@ -715,6 +754,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
     (
         "two_qualified_stars",
         "SELECT o.*, c.* FROM orders o CROSS JOIN customers c",
+        False,
+    ),
+    (
+        "ambiguous_output_name_collision",
+        "SELECT o.id AS id, c.id AS id FROM orders o CROSS JOIN customers c",
         False,
     ),
     ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
