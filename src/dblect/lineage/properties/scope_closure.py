@@ -6,9 +6,9 @@ expression (:class:`Computed`), or the identity of one input's row
 (:class:`RowToken`). A key is then a set of attributes whose closure reaches the
 output row token. Each FROM/JOIN source contributes an :class:`Input`;
 :func:`scope_facts` mints the scope's qualified facts (join sides, predicates,
-GROUP BY, DISTINCT) and projects them back to an ``Input`` in the output names,
-so a fact survives projection whenever the closure reaches it through any equal
-column.
+GROUP BY, DISTINCT, projected literals) and projects them back to an ``Input`` in
+the output names, so a fact survives projection whenever the closure reaches it
+through any equal column.
 
 Every derived fact is a sound under-approximation. ``Input.exact`` records
 whether an absent fact is a proven absence or a give-up, for consumers making a
@@ -692,6 +692,10 @@ def _select_facts(
 
     for name in proj.computed:
         facts.add((frozenset({r_out}), Computed(name)))
+    for name in proj.constant:
+        # A projected literal is single-valued over every row, the same pin
+        # `WHERE col = 'lit'` mints, so it needs no determinant either.
+        facts.add((frozenset(), Computed(name)))
 
     if sel.args.get("distinct") is not None:
         distinct_attrs: frozenset[Attr] = frozenset(proj.named) | frozenset(
@@ -991,9 +995,10 @@ def _remap_declared(
 @dataclass(frozen=True, slots=True)
 class _Projection:
     """A SELECT projection's output names: ``named`` per bare-column source,
-    ``computed`` for expressions, ``star_aliases`` for the aliases whose columns
-    pass through wholesale, ``blocked`` when a star's output universe cannot be
-    pinned down.
+    ``computed`` for expressions, ``constant`` for the subset of ``computed`` that is
+    a bare literal (through ``CAST``/parens), ``star_aliases`` for the aliases whose
+    columns pass through wholesale, ``blocked`` when a star's output universe cannot
+    be pinned down.
 
     An alias in ``star_aliases`` (an unqualified star over the sole active input,
     or a qualified star naming one alias among several) gives every column of
@@ -1009,6 +1014,7 @@ class _Projection:
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
+    constant: frozenset[str]
     star_aliases: frozenset[str]
     blocked: bool
 
@@ -1020,6 +1026,7 @@ def _build_projection(
     computed: set[str] = set()
     unqualified_star = False
     qualified_stars: set[str] = set()
+    constant: set[str] = set()
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
             unqualified_star = True
@@ -1038,7 +1045,10 @@ def _build_projection(
             continue
         name = proj.alias_or_name
         if name:
-            computed.add(name.lower())
+            lowered = name.lower()
+            computed.add(lowered)
+            if isinstance(inner, Expr) and sg.literal_constant(inner) is not None:
+                constant.add(lowered)
 
     active_set = set(active_aliases)
     star_aliases: set[str] = set()
@@ -1061,6 +1071,7 @@ def _build_projection(
     return _Projection(
         named={qc: tuple(ns) for qc, ns in named.items()},
         computed=frozenset(computed),
+        constant=frozenset(constant),
         star_aliases=frozenset(star_aliases),
         blocked=blocked,
     )
