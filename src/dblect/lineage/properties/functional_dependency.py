@@ -87,14 +87,7 @@ __all__ = [
     "minimal_cover",
 ]
 
-# --- the value type ------------------------------------------------------------
-#
-# ``FD``, ``DeclaredFD`` and ``FDSet`` live in ``scope_closure.py``: the engine
-# builds and carries the first two directly (they describe one resolved input's
-# own dependencies), and ``FDSet`` sits beside them so ``uniqueness.py`` can seed
-# base-table dependencies without a cycle back through this module (which needs
-# ``CandidateKeySet`` from ``uniqueness.py``). This module imports all three back
-# for its lattice and public API.
+# --- the lattice ---------------------------------------------------------------
 
 
 def _meet(a: FDSet, b: FDSet) -> FDSet:

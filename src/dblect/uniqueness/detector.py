@@ -23,11 +23,9 @@ to make a claim, and stay silent otherwise):
   a magnitude: it counts the relation's rows, whose grain the relation preserves, so
   it stays silent (the ``SUM(qty)`` analog), unlike ``SUM(amount)``.
 
-The first two read facts from two places: cross-model propagation
-(``uniqueness_property`` over the relation graph) supplies per-model keys, and a
-per-tree scope index (``relation_scope_facts``) supplies the facts (keys and
-dependencies) of every FROM/JOIN source, a CTE, a subquery, or a model alike, none
-of which the propagator annotates as its own relation.
+Per-model keys and dependencies come from cross-model propagation over the
+relation graph; a per-tree scope index (``relation_scope_facts``) then supplies
+the facts of every FROM/JOIN source, CTE, subquery, or model alike.
 """
 
 from __future__ import annotations
@@ -222,15 +220,10 @@ def detect_join_fanout(
     ref'd model), we ask whether the join's equality columns cover a known key. If yes,
     the join cannot multiply rows. If no, we flag.
 
-    Coverage is closure-based, not raw containment: a known key ``K`` is covered when the
-    join columns *functionally determine* every column of ``K`` under the joined-in side's
-    own dependencies, read off the scope index alongside its keys. Where a relation has no
-    known dependencies, the closure test reduces to ``K`` being a subset of the join columns.
-    The generalization removes a false positive on a non-minimal key: a key carrying
-    descriptive columns dependent on an id (``(month, platform, project_family, wiki_id,
-    wiki_name)`` with ``wiki_id`` determining ``project_family`` and ``wiki_name``) is covered
-    by a join on ``(month, platform, wiki_id)``, since the closure of the join columns reaches
-    the rest.
+    Coverage is closure-based: a known key ``K`` is covered when the join columns
+    functionally determine every column of ``K`` under the joined-in side's dependencies
+    (plain containment when none are known). So a join on ``(month, wiki_id)`` covers the
+    key ``(month, wiki_id, wiki_name)`` when ``wiki_id`` determines ``wiki_name``.
 
     The finding is suppressed when the fan-out is collapsed in the same query before
     any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
@@ -887,23 +880,16 @@ def _scope_index_for(
 
 
 def _source_facts(node: Expr, scopes: ScopeIndex) -> Input | None:
-    """The resolved facts of one FROM/JOIN source node: a table (a CTE or a model
-    ref) reads its own recorded id, a subquery reads its inner SELECT's, which the
-    engine records directly. ``None`` when the scope index has nothing for this
-    node (the walk gave up on its shape)."""
+    """The resolved facts of one FROM/JOIN source node; a subquery reads its inner
+    SELECT's entry. ``None`` when the walk gave up on the node's shape."""
     key_node = node.this if isinstance(node, exp.Subquery) and isinstance(node.this, Expr) else node
     return scopes.get(id(key_node))
 
 
 def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
-    """Facts for ``sel``'s single FROM source, or ``None`` if it is not a clean
-    single-source scope with known keys.
-
-    A scope qualifies when there are no JOINs and FROM is a single source: a bare
-    table (a CTE or a model ref, resolved the same way a join target is) or an
-    inline subquery. ``None`` when the shape doesn't qualify or no key is known, so
-    the order-key and LIMIT detectors stay silent.
-    """
+    """Facts for ``sel``'s single FROM source, or ``None`` when the scope has a JOIN,
+    no FROM, or a source with no known keys, so the order-key and LIMIT detectors
+    stay silent."""
     from_ = sg.from_of(sel)
     if from_ is None or sg.joins_of(sel):
         return None
@@ -1019,16 +1005,10 @@ def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
 def _uncovered_order_keys(
     order: list[Expr], grouping: list[Expr], source: Input
 ) -> tuple[list[str], list[str]] | None:
-    """The bare order and grouping column names when their combined key set is not covered by a
-    known source key, signalling a non-total order; ``None`` when the order is provably total or
-    we cannot judge it.
-
-    The window and top-n-aggregate checks share this decision: the order is total iff the
-    combined (grouping + order) columns functionally determine some candidate key of the
-    source, under the source's own dependencies. ``None`` folds the three silent cases both
-    share: an empty order, an order or grouping key that is not a bare column (an expression
-    we do not model an equivalence for), or a combined set a known key is already covered by.
-    """
+    """The bare order and grouping column names when their union does not cover any
+    source key under the source's dependencies, so the order may not be total. ``None``
+    when it is provably total or we cannot judge it: an empty order, or an order or
+    grouping key that is not a bare column."""
     if not order:
         return None
     order_cols = _bare_column_names(order)

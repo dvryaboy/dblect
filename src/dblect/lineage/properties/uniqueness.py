@@ -662,32 +662,18 @@ def relation_scope_facts(
     conditional_by_name: Mapping[str, frozenset[ConditionalKey]] = {},
     scope_flow: Mapping[int, frozenset[Canon]] = {},
 ) -> Mapping[int, Input]:
-    """Per-scope resolved facts for every SELECT/UNION node in ``tree``, and for
-    every FROM/JOIN table reference (a CTE or a base table), keyed by ``id(node)``.
+    """Resolved facts for every SELECT/UNION scope and every FROM/JOIN table
+    reference in ``tree``, keyed by ``id(node)`` and valid only while ``tree`` lives.
+    Base tables resolve by name; CTEs and subqueries come from the walk itself.
 
-    Base tables resolve by name against ``model_keys``/``model_fds``/
-    ``conditional_by_name`` rather than by graph stamp. This is how a detector reads
-    the keys and dependencies of a CTE, a subquery, or a joined-in model alike,
-    none of which the cross-model propagator annotates as its own relation. Valid
-    only for the lifetime of ``tree``.
+    Keys are activated: a conditional key is promoted where the scope's own flow
+    implies its predicate. A scope the flow walk did not record (it stops at a
+    join) gets the empty filter, which activates nothing, the safe direction.
 
-    Each returned ``Input``'s keys are the activated ones: a conditional key is
-    carried into every scope and promoted where that scope's own flow
-    (``scope_flow``) implies its predicate, so a window or join over a filtering CTE
-    sees the key the filter activates. The flow walk does not record every scope
-    this engine does: it stops at a join rather than recursing into it, so a scope
-    nested inside a joined subquery has no recorded flow. ``scope_flow.get`` then
-    defaults to the empty filter, which implies nothing and so activates nothing,
-    the safe direction (a conditional key stays conditional) and consistent with
-    the flow's own posture of dropping at a join.
-
-    A CTE's own defining scope and every FROM/JOIN reference to it share the
-    identical ``Input`` object (``cte_scope`` hands out the same value at each
-    lookup), but ``scope_flow`` is keyed by SELECT/UNION scope, so only the
-    defining scope's id carries a real entry; a reference's own id would default
-    to the empty flow and under-promote. Promoting once per distinct ``Input``
-    object, and reusing that result for every id it is recorded under, routes
-    every reference through the defining scope's own promotion instead.
+    A CTE body and every reference to it share one ``Input`` object, but only the
+    body's id has a flow entry. Promotion therefore runs once per object and every
+    reference reuses the body's result; promoting a reference by its own id would
+    silently under-promote.
     """
 
     def base_resolve(table: exp.Table) -> Input:

@@ -191,10 +191,6 @@ class FDSet:
     no resolution of real declarations reaches it, since dependency claims only
     ever union. Equality is structural, so ``FDSet(frozenset())`` (top) and the
     bottom sentinel are distinct values.
-
-    Lives beside ``FD``/``DeclaredFD`` rather than in ``functional_dependency.py``
-    so ``uniqueness.py`` can seed a base table's dependencies without importing a
-    module that itself imports ``uniqueness.py`` for ``CandidateKeySet``.
     """
 
     fds: frozenset[FD]
@@ -242,9 +238,8 @@ def scope_facts(
     record: dict[int, Input] | None = None,
 ) -> Input:
     """The ``Input`` a SELECT or UNION scope projects. ``record``, when given,
-    collects every nested scope's result by ``id(node)``, and also every resolved
-    ``exp.Table`` reference (a CTE or a base table) by its own node id, so a caller
-    can read the facts of any FROM/JOIN source the same way regardless of shape."""
+    collects every nested scope's result and every resolved FROM/JOIN table's
+    ``Input`` by ``id(node)``."""
     if isinstance(node, exp.Select):
         result = _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
     elif isinstance(node, exp.Union):

@@ -103,11 +103,9 @@ def test_cte_shadowing_a_declared_model_does_not_inherit_its_fds() -> None:
 
 
 def test_declared_dependency_quiets_a_grouped_cte_join_target() -> None:
-    # #248: `report` joins a query-local CTE `tot`, grouped on (a, b), rather than a
-    # bare model. `dim`'s `a` and `b` are declared as a bijective pair (a <-> b), so
-    # `tot`'s own key minimizes to whichever of the two the engine keeps; the join on
-    # `a` alone checks out only through the dependency reaching `tot`. Before #248
-    # join-fanout forced NO_FDS for any CTE target, so it never did.
+    # `report` joins a query-local CTE `tot` grouped on (a, b). With `a` and `b`
+    # declared a bijective pair, the engine minimizes `tot`'s key to (b), so the join
+    # on `a` checks out only through the dependency reaching `tot`.
     report_sql = (
         "WITH tot AS (SELECT a, b, SUM(x) AS s FROM dim GROUP BY a, b) "
         "SELECT f.a, tot.s FROM fact_src AS f JOIN tot ON f.a = tot.a"
