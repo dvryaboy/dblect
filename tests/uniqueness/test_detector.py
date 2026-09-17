@@ -14,7 +14,8 @@ import pytest
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
-from dblect.lineage.properties.functional_dependency import FD, FDSet
+from dblect.lineage.builder import build_relation_graph
+from dblect.lineage.properties.functional_dependency import FD, NO_FDS, FDSet
 from dblect.manifest import DbtTestMetadata, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
@@ -22,7 +23,9 @@ from dblect.uniqueness.detector import (
     detect_limit_without_deterministic_order,
     detect_non_unique_aggregate_order_keys,
     detect_non_unique_window_order_keys,
+    fd_annotations_by_name,
     make_fact_grounded_detectors,
+    relation_uniqueness,
 )
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -958,3 +961,25 @@ def test_limit_detector_fires_only_for_persisted_materialization(
         assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
     else:
         assert findings == ()
+
+
+# --- the uniqueness edge through fd_annotations_by_name -----------------------
+
+
+def test_fd_annotations_by_name_wires_the_uniqueness_edge() -> None:
+    """``fd_annotations_by_name`` mints the key-derived FD only when
+    ``relation_uniqueness``'s pair is threaded in as ``relation_keys``; omitted, the
+    map stays silent, matching ``functional_dependency_property``'s own contract at
+    this production entry point (issue #252)."""
+    orders = _source("source.shop.raw.orders")
+    unique = _unique_test("test.shop.u", column="id", target=orders.unique_id)
+    stg = _node("model.shop.stg", "SELECT id, customer_id FROM orders")
+    manifest = _manifest(orders, unique, stg)
+    graph = build_relation_graph(manifest).graph
+    relation_keys = relation_uniqueness(manifest, _DUCKDB, graph=graph)
+
+    with_edge = fd_annotations_by_name(manifest, graph, relation_keys=relation_keys)
+    without_edge = fd_annotations_by_name(manifest, graph)
+
+    assert with_edge["stg"] == FDSet.of(FD(frozenset({"id"}), "customer_id"))
+    assert without_edge["stg"] == NO_FDS
