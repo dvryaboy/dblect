@@ -482,3 +482,32 @@ def test_consumer_where_excludes_a_correlated_outer_predicate() -> None:
         _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+def test_consumer_where_excludes_an_unqualified_correlated_predicate() -> None:
+    # Same shape, but the conjunct is unqualified rather than explicitly foreign.
+    # This analysis has no catalog to say ``c``/``events`` actually has a ``status``
+    # column, so inside a JOIN arm (where ``a`` is in view via duckdb's implicit
+    # lateral) an unqualified column is just as ambiguous as one explicitly
+    # qualified to ``a``, and must not activate ``c``'s conditional key either.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
