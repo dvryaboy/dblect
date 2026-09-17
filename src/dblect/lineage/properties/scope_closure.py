@@ -25,6 +25,7 @@ INTERSECT and EXCEPT.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TypeVar, cast
@@ -947,27 +948,6 @@ def _union_facts(
     return Input(keys, frozenset(inst.fd for inst in shared), shared, exact=arms_exact)
 
 
-def _union_key(u: exp.Union) -> frozenset[Key]:
-    """The DISTINCT full-output-tuple key, read off the union's own first arm.
-    A star anywhere leaves the full tuple unnamed, so it voids the key rather
-    than being skipped: DISTINCT dedups every column, and a named subset is
-    not a key of that wider tuple. UNION ALL, or a first arm that is itself a
-    nested set operation (an unflattened chain), mints no key."""
-    if not bool(u.args.get("distinct")) or not isinstance(u.this, exp.Select):
-        return frozenset()
-    names: list[str] = []
-    for proj in u.this.expressions:
-        if isinstance(proj, exp.Star):
-            return frozenset()
-        if isinstance(proj, exp.Alias):
-            names.append(proj.alias_or_name.lower())
-        elif isinstance(proj, exp.Column):
-            if isinstance(proj.this, exp.Star):
-                return frozenset()
-            names.append(sg.column_name(proj).lower())
-    return frozenset({frozenset(names)}) if names else frozenset()
-
-
 def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
     """An arm's output column names in projection order, or ``None`` when they
     cannot be lined up positionally (a star, a duplicated name, not a SELECT)."""
@@ -984,6 +964,20 @@ def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
     if len(set(out)) != len(out):
         return None
     return tuple(out)
+
+
+def _union_key(u: exp.Union) -> frozenset[Key]:
+    """The DISTINCT full-output-tuple key, read off the union's own first arm
+    through :func:`_positional_outputs`. A star or a duplicated output name
+    leaves the full tuple unnamed, so it voids the key rather than being
+    skipped: DISTINCT dedups every column, and a named subset is not a key of
+    that wider tuple, nor is a name that does not pick out one column. UNION
+    ALL, or a first arm that is itself a nested set operation (an unflattened
+    chain) or not a SELECT, mints no key."""
+    if not bool(u.args.get("distinct")):
+        return frozenset()
+    names = _positional_outputs(u.this)
+    return frozenset({frozenset(names)}) if names else frozenset()
 
 
 def _remap_declared(
@@ -1025,6 +1019,7 @@ class _Projection:
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
+    duplicate_computed: frozenset[str]
     constant: frozenset[str]
     star_aliases: frozenset[str]
     blocked: bool
@@ -1034,7 +1029,7 @@ def _build_projection(
     sel: exp.Select, *, from_alias: str, active_aliases: Sequence[str]
 ) -> _Projection:
     named: dict[QCol, list[str]] = {}
-    computed: set[str] = set()
+    computed_counts: Counter[str] = Counter()
     unqualified_star = False
     qualified_stars: set[str] = set()
     constant: set[str] = set()
@@ -1057,7 +1052,7 @@ def _build_projection(
         name = proj.alias_or_name
         if name:
             lowered = name.lower()
-            computed.add(lowered)
+            computed_counts[lowered] += 1
             if isinstance(inner, Expr) and sg.literal_constant(inner) is not None:
                 constant.add(lowered)
 
@@ -1081,7 +1076,8 @@ def _build_projection(
 
     return _Projection(
         named={qc: tuple(ns) for qc, ns in named.items()},
-        computed=frozenset(computed),
+        computed=frozenset(computed_counts),
+        duplicate_computed=frozenset(name for name, n in computed_counts.items() if n > 1),
         constant=frozenset(constant),
         star_aliases=frozenset(star_aliases),
         blocked=blocked,
@@ -1166,7 +1162,14 @@ def _ambiguous_output_name(proj: _Projection, classes: Mapping[Attr, frozenset[A
     proven-equal class. DuckDB accepts the collision and resolves a downstream
     reference to whichever attribute it parses first, silently hiding the other's
     values, so a name two unrelated attributes share makes the scope's output
-    universe unreliable, the same posture as two qualified stars."""
+    universe unreliable, the same posture as two qualified stars.
+
+    Two computed projections sharing a name are always ambiguous rather than
+    checked against the classes: ``Computed`` identifies an attribute by name
+    alone, so two different expressions under the same alias collapse to one
+    value and no equivalence proof can ever tell them apart."""
+    if proj.duplicate_computed:
+        return True
     by_name: dict[str, set[Attr]] = {}
     for qc, names in proj.named.items():
         for name in names:

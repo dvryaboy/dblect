@@ -215,6 +215,22 @@ def test_distinct_drops_a_projected_literal_from_the_key() -> None:
     assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id", "region"))
 
 
+def test_distinct_with_duplicate_computed_output_names_claims_no_key() -> None:
+    """``a + 1 AS x, b + 1 AS x`` are two different expressions sharing a name,
+    the same DuckDB-resolves-one-arbitrarily hazard as two duplicate bare
+    columns; a full-tuple key built from the collapsed name would claim
+    uniqueness on a column the query does not actually have."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node(
+            "model.shop.d",
+            "SELECT DISTINCT customer_id + 1 AS x, region_id + 1 AS x FROM orders",
+        ),
+    )
+    assert keys["model.shop.d"] == CandidateKeySet.of()
+
+
 def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> None:
     """A LEFT JOIN to a dimension unique on the join key cannot fan out, so the
     probe side's key survives."""
@@ -500,6 +516,24 @@ def test_union_distinct_proves_the_full_tuple_key() -> None:
         _node("model.shop.u", "SELECT id, kind FROM a UNION SELECT id, kind FROM b"),
     )
     assert keys["model.shop.u"] == CandidateKeySet.of(_key("id", "kind"))
+
+
+def test_union_distinct_with_a_duplicate_first_arm_alias_proves_no_key() -> None:
+    """The first arm names two columns ``x``, so its output tuple can't be read
+    positionally; the full-tuple key the DISTINCT union would otherwise mint
+    must not survive on the strength of a name that does not pick out one
+    column."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id AS x, kind AS x FROM a UNION SELECT id, kind FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
 
 
 def test_cross_model_propagation_through_a_stage() -> None:
