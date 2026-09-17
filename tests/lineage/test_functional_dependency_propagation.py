@@ -608,6 +608,75 @@ def test_inner_join_carries_a_where_pin_on_either_side() -> None:
     assert out["model.shop.m"] == FDSet.of(_fd("currency"))
 
 
+# --- lookup-join key mint (#251) --------------------------------------------------
+#
+# A join onto a relation on its own unique key determines every column of that
+# relation: two output rows agreeing on the key came from the same lookup row,
+# whichever join kind brought it in and regardless of what the rest of the query
+# does with the probe side.
+
+_BILL = SourceRef(SourceKind.SOURCE, "source.shop.raw.terminology__bill_type")
+
+
+def test_lookup_join_on_its_key_determines_the_looked_up_column() -> None:
+    bill = _source(_BILL.unique_id)
+    out = _fds(
+        _declared(),
+        _source("source.shop.raw.claims"),
+        bill,
+        _unique("test.shop.bill", column="bill_type_code", target=bill.unique_id),
+        _node(
+            "model.shop.m",
+            "SELECT c.claim_id, c.data_source, bill.bill_type_code, bill.bill_type_description "
+            "FROM claims c INNER JOIN terminology__bill_type AS bill "
+            "ON c.bill_type_code = bill.bill_type_code",
+        ),
+        read_keys=True,
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("bill_type_description", "bill_type_code"))
+
+
+def test_lookup_left_join_on_its_key_determines_the_looked_up_column() -> None:
+    """A LEFT join still carries the fact: an unmatched probe row pads every
+    column of the joined-in alias with NULL, key included, so no two rows can
+    disagree on the dependent while agreeing on the (NULL) key."""
+    bill = _source(_BILL.unique_id)
+    out = _fds(
+        _declared(),
+        _source("source.shop.raw.claims"),
+        bill,
+        _unique("test.shop.bill", column="bill_type_code", target=bill.unique_id),
+        _node(
+            "model.shop.m",
+            "SELECT c.claim_id, c.data_source, bill.bill_type_code, bill.bill_type_description "
+            "FROM claims c LEFT JOIN terminology__bill_type AS bill "
+            "ON c.bill_type_code = bill.bill_type_code",
+        ),
+        read_keys=True,
+    )
+    assert out["model.shop.m"] == FDSet.of(_fd("bill_type_description", "bill_type_code"))
+
+
+def test_lookup_join_on_a_non_key_column_determines_nothing() -> None:
+    """``bill`` is keyed on ``id``, not the join column, and ``id`` is never
+    projected, so the lookup's real key has no output name to rewrite through."""
+    bill = _source(_BILL.unique_id)
+    out = _fds(
+        _declared(),
+        _source("source.shop.raw.claims"),
+        bill,
+        _unique("test.shop.bill", column="id", target=bill.unique_id),
+        _node(
+            "model.shop.m",
+            "SELECT c.claim_id, bill.bill_type_code, bill.bill_type_description "
+            "FROM claims c INNER JOIN terminology__bill_type AS bill "
+            "ON c.bill_type_code = bill.bill_type_code",
+        ),
+        read_keys=True,
+    )
+    assert out["model.shop.m"] == NO_FDS
+
+
 # --- set operations ---------------------------------------------------------------
 #
 # The union merge keeps exactly the declared instances every arm shares, whole,

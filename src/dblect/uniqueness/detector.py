@@ -476,6 +476,7 @@ def relation_uniqueness(
     *,
     parsed: Mapping[str, Expr] | None = None,
     graph: RelationLineageGraph | None = None,
+    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
 ) -> RelationUniqueness:
     """Build the relation graph and propagate the uniqueness property over it.
 
@@ -485,13 +486,14 @@ def relation_uniqueness(
     ``parsed`` shares the audit's already-parsed trees; ``graph`` shares a relation graph the
     check family already built (``analyze`` threads it) so the build runs once per run, while the
     uniqueness fixpoint still runs here (the two families propagate different properties).
+    ``key_facts`` adds keys the caller already resolved (Python contracts), the same channel
+    the check family grounds the grain check through.
     """
     if graph is None:
         graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    uniqueness = uniqueness_property(manifest, profile, parsed=parsed)
+    uniqueness = uniqueness_property(manifest, profile, parsed=parsed, extra_facts=key_facts)
     keys = propagate(graph, uniqueness)
     return graph, keys, uniqueness
-
 
 def fd_annotations_by_name(
     manifest: Manifest,

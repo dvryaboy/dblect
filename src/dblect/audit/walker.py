@@ -50,6 +50,7 @@ from dblect.sql import (
     parse_manifest_models,
 )
 from dblect.uniqueness.detector import (
+    CandidateKeySet,
     fd_annotations_by_name,
     make_cross_model_fanout_detectors,
     make_fact_grounded_detectors,
@@ -155,6 +156,7 @@ def run_audit(
     *,
     detectors: Sequence[Detector] = DEFAULT_DETECTORS,
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
+    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr | SQLParseError] | None = None,
     column_graph: ColumnLineageGraph | None = None,
     relation_graph: RelationLineageGraph | None = None,
@@ -168,6 +170,11 @@ def run_audit(
     Sources, seeds, and snapshots are not scanned: they have no SQL we own.
     Models whose ``compiled_code`` is missing or unparseable are listed in
     the report's ``skipped`` field with a reason rather than raising.
+
+    ``fd_facts`` and ``key_facts`` are the resolved contracts' ``determines`` and
+    ``key`` facts, the same channel the declaration-level check family grounds
+    against; passing them here lets a declared key or dependency reach the
+    structural detectors too, not just the grain check.
 
     Context-bound detectors run alongside the configured `detectors` list, each
     built from the resolved profile and the pre-parsed trees: the non-determinism
@@ -199,7 +206,9 @@ def run_audit(
     # fan-out factories. A shared ``relation_graph`` skips the rebuild; the propagation still runs
     # here (the check family propagates the FD property over the same graph, so only the build is
     # shared).
-    rel_keys = relation_uniqueness(manifest, profile, parsed=trees, graph=relation_graph)
+    rel_keys = relation_uniqueness(
+        manifest, profile, parsed=trees, graph=relation_graph, key_facts=key_facts
+    )
     # Propagate the functional-dependency property once over that same relation graph and share it
     # across the fanout and nullable-key detectors, so a declared ``determines`` reaches both
     # (fanout tests key coverage through it; the join-key detector folds a co-determined key column
