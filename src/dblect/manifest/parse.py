@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from dbt_artifacts_parser.parser import parse_manifest  # type: ignore[import-untyped]
 
 from dblect.manifest.dag import Dag
+from dblect.sql._sqlglot import relation_key
 
 if TYPE_CHECKING:
     from dblect.manifest.catalog import Catalog
@@ -317,10 +318,19 @@ class Node:
 
     @property
     def relation_name(self) -> str:
-        """The name this node is addressed by in compiled SQL: ``identifier``
-        when set, else ``name``. The one lookup key every SQL-level name-keyed
-        map (``build_name_to_source`` and its composers) should index under."""
+        """The bare name this node is addressed by in compiled SQL: ``identifier``
+        when set, else ``name``. The one *unqualified* lookup key every SQL-level
+        name-keyed map should index under; :func:`relation_lookup_keys` pairs it with
+        the schema-qualified form a real compiled reference carries, so a caller
+        building a name-keyed map indexes under both rather than this alone."""
         return self.identifier or self.name
+
+    @property
+    def qualified_relation_name(self) -> str:
+        """:attr:`relation_name` qualified by :attr:`schema` (``schema.name``), the
+        form a real dbt-compiled reference carries (``ref``/``source`` always render
+        schema-qualified). Bare when the node carries no schema."""
+        return relation_key(self.schema, self.relation_name)
 
     @property
     def analysis_sql(self) -> str | None:
@@ -333,6 +343,24 @@ class Node:
         macros emit).
         """
         return self.compiled_code
+
+
+def relation_lookup_keys(node: Node) -> tuple[str, ...]:
+    """Every key a name-keyed map should index ``node`` under: its bare
+    :attr:`Node.relation_name` and, when it differs, its schema-qualified
+    :attr:`Node.qualified_relation_name`.
+
+    A real dbt-compiled reference is always schema-qualified (``ref``/``source``
+    render ``schema.identifier``), so a production lookup needs the qualified key to
+    tell two same-named relations in different schemas apart. Hand-written SQL (tests,
+    or a project with everything in one schema) often stays unqualified, so the bare
+    key stays indexed too rather than dropped. Indexing under both means a builder
+    fills its map once per node and a lookup keyed by whichever form the parsed SQL
+    actually carries (:func:`dblect.sql._sqlglot.table_relation_key`) still hits.
+    """
+    bare = node.relation_name
+    qualified = node.qualified_relation_name
+    return (bare,) if qualified == bare else (bare, qualified)
 
 
 # The unique_id prefixes dbt gives the data-flow node kinds, derived from the
@@ -484,11 +512,24 @@ class Manifest:
         return {uid: n for uid, n in self.nodes.items() if n.resource_type is kind}
 
 
+def _schema_of(n: Any) -> str | None:
+    """The node's ``schema`` field.
+
+    dbt-artifacts-parser's pydantic models alias the manifest's ``schema`` JSON key to
+    the Python attribute ``schema_``: pydantic's own ``BaseModel.schema`` is a bound
+    method, so a field literally named ``schema`` would shadow it inconsistently, and
+    the parser sidesteps that by renaming the attribute. ``getattr(n, "schema", None)``
+    would silently return that unrelated bound method instead of the parsed value.
+    """
+    value = getattr(n, "schema_", None)
+    return value if isinstance(value, str) else None
+
+
 def _node_from_parsed(uid: str, n: Any) -> Node:
     """Map a dbt-artifacts-parser node (any schema version) into our `Node`."""
     raw_code = getattr(n, "raw_code", None)
     compiled_code = getattr(n, "compiled_code", None)
-    schema = getattr(n, "schema", None)
+    schema = _schema_of(n)
     depends_on_nodes = ()
     depends_on = getattr(n, "depends_on", None)
     if depends_on is not None:
@@ -598,7 +639,7 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
         resource_type=ResourceType.SOURCE,
         fqn=tuple(s.fqn),
         package_name=s.package_name,
-        schema=getattr(s, "schema", None),
+        schema=_schema_of(s),
         raw_code=None,
         compiled_code=None,
         original_file_path=getattr(s, "original_file_path", None),

@@ -270,12 +270,13 @@ def detect_join_fanout(
                 continue
             sample_keys = ", ".join(sorted(joined_cols))
             known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in facts.keys)
+            target_name = sg.table_relation_key(target)
             out.append(
                 Finding(
                     kind=FindingKind.JOIN_FANOUT,
                     message=(
-                        f"JOIN to {target.name} on ({sample_keys}) isn't covered by any "
-                        f"known uniqueness key on {target.name} (known: {known_keys}); "
+                        f"JOIN to {target_name} on ({sample_keys}) isn't covered by any "
+                        f"known uniqueness key on {target_name} (known: {known_keys}); "
                         f"the join can multiply rows. Either pin the join to a unique key "
                         f"or aggregate the joined-in side first."
                     ),
@@ -758,7 +759,7 @@ def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | Non
     name = from_.this.name
     if _cte_body_for(name, sel) is not None:
         return None
-    return name_to_ref.get(name)
+    return name_to_ref.get(sg.table_relation_key(from_.this))
 
 
 def _group_by_columns(sel: exp.Select) -> frozenset[str] | None:

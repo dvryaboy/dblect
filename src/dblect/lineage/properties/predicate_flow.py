@@ -279,14 +279,15 @@ def relation_scope_filters(
     ``id(node)``.
 
     The same flow algebra the reducer runs, but for one already-parsed tree with base
-    tables resolved by name against ``model_flow`` (the per-model filters propagation
-    produced). This is what a detector consults to learn the filter in force at an
-    intermediate CTE or inline subquery, so it can activate a conditional key there.
-    The returned map is valid only for the lifetime of ``tree``.
+    tables resolved by their schema-qualified relation key against ``model_flow`` (the
+    per-model filters propagation produced, indexed the same way). This is what a
+    detector consults to learn the filter in force at an intermediate CTE or inline
+    subquery, so it can activate a conditional key there. The returned map is valid
+    only for the lifetime of ``tree``.
     """
 
     def base_filter(table: exp.Table) -> frozenset[Canon]:
-        return model_flow.get(table.name, NO_FILTER).atoms
+        return model_flow.get(sg.table_relation_key(table), NO_FILTER).atoms
 
     walk = _FlowWalk(base_filter, record=True)
     walk.scope_filter(tree, cte_scope={})

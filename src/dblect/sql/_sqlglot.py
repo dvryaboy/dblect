@@ -559,6 +559,28 @@ def column_key(c: exp.Column) -> tuple[str | None, str]:
     return (column_table(c), column_name(c))
 
 
+def relation_key(schema: str | None, name: str) -> str:
+    """The schema-qualified key a relation resolves to in compiled SQL: ``schema.name``
+    when a schema is known, else the bare ``name``.
+
+    This is the one join rule every relation-identity map builds its keys through, on
+    both the manifest side (a dbt node's declared schema paired with its compiled-SQL
+    name, see ``Node.relation_name``) and the parsed-SQL side (:func:`table_relation_key`).
+    A bare name alone collides two same-named relations in different schemas onto one
+    key; joining the schema in keeps them distinct.
+    """
+    return f"{schema}.{name}" if schema else name
+
+
+def table_relation_key(t: exp.Table) -> str:
+    """The schema-qualified key ``t`` resolves to; see :func:`relation_key`.
+
+    ``t.db`` is the schema sqlglot parses out of a qualified reference (``schema.table``),
+    empty for an unqualified one (a bare table, or a local CTE/derived-table reference).
+    """
+    return relation_key(t.db or None, t.name)
+
+
 def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
     """``e`` with ``CAST``/``TRY_CAST`` and parentheses unwrapped, if what remains is a
     literal or a boolean; ``None`` otherwise. sqlglot parses ``TRUE``/``FALSE`` as
