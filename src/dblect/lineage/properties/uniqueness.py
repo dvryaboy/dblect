@@ -660,7 +660,12 @@ def _consumer_where_atoms(tree: Expr) -> Mapping[int, frozenset[Canon]]:
 
     A single-source scope's atom parser drops table qualifiers, so these atoms are
     already in the source's own namespace and need no rename before folding into its
-    promotion.
+    promotion, *provided* the conjunct is actually about this source. A conjunct
+    qualified to a different table is a correlated reference to a sibling (duckdb
+    treats an uncorrelated JOIN subquery's WHERE as an implicit lateral, reaching a
+    preceding FROM item with no ``LATERAL`` keyword); with qualifiers dropped, that
+    would otherwise misattribute a sibling's filter to this source under a
+    same-named column, so such a conjunct is dropped rather than folded in.
     """
     out: dict[int, frozenset[Canon]] = {}
     for sel in sg.find_all_selects(tree):
@@ -672,7 +677,17 @@ def _consumer_where_atoms(tree: Expr) -> Mapping[int, frozenset[Canon]]:
         where = sg.where_of(sel)
         if where is None or not isinstance(where.this, Expr):
             continue
-        out[id(from_.this)] = atoms_of(where.this)
+        alias = from_.this.alias_or_name.lower()
+        local = [
+            leaf
+            for leaf in sg.conjunctive_leaves(where.this)
+            if all(
+                (sg.column_table(c) or alias).lower() == alias for c in leaf.find_all(exp.Column)
+            )
+        ]
+        if not local:
+            continue
+        out[id(from_.this)] = frozenset().union(*(atoms_of(leaf) for leaf in local))
     return out
 
 

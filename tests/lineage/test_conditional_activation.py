@@ -452,3 +452,33 @@ def test_consumer_where_does_not_activate_a_joined_sources_conditional_key() -> 
         sql=sql,
     )
     assert FindingKind.JOIN_FANOUT in kinds
+
+
+def test_consumer_where_excludes_a_correlated_outer_predicate() -> None:
+    # ``c``'s own scope is join-free and single-source, so it is eligible for
+    # consumer-WHERE promotion; but the ``status = 'active'`` conjunct qualifies to
+    # the outer, sibling source ``a`` (duckdb treats an uncorrelated JOIN subquery
+    # referencing a sibling as an implicit lateral), not to ``c``. With the atom
+    # parser dropping qualifiers, ``a.status`` and ``c.status`` canonicalise to the
+    # same atom, so this must not activate ``c``'s conditional key.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE a.status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
