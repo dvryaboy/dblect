@@ -191,7 +191,7 @@ class _FlowWalk:
         atoms = source | where_atoms
 
         group = sg.group_of(sel)
-        if group is not None and group.expressions:
+        if group is not None:
             atoms = _group_key_atoms(sel, atoms)
 
         return _project_filter(sel, atoms)
