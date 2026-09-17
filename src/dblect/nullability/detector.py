@@ -95,10 +95,11 @@ def detect_null_group_on_nullable_key(
     decision site an analyst following the line number is looking for.
 
     A local ``WHERE`` that proves the grouped column non-null clears it: no NULL can reach the
-    GROUP BY, so there is no phantom bucket to warn about. Only conjuncts qualified to this
-    scope's own source count as local: some dialects (duckdb) let an uncorrelated JOIN
-    subquery's WHERE reach a preceding sibling FROM item with no ``LATERAL`` keyword, and a
-    conjunct on that sibling must not be read as proving anything about this source.
+    GROUP BY, so there is no phantom bucket to warn about. Only conjuncts local to this scope's
+    own source count: some dialects (duckdb) let an uncorrelated JOIN subquery's WHERE reach a
+    preceding sibling FROM item with no ``LATERAL`` keyword, so inside such an arm even an
+    unqualified column is ambiguous and is dropped along with an explicitly foreign one, rather
+    than assumed to belong to this source.
     """
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
@@ -116,7 +117,11 @@ def detect_null_group_on_nullable_key(
             frozenset[Canon]().union(
                 *(
                     atoms_of(leaf)
-                    for leaf in sg.local_conjuncts(where.this, alias=target.alias_or_name)
+                    for leaf in sg.local_conjuncts(
+                        where.this,
+                        alias=target.alias_or_name,
+                        require_qualifier=sg.nested_in_join_arm(sel),
+                    )
                 )
             )
             if where is not None and isinstance(where.this, Expr)

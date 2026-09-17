@@ -741,25 +741,55 @@ def conjunctive_leaves(predicate: Expr) -> list[Expr]:
     return [predicate]
 
 
-def local_conjuncts(predicate: Expr, *, alias: str) -> list[Expr]:
-    """The conjuncts of ``predicate`` whose columns are all unqualified or qualified
-    to ``alias``, dropping any conjunct that reaches a different table.
+def local_conjuncts(predicate: Expr, *, alias: str, require_qualifier: bool = False) -> list[Expr]:
+    """The conjuncts of ``predicate`` whose columns are all local to ``alias``,
+    dropping any conjunct that reaches a different table.
 
     A join-free, single-source scope's own WHERE is ordinarily safe to read as that
     source's filter, but some dialects (duckdb) treat an uncorrelated JOIN
     subquery's WHERE as an implicit lateral, letting a conjunct there reach a
-    preceding sibling FROM item with no ``LATERAL`` keyword. A caller that folds
-    such a WHERE into a claim about ``alias`` alone (typically after further
-    dropping the qualifier to match a predicate written without one) would
-    misattribute the sibling's filter under a same-named column; this keeps only
-    the conjuncts that are actually about ``alias``.
+    preceding sibling FROM item with no ``LATERAL`` keyword. A qualified column is
+    unambiguous either way: it names ``alias`` or it doesn't. An *unqualified*
+    column is the harder case: this analysis has no catalog to say whether
+    ``alias`` even has a column of that name, so in a scope where a sibling is in
+    view (``require_qualifier=True``, see :func:`nested_in_join_arm`) an
+    unqualified column could just as well resolve to the sibling, and is dropped
+    along with it. Where no sibling can be in view, an unqualified column has
+    nothing else to resolve to, so it is trusted as local.
     """
     alias = alias.lower()
+
+    def is_local(c: exp.Column) -> bool:
+        qualifier = column_table(c)
+        if qualifier is None:
+            return not require_qualifier
+        return qualifier.lower() == alias
+
     return [
         leaf
         for leaf in conjunctive_leaves(predicate)
-        if all((column_table(c) or alias).lower() == alias for c in leaf.find_all(exp.Column))
+        if all(is_local(c) for c in leaf.find_all(exp.Column))
     ]
+
+
+def nested_in_join_arm(sel: exp.Select) -> bool:
+    """Whether ``sel`` sits inside a JOIN's source arm, at any depth of subquery
+    nesting, rather than being reached purely through FROM position or CTE bodies.
+
+    Some dialects (duckdb) let a JOIN arm's WHERE correlate to a preceding sibling
+    with no ``LATERAL`` keyword, and that visibility carries through further
+    subquery nesting inside the arm the same way ordinary correlation would. A CTE
+    body can never see outer context regardless of where the CTE itself is used,
+    so hitting one stops the walk and reads as unambiguous.
+    """
+    node: Expr = sel
+    while True:
+        parent = node.parent
+        if parent is None or isinstance(parent, exp.CTE):
+            return False
+        if isinstance(parent, exp.Join):
+            return True
+        node = parent
 
 
 def line_range(e: Expr) -> tuple[int, int] | None:
