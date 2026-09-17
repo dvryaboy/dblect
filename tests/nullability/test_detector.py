@@ -176,6 +176,18 @@ _CASES: list[tuple[str, str, bool]] = [
         ") sub",
         True,
     ),
+    # A CTE defined *inside* a JOIN arm still keeps its body unambiguous: a CTE
+    # can never see outer context, so nested_in_join_arm must stop at the CTE
+    # boundary rather than continuing up through the WITH clause to the JOIN the
+    # whole arm sits in.
+    (
+        "group-by/where-cte-inside-join-arm-not-null-clears",
+        "SELECT o.k, sub.tag, sub.n FROM other o CROSS JOIN ("
+        "  WITH grouped AS (SELECT tag, count(*) AS n FROM stg WHERE tag IS NOT NULL GROUP BY tag) "
+        "  SELECT tag, n FROM grouped"
+        ") sub",
+        False,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
