@@ -741,6 +741,27 @@ def conjunctive_leaves(predicate: Expr) -> list[Expr]:
     return [predicate]
 
 
+def local_conjuncts(predicate: Expr, *, alias: str) -> list[Expr]:
+    """The conjuncts of ``predicate`` whose columns are all unqualified or qualified
+    to ``alias``, dropping any conjunct that reaches a different table.
+
+    A join-free, single-source scope's own WHERE is ordinarily safe to read as that
+    source's filter, but some dialects (duckdb) treat an uncorrelated JOIN
+    subquery's WHERE as an implicit lateral, letting a conjunct there reach a
+    preceding sibling FROM item with no ``LATERAL`` keyword. A caller that folds
+    such a WHERE into a claim about ``alias`` alone (typically after further
+    dropping the qualifier to match a predicate written without one) would
+    misattribute the sibling's filter under a same-named column; this keeps only
+    the conjuncts that are actually about ``alias``.
+    """
+    alias = alias.lower()
+    return [
+        leaf
+        for leaf in conjunctive_leaves(predicate)
+        if all((column_table(c) or alias).lower() == alias for c in leaf.find_all(exp.Column))
+    ]
+
+
 def line_range(e: Expr) -> tuple[int, int] | None:
     """The 1-indexed (start, end) source-line span covered by `e`.
 
