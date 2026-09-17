@@ -5,7 +5,9 @@ names) that every one of its rows is known to satisfy. A ``WHERE`` conjoins its
 atoms, a passthrough carries the upstream filter, a consumer's own ``WHERE`` adds
 to it, and a projection renames the filter's columns (``country = 'US'`` becomes
 ``region = 'US'`` after ``country AS region``). CTEs and inline subqueries
-accumulate for free, since the relation walk recurses through them.
+accumulate for free, since the relation walk recurses through them. A ``GROUP BY``
+over a bare column keeps the atoms on that column (each output row's key value is
+one of the input values that passed the filter) and drops the rest.
 
 A later activation step reads this property to decide when a captured conditional
 fact applies: a conditional ``unique`` / ``not_null`` holds at any scope whose
@@ -15,8 +17,9 @@ validation read the same flow too.
 The value reuses the predicate engine's typed atoms (:data:`Canon`), so the filter
 is rigorously shaped and feeds the engine directly. Posture is silent-when-unproven:
 a shape the walk cannot carry soundly (a ``JOIN`` whose columns could blur across
-sources, a ``UNION`` whose arms differ, a ``GROUP BY`` that changes row identity, a
-filtered column the projection drops) yields "no filter known" rather than a guess.
+sources, a ``UNION`` whose arms differ, a ``GROUP BY`` key that is not a bare
+column, a filtered column the projection drops) yields "no filter known" rather
+than a guess.
 The lattice orders by precision, where knowing *more* atoms is more precise: ``meet``
 unions the atom sets, ``join`` (confluence) keeps the atoms both branches carry, and
 ``top`` is the empty set. Filters are never declared, only derived, so ``ground``
@@ -179,17 +182,19 @@ class _FlowWalk:
         if source is None:
             return frozenset()
 
-        group = sg.group_of(sel)
-        if group is not None and group.expressions:
-            return frozenset()  # GROUP BY changes row identity; the input filter no longer applies
-
         where = sg.where_of(sel)
         where_atoms: frozenset[Canon] = (
             atoms_of(where.this)
             if where is not None and isinstance(where.this, Expr)
             else frozenset()
         )
-        return _project_filter(sel, source | where_atoms)
+        atoms = source | where_atoms
+
+        group = sg.group_of(sel)
+        if group is not None:
+            atoms = _group_key_atoms(sel, atoms)
+
+        return _project_filter(sel, atoms)
 
     def _resolve_source(
         self, node: Expr, *, cte_scope: Mapping[str, frozenset[Canon]]
@@ -204,6 +209,24 @@ class _FlowWalk:
                 return None
             return self.scope_filter(inner, cte_scope=cte_scope)
         return None
+
+
+def _group_key_atoms(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon]:
+    """The atoms of ``atoms`` that survive ``sel``'s ``GROUP BY``.
+
+    Each output row's group-key value is one of the input values that passed the
+    filter, so an atom on a bare-column key still holds after grouping; an atom on
+    any other column does not, since a bucket can mix rows that satisfied it with
+    rows that did not. A key that is not a bare column (``date_trunc(ts)``) carries
+    no column identity to check atoms against, so nothing survives.
+    """
+    keys: set[str] = set()
+    for target in sg.group_targets(sel):
+        expr = target.grounded_expression
+        if not isinstance(expr, exp.Column):
+            return frozenset()
+        keys.add(sg.column_name(expr).lower())
+    return frozenset(a for a in atoms if atom_column(a) in keys)
 
 
 def _project_filter(sel: exp.Select, atoms: frozenset[Canon]) -> frozenset[Canon]:

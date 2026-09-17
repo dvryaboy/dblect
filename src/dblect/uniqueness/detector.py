@@ -39,6 +39,8 @@ from sqlglot import Expr
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph, index_by_name
 from dblect.lineage.facts.model import Annotation, Fact, by_scope
+from dblect.lineage.facts.property import Property
+from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.functional_dependency import (
@@ -458,10 +460,14 @@ def _projection_aliases(sel: exp.Select) -> dict[str, str]:
     return out
 
 
-# The relation graph and the uniqueness annotations propagated over it. The fact-grounded
-# and cross-model fan-out factories both rest on this pair, so an audit computes it once and
-# threads it into both rather than re-running the fixpoint per factory.
-RelationUniqueness = tuple[RelationLineageGraph, Mapping[SourceRef, Annotation[CandidateKeySet]]]
+# The relation graph, the uniqueness annotations propagated over it, and the property that
+# produced them. An audit computes this once and threads it into every factory, and the FD
+# walk reads the same keys through its uniqueness edge rather than re-propagating them.
+RelationUniqueness = tuple[
+    RelationLineageGraph,
+    Mapping[SourceRef, Annotation[CandidateKeySet]],
+    Property[CandidateKeySet, SourceRef],
+]
 
 
 def relation_uniqueness(
@@ -470,6 +476,7 @@ def relation_uniqueness(
     *,
     parsed: Mapping[str, Expr] | None = None,
     graph: RelationLineageGraph | None = None,
+    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
 ) -> RelationUniqueness:
     """Build the relation graph and propagate the uniqueness property over it.
 
@@ -479,17 +486,22 @@ def relation_uniqueness(
     ``parsed`` shares the audit's already-parsed trees; ``graph`` shares a relation graph the
     check family already built (``analyze`` threads it) so the build runs once per run, while the
     uniqueness fixpoint still runs here (the two families propagate different properties).
+    ``key_facts`` adds keys the caller already resolved (Python contracts), the same channel
+    the check family grounds the grain check through.
     """
     if graph is None:
         graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    keys = propagate(graph, uniqueness_property(manifest, profile, parsed=parsed))
-    return graph, keys
+    uniqueness = uniqueness_property(manifest, profile, parsed=parsed, extra_facts=key_facts)
+    keys = propagate(graph, uniqueness)
+    return graph, keys, uniqueness
 
 
 def fd_annotations_by_name(
     manifest: Manifest,
     graph: RelationLineageGraph,
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
+    *,
+    relation_keys: RelationUniqueness | None = None,
 ) -> dict[str, FDSet]:
     """Propagate the functional-dependency property over the relation graph, indexed by the
     relation name as it appears in compiled SQL.
@@ -499,11 +511,23 @@ def fd_annotations_by_name(
     their own. Both the join-fanout detector (key coverage through ``determines``) and the
     join-on-nullable-key detector (folding a co-determined key column into its declared key)
     read this map, so :func:`dblect.audit.walker.run_audit` computes it once over the shared
-    graph and threads it into both factories rather than re-running the fixpoint per factory."""
-    fd_prop = functional_dependency_property(functional_dependency_grounding(by_scope(fd_facts)))
-    return index_by_name(
-        manifest, {ref: ann.value for ref, ann in propagate(graph, fd_prop).items()}
-    )
+    graph and threads it into both factories rather than re-running the fixpoint per factory.
+
+    ``relation_keys`` (an already-propagated pass over this same ``graph``) wires the FD
+    property's uniqueness edge, so a candidate key determines the columns selected alongside
+    it."""
+    ground = functional_dependency_grounding(by_scope(fd_facts))
+    if relation_keys is None:
+        fd_anns = propagate(graph, functional_dependency_property(ground))
+    else:
+        _, keys, uniqueness = relation_keys
+        store = AnnotationStore()
+        for scope, ann in keys.items():
+            store.record(uniqueness.name, scope, ann)
+        fd_prop = functional_dependency_property(ground, uniqueness=uniqueness.ref)
+        ctx = PropertyRegistry((uniqueness, fd_prop)).dep_context(store)
+        fd_anns = propagate(graph, fd_prop, dep_context=ctx)
+    return index_by_name(manifest, {ref: ann.value for ref, ann in fd_anns.items()})
 
 
 def make_fact_grounded_detectors(
@@ -541,11 +565,12 @@ def make_fact_grounded_detectors(
         materialized_by_tree[id(tree)] = _is_persisted_materialization(
             config.materialized if config is not None else None
         )
-    graph, keys = (
+    relation_keys = (
         relation_keys
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
     )
+    graph, keys, _uniqueness = relation_keys
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every
@@ -565,7 +590,7 @@ def make_fact_grounded_detectors(
     # join covering a key's determinant covers the key). ``run_audit`` propagates it once over the
     # shared graph and threads it in; a standalone caller lets it default and we propagate here.
     if fd_by_name is None:
-        fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts)
+        fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts, relation_keys=relation_keys)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -713,7 +738,7 @@ def make_cross_model_fanout_detectors(
     likewise lets the audit pass the manifest column graph it built once, so the heavy
     qualify-and-resolve walk is not repeated per fact family.
     """
-    _, keys = (
+    _, keys, _uniqueness = (
         relation_keys
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
