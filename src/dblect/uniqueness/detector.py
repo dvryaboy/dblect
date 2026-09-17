@@ -495,6 +495,7 @@ def relation_uniqueness(
     keys = propagate(graph, uniqueness)
     return graph, keys, uniqueness
 
+
 def fd_annotations_by_name(
     manifest: Manifest,
     graph: RelationLineageGraph,
