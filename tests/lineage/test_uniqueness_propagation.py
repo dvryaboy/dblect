@@ -554,6 +554,25 @@ def test_union_distinct_with_an_unaliased_computed_first_arm_proves_no_key() -> 
     assert keys["model.shop.u"] == CandidateKeySet.of()
 
 
+def test_union_distinct_with_a_later_unreadable_arm_proves_no_key() -> None:
+    """The first arm reads cleanly, but a later arm's duplicate alias makes its own output
+    unreadable positionally. ``_union_key`` only ever looks at the first arm, so on its own it
+    would still mint a full-tuple key here; the engine's ambiguous-arm policy (give up rather
+    than guess, as for a duplicated or unaliased-computed *first* arm above) must withhold it
+    just the same when the ambiguity is in a later arm instead."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id, kind FROM a UNION SELECT id AS x, other AS x FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
+
+
 def test_cross_model_propagation_through_a_stage() -> None:
     """Keys flow across model boundaries: the staging model carries the source key,
     and the mart that selects from the staging model carries it too."""

@@ -926,14 +926,14 @@ def _union_facts(
     """The union merge: the declared instances every arm shares after positional
     alignment (derived facts are arm-local and die), plus the DISTINCT full-tuple
     key. Conditional keys drop, since arms may carry different predicates."""
-    keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
-        return Input(keys, exact=False)  # an unflattened or otherwise unreadable set-op chain
+        return Input(frozenset(), exact=False)  # unflattened or otherwise unreadable set-op chain
     names = [_positional_outputs(arm) for arm in arms]
     first = names[0] if names else None
     if first is None or any(n is None or len(n) != len(first) for n in names):
-        return Input(keys, exact=False)  # an arm's output columns can't be read positionally
+        return Input(frozenset(), exact=False)  # an arm's output columns can't be read positionally
+    keys = _union_key(u)
     local = _with_scope(u, cte_scope, base_resolve, record)
     shared: frozenset[DeclaredFD] | None = None
     arms_exact = True
