@@ -188,6 +188,16 @@ _CASES: list[tuple[str, str, bool]] = [
         ") sub",
         False,
     ),
+    # A subquery in a JOIN's ON condition is not the JOIN's source arm: no sibling FROM
+    # item is in view there the way duckdb's implicit-lateral WHERE reaches one inside the
+    # arm itself, so its own unqualified WHERE is unambiguous and clears the finding.
+    (
+        "group-by/where-on-subquery-not-in-join-arm-not-null-clears",
+        "SELECT o.k FROM other o JOIN stg s ON s.id IN ("
+        "  SELECT tag FROM stg WHERE tag IS NOT NULL GROUP BY tag"
+        ")",
+        False,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
