@@ -950,14 +950,12 @@ def _union_facts(
 
 def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
     """An arm's output column names in projection order, or ``None`` when they
-    cannot be lined up positionally (a star, a duplicated name, an unaliased
-    computed projection, not a SELECT).
+    cannot be lined up positionally (a star, a duplicated name, a projection whose
+    ``alias_or_name`` is not a reliable output name, not a SELECT).
 
-    An unaliased projection must be a bare column: SQLGlot's ``alias_or_name``
-    falls back to the expression's ``name``, which for a computed expression
-    (e.g. an unaliased ``CAST``) can differ from the name the adapter actually
-    renders for that output column. Trusting it there would let a union key or
-    an arm rename bind to a name that is not the relation's real output column.
+    See :func:`sg.has_reliable_output_name`: trusting an unreliable name here would
+    let a union key or an arm rename bind to a name that is not the relation's real
+    output column.
     """
     if not isinstance(arm, exp.Select):
         return None
@@ -968,7 +966,7 @@ def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         if isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star):
             return None
-        if not isinstance(proj, exp.Alias) and not isinstance(inner, exp.Column):
+        if not sg.has_reliable_output_name(proj):
             return None
         out.append(proj.alias_or_name.lower())
     if len(set(out)) != len(out):
@@ -1043,6 +1041,7 @@ def _build_projection(
     unqualified_star = False
     qualified_stars: set[str] = set()
     constant: set[str] = set()
+    blocked = False
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
             unqualified_star = True
@@ -1059,6 +1058,13 @@ def _build_projection(
             qc = QCol((sg.column_table(inner) or from_alias).lower(), sg.column_name(inner).lower())
             named.setdefault(qc, []).append(proj.alias_or_name.lower())
             continue
+        if not sg.has_reliable_output_name(proj):
+            # An unaliased computed expression or literal: SQLGlot's alias_or_name can
+            # diverge from the adapter's real output-column name (see
+            # sg.has_reliable_output_name), so the scope's output universe cannot be
+            # pinned down and a key or dependency drawn from it would be unsound.
+            blocked = True
+            continue
         name = proj.alias_or_name
         if name:
             lowered = name.lower()
@@ -1068,7 +1074,6 @@ def _build_projection(
 
     active_set = set(active_aliases)
     star_aliases: set[str] = set()
-    blocked = False
     if unqualified_star:
         if len(active_aliases) == 1:
             star_aliases.add(active_aliases[0])

@@ -231,6 +231,19 @@ def test_distinct_with_duplicate_computed_output_names_claims_no_key() -> None:
     assert keys["model.shop.d"] == CandidateKeySet.of()
 
 
+def test_distinct_with_an_unaliased_computed_projection_claims_no_key() -> None:
+    """An unaliased ``CAST(id AS VARCHAR)`` reports ``alias_or_name`` as ``id`` (SQLGlot's
+    fallback to the cast operand's name), but DuckDB names the real output column
+    ``CAST(id AS VARCHAR)``. Minting ``{id}`` as a key from that borrowed name would claim
+    uniqueness on a column the query does not actually have."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node("model.shop.d", "SELECT DISTINCT customer_id, CAST(id AS VARCHAR) FROM orders"),
+    )
+    assert keys["model.shop.d"] == CandidateKeySet.of()
+
+
 def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> None:
     """A LEFT JOIN to a dimension unique on the join key cannot fan out, so the
     probe side's key survives."""
