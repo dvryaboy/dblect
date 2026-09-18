@@ -14,7 +14,8 @@ import pytest
 from sqlglot import Expr
 
 from dblect.adapters import profile_for_adapter
-from dblect.lineage.properties.functional_dependency import FD, FDSet
+from dblect.lineage.builder import build_relation_graph
+from dblect.lineage.properties.functional_dependency import FD, NO_FDS, FDSet
 from dblect.manifest import DbtTestMetadata, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
 from dblect.uniqueness.detector import (
@@ -22,7 +23,9 @@ from dblect.uniqueness.detector import (
     detect_limit_without_deterministic_order,
     detect_non_unique_aggregate_order_keys,
     detect_non_unique_window_order_keys,
+    fd_annotations_by_name,
     make_fact_grounded_detectors,
+    relation_uniqueness,
 )
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -162,6 +165,37 @@ def test_window_silent_when_fd_closure_covers_key() -> None:
     assert len(findings) == 1
 
     assert detect_non_unique_window_order_keys(parsed, model_keys=keys, model_fds=fds) == ()
+
+
+def test_window_covered_by_lookup_join_key_through_a_cte_chain() -> None:
+    # Mirrors #246's first tuva-core example: a terminology lookup joined on its
+    # own key determines the column it looks up, so the window's partition key
+    # (missing `bill_type_description`) still closes over `distinct_counts`'s
+    # full grouping key once the lookup's key is known.
+    sql = (
+        "with normalize_cte as ("
+        "  select c.claim_id, c.data_source, c.bill_type_code, bill.bill_type_description "
+        "  from claims c "
+        "  inner join terminology__bill_type as bill on c.bill_type_code = bill.bill_type_code"
+        "), distinct_counts as ("
+        "  select claim_id, data_source, bill_type_code, bill_type_description, count(*) as occ "
+        "  from normalize_cte "
+        "  group by claim_id, data_source, bill_type_code, bill_type_description"
+        ") "
+        "select claim_id, data_source, bill_type_code, bill_type_description, occ, "
+        "row_number() over (partition by claim_id, data_source "
+        "order by occ desc, bill_type_code) as rn "
+        "from distinct_counts"
+    )
+    parsed = _parse(sql)
+
+    keyed = detect_non_unique_window_order_keys(
+        parsed, model_keys=_model_keys(terminology__bill_type=(("bill_type_code",),))
+    )
+    assert keyed == ()
+
+    unkeyed = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys())
+    assert len(unkeyed) == 1
 
 
 # --- top-level LIMIT without a deterministic ORDER BY ------------------------
@@ -928,3 +962,25 @@ def test_limit_detector_fires_only_for_persisted_materialization(
         assert findings[0].kind is FindingKind.LIMIT_WITHOUT_DETERMINISTIC_ORDER
     else:
         assert findings == ()
+
+
+# --- the uniqueness edge through fd_annotations_by_name -----------------------
+
+
+def test_fd_annotations_by_name_wires_the_uniqueness_edge() -> None:
+    """``fd_annotations_by_name`` mints the key-derived FD only when
+    ``relation_uniqueness``'s pair is threaded in as ``relation_keys``; omitted, the
+    map stays silent, matching ``functional_dependency_property``'s own contract at
+    this production entry point (issue #252)."""
+    orders = _source("source.shop.raw.orders")
+    unique = _unique_test("test.shop.u", column="id", target=orders.unique_id)
+    stg = _node("model.shop.stg", "SELECT id, customer_id FROM orders")
+    manifest = _manifest(orders, unique, stg)
+    graph = build_relation_graph(manifest).graph
+    relation_keys = relation_uniqueness(manifest, _DUCKDB, graph=graph)
+
+    with_edge = fd_annotations_by_name(manifest, graph, relation_keys=relation_keys)
+    without_edge = fd_annotations_by_name(manifest, graph)
+
+    assert with_edge["stg"] == FDSet.of(FD(frozenset({"id"}), "customer_id"))
+    assert without_edge["stg"] == NO_FDS

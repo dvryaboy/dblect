@@ -184,6 +184,48 @@ def test_coverage_runs_through_the_fd_closure() -> None:
     assert _grain_findings(report) == []
 
 
+def test_coverage_runs_through_a_key_derived_fd_closure() -> None:
+    # order_id is declared unique on regions_src, not order_regions. order_regions_stg
+    # passes the columns through unchanged (its own key stays order_id, and its FD set
+    # gains order_id -> region); order_regions then groups by (order_id, region), a new
+    # grain whose own structural key is the composite pair, but order_id -> region
+    # carries through the grouping. Recovering it runs only through the FD property's
+    # uniqueness edge, not a direct declared ``determines``.
+    class FctOrders(ModelContract):
+        dbt_model = "fct_orders"
+
+        @contract
+        def one_row_per_order(self: ContractSelf) -> object:
+            return self.grain(per=self.order_id)
+
+    regions_src = _source(
+        "source.shop.raw.regions_src", columns=_cols(order_id="INT", region="TEXT")
+    )
+    unique_test = _node(
+        "test.shop.unique_regions_src_order_id",
+        kind=ResourceType.OTHER,
+        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": "order_id"}),
+        attached_node=regions_src.unique_id,
+    )
+    stg = _node(
+        "model.shop.order_regions_stg",
+        sql="select order_id, region from regions_src",
+        columns=_cols(order_id="INT", region="TEXT"),
+    )
+    order_regions = _node(
+        "model.shop.order_regions",
+        sql="select order_id, region from order_regions_stg group by order_id, region",
+        columns=_cols(order_id="INT", region="TEXT"),
+    )
+    fct = _node(
+        "model.shop.fct_orders",
+        sql="select order_id, region, 1.0 as amount from order_regions",
+        columns=_cols(order_id="INT", region="TEXT", amount="DECIMAL"),
+    )
+    report = run_check(_manifest(regions_src, unique_test, stg, order_regions, fct), _DUCKDB)
+    assert _grain_findings(report) == []
+
+
 # --- no witness: the walk's silence is not evidence ---------------------------------
 
 

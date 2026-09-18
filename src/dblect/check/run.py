@@ -201,15 +201,25 @@ def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
 
 
 def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
-    """Propagate the FD property over the relation graph, then domain type over the
-    column graph reading it, grounding from one world's ``facts``. Pure in
-    ``graphs``: a fresh ``AnnotationStore`` per call and no mutation of the shared
-    build, so worlds re-run independently."""
-    fd_prop = functional_dependency_property(
-        functional_dependency_grounding(by_scope(facts.fd_facts))
+    """Propagate uniqueness over the relation graph, then FD reading its key edge,
+    then domain type over the column graph reading FD, grounding from one world's
+    ``facts``. Pure in ``graphs``: a fresh ``AnnotationStore`` per call and no
+    mutation of the shared build, so worlds re-run independently."""
+    uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
+    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
+    uniqueness_flow = propagate(
+        graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred
     )
     store = AnnotationStore()
-    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop))
+    for scope, ann in uniqueness_flow.items():
+        store.record(uniqueness_prop.name, scope, ann)
+
+    fd_prop = functional_dependency_property(
+        functional_dependency_grounding(by_scope(facts.fd_facts)),
+        uniqueness=uniqueness_prop.ref,
+    )
+    fd_ctx = PropertyRegistry((uniqueness_prop, fd_prop)).dep_context(store)
+    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop, dep_context=fd_ctx))
     for scope, ann in fd_anns.items():
         store.record(fd_prop.name, scope, ann)
 
@@ -217,13 +227,10 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
     )
-    ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
+    dt_ctx = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop)).dep_context(store)
     clears: list[CoherenceClear[DomainTag]] = []
-    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=ctx, sink=clears)
+    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=dt_ctx, sink=clears)
 
-    uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
-    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
-    propagate(graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred)
     return WorldAnnotations(
         world=facts.world,
         domain_type=domain_type,

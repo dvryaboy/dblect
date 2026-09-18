@@ -164,6 +164,18 @@ _CASES: list[tuple[str, str, bool]] = [
         "SELECT tag, count(*) AS n FROM stg WHERE (tag IS NOT NULL) GROUP BY tag",
         False,
     ),
+    # A NOT NULL qualified to a sibling source proves nothing about the grouped
+    # column either, even though it shares the same bare name once a qualifier is
+    # dropped: duckdb treats an uncorrelated JOIN subquery's WHERE as an implicit
+    # lateral, so ``o.tag`` here really is the outer, joined-in ``other.tag``, not
+    # ``stg``'s own.
+    (
+        "group-by/where-correlated-sibling-not-null-does-not-clear",
+        "SELECT o.k, sub.tag, sub.n FROM other o CROSS JOIN ("
+        "  SELECT tag, count(*) AS n FROM stg WHERE o.tag IS NOT NULL GROUP BY tag"
+        ") sub",
+        True,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),

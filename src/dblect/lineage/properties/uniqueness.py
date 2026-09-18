@@ -764,13 +764,16 @@ def uniqueness_property(
     profile: AdapterProfile,
     *,
     extra: tuple[FactDiscoverer[CandidateKeySet, SourceRef], ...] = (),
+    extra_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
     parsed: Mapping[str, Expr] | None = None,
 ) -> Property[CandidateKeySet, SourceRef]:
     """The manifest-backed uniqueness property: :func:`uniqueness_facts` grounds
     each relation and the reducer infers more from the SQL. ``profile`` fixes the
-    adapter's enforcement and dedup semantics."""
+    adapter's enforcement and dedup semantics. ``extra_facts`` adds keys the caller
+    already resolved (Python contracts), the same channel :func:`uniqueness_facts`
+    takes directly."""
     return uniqueness_property_from_facts(
-        uniqueness_facts(manifest, profile, extra=extra, parsed=parsed)
+        uniqueness_facts(manifest, profile, extra=extra, extra_facts=extra_facts, parsed=parsed)
     )
 
 

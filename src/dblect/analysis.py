@@ -101,9 +101,10 @@ def analyze(
     themselves. ``run_check`` takes ``graphs`` rather than ``registry`` here, since ``graphs``
     already carries the resolved contracts.
 
-    The build's resolved ``determines`` facts are also threaded into the structural audit so
-    join-fanout extends key coverage through functional dependencies (a declared ``wiki_id
-    determines wiki_name`` lets a join on the determinant cover a key carrying the dependent).
+    The build's resolved ``determines`` and ``key`` facts are also threaded into the structural
+    audit, so join-fanout extends key coverage through both a functional dependency (a declared
+    ``wiki_id determines wiki_name`` lets a join on the determinant cover a key carrying the
+    dependent) and a declared key itself (a ``key()`` contract on a relation no dbt test covers).
     The declaration family already reads these off the shared build; this hands the same facts
     to the structural one.
     """
@@ -117,6 +118,7 @@ def analyze(
         column_graph=graphs.column_build.graph,
         relation_graph=graphs.relation_build.graph,
         fd_facts=graphs.resolved.fd_facts,
+        key_facts=graphs.resolved.key_facts,
     )
     return AnalysisReport(
         findings=(*check.findings, *audit.findings),

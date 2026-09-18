@@ -4,9 +4,11 @@ These pin the relation algebra at the contract boundary: build a manifest of
 sources and models, run the one propagator with the predicate-flow property, and
 read each relation's accumulated row filter. The rules under test are the sound
 ones: a ``WHERE`` conjoins, a passthrough carries the upstream filter, a consumer
-adds its own filter, a projection renames the filter's columns, and the shapes
-where row identity changes or the columns blur (``JOIN``, ``UNION``, ``GROUP BY``,
-a dropped column) drop conservatively to "no filter known".
+adds its own filter, a projection renames the filter's columns, an atom on a bare
+``GROUP BY`` key column survives grouping, and the shapes where row identity
+otherwise changes or the columns blur (``JOIN``, ``UNION``, a non-key or
+expression group target, a dropped column) drop conservatively to "no filter
+known".
 """
 
 from __future__ import annotations
@@ -141,12 +143,104 @@ def test_join_drops_the_filter() -> None:
     assert flow["model.shop.m"].atoms == frozenset()
 
 
-def test_group_by_drops_the_filter() -> None:
+def test_group_by_drops_a_filter_on_a_non_key_column() -> None:
+    # ``amount`` is filtered but is not the group key, so it does not survive
+    # grouping: a bucket's rows need not all have satisfied it.
     flow = _flow(
         _source(_ORDERS),
         _node(
             "model.shop.m",
-            "SELECT country, count(*) AS n FROM orders WHERE country = 'US' GROUP BY country",
+            "SELECT country, count(*) AS n FROM orders WHERE amount > 0 GROUP BY country",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == frozenset()
+
+
+def test_group_by_key_atom_survives_the_group_by() -> None:
+    # Every output row's ``region`` is one of the input values that passed the
+    # filter, so ``region = 'x'`` still holds; ``amount`` is not the group key, so
+    # ``amount > 0`` does not.
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region, count(*) AS n FROM orders "
+            "WHERE region = 'x' AND amount > 0 GROUP BY region",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("region = 'x'")
+
+
+def test_group_by_ordinal_key_atom_survives() -> None:
+    # ``GROUP BY 1`` names the same projection as spelling ``region`` out.
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region, count(*) AS n FROM orders WHERE region = 'x' AND amount > 0 GROUP BY 1",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("region = 'x'")
+
+
+def test_group_by_key_atom_renames_through_an_alias() -> None:
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region AS r, count(*) AS n FROM orders "
+            "WHERE region = 'x' AND amount > 0 GROUP BY region",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("r = 'x'")
+
+
+def test_group_by_multiple_key_atoms_all_survive() -> None:
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region, day, count(*) AS n FROM orders "
+            "WHERE region = 'x' AND day > 5 GROUP BY region, day",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("region = 'x' AND day > 5")
+
+
+def test_not_null_key_atom_survives_the_group_by() -> None:
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region, count(*) AS n FROM orders WHERE region IS NOT NULL GROUP BY region",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == _atoms("region IS NOT NULL")
+
+
+def test_group_by_expression_target_carries_nothing() -> None:
+    # The key is a computed expression, not a bare column: no column identity to
+    # track through the aggregation, so nothing survives.
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT date_trunc('day', ts) AS day, count(*) AS n FROM orders "
+            "WHERE ts > '2020-01-01' GROUP BY date_trunc('day', ts)",
+        ),
+    )
+    assert flow["model.shop.m"].atoms == frozenset()
+
+
+def test_group_by_mixed_bare_and_expression_targets_carries_nothing() -> None:
+    # One target is a bare column, the other an expression: the expression target
+    # rules out the whole key, so even the bare column's atom does not survive.
+    flow = _flow(
+        _source(_ORDERS),
+        _node(
+            "model.shop.m",
+            "SELECT region, date_trunc('day', ts) AS day, count(*) AS n FROM orders "
+            "WHERE region = 'x' GROUP BY region, date_trunc('day', ts)",
         ),
     )
     assert flow["model.shop.m"].atoms == frozenset()
