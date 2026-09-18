@@ -539,3 +539,34 @@ def test_consumer_where_excludes_an_unqualified_correlated_predicate() -> None:
         _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+def test_consumer_where_activates_on_a_predicate_qualified_to_the_local_source() -> None:
+    # Same nested-in-a-JOIN-arm shape as the two tests above, but now the conjunct
+    # is qualified to ``c`` itself, not to the outer sibling ``a``. A column
+    # qualified to its own local alias is never ambiguous, in a JOIN arm or
+    # anywhere else: no dialect resolves ``c.status`` to some other table just
+    # because ``c``'s subquery sits in a JOIN arm. This is the positive case the
+    # other two bound: activation must still happen here, or this PR's whole
+    # feature would be dead inside every JOIN-nested CTE or subquery.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE c.status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
