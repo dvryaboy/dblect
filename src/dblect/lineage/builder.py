@@ -49,7 +49,7 @@ from dblect.lineage.graph import (
     attach_source_ref,
 )
 from dblect.lineage.property import attach_column_ref
-from dblect.manifest import Manifest, ResourceType, compilation_miss_reason
+from dblect.manifest import Manifest, ResourceType, compilation_miss_reason, relation_lookup_keys
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
@@ -158,12 +158,13 @@ def build_relation_graph(
 def _stamp_tables(tree: Expr, name_to_source: Mapping[str, SourceRef]) -> None:
     """Stamp every upstream table reference with its ``SourceRef``.
 
-    Naive by name: a reference whose rightmost name matches a manifest relation is
-    stamped. A local CTE that shadows a relation name is also stamped, but the
-    reducer consults its CTE scope before reading a stamp, so the shadow wins.
+    Naive by name: a reference whose schema-qualified key (:func:`sg.table_relation_key`,
+    matching how ``name_to_source`` is keyed) matches a manifest relation is stamped. A
+    local CTE that shadows a relation name is also stamped, but the reducer consults its
+    CTE scope before reading a stamp, so the shadow wins.
     """
     for table in tree.find_all(exp.Table):
-        ref = name_to_source.get(table.name)
+        ref = name_to_source.get(sg.table_relation_key(table))
         if ref is not None:
             attach_source_ref(table, ref)
 
@@ -222,13 +223,13 @@ def build_manifest_graph(
                 tree=parsed.get(uid) if parsed is not None else None,
             )
             per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
-            _record_output_columns(schema, model.name, uid, per_model)
+            _record_output_columns(schema, model.relation_name, uid, per_model)
             # Mirror this model's columns into the live Schema so its dependents qualify against
             # them. Inside the try so a schema-shape failure (e.g. a relation name `add_table`
             # parses to a mismatched depth) degrades this one model to a BuildIssue rather than
             # aborting the whole build.
             mapping_schema.add_table(
-                model.name, schema[model.name], dialect=dialect, normalize=True
+                model.relation_name, schema[model.relation_name], dialect=dialect, normalize=True
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -650,7 +651,7 @@ class _Walker:
         if src is None:
             return None
         if isinstance(src, exp.Table):
-            source_ref = self._name_to_source.get(src.name)
+            source_ref = self._name_to_source.get(sg.table_relation_key(src))
             if source_ref is None:
                 return None
             # A source relation is a terminal leaf, so a struct field access
@@ -741,7 +742,7 @@ class _Walker:
             return None
         src = scope.sources.get(from_.this.alias_or_name)
         if isinstance(src, exp.Table):
-            return self._name_to_source.get(src.name)
+            return self._name_to_source.get(sg.table_relation_key(src))
         if src is not None:
             return self._scope_source_ref.get(id(src))
         return None
@@ -991,10 +992,19 @@ def _projection_leaves(expr: Expr) -> tuple[list[exp.Column], list[exp.Subquery]
 def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     """Map every name that can appear as a table qualifier to its ``SourceRef``.
 
-    Includes models (by ``name``), sources (by ``identifier or name`` since
-    dbt compiles ``{{ source(...) }}`` to ``identifier``), and seeds. On a
-    name collision, models win, matching the convention that ``ref('x')``
-    refers to a model named ``x`` over a source that happens to share it.
+    Every node kind indexes under :func:`~dblect.manifest.relation_lookup_keys`: the
+    bare :attr:`Node.relation_name` (``identifier or name``, matching unqualified SQL)
+    and, when it differs, the schema-qualified :attr:`Node.qualified_relation_name`
+    (matching a real dbt-compiled reference, which ``ref``/``source`` always render
+    schema-qualified). A source's ``identifier`` and a model/seed/snapshot's ``alias``
+    are the same relation-name concept. On a same-key collision, models win, matching
+    the convention that ``ref('x')`` refers to a model named ``x`` over a source that
+    happens to share it. Aliases make such collisions likelier (two packages can each
+    alias a model to ``patient``); the same rule applies. Two relations sharing a bare
+    name in different schemas still collide on that shared bare key (an unqualified
+    reference cannot itself disambiguate them), but key separately, without colliding,
+    under their qualified keys, which is what a schema-qualified compiled reference
+    actually resolves through.
 
     This is the single owner of the compiled-SQL name resolution convention. The
     relation-graph builder keys the propagation on the ``SourceRef``s it returns,
@@ -1003,14 +1013,22 @@ def build_name_to_source(manifest: Manifest) -> Mapping[str, SourceRef]:
     """
     out: dict[str, SourceRef] = {}
     for uid, src in manifest.sources.items():
-        out.setdefault(src.identifier or src.name, SourceRef(SourceKind.SOURCE, uid))
+        ref = SourceRef(SourceKind.SOURCE, uid)
+        for key in relation_lookup_keys(src):
+            out.setdefault(key, ref)
     for uid, node in manifest.nodes.items():
         if node.resource_type is ResourceType.SEED:
-            out[node.name] = SourceRef(SourceKind.SEED, uid)
+            ref = SourceRef(SourceKind.SEED, uid)
         elif node.resource_type is ResourceType.SNAPSHOT:
-            out[node.name] = SourceRef(SourceKind.SNAPSHOT, uid)
+            ref = SourceRef(SourceKind.SNAPSHOT, uid)
+        else:
+            continue
+        for key in relation_lookup_keys(node):
+            out[key] = ref
     for uid, model in manifest.models.items():
-        out[model.name] = SourceRef(SourceKind.MODEL, uid)
+        ref = SourceRef(SourceKind.MODEL, uid)
+        for key in relation_lookup_keys(model):
+            out[key] = ref
     return out
 
 
@@ -1045,12 +1063,11 @@ def _build_schema(manifest: Manifest) -> Mapping[str, Mapping[str, str]]:
     """
     out: dict[str, dict[str, str]] = {}
     for src in manifest.sources.values():
-        name = src.identifier or src.name
         for col_name, col in src.columns.items():
-            out.setdefault(name, {})[col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(src.relation_name, {})[col_name] = col.data_type or "UNKNOWN"
     for node in _models_seeds_snapshots(manifest):
         for col_name, col in node.columns.items():
-            out.setdefault(node.name, {})[col_name] = col.data_type or "UNKNOWN"
+            out.setdefault(node.relation_name, {})[col_name] = col.data_type or "UNKNOWN"
     return out
 
 

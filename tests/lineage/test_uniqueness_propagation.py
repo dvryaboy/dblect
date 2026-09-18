@@ -114,6 +114,20 @@ def test_unique_test_on_a_snapshot_flows_into_a_model_that_refs_it() -> None:
     assert keys["model.shop.current_orders"] == CandidateKeySet.of(_key("dbt_scd_id"))
 
 
+def test_aliased_upstream_model_key_propagates_through_its_alias() -> None:
+    # dbt compiles ref('terminology__bill_type') to the model's alias, so the
+    # declared key must resolve under that compiled name, not the dbt name.
+    upstream = _node(
+        "model.shop.terminology__bill_type", name="terminology__bill_type", identifier="bill_type"
+    )
+    keys = _keys(
+        upstream,
+        _unique("test.shop.u", column="code", target=upstream.unique_id),
+        _node("model.shop.stg", "SELECT code, description FROM bill_type"),
+    )
+    assert keys["model.shop.stg"] == CandidateKeySet.of(_key("code"))
+
+
 def test_projection_rename_remaps_the_key() -> None:
     src = _source("source.shop.raw.orders")
     keys = _keys(

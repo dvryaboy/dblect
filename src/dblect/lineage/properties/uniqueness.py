@@ -664,7 +664,9 @@ def relation_scope_facts(
 ) -> Mapping[int, Input]:
     """Resolved facts for every SELECT/UNION scope and every FROM/JOIN table
     reference in ``tree``, keyed by ``id(node)`` and valid only while ``tree`` lives.
-    Base tables resolve by name; CTEs and subqueries come from the walk itself.
+    Base tables resolve by their schema-qualified relation key (matching how
+    ``model_keys``/``model_fds``/``conditional_by_name`` are indexed); CTEs and
+    subqueries come from the walk itself.
 
     Keys are activated: a conditional key is promoted where the scope's own flow
     implies its predicate. A scope the flow walk did not record (it stops at a
@@ -677,7 +679,7 @@ def relation_scope_facts(
     """
 
     def base_resolve(table: exp.Table) -> Input:
-        name = table.name
+        name = sg.table_relation_key(table)
         fd = model_fds.get(name, NO_FDS)
         return Input(
             model_keys.get(name, frozenset()),

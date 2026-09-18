@@ -45,7 +45,8 @@ class AntiJoin:
     ``probe_cols`` / ``matched_cols`` are the bare (lower-cased) columns of a clean equality
     predicate, empty when the predicate does not decode to column equalities (a native anti-join
     still filters, so its form is reported even when its columns are not readable). ``matched_name``
-    is ``R``'s bare table name, or ``None`` when ``R`` is a subquery or derived table. ``join`` is
+    is ``R``'s schema-qualified relation key (:func:`dblect.sql._sqlglot.table_relation_key`), or
+    ``None`` when ``R`` is a subquery or derived table. ``join`` is
     the join-arm node for the forms that have one (``NATIVE`` / ``LEFT_IS_NULL``), so a per-join
     reducer can match it by identity; it is ``None`` for the predicate forms. ``node`` is the anchor
     a finding attaches to (the join arm, or the ``NOT EXISTS`` / ``NOT IN`` predicate), always set.
@@ -135,7 +136,11 @@ def _probe_split(
 def _join_anti(j: exp.Join, form: AntiJoinForm, *, from_alias: str) -> AntiJoin:
     target = j.this
     matched_alias = target.alias_or_name
-    matched_name = target.name if isinstance(target, exp.Table) else None
+    matched_name = (
+        sg.table_relation_key(target)
+        if isinstance(target, exp.Table) and not sg.cte_shadows(target)
+        else None
+    )
     sides = _sides_of(sg.on_of(j))
     probe_alias, probe_cols, matched_cols = _probe_split(
         sides, matched_alias=matched_alias, from_alias=from_alias
@@ -177,7 +182,11 @@ def _not_exists_anti_join(exists: exp.Exists, *, from_alias: str, node: Expr) ->
     if inner_from is None or inner_from.this is None:
         return None
     matched_alias = inner_from.this.alias_or_name
-    matched_name = inner_from.this.name if isinstance(inner_from.this, exp.Table) else None
+    matched_name = (
+        sg.table_relation_key(inner_from.this)
+        if isinstance(inner_from.this, exp.Table) and not sg.cte_shadows(inner_from.this)
+        else None
+    )
     inner_where = sg.where_of(inner)
     sides = _sides_of(inner_where.this if inner_where is not None else None)
     probe_alias, probe_cols, matched_cols = _probe_split(
@@ -219,8 +228,11 @@ def _not_in_anti_join(in_node: exp.In, *, from_alias: str, node: Expr) -> AntiJo
 
 def single_projected_column(query: Expr) -> tuple[str, str] | None:
     """The ``(relation, column)`` a subquery projects, when it is a single bare column over a
-    single bare-table FROM with no joins; else ``None``. The lower-cased column matches the
-    column-key casing the nullability analysis uses."""
+    single bare-table FROM with no joins; else ``None``. ``relation`` is the schema-qualified
+    relation key (:func:`dblect.sql._sqlglot.table_relation_key`); the column is lower-cased to
+    match the column-key casing the nullability analysis uses. A bare FROM shadowed by an
+    enclosing CTE of the same name is not a genuine relation read either, so it also yields
+    ``None`` (see :func:`dblect.sql._sqlglot.cte_shadows`)."""
     select = query.this if isinstance(query, exp.Subquery) else query
     if not isinstance(select, exp.Select) or sg.joins_of(select):
         return None
@@ -232,6 +244,6 @@ def single_projected_column(query: Expr) -> tuple[str, str] | None:
     if not isinstance(column, exp.Column):
         return None
     from_ = sg.from_of(select)
-    if from_ is None or not isinstance(from_.this, exp.Table):
+    if from_ is None or not isinstance(from_.this, exp.Table) or sg.cte_shadows(from_.this):
         return None
-    return (from_.this.name, sg.column_name(column).lower())
+    return (sg.table_relation_key(from_.this), sg.column_name(column).lower())
