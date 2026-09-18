@@ -788,7 +788,7 @@ def nested_in_join_arm(sel: exp.Select) -> bool:
         if parent is None or isinstance(parent, exp.CTE):
             return False
         if isinstance(parent, exp.Join):
-            return True
+            return parent.this is node
         node = parent
 
 
