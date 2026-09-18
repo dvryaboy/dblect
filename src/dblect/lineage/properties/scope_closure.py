@@ -25,6 +25,7 @@ INTERSECT and EXCEPT.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TypeVar, cast
@@ -711,6 +712,8 @@ def _select_facts(
             extra_candidates.append(distinct_attrs)
 
     classes = _equivalence_classes(tuple(predicate_pairs))
+    if _ambiguous_output_name(proj, classes):
+        return _GIVE_UP  # two unrelated attributes share an output name: an unreliable universe
     declared_final = _rename_declared(declared_by_alias, classes, proj)
     result = _project(
         facts,
@@ -923,14 +926,14 @@ def _union_facts(
     """The union merge: the declared instances every arm shares after positional
     alignment (derived facts are arm-local and die), plus the DISTINCT full-tuple
     key. Conditional keys drop, since arms may carry different predicates."""
-    keys = _union_key(u)
     arms = sg.union_arms(u)
     if arms is None:
-        return Input(keys, exact=False)  # an unflattened or otherwise unreadable set-op chain
+        return Input(frozenset(), exact=False)  # unflattened or otherwise unreadable set-op chain
     names = [_positional_outputs(arm) for arm in arms]
     first = names[0] if names else None
     if first is None or any(n is None or len(n) != len(first) for n in names):
-        return Input(keys, exact=False)  # an arm's output columns can't be read positionally
+        return Input(frozenset(), exact=False)  # an arm's output columns can't be read positionally
+    keys = _union_key(u)
     local = _with_scope(u, cte_scope, base_resolve, record)
     shared: frozenset[DeclaredFD] | None = None
     arms_exact = True
@@ -945,30 +948,15 @@ def _union_facts(
     return Input(keys, frozenset(inst.fd for inst in shared), shared, exact=arms_exact)
 
 
-def _union_key(u: exp.Union) -> frozenset[Key]:
-    """The DISTINCT full-output-tuple key, read off the union's own first arm.
-    A star anywhere leaves the full tuple unnamed, so it voids the key rather
-    than being skipped: DISTINCT dedups every column, and a named subset is
-    not a key of that wider tuple. UNION ALL, or a first arm that is itself a
-    nested set operation (an unflattened chain), mints no key."""
-    if not bool(u.args.get("distinct")) or not isinstance(u.this, exp.Select):
-        return frozenset()
-    names: list[str] = []
-    for proj in u.this.expressions:
-        if isinstance(proj, exp.Star):
-            return frozenset()
-        if isinstance(proj, exp.Alias):
-            names.append(proj.alias_or_name.lower())
-        elif isinstance(proj, exp.Column):
-            if isinstance(proj.this, exp.Star):
-                return frozenset()
-            names.append(sg.column_name(proj).lower())
-    return frozenset({frozenset(names)}) if names else frozenset()
-
-
 def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
     """An arm's output column names in projection order, or ``None`` when they
-    cannot be lined up positionally (a star, a duplicated name, not a SELECT)."""
+    cannot be lined up positionally (a star, a duplicated name, a projection whose
+    ``alias_or_name`` is not a reliable output name, not a SELECT).
+
+    See :func:`sg.has_reliable_output_name`: trusting an unreliable name here would
+    let a union key or an arm rename bind to a name that is not the relation's real
+    output column.
+    """
     if not isinstance(arm, exp.Select):
         return None
     out: list[str] = []
@@ -978,10 +966,26 @@ def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         if isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star):
             return None
+        if not sg.has_reliable_output_name(proj):
+            return None
         out.append(proj.alias_or_name.lower())
     if len(set(out)) != len(out):
         return None
     return tuple(out)
+
+
+def _union_key(u: exp.Union) -> frozenset[Key]:
+    """The DISTINCT full-output-tuple key, read off the union's own first arm
+    through :func:`_positional_outputs`. A star or a duplicated output name
+    leaves the full tuple unnamed, so it voids the key rather than being
+    skipped: DISTINCT dedups every column, and a named subset is not a key of
+    that wider tuple, nor is a name that does not pick out one column. UNION
+    ALL, or a first arm that is itself a nested set operation (an unflattened
+    chain) or not a SELECT, mints no key."""
+    if not bool(u.args.get("distinct")):
+        return frozenset()
+    names = _positional_outputs(u.this)
+    return frozenset({frozenset(names)}) if names else frozenset()
 
 
 def _remap_declared(
@@ -1012,6 +1016,10 @@ class _Projection:
     name collision with another explicitly projected column, and that is the same
     risk the single-input star already accepts: qualifying the star only narrows
     which alias's columns pass through, so both sit at the same soundness level.
+    A collision between two *explicit* names is caught separately
+    (``_ambiguous_output_name``, since it needs the scope's equivalence classes
+    too); a star's hidden columns colliding with one stays this accepted risk,
+    since the engine never enumerates what a star actually projects.
     A star is ``blocked`` when it cannot be pinned to one active alias: an
     unqualified star spanning several inputs, a qualified star naming an alias
     that is not one of them, or more than one qualified star (two starred inputs
@@ -1019,6 +1027,7 @@ class _Projection:
 
     named: Mapping[QCol, tuple[str, ...]]
     computed: frozenset[str]
+    duplicate_computed: frozenset[str]
     constant: frozenset[str]
     star_aliases: frozenset[str]
     blocked: bool
@@ -1028,10 +1037,11 @@ def _build_projection(
     sel: exp.Select, *, from_alias: str, active_aliases: Sequence[str]
 ) -> _Projection:
     named: dict[QCol, list[str]] = {}
-    computed: set[str] = set()
+    computed_counts: Counter[str] = Counter()
     unqualified_star = False
     qualified_stars: set[str] = set()
     constant: set[str] = set()
+    blocked = False
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
             unqualified_star = True
@@ -1048,16 +1058,22 @@ def _build_projection(
             qc = QCol((sg.column_table(inner) or from_alias).lower(), sg.column_name(inner).lower())
             named.setdefault(qc, []).append(proj.alias_or_name.lower())
             continue
+        if not sg.has_reliable_output_name(proj):
+            # An unaliased computed expression or literal: SQLGlot's alias_or_name can
+            # diverge from the adapter's real output-column name (see
+            # sg.has_reliable_output_name), so the scope's output universe cannot be
+            # pinned down and a key or dependency drawn from it would be unsound.
+            blocked = True
+            continue
         name = proj.alias_or_name
         if name:
             lowered = name.lower()
-            computed.add(lowered)
+            computed_counts[lowered] += 1
             if isinstance(inner, Expr) and sg.literal_constant(inner) is not None:
                 constant.add(lowered)
 
     active_set = set(active_aliases)
     star_aliases: set[str] = set()
-    blocked = False
     if unqualified_star:
         if len(active_aliases) == 1:
             star_aliases.add(active_aliases[0])
@@ -1075,7 +1091,8 @@ def _build_projection(
 
     return _Projection(
         named={qc: tuple(ns) for qc, ns in named.items()},
-        computed=frozenset(computed),
+        computed=frozenset(computed_counts),
+        duplicate_computed=frozenset(name for name, n in computed_counts.items() if n > 1),
         constant=frozenset(constant),
         star_aliases=frozenset(star_aliases),
         blocked=blocked,
@@ -1142,12 +1159,43 @@ def _equivalence_classes(pairs: Sequence[QFD]) -> dict[Attr, frozenset[Attr]]:
     return classes
 
 
+def _class_of(attr: Attr, classes: Mapping[Attr, frozenset[Attr]]) -> frozenset[Attr]:
+    """``attr``'s proven-equal-value group, or itself alone when it is in none."""
+    return classes.get(attr, frozenset({attr}))
+
+
 def _output_name(
     attr: Attr, classes: Mapping[Attr, frozenset[Attr]], proj: _Projection
 ) -> str | None:
-    members = classes.get(attr, frozenset({attr}))
+    members = _class_of(attr, classes)
     names = [n for m in members for n in _direct_name(m, proj)]
     return min(names) if names else None
+
+
+def _ambiguous_output_name(proj: _Projection, classes: Mapping[Attr, frozenset[Attr]]) -> bool:
+    """Whether an explicit output name is claimed by two attributes outside one
+    proven-equal class. DuckDB accepts the collision and resolves a downstream
+    reference to whichever attribute it parses first, silently hiding the other's
+    values, so a name two unrelated attributes share makes the scope's output
+    universe unreliable, the same posture as two qualified stars.
+
+    Two computed projections sharing a name are always ambiguous rather than
+    checked against the classes: ``Computed`` identifies an attribute by name
+    alone, so two different expressions under the same alias collapse to one
+    value and no equivalence proof can ever tell them apart."""
+    if proj.duplicate_computed:
+        return True
+    by_name: dict[str, set[Attr]] = {}
+    for qc, names in proj.named.items():
+        for name in names:
+            by_name.setdefault(name, set()).add(qc)
+    for name in proj.computed:
+        by_name.setdefault(name, set()).add(Computed(name))
+    return any(
+        len({_class_of(a, classes) for a in claimants}) > 1
+        for claimants in by_name.values()
+        if len(claimants) > 1
+    )
 
 
 def _rewrite(

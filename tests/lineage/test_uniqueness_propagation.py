@@ -229,6 +229,35 @@ def test_distinct_drops_a_projected_literal_from_the_key() -> None:
     assert keys["model.shop.d"] == CandidateKeySet.of(_key("customer_id", "region"))
 
 
+def test_distinct_with_duplicate_computed_output_names_claims_no_key() -> None:
+    """``a + 1 AS x, b + 1 AS x`` are two different expressions sharing a name,
+    the same DuckDB-resolves-one-arbitrarily hazard as two duplicate bare
+    columns; a full-tuple key built from the collapsed name would claim
+    uniqueness on a column the query does not actually have."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node(
+            "model.shop.d",
+            "SELECT DISTINCT customer_id + 1 AS x, region_id + 1 AS x FROM orders",
+        ),
+    )
+    assert keys["model.shop.d"] == CandidateKeySet.of()
+
+
+def test_distinct_with_an_unaliased_computed_projection_claims_no_key() -> None:
+    """An unaliased ``CAST(id AS VARCHAR)`` reports ``alias_or_name`` as ``id`` (SQLGlot's
+    fallback to the cast operand's name), but DuckDB names the real output column
+    ``CAST(id AS VARCHAR)``. Minting ``{id}`` as a key from that borrowed name would claim
+    uniqueness on a column the query does not actually have."""
+    src = _source("source.shop.raw.orders")
+    keys = _keys(
+        src,
+        _node("model.shop.d", "SELECT DISTINCT customer_id, CAST(id AS VARCHAR) FROM orders"),
+    )
+    assert keys["model.shop.d"] == CandidateKeySet.of()
+
+
 def test_join_preserves_probe_keys_when_joined_side_is_unique_on_the_key() -> None:
     """A LEFT JOIN to a dimension unique on the join key cannot fan out, so the
     probe side's key survives."""
@@ -281,6 +310,45 @@ def test_two_qualified_stars_claim_nothing() -> None:
         _node("model.shop.product", "SELECT o.*, c.* FROM orders o CROSS JOIN customers c"),
     )
     assert keys["model.shop.product"] == CandidateKeySet.of()
+
+
+def test_duplicate_output_name_across_unrelated_columns_claims_no_key() -> None:
+    """``p.id AS id, d.id AS id`` collapses to one output name in DuckDB, which
+    resolves ``id`` to whichever column it parses first; the other's values are
+    invisible. A key built from both would claim uniqueness the engine cannot see,
+    so the ambiguous name blocks the scope the same way two qualified stars do."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node(
+            "model.shop.product",
+            "SELECT o.id AS id, c.id AS id FROM orders o CROSS JOIN customers c",
+        ),
+    )
+    assert keys["model.shop.product"] == CandidateKeySet.of()
+
+
+def test_duplicate_output_name_in_one_equivalence_class_still_claims_the_key() -> None:
+    """An equi-join proves ``o.id`` and ``c.id`` carry the same value, so DuckDB's
+    arbitrary pick between them reads a provably-equal column either way: the
+    shared name is safe, unlike the unrelated-columns case above."""
+    orders = _source("source.shop.raw.orders")
+    customers = _source("source.shop.raw.customers")
+    keys = _keys(
+        orders,
+        customers,
+        _unique("test.shop.o", column="id", target=orders.unique_id),
+        _unique("test.shop.c", column="id", target=customers.unique_id),
+        _node(
+            "model.shop.joined",
+            "SELECT o.id AS id, c.id AS id FROM orders o JOIN customers c ON o.id = c.id",
+        ),
+    )
+    assert keys["model.shop.joined"] == CandidateKeySet.of(_key("id"))
 
 
 def test_right_join_does_not_preserve_probe_keys() -> None:
@@ -475,6 +543,61 @@ def test_union_distinct_proves_the_full_tuple_key() -> None:
         _node("model.shop.u", "SELECT id, kind FROM a UNION SELECT id, kind FROM b"),
     )
     assert keys["model.shop.u"] == CandidateKeySet.of(_key("id", "kind"))
+
+
+def test_union_distinct_with_a_duplicate_first_arm_alias_proves_no_key() -> None:
+    """The first arm names two columns ``x``, so its output tuple can't be read
+    positionally; the full-tuple key the DISTINCT union would otherwise mint
+    must not survive on the strength of a name that does not pick out one
+    column."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id AS x, kind AS x FROM a UNION SELECT id, kind FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
+
+
+def test_union_distinct_with_an_unaliased_computed_first_arm_proves_no_key() -> None:
+    """The first arm's second column is an unaliased ``CAST``, not a bare column: SQLGlot's
+    ``alias_or_name`` falls back to the cast operand's name (``kind``), but DuckDB labels the
+    real output column ``CAST(kind AS VARCHAR)``. Minting the full-tuple key under a name that
+    is not the relation's actual output column would be unsound, so the union proves none."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id, CAST(kind AS VARCHAR) FROM a UNION SELECT id, kind FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
+
+
+def test_union_distinct_with_a_later_unreadable_arm_proves_no_key() -> None:
+    """The first arm reads cleanly, but a later arm's duplicate alias makes its own output
+    unreadable positionally. ``_union_key`` only ever looks at the first arm, so on its own it
+    would still mint a full-tuple key here; the engine's ambiguous-arm policy (give up rather
+    than guess, as for a duplicated or unaliased-computed *first* arm above) must withhold it
+    just the same when the ambiguity is in a later arm instead."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id, kind FROM a UNION SELECT id AS x, other AS x FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
 
 
 def test_cross_model_propagation_through_a_stage() -> None:
@@ -729,6 +852,11 @@ _EXACTNESS_CASES: list[tuple[str, str, bool]] = [
     (
         "two_qualified_stars",
         "SELECT o.*, c.* FROM orders o CROSS JOIN customers c",
+        False,
+    ),
+    (
+        "ambiguous_output_name_collision",
+        "SELECT o.id AS id, c.id AS id FROM orders o CROSS JOIN customers c",
         False,
     ),
     ("from_unnest", "SELECT x FROM UNNEST([1, 2, 3]) AS t(x)", False),
