@@ -18,6 +18,7 @@ from dblect.manifest.parse import (
     ResourceType,
     compilation_miss_reason,
     generic_test_target_uid,
+    relation_lookup_keys,
 )
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     "ResourceType",
     "compilation_miss_reason",
     "generic_test_target_uid",
+    "relation_lookup_keys",
 ]

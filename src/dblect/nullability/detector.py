@@ -35,7 +35,7 @@ from dblect.lineage.properties.nullability import (
     activated_nullability,
     outer_join_nullable_columns,
 )
-from dblect.manifest import Manifest
+from dblect.manifest import Manifest, relation_lookup_keys
 from dblect.sql import Finding, FindingKind, anti_join, finding_at
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
@@ -107,9 +107,9 @@ def detect_null_group_on_nullable_key(
         if from_ is None or sg.joins_of(sel):
             continue
         target = from_.this
-        if not isinstance(target, exp.Table):
+        if not isinstance(target, exp.Table) or sg.cte_shadows(target):
             continue
-        nullable = nullable_by_name.get(target.name)
+        nullable = nullable_by_name.get(sg.table_relation_key(target))
         if not nullable:
             continue
         where = sg.where_of(sel)
@@ -141,7 +141,12 @@ def detect_null_group_on_nullable_key(
             if proves(frozenset({NotNullAtom(Column(column))})):
                 continue
             out.append(
-                _finding(grp_expr, written_at=grouped.written_at, source=target.name, column=column)
+                _finding(
+                    grp_expr,
+                    written_at=grouped.written_at,
+                    source=sg.table_relation_key(target),
+                    column=column,
+                )
             )
     return tuple(out)
 
@@ -350,16 +355,18 @@ def detect_not_exists_on_nullable_key(
 
 
 def _alias_to_relation(sel: exp.Select) -> dict[str, str]:
-    """Map each FROM/JOIN alias to its bare table name. Subquery and CTE sources are
-    skipped (their per-scope nullability is a later increment)."""
+    """Map each FROM/JOIN alias to its schema-qualified relation key (matching how
+    ``nullable_by_name`` and friends are keyed). Subquery and CTE sources are skipped
+    (their per-scope nullability is a later increment); :func:`sg.cte_shadows` tells a
+    bare CTE reference apart from a genuine manifest relation of the same name."""
     out: dict[str, str] = {}
     from_ = sg.from_of(sel)
-    if from_ is not None and isinstance(from_.this, exp.Table):
-        out[from_.this.alias_or_name] = from_.this.name
+    if from_ is not None and isinstance(from_.this, exp.Table) and not sg.cte_shadows(from_.this):
+        out[from_.this.alias_or_name] = sg.table_relation_key(from_.this)
     for join in sg.joins_of(sel):
         target = join.this
-        if isinstance(target, exp.Table):
-            out[target.alias_or_name] = target.name
+        if isinstance(target, exp.Table) and not sg.cte_shadows(target):
+            out[target.alias_or_name] = sg.table_relation_key(target)
     return out
 
 
@@ -549,11 +556,12 @@ def _not_in_finding(node: Expr, *, source: str, column: str) -> Finding:
 def _nullable_by_name(
     manifest: Manifest, anns: Mapping[ColumnRef, Annotation[Nullability]]
 ) -> dict[str, frozenset[str]]:
-    """Index the proven-NULLABLE columns by the relation name as it appears in compiled
-    SQL, mirroring the uniqueness detector's name resolution: a source resolves under
-    ``identifier or name``, a model under ``name``, and a model wins on a name collision
-    (as a ``ref`` would). Column names are lowercased so the index matches the detectors'
-    lowercased AST keys on a dialect that case-folds bare identifiers."""
+    """Index the proven-NULLABLE columns by every key :func:`relation_lookup_keys` gives
+    the relation as it appears in compiled SQL, mirroring the uniqueness detector's name
+    resolution: a node's bare :attr:`Node.relation_name` (``identifier or name``) and, when
+    it differs, its schema-qualified :attr:`Node.qualified_relation_name`, and a model wins
+    on a same-key collision (as a ``ref`` would). Column names are lowercased so the index
+    matches the detectors' lowercased AST keys on a dialect that case-folds bare identifiers."""
     sources: dict[str, set[str]] = {}
     models: dict[str, set[str]] = {}
     for col_ref, ann in anns.items():
@@ -563,7 +571,8 @@ def _nullable_by_name(
         if node is None:
             continue
         bucket = models if col_ref.source.kind is SourceKind.MODEL else sources
-        bucket.setdefault(node.identifier or node.name, set()).add(col_ref.column.lower())
+        for key in relation_lookup_keys(node):
+            bucket.setdefault(key, set()).add(col_ref.column.lower())
     merged: dict[str, set[str]] = {name: set(cols) for name, cols in sources.items()}
     merged.update(models)  # a model wins on a name collision, as a ref would
     return {name: frozenset(cols) for name, cols in merged.items()}
