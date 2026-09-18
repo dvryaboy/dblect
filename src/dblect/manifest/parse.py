@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from dbt_artifacts_parser.parser import parse_manifest  # type: ignore[import-untyped]
 
 from dblect.manifest.dag import Dag
+from dblect.sql._sqlglot import relation_key
 
 if TYPE_CHECKING:
     from dblect.manifest.catalog import Catalog
@@ -271,12 +272,11 @@ class Node:
     incremental keys); ``None`` for sources and for nodes with no config block.
     """
     identifier: str | None = None
-    """The relation name as it appears in compiled SQL.
-
-    Populated for sources (where it can diverge from ``name`` via the
-    ``identifier`` setting in ``schema.yml``). ``None`` for nodes that
-    don't have a separate identifier concept; callers that need a
-    SQL-level lookup name should prefer ``identifier or name``.
+    """The relation name as it appears in compiled SQL, for any node kind: a
+    source's ``identifier`` (``schema.yml``), or a model/seed/snapshot's
+    ``alias`` config. ``None`` when the node carries neither (an unaliased
+    node, or a non-data-flow node such as a test); callers that need a
+    SQL-level lookup name should prefer :attr:`relation_name`.
     """
     compiled_flag: bool | None = None
     """dbt's own ``compiled`` flag for the node, or ``None`` when the manifest
@@ -317,6 +317,22 @@ class Node:
         return self.resource_type is not ResourceType.OTHER
 
     @property
+    def relation_name(self) -> str:
+        """The bare name this node is addressed by in compiled SQL: ``identifier``
+        when set, else ``name``. The one *unqualified* lookup key every SQL-level
+        name-keyed map should index under; :func:`relation_lookup_keys` pairs it with
+        the schema-qualified form a real compiled reference carries, so a caller
+        building a name-keyed map indexes under both rather than this alone."""
+        return self.identifier or self.name
+
+    @property
+    def qualified_relation_name(self) -> str:
+        """:attr:`relation_name` qualified by :attr:`schema` (``schema.name``), the
+        form a real dbt-compiled reference carries (``ref``/``source`` always render
+        schema-qualified). Bare when the node carries no schema."""
+        return relation_key(self.schema, self.relation_name)
+
+    @property
     def analysis_sql(self) -> str | None:
         """The SQL the analysis layer should parse for this node, or `None`.
 
@@ -327,6 +343,24 @@ class Node:
         macros emit).
         """
         return self.compiled_code
+
+
+def relation_lookup_keys(node: Node) -> tuple[str, ...]:
+    """Every key a name-keyed map should index ``node`` under: its bare
+    :attr:`Node.relation_name` and, when it differs, its schema-qualified
+    :attr:`Node.qualified_relation_name`.
+
+    A real dbt-compiled reference is always schema-qualified (``ref``/``source``
+    render ``schema.identifier``), so a production lookup needs the qualified key to
+    tell two same-named relations in different schemas apart. Hand-written SQL (tests,
+    or a project with everything in one schema) often stays unqualified, so the bare
+    key stays indexed too rather than dropped. Indexing under both means a builder
+    fills its map once per node and a lookup keyed by whichever form the parsed SQL
+    actually carries (:func:`dblect.sql._sqlglot.table_relation_key`) still hits.
+    """
+    bare = node.relation_name
+    qualified = node.qualified_relation_name
+    return (bare,) if qualified == bare else (bare, qualified)
 
 
 # The unique_id prefixes dbt gives the data-flow node kinds, derived from the
@@ -478,11 +512,24 @@ class Manifest:
         return {uid: n for uid, n in self.nodes.items() if n.resource_type is kind}
 
 
+def _schema_of(n: Any) -> str | None:
+    """The node's ``schema`` field.
+
+    dbt-artifacts-parser's pydantic models alias the manifest's ``schema`` JSON key to
+    the Python attribute ``schema_``: pydantic's own ``BaseModel.schema`` is a bound
+    method, so a field literally named ``schema`` would shadow it inconsistently, and
+    the parser sidesteps that by renaming the attribute. ``getattr(n, "schema", None)``
+    would silently return that unrelated bound method instead of the parsed value.
+    """
+    value = getattr(n, "schema_", None)
+    return value if isinstance(value, str) else None
+
+
 def _node_from_parsed(uid: str, n: Any) -> Node:
     """Map a dbt-artifacts-parser node (any schema version) into our `Node`."""
     raw_code = getattr(n, "raw_code", None)
     compiled_code = getattr(n, "compiled_code", None)
-    schema = getattr(n, "schema", None)
+    schema = _schema_of(n)
     depends_on_nodes = ()
     depends_on = getattr(n, "depends_on", None)
     if depends_on is not None:
@@ -507,6 +554,9 @@ def _node_from_parsed(uid: str, n: Any) -> Node:
         test_metadata=_test_metadata_from_parsed(n),
         attached_node=getattr(n, "attached_node", None),
         config=_model_config_from_parsed(n),
+        # `alias` is the relation name in compiled SQL, the role `identifier` plays
+        # for a source; a test or other non-data-flow node carries none.
+        identifier=_opt_str(getattr(n, "alias", None)),
         compiled_flag=compiled_flag,
         language=language,
     )
@@ -583,21 +633,19 @@ def _source_from_parsed(uid: str, s: Any) -> Node:
     to in compiled SQL; it defaults to ``name`` in the v12 schema but may
     differ when the schema.yml sets it explicitly.
     """
-    raw_identifier = getattr(s, "identifier", None)
-    identifier = raw_identifier if isinstance(raw_identifier, str) and raw_identifier else None
     return Node(
         unique_id=uid,
         name=s.name,
         resource_type=ResourceType.SOURCE,
         fqn=tuple(s.fqn),
         package_name=s.package_name,
-        schema=getattr(s, "schema", None),
+        schema=_schema_of(s),
         raw_code=None,
         compiled_code=None,
         original_file_path=getattr(s, "original_file_path", None),
         columns=_columns_from_parsed(getattr(s, "columns", {}) or {}),
         depends_on=frozenset(),
-        identifier=identifier,
+        identifier=_opt_str(getattr(s, "identifier", None)),
     )
 
 

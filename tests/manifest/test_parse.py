@@ -170,6 +170,22 @@ def test_macro_registry_transcribes_macro_dependencies(
     assert saw_dependency, "fixture should exercise at least one macro-to-macro edge"
 
 
+def test_model_and_seed_identifier_reads_the_alias(jaffle_manifest_path: Path) -> None:
+    # dbt compiles ref()/source() to the node's alias, not its name; a model or seed
+    # with alias set must expose it as identifier, the relation-name concept a
+    # source already carries.
+    raw = json.loads(jaffle_manifest_path.read_text())
+    model_uid = next(uid for uid, n in raw["nodes"].items() if n["resource_type"] == "model")
+    seed_uid = next(uid for uid, n in raw["nodes"].items() if n["resource_type"] == "seed")
+    raw["nodes"][model_uid]["alias"] = "aliased_model"
+    raw["nodes"][seed_uid]["alias"] = "aliased_seed"
+
+    manifest = Manifest.from_raw(raw)
+
+    assert manifest.nodes[model_uid].identifier == "aliased_model"
+    assert manifest.nodes[seed_uid].identifier == "aliased_seed"
+
+
 def test_jaffle_tests_round_trip_with_default_test_config(jaffle: Manifest) -> None:
     # jaffle's generic tests are all built-in, enabled, and unfiltered: the
     # parser should surface those as the defaults on DbtTestMetadata.

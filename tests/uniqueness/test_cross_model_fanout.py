@@ -176,6 +176,19 @@ def test_unrelated_nested_cte_does_not_shadow_a_real_read() -> None:
     assert [f.kind for f in _findings(manifest, _MART)] == [FindingKind.CROSS_MODEL_FANOUT]
 
 
+def test_schema_qualified_read_is_not_shadowed_by_a_same_named_cte() -> None:
+    """A CTE alias is never schema-qualified in SQL, so a CTE named like the fanned-out
+    relation cannot shadow a schema-qualified read of it: ``analytics.stg_order_items`` can
+    only mean the real relation, never the unrelated local CTE sharing its bare name."""
+    mart_sql = (
+        "WITH stg_order_items AS (SELECT 1 AS x) "
+        "SELECT order_id, SUM(amount) AS total FROM analytics.stg_order_items "
+        "GROUP BY order_id"
+    )
+    manifest = _shop(items_unique_on=None, mart_sql=mart_sql)
+    assert [f.kind for f in _findings(manifest, _MART)] == [FindingKind.CROSS_MODEL_FANOUT]
+
+
 # --- the COUNT fold: COUNT(*), COUNT(1), COUNT(col), COUNT_IF stay silent (#179) ----------
 #
 # A COUNT-behavior fold yields a cardinality, not a magnitude: it counts rows (modulo nulls),

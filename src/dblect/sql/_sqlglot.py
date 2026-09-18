@@ -559,6 +559,52 @@ def column_key(c: exp.Column) -> tuple[str | None, str]:
     return (column_table(c), column_name(c))
 
 
+def relation_key(schema: str | None, name: str) -> str:
+    """The schema-qualified key a relation resolves to in compiled SQL: ``schema.name``
+    when a schema is known, else the bare ``name``.
+
+    This is the one join rule every relation-identity map builds its keys through, on
+    both the manifest side (a dbt node's declared schema paired with its compiled-SQL
+    name, see ``Node.relation_name``) and the parsed-SQL side (:func:`table_relation_key`).
+    A bare name alone collides two same-named relations in different schemas onto one
+    key; joining the schema in keeps them distinct.
+    """
+    return f"{schema}.{name}" if schema else name
+
+
+def table_relation_key(t: exp.Table) -> str:
+    """The schema-qualified key ``t`` resolves to; see :func:`relation_key`.
+
+    ``t.db`` is the schema sqlglot parses out of a qualified reference (``schema.table``),
+    empty for an unqualified one (a bare table, or a local CTE/derived-table reference).
+    """
+    return relation_key(t.db or None, t.name)
+
+
+def cte_shadows(table: exp.Table) -> bool:
+    """True when ``table`` is a bare reference to a CTE declared in an enclosing WITH,
+    walking outward from ``table``'s own position to honour lexical CTE scoping (a name
+    defined only in an unrelated sibling scope does not shadow a genuine relation read).
+
+    A CTE reference is never schema-qualified in SQL, so a schema-qualified ``table``
+    (``analytics.orders``) can only mean the real relation, never a CTE named ``orders``,
+    and this is ``False`` for it without walking anything.
+    """
+    if table.db:
+        return False
+    name = table.name
+    current: Expr | None = table.parent
+    while current is not None:
+        if isinstance(current, exp.Select):
+            w = current.args.get("with_")
+            if isinstance(w, exp.With) and any(
+                isinstance(cte, exp.CTE) and cte.alias_or_name == name for cte in w.expressions
+            ):
+                return True
+        current = current.parent
+    return False
+
+
 def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
     """``e`` with ``CAST``/``TRY_CAST`` and parentheses unwrapped, if what remains is a
     literal or a boolean; ``None`` otherwise. sqlglot parses ``TRUE``/``FALSE`` as

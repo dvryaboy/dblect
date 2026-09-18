@@ -876,18 +876,19 @@ def _unique_test(uid: str, *, column: str, target: str) -> Node:
     )
 
 
-def test_source_keys_resolve_by_compiled_identifier_not_name() -> None:
-    """A source whose ``identifier`` diverges from its ``name`` (a common
-    ``schema.yml`` setting) appears in compiled SQL under the identifier. The
-    detectors must look its keys up by that identifier, matching the relation-graph
-    builder. Keyed by ``name`` instead, the declared key would be invisible and the
-    hazard would go unflagged."""
-    src = _source_with_identifier("source.shop.raw.orders", name="orders", identifier="orders_v2")
-    test = _unique_test("test.shop.u", column="id", target=src.unique_id)
-    # The compiled SQL references the source by its identifier, as dbt emits it.
+@pytest.mark.parametrize("kind", [ResourceType.SOURCE, ResourceType.MODEL, ResourceType.SEED])
+def test_relation_keys_resolve_by_compiled_identifier_not_name(kind: ResourceType) -> None:
+    """A relation whose ``identifier`` diverges from its ``name`` (a source's
+    ``schema.yml`` setting, or a model/seed's dbt ``alias``) appears in compiled SQL
+    under the identifier. The detectors must look its keys up by that identifier,
+    matching the relation-graph builder. Keyed by ``name`` instead, the declared key
+    would be invisible and the hazard would go unflagged."""
+    upstream = _node(f"{kind.value}.shop.orders", kind=kind, name="orders", identifier="orders_v2")
+    test = _unique_test("test.shop.u", column="id", target=upstream.unique_id)
+    # The compiled SQL references the upstream relation by its identifier, as dbt emits it.
     sql = "select row_number() over (partition by customer_id order by ts) as rn from orders_v2"
     model = _node("model.shop.ranked", sql)
-    manifest = _manifest(*(src, test, model))
+    manifest = _manifest(*(upstream, test, model))
     tree = _parse(sql)
     window_keys, _fanout, _limit, _agg = make_fact_grounded_detectors(
         manifest, _DUCKDB, parsed={model.unique_id: tree}

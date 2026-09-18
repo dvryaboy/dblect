@@ -68,7 +68,13 @@ from dblect.lineage.properties.uniqueness import (
     relation_reduce,
 )
 from dblect.lineage.property import propagate
-from dblect.manifest import ConstraintType, Manifest, ResourceType, generic_test_target_uid
+from dblect.manifest import (
+    ConstraintType,
+    Manifest,
+    ResourceType,
+    generic_test_target_uid,
+    relation_lookup_keys,
+)
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import JoinSide
@@ -572,8 +578,10 @@ def outer_join_nullable_columns(
     consumer (the join-on-nullable-key finding) can name *why* a key is nullable upstream
     without rediscovering it. It is a sufficient condition: a model the analysis cannot
     read (CTE-collapsed, unparseable, a projection that is not a bare optional-side column)
-    contributes nothing rather than a guess. Keyed by ``identifier or name`` to match how
-    the detectors resolve a relation in compiled SQL."""
+    contributes nothing rather than a guess. Keyed by every :func:`~dblect.manifest.relation_lookup_keys`
+    entry (the bare :attr:`Node.relation_name` and, when it differs, the schema-qualified
+    :attr:`Node.qualified_relation_name`) to match how the detectors resolve a relation in
+    compiled SQL."""
     out: dict[str, Mapping[str, JoinSide]] = {}
     for node in manifest.nodes.values():
         if node.resource_type is not ResourceType.MODEL:
@@ -595,7 +603,8 @@ def outer_join_nullable_columns(
             continue
         columns = _outer_join_output_columns(select, optional)
         if columns:
-            out[node.identifier or node.name] = columns
+            for key in relation_lookup_keys(node):
+                out[key] = columns
     return out
 
 

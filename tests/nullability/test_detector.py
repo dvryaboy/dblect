@@ -176,8 +176,21 @@ _CASES: list[tuple[str, str, bool]] = [
         ") sub",
         True,
     ),
+    # A local CTE named like the upstream model is a distinct relation, not the model: its
+    # own ``tag`` (a literal here, never NULL) must not inherit the real ``stg.tag``'s
+    # upstream nullability just because the bare names collide.
+    (
+        "group-by/cte-shadow-does-not-fire",
+        "WITH stg AS (SELECT 'x' AS tag) SELECT tag, count(*) AS n FROM stg GROUP BY tag",
+        False,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
+    (
+        "join/cte-shadow-does-not-fire",
+        "WITH stg AS (SELECT 'x' AS tag) SELECT s.tag FROM other o JOIN stg s ON o.k = s.tag",
+        False,
+    ),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
     ("not-in/non-null", "SELECT id FROM stg WHERE id NOT IN (SELECT id FROM stg)", False),
 ]
@@ -569,3 +582,50 @@ def test_determines_consolidates_but_never_silences() -> None:
     msg = findings[0].message
     assert "keys on region_id, which is nullable upstream" in msg
     assert "country_id in 'dim' (functionally determined by the declared key region_id)" in msg
+
+
+def test_schema_qualified_reference_does_not_inherit_a_same_named_relations_nullability() -> None:
+    """Two models sharing a bare relation name in different schemas must key
+    separately: joining the clean one's key on a schema-qualified reference must not
+    fire just because the other schema's same-named relation is genuinely nullable on
+    it.
+
+    Regression for the schema-collision CodeRabbit flagged on PR #270: a bare relation
+    name alone let ``_nullable_by_name`` merge two different relations' nullable
+    columns onto one key.
+    """
+    clean_sql = "SELECT k AS id, k AS tag FROM other"
+    nodes = [
+        _source("base"),
+        _source("lkp"),
+        _source("other"),
+        _not_null("base", "id"),
+        _not_null("base", "fk"),
+        _not_null("lkp", "id"),
+        _not_null("lkp", "tag"),
+        _not_null("other", "k"),
+        _model(
+            "stg", _STG_SQL, depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"})
+        ),
+        # Same bare relation name as `stg` (via `identifier`), but a different schema
+        # and a clean, join-free derivation: its `tag` is genuinely NON_NULL.
+        _node(
+            "model.shop.stg_dup",
+            clean_sql,
+            raw=clean_sql,
+            depends_on=frozenset({"source.shop.raw.other"}),
+            identifier="stg",
+            schema="other_schema",
+        ),
+    ]
+    manifest = _manifest(*nodes)
+    mart_sql = "SELECT s.id AS id, s.tag AS tag FROM other_schema.stg s JOIN other o ON s.tag = o.k"
+    detectors = make_nullability_detectors(manifest, _DUCKDB)
+    tree = parse_sql(mart_sql, dialect="duckdb")
+    findings = [
+        f
+        for detector in detectors
+        for f in detector(tree)
+        if f.kind is FindingKind.JOIN_ON_NULLABLE_KEY
+    ]
+    assert findings == []

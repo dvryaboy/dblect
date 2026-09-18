@@ -6,8 +6,11 @@ fixture. These builders carry the shared defaults for that shape (package
 ``shop``, model schema ``analytics``, source schema ``raw``, ``fqn`` and
 ``name`` derived from the unique_id) so a test states only what it asserts
 on. A test whose subject is one of the defaulted fields passes the value
-explicitly; ``package_name`` and ``schema`` are carried but never read by
-the analysis layer, so their defaults are inert for behavior.
+explicitly; ``package_name`` is carried but never read by the analysis
+layer, so its default is inert for behavior. ``schema`` contributes to
+``Node.qualified_relation_name``. Name-keyed lookups index both this
+schema-qualified key and the bare ``Node.relation_name``, so qualified
+references resolve separately across the default ``analytics``/``raw`` split.
 """
 
 from __future__ import annotations
