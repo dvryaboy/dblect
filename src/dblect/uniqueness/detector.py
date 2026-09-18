@@ -775,16 +775,19 @@ def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | Non
     does not annotate, so all three return ``None`` and the detector stays silent. CTE
     resolution uses :func:`_cte_body_for`, walking the enclosing WITH chain outward, so a name
     defined only as a CTE in an unrelated sibling scope does not shadow a genuine relation read.
+    A CTE reference is never schema-qualified, so the shadow check only applies to an
+    unqualified FROM: a schema-qualified ``analytics.orders`` can only mean the real relation,
+    never a CTE named ``orders``.
     """
     if sg.joins_of(sel):
         return None
     from_ = sg.from_of(sel)
     if from_ is None or not isinstance(from_.this, exp.Table):
         return None
-    name = from_.this.name
-    if _cte_body_for(name, sel) is not None:
+    table = from_.this
+    if not table.db and _cte_body_for(table.name, sel) is not None:
         return None
-    return name_to_ref.get(sg.table_relation_key(from_.this))
+    return name_to_ref.get(sg.table_relation_key(table))
 
 
 def _group_by_columns(sel: exp.Select) -> frozenset[str] | None:

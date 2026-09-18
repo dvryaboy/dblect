@@ -7,11 +7,10 @@ fixture. These builders carry the shared defaults for that shape (package
 ``name`` derived from the unique_id) so a test states only what it asserts
 on. A test whose subject is one of the defaulted fields passes the value
 explicitly; ``package_name`` is carried but never read by the analysis
-layer, so its default is inert for behavior. ``schema`` is not: it feeds
-``Node.relation_name``, the schema-qualified key every name-keyed lookup
-resolves a relation by, so two nodes sharing a bare ``name``/``identifier``
-across the default ``analytics``/``raw`` split resolve to distinct keys
-rather than colliding.
+layer, so its default is inert for behavior. ``schema`` contributes to
+``Node.qualified_relation_name``. Name-keyed lookups index both this
+schema-qualified key and the bare ``Node.relation_name``, so qualified
+references resolve separately across the default ``analytics``/``raw`` split.
 """
 
 from __future__ import annotations
