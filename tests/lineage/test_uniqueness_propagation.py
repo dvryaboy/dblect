@@ -536,6 +536,24 @@ def test_union_distinct_with_a_duplicate_first_arm_alias_proves_no_key() -> None
     assert keys["model.shop.u"] == CandidateKeySet.of()
 
 
+def test_union_distinct_with_an_unaliased_computed_first_arm_proves_no_key() -> None:
+    """The first arm's second column is an unaliased ``CAST``, not a bare column: SQLGlot's
+    ``alias_or_name`` falls back to the cast operand's name (``kind``), but DuckDB labels the
+    real output column ``CAST(kind AS VARCHAR)``. Minting the full-tuple key under a name that
+    is not the relation's actual output column would be unsound, so the union proves none."""
+    a = _source("source.shop.raw.a")
+    b = _source("source.shop.raw.b")
+    keys = _keys(
+        a,
+        b,
+        _node(
+            "model.shop.u",
+            "SELECT id, CAST(kind AS VARCHAR) FROM a UNION SELECT id, kind FROM b",
+        ),
+    )
+    assert keys["model.shop.u"] == CandidateKeySet.of()
+
+
 def test_cross_model_propagation_through_a_stage() -> None:
     """Keys flow across model boundaries: the staging model carries the source key,
     and the mart that selects from the staging model carries it too."""

@@ -950,7 +950,15 @@ def _union_facts(
 
 def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
     """An arm's output column names in projection order, or ``None`` when they
-    cannot be lined up positionally (a star, a duplicated name, not a SELECT)."""
+    cannot be lined up positionally (a star, a duplicated name, an unaliased
+    computed projection, not a SELECT).
+
+    An unaliased projection must be a bare column: SQLGlot's ``alias_or_name``
+    falls back to the expression's ``name``, which for a computed expression
+    (e.g. an unaliased ``CAST``) can differ from the name the adapter actually
+    renders for that output column. Trusting it there would let a union key or
+    an arm rename bind to a name that is not the relation's real output column.
+    """
     if not isinstance(arm, exp.Select):
         return None
     out: list[str] = []
@@ -959,6 +967,8 @@ def _positional_outputs(arm: Expr) -> tuple[str, ...] | None:
             return None
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         if isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star):
+            return None
+        if not isinstance(proj, exp.Alias) and not isinstance(inner, exp.Column):
             return None
         out.append(proj.alias_or_name.lower())
     if len(set(out)) != len(out):
