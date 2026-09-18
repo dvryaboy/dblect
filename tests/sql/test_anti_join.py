@@ -133,3 +133,34 @@ def test_not_in_with_non_column_left_side_decodes_the_matched_side_without_a_pro
     assert a.probe_cols == frozenset()
     assert a.matched_name == "r"
     assert a.matched_cols == frozenset({"k"})
+
+
+# --- a bare CTE reference on the matched side is not the manifest relation of the same name --
+#
+# ``table_relation_key`` returns the bare name for both an unqualified manifest table and a
+# local CTE, so a query-local ``WITH r AS (...)`` can shadow a genuine relation named ``r``. The
+# matched side is then unresolvable to a manifest relation (like a subquery or derived table
+# always was), not the shadowing CTE under a false identity.
+
+
+def test_native_anti_matched_side_shadowed_by_a_cte_has_no_relation_identity() -> None:
+    a = _only("WITH r AS (SELECT 1 AS k) SELECT l.a FROM l ANTI JOIN r ON l.k = r.k")
+    assert a.form is AntiJoinForm.NATIVE
+    assert a.matched_name is None
+
+
+def test_not_exists_matched_side_shadowed_by_a_cte_has_no_relation_identity() -> None:
+    sql = "WITH r AS (SELECT 1 AS k) SELECT l.a FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)"
+    a = _only(sql)
+    assert a.form is AntiJoinForm.NOT_EXISTS
+    assert a.matched_name is None
+
+
+def test_not_in_matched_side_shadowed_by_a_cte_is_not_recognised() -> None:
+    """Unlike the join-arm forms, a NOT IN whose matched relation is unresolvable is not
+    recognised as an anti-join at all: :func:`single_projected_column` requires a genuine
+    bare-table FROM, and a CTE-shadowed reference is not one."""
+    sel = sqlglot.parse_one(
+        "WITH r AS (SELECT 1 AS k) SELECT l.a FROM l WHERE l.k NOT IN (SELECT k FROM r)"
+    )
+    assert anti_joins_of(sel) == ()  # type: ignore[arg-type]

@@ -106,7 +106,7 @@ def detect_null_group_on_nullable_key(
         if from_ is None or sg.joins_of(sel):
             continue
         target = from_.this
-        if not isinstance(target, exp.Table):
+        if not isinstance(target, exp.Table) or sg.cte_shadows(target):
             continue
         nullable = nullable_by_name.get(sg.table_relation_key(target))
         if not nullable:
@@ -352,14 +352,15 @@ def detect_not_exists_on_nullable_key(
 def _alias_to_relation(sel: exp.Select) -> dict[str, str]:
     """Map each FROM/JOIN alias to its schema-qualified relation key (matching how
     ``nullable_by_name`` and friends are keyed). Subquery and CTE sources are skipped
-    (their per-scope nullability is a later increment)."""
+    (their per-scope nullability is a later increment); :func:`sg.cte_shadows` tells a
+    bare CTE reference apart from a genuine manifest relation of the same name."""
     out: dict[str, str] = {}
     from_ = sg.from_of(sel)
-    if from_ is not None and isinstance(from_.this, exp.Table):
+    if from_ is not None and isinstance(from_.this, exp.Table) and not sg.cte_shadows(from_.this):
         out[from_.this.alias_or_name] = sg.table_relation_key(from_.this)
     for join in sg.joins_of(sel):
         target = join.this
-        if isinstance(target, exp.Table):
+        if isinstance(target, exp.Table) and not sg.cte_shadows(target):
             out[target.alias_or_name] = sg.table_relation_key(target)
     return out
 

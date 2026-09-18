@@ -771,13 +771,9 @@ def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | Non
     """The ``SourceRef`` of ``sel``'s FROM when it is a single ref'd relation with no joins.
 
     A join or a non-table FROM (subquery) needs column-level reasoning we keep for later, and
-    a name shadowed by a CTE in ``sel``'s lexical scope is a per-query scope the propagator
-    does not annotate, so all three return ``None`` and the detector stays silent. CTE
-    resolution uses :func:`_cte_body_for`, walking the enclosing WITH chain outward, so a name
-    defined only as a CTE in an unrelated sibling scope does not shadow a genuine relation read.
-    A CTE reference is never schema-qualified, so the shadow check only applies to an
-    unqualified FROM: a schema-qualified ``analytics.orders`` can only mean the real relation,
-    never a CTE named ``orders``.
+    a name shadowed by a CTE in ``sel``'s lexical scope (:func:`sg.cte_shadows`) is a
+    per-query scope the propagator does not annotate, so all three return ``None`` and the
+    detector stays silent.
     """
     if sg.joins_of(sel):
         return None
@@ -785,7 +781,7 @@ def _single_from_ref(sel: exp.Select, name_to_ref: NameToRef) -> SourceRef | Non
     if from_ is None or not isinstance(from_.this, exp.Table):
         return None
     table = from_.this
-    if not table.db and _cte_body_for(table.name, sel) is not None:
+    if sg.cte_shadows(table):
         return None
     return name_to_ref.get(sg.table_relation_key(table))
 
@@ -926,22 +922,6 @@ def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
     if facts is None or not facts.keys:
         return None
     return facts
-
-
-def _cte_body_for(name: str, sel: exp.Select) -> Expr | None:
-    """The CTE body matching ``name`` in ``sel``'s enclosing WITH, walking outward
-    to honour lexical CTE scoping."""
-    node: Expr | None = sel
-    while node is not None:
-        if isinstance(node, exp.Select):
-            w = node.args.get("with_")
-            if isinstance(w, exp.With):
-                for cte in w.expressions:
-                    if isinstance(cte, exp.CTE) and cte.alias_or_name == name:
-                        body = cte.this
-                        return body if isinstance(body, Expr) else None
-        node = node.parent
-    return None
 
 
 def _collapsed_before_sensitive_consumer(sel: exp.Select, *, safe_builtins: frozenset[str]) -> bool:

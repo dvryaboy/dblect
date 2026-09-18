@@ -176,8 +176,21 @@ _CASES: list[tuple[str, str, bool]] = [
         ") sub",
         True,
     ),
+    # A local CTE named like the upstream model is a distinct relation, not the model: its
+    # own ``tag`` (a literal here, never NULL) must not inherit the real ``stg.tag``'s
+    # upstream nullability just because the bare names collide.
+    (
+        "group-by/cte-shadow-does-not-fire",
+        "WITH stg AS (SELECT 'x' AS tag) SELECT tag, count(*) AS n FROM stg GROUP BY tag",
+        False,
+    ),
     ("join/nullable", "SELECT s.id FROM other o JOIN stg s ON o.k = s.tag", True),
     ("join/non-null", "SELECT s.id FROM other o JOIN stg s ON o.k = s.id", False),
+    (
+        "join/cte-shadow-does-not-fire",
+        "WITH stg AS (SELECT 'x' AS tag) SELECT s.tag FROM other o JOIN stg s ON o.k = s.tag",
+        False,
+    ),
     ("not-in/nullable", "SELECT id FROM stg WHERE id NOT IN (SELECT tag FROM stg)", True),
     ("not-in/non-null", "SELECT id FROM stg WHERE id NOT IN (SELECT id FROM stg)", False),
 ]

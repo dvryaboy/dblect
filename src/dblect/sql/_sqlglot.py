@@ -581,6 +581,30 @@ def table_relation_key(t: exp.Table) -> str:
     return relation_key(t.db or None, t.name)
 
 
+def cte_shadows(table: exp.Table) -> bool:
+    """True when ``table`` is a bare reference to a CTE declared in an enclosing WITH,
+    walking outward from ``table``'s own position to honour lexical CTE scoping (a name
+    defined only in an unrelated sibling scope does not shadow a genuine relation read).
+
+    A CTE reference is never schema-qualified in SQL, so a schema-qualified ``table``
+    (``analytics.orders``) can only mean the real relation, never a CTE named ``orders``,
+    and this is ``False`` for it without walking anything.
+    """
+    if table.db:
+        return False
+    name = table.name
+    current: Expr | None = table.parent
+    while current is not None:
+        if isinstance(current, exp.Select):
+            w = current.args.get("with_")
+            if isinstance(w, exp.With) and any(
+                isinstance(cte, exp.CTE) and cte.alias_or_name == name for cte in w.expressions
+            ):
+                return True
+        current = current.parent
+    return False
+
+
 def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
     """``e`` with ``CAST``/``TRY_CAST`` and parentheses unwrapped, if what remains is a
     literal or a boolean; ``None`` otherwise. sqlglot parses ``TRUE``/``FALSE`` as
