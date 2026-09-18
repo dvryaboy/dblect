@@ -654,6 +654,54 @@ def relation_reduce(
     return Annotation(value, opacity, provisional=provisional, exact=resolved.exact)
 
 
+def _consumer_where_atoms(tree: Expr) -> Mapping[int, frozenset[Canon]]:
+    """Each join-free, single-table FROM's own enclosing SELECT WHERE, as atoms,
+    keyed by the FROM table node's id.
+
+    A single-source scope's atom parser drops table qualifiers, so these atoms are
+    already in the source's own namespace and need no rename before folding into its
+    promotion, *provided* the conjunct is actually about this source. A conjunct
+    qualified to a different table is a correlated reference to a sibling (duckdb
+    treats an uncorrelated JOIN subquery's WHERE as an implicit lateral, reaching a
+    preceding FROM item with no ``LATERAL`` keyword); with qualifiers dropped, that
+    would otherwise misattribute a sibling's filter to this source under a
+    same-named column. Inside such an arm even an unqualified column is ambiguous,
+    since this analysis has no catalog to say the local source actually has a
+    column of that name rather than resolving out to the sibling, so it too is
+    dropped there rather than assumed local.
+    """
+    out: dict[int, frozenset[Canon]] = {}
+    for sel in sg.find_all_selects(tree):
+        if sg.joins_of(sel):
+            continue
+        from_ = sg.from_of(sel)
+        if from_ is None or not isinstance(from_.this, exp.Table):
+            continue
+        where = sg.where_of(sel)
+        if where is None or not isinstance(where.this, Expr):
+            continue
+        local = sg.local_conjuncts(
+            where.this,
+            alias=from_.this.alias_or_name,
+            require_qualifier=sg.nested_in_join_arm(sel),
+        )
+        if not local:
+            continue
+        out[id(from_.this)] = frozenset[Canon]().union(*(atoms_of(leaf) for leaf in local))
+    return out
+
+
+def _promote(inp: Input, flow_atoms: frozenset[Canon]) -> Input:
+    """``inp`` with its conditional keys activated against ``flow_atoms``."""
+    promoted = activate(
+        CandidateKeySet(inp.keys),
+        ((CandidateKeySet.of(ck.key), ck.predicate) for ck in inp.conditional),
+        flow_atoms,
+        _meet,
+    )
+    return replace(inp, keys=promoted.keys)
+
+
 def relation_scope_facts(
     tree: Expr,
     model_keys: Mapping[str, frozenset[Key]],
@@ -673,9 +721,12 @@ def relation_scope_facts(
     join) gets the empty filter, which activates nothing, the safe direction.
 
     A CTE body and every reference to it share one ``Input`` object, but only the
-    body's id has a flow entry. Promotion therefore runs once per object and every
-    reference reuses the body's result; promoting a reference by its own id would
-    silently under-promote.
+    body's id has a flow entry, so promotion runs once per object against the
+    defining scope's flow and every reference reuses it. A reference that sits alone
+    in a join-free SELECT also folds in that SELECT's own WHERE: a consumer's filter
+    narrows the source's rows as surely as the source's own filter would, and the
+    atoms are already in the source's namespace there. A reference inside a join
+    keeps the shared, unfiltered promotion, matching the flow walk's own posture.
     """
 
     def base_resolve(table: exp.Table) -> Input:
@@ -690,18 +741,20 @@ def relation_scope_facts(
 
     record: dict[int, Input] = {}
     scope_facts(tree, cte_scope={}, base_resolve=base_resolve, record=record)
+    consumer_where = _consumer_where_atoms(tree)
+
+    defining_flow: dict[int, frozenset[Canon]] = {}
     promoted_by_input: dict[int, Input] = {}
     out: dict[int, Input] = {}
     for node_id, inp in record.items():
+        flow_atoms = defining_flow.setdefault(id(inp), scope_flow.get(node_id, frozenset()))
+        extra = consumer_where.get(node_id)
+        if extra is not None:
+            out[node_id] = _promote(inp, flow_atoms | extra)
+            continue
         cached = promoted_by_input.get(id(inp))
         if cached is None:
-            promoted = activate(
-                CandidateKeySet(inp.keys),
-                ((CandidateKeySet.of(ck.key), ck.predicate) for ck in inp.conditional),
-                scope_flow.get(node_id, frozenset()),
-                _meet,
-            )
-            cached = replace(inp, keys=promoted.keys)
+            cached = _promote(inp, flow_atoms)
             promoted_by_input[id(inp)] = cached
         out[node_id] = cached
     return out
