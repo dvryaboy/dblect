@@ -484,6 +484,34 @@ def test_consumer_where_excludes_a_correlated_outer_predicate() -> None:
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
 
 
+def test_consumer_where_excludes_an_unqualified_predicate_inside_an_exists_body() -> None:
+    # A single-table SELECT inside a bare ``WHERE EXISTS`` (no JOIN arm at all) reads
+    # from the same source as the outer window scope, with an unqualified conjunct
+    # that duckdb's outer-name resolution could in principle borrow from a sibling if
+    # the local table lacked the column. Unlike the JOIN-arm case above, this table is
+    # reachable only through the predicate: ``scope_facts``'s FROM/JOIN/CTE walk never
+    # visits it, so it gets no ``record`` entry, and ``_consumer_where_atoms``'s atoms
+    # for it (keyed by that exact node's id) can never be looked up by the promotion
+    # loop (which only iterates ``record``'s own keys). The finding must stay lit.
+    sql = (
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM events "
+        "WHERE EXISTS (SELECT 1 FROM events WHERE active = 'active')"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.id",
+            column="id",
+            target="source.shop.raw.events",
+            where="active = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
 def test_consumer_where_excludes_an_unqualified_correlated_predicate() -> None:
     # Same shape, but the conjunct is unqualified rather than explicitly foreign.
     # This analysis has no catalog to say ``c``/``events`` actually has a ``status``
