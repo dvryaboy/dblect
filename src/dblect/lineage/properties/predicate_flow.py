@@ -200,7 +200,9 @@ class _FlowWalk:
         self, node: Expr, *, cte_scope: Mapping[str, frozenset[Canon]]
     ) -> frozenset[Canon] | None:
         if isinstance(node, exp.Table):
-            if node.name in cte_scope:
+            # A CTE alias is never schema-qualified, so a qualified table (``analytics.orders``)
+            # can only mean the real relation, never a CTE named ``orders``.
+            if not node.db and node.name in cte_scope:
                 return cte_scope[node.name]
             return self._base_filter(node)
         if isinstance(node, exp.Subquery):

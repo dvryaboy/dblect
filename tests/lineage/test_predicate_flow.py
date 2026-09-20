@@ -21,9 +21,14 @@ from hypothesis import strategies as st
 from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.graph import SourceKind
 from dblect.lineage.predicate import Canon, atoms_of, parse_predicate
-from dblect.lineage.properties.predicate_flow import RowFilter, predicate_flow_property
+from dblect.lineage.properties.predicate_flow import (
+    RowFilter,
+    predicate_flow_property,
+    relation_scope_filters,
+)
 from dblect.lineage.property import propagate
 from dblect.manifest import Node
+from dblect.sql import parse_sql
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
 from tests._manifest_builders import source as _source
@@ -294,6 +299,20 @@ def test_cte_filter_conjoins_with_the_outer_filter() -> None:
         ),
     )
     assert flow["model.shop.m"].atoms == _atoms("country = 'US' AND amount > 0")
+
+
+# --- a bare CTE alias does not shadow a schema-qualified read -------------------------
+#
+# ``relation_scope_filters`` resolves base tables by their schema-qualified relation key
+# against ``model_flow``. A CTE alias is never schema-qualified in SQL, so a
+# schema-qualified FROM can only mean the real relation, never a same-named CTE.
+
+
+def test_relation_scope_filters_does_not_let_a_cte_shadow_a_schema_qualified_read() -> None:
+    tree = parse_sql("WITH orders AS (SELECT 1 AS id) SELECT * FROM raw.orders", dialect="duckdb")
+    model_flow = {"raw.orders": RowFilter.of(*_atoms("country = 'US'"))}
+    scopes = relation_scope_filters(tree, model_flow)
+    assert scopes[id(tree)] == _atoms("country = 'US'")
 
 
 # --- accumulation invariant (PBT) ------------------------------------------------
