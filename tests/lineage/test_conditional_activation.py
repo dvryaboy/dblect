@@ -290,10 +290,10 @@ def test_conditional_dropped_by_a_star_over_a_join() -> None:
 _CONSUMER = "SELECT f.x FROM events f JOIN dim d ON f.did = d.id"
 
 
-def _fanout_kinds(*nodes: Node) -> list[FindingKind]:
+def _fanout_kinds(*nodes: Node, sql: str = _CONSUMER) -> list[FindingKind]:
     manifest = _manifest(*nodes)
     _window, fanout, _limit, _agg = make_fact_grounded_detectors(manifest, _DUCKDB)
-    return [f.kind for f in fanout(parse_sql(_CONSUMER, dialect="duckdb"))]
+    return [f.kind for f in fanout(parse_sql(sql, dialect="duckdb"))]
 
 
 def test_activation_covers_a_join_and_suppresses_the_fanout_finding() -> None:
@@ -391,3 +391,182 @@ def test_intra_model_cte_without_filter_leaves_the_window_uncovered() -> None:
         _node("model.shop.win", sql),
     )
     assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+# --- a consumer's own WHERE activates a FROM source's conditional key ------------
+#
+# The CTE body or base table carries the conditional key itself, with no filter of
+# its own; the reference's *enclosing* SELECT carries the WHERE instead. For a
+# join-free, single-source scope that WHERE is already in the source's own namespace
+# (the atom parser drops qualifiers), so it activates the source's conditional key
+# there, without needing the source to repeat the filter itself. A reference that
+# shares its scope with a JOIN is left alone, matching the flow walk's own posture.
+
+
+def test_consumer_where_activates_a_cte_sources_conditional_key() -> None:
+    # ``c``'s own body carries no filter; the outer, join-free SELECT's WHERE does,
+    # and that is what activates ``c``'s conditional ``id`` key for the window.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM c WHERE active"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
+
+
+def test_consumer_where_activates_a_base_tables_conditional_key() -> None:
+    # No CTE at all: the base table's own reference sits directly in the join-free
+    # SELECT that carries the WHERE, so the same promotion applies to it.
+    sql = "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM events WHERE active"
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
+
+
+def test_consumer_where_does_not_activate_a_joined_sources_conditional_key() -> None:
+    # ``c``'s reference sits in a scope that also joins another source, so this
+    # scope's WHERE does not promote it; the fanout finding still stands. ``probe``
+    # gives ``events`` a real derivation so its key propagates onto the graph at all;
+    # the fanout check itself runs against ``sql`` directly, like the other
+    # ``_fanout_kinds`` cases.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT f.x FROM other f JOIN c ON f.eid = c.id WHERE active"
+    )
+    kinds = _fanout_kinds(
+        _source("source.shop.raw.events"),
+        _node("model.shop.probe", "SELECT * FROM events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique("test.shop.id", column="id", target="source.shop.raw.events", where="active"),
+        sql=sql,
+    )
+    assert FindingKind.JOIN_FANOUT in kinds
+
+
+def test_consumer_where_excludes_a_correlated_outer_predicate() -> None:
+    # ``c``'s own scope is join-free and single-source, so it is eligible for
+    # consumer-WHERE promotion; but the ``status = 'active'`` conjunct qualifies to
+    # the outer, sibling source ``a`` (duckdb treats an uncorrelated JOIN subquery
+    # referencing a sibling as an implicit lateral), not to ``c``. With the atom
+    # parser dropping qualifiers, ``a.status`` and ``c.status`` canonicalise to the
+    # same atom, so this must not activate ``c``'s conditional key.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE a.status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+def test_consumer_where_excludes_an_unqualified_predicate_inside_an_exists_body() -> None:
+    # A single-table SELECT inside a bare ``WHERE EXISTS`` (no JOIN arm at all) reads
+    # from the same source as the outer window scope, with an unqualified conjunct
+    # that duckdb's outer-name resolution could in principle borrow from a sibling if
+    # the local table lacked the column. Unlike the JOIN-arm case above, this table is
+    # reachable only through the predicate: ``scope_facts``'s FROM/JOIN/CTE walk never
+    # visits it, so it gets no ``record`` entry, and ``_consumer_where_atoms``'s atoms
+    # for it (keyed by that exact node's id) can never be looked up by the promotion
+    # loop (which only iterates ``record``'s own keys). The finding must stay lit.
+    sql = (
+        "SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn FROM events "
+        "WHERE EXISTS (SELECT 1 FROM events WHERE active = 'active')"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.id",
+            column="id",
+            target="source.shop.raw.events",
+            where="active = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+def test_consumer_where_excludes_an_unqualified_correlated_predicate() -> None:
+    # Same shape, but the conjunct is unqualified rather than explicitly foreign.
+    # This analysis has no catalog to say ``c``/``events`` actually has a ``status``
+    # column, so inside a JOIN arm (where ``a`` is in view via duckdb's implicit
+    # lateral) an unqualified column is just as ambiguous as one explicitly
+    # qualified to ``a``, and must not activate ``c``'s conditional key either.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS in kinds
+
+
+def test_consumer_where_activates_on_a_predicate_qualified_to_the_local_source() -> None:
+    # Same nested-in-a-JOIN-arm shape as the two tests above, but now the conjunct
+    # is qualified to ``c`` itself, not to the outer sibling ``a``. A column
+    # qualified to its own local alias is never ambiguous, in a JOIN arm or
+    # anywhere else: no dialect resolves ``c.status`` to some other table just
+    # because ``c``'s subquery sits in a JOIN arm. This is the positive case the
+    # other two bound: activation must still happen here, or this PR's whole
+    # feature would be dead inside every JOIN-nested CTE or subquery.
+    sql = (
+        "WITH c AS (SELECT * FROM events) "
+        "SELECT a.id, sub.rn FROM accounts a CROSS JOIN ("
+        "  SELECT row_number() OVER (PARTITION BY id ORDER BY ts) AS rn "
+        "  FROM c WHERE c.status = 'active'"
+        ") sub"
+    )
+    kinds = _window_kinds(
+        sql,
+        _source("source.shop.raw.events"),
+        _source("source.shop.raw.accounts"),
+        _unique("test.shop.region", column="region", target="source.shop.raw.events"),
+        _unique(
+            "test.shop.status",
+            column="id",
+            target="source.shop.raw.events",
+            where="status = 'active'",
+        ),
+        _node("model.shop.win", sql),
+    )
+    assert FindingKind.NON_UNIQUE_WINDOW_ORDER_KEYS not in kinds
