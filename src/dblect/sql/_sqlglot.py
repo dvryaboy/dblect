@@ -619,6 +619,22 @@ def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
     return e if isinstance(e, exp.Literal | exp.Boolean) else None
 
 
+def has_reliable_output_name(proj: Expr) -> bool:
+    """Whether ``proj``'s ``alias_or_name`` reliably names the adapter's real output
+    column: true for an explicit alias, or for ``proj`` itself being a bare column
+    reference. False for any other unaliased expression.
+
+    SQLGlot's ``alias_or_name`` falls back to the expression's own ``name`` when there
+    is no alias, and that fallback can diverge from what the adapter actually renders
+    as the column header: an unaliased ``CAST(id AS VARCHAR)`` reports ``id``, not the
+    rendered expression text, and an unaliased string literal ``'x'`` reports ``x``,
+    dropping the quotes a real header keeps. Trusting either name would let a
+    DISTINCT/GROUP BY key or a UNION arm alignment bind to a name that is not really
+    one of the relation's output columns.
+    """
+    return isinstance(proj, exp.Alias | exp.Column)
+
+
 def find_columns(e: Expr) -> list[exp.Column]:
     return list(e.find_all(exp.Column))
 
