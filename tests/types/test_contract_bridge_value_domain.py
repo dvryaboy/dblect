@@ -77,6 +77,19 @@ def test_bare_unit_enum_scalar_also_grounds_its_member_set() -> None:
     assert fact.value == _currency_set()
 
 
+def test_a_mixed_case_scalar_field_grounds_the_case_folded_column() -> None:
+    """``ColumnRef`` column names are case-folded at every construction site,
+    and the lineage keys a model's columns that way, so a contract field written
+    the way the warehouse spells the column still meets its propagated scope."""
+
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+        Country_Code: Country
+
+    (fact,) = _resolved().value_domain_facts
+    assert fact.scope == ColumnRef(_CHARGES_SRC, "country_code")
+
+
 def test_bare_bool_scalar_grounds_nothing() -> None:
     class StgCharges(ModelContract):
         dbt_model = "stg_charges"
@@ -113,6 +126,15 @@ def test_open_unit_enum_facet_grounds_its_companion_column() -> None:
     assert fact.value == _currency_set()
     assert fact.detail is not None
     assert "StgCharges.charge_amount" in fact.detail
+
+
+def test_a_mixed_case_facet_column_grounds_the_case_folded_scope() -> None:
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+        charge_amount: Money.columns(amount="charge_amount", currency="Currency")
+
+    (fact,) = _resolved().value_domain_facts
+    assert fact.scope == ColumnRef(_CHARGES_SRC, "currency")
 
 
 def test_open_nominal_enum_facet_grounds_its_companion_column() -> None:
