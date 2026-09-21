@@ -212,10 +212,13 @@ Suggested wording, never "violated": *"this JOIN discards rows of
 `region_id` is declared a foreign key to `dim_regions.region_id`, so no such
 rows are expected; if that ever stops holding, they vanish here with
 nothing reporting it. Guard the edge with a `relationships` test so a
-violation fails loudly, or switch to a LEFT JOIN and handle the unmatched
-side explicitly."* When the `ON` carries other conjuncts, append: *"the join
-also requires `data_source` to match, so rows can leave here even while the
-foreign key holds."*
+break fails loudly, or make `stg_orders` the preserved side of an outer
+join and handle its unmatched rows explicitly."* The remediation names the
+child relation rather than prescribing a join keyword, because the finding
+fires on LEFT, RIGHT, and SEMI joins too, where "switch to a LEFT JOIN" is
+already the case or the wrong fix. When the `ON` carries other conjuncts,
+append: *"the join also requires `data_source` to match, so rows can leave
+here even while the foreign key holds."*
 
 ### Verdict grade: WARN, and why
 
@@ -527,10 +530,15 @@ to a non-null `ELSE` (`'delivered'` routed to `'Other'`), so a non-null
 `ELSE` must not silence the finding. The shape to spare is the indicator
 idiom, `sum(case when status = 'cancelled' then 1 else 0 end)`, which is a
 deliberate complement: a `CASE` with exactly one arm is silent, and so is a
-`CASE` whose every THEN and ELSE literal lies outside the column's own
-domain (it is computing something about the column, not remapping it). A
-multi-arm remap with a missing member fires whether the default is absent,
-`ELSE NULL`, or `ELSE 'other'`.
+multi-arm `CASE` whose every THEN literal is the same value (`then 1 ...
+then 1 else 0`, a disjunction spelled as a CASE). The indicator's defining
+shape is that every arm yields one value, not that its literals lie outside
+the column's domain: a remap into a fresh vocabulary (`then 'inpatient' ...
+then 'ed' else 'other'`) has every literal outside the domain and is exactly
+the shape that routes a missing member to its default, so an out-of-domain
+exemption would silence the parent's motivating case. A multi-arm remap with
+a missing member fires whether the default is absent, `ELSE NULL`, or
+`ELSE 'other'`.
 
 ### Verdict grade: ERROR for the dead predicate, WARN for the other three
 
@@ -615,8 +623,9 @@ never "wrong."
    with a `NULL` list member staying silent, `NOT (col = 'stray')` firing
    the redundant kind, and a projected `col = 'stray'` worded "never true";
    the CASE table (simple, searched, no `ELSE`,
-   `ELSE NULL`, `ELSE 'other'` firing, the one-arm indicator silent, an
-   all-literals-out-of-domain `CASE` silent, a non-column arm); lineage
+   `ELSE NULL`, `ELSE 'other'` firing, the one-arm indicator silent, a
+   multi-arm same-THEN indicator silent, a coded remap (`then 1 ... then 2
+   else 0`) firing, a non-column arm); lineage
    rows (direct, through a CTE, through a passthrough model, through
    `upper()` silenced, through a `UNION` of two enum'd sources with a stray
    only when absent from both); a tuva-shaped fixture: an enum bound to
