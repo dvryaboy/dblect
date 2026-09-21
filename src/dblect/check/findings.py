@@ -52,6 +52,14 @@ class CheckFindingKind(StrEnum):
     the analysis covers only a fraction of columns and a clean report would
     overstate what was checked. A capability gap, not a project defect."""
 
+    REFERENTIAL_ORPHAN_DROP = auto()
+    """A join's row effect discards a declared foreign key's unmatched child rows,
+    with no enabled, unconditional, error-severity ``relationships`` test already
+    giving that edge a loud failure mode. The foreign key is trusted forward, not
+    disproven; the finding is about the join turning a violation into a silent
+    drop rather than a loud one, so it never claims the key is broken today. See
+    ``docs/design/referential-drop-and-dead-predicate.md``."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:
