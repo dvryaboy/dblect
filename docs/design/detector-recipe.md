@@ -1,13 +1,18 @@
-# Adding a detector: the file set and a rough line budget
+# Adding a detector: the file set and where the size should go
 
 A declaration-graded detector is a lattice, a way to ground it from what a user
 declared, a way to propagate it through SQL, and a check reader that turns its
 flow annotations into findings. The property kit
 (`src/dblect/lineage/facts/kit.py`) and the located-finding helper
 (`src/dblect/check/located.py`) exist so that shape is data and glue, not code
-you write fresh each time. This note names the files a new detector touches and
-about how big each one should be; a module coming in well over its budget is
-usually building something the kit already has a piece for.
+you write fresh each time. This note names the files a new detector touches;
+the budget that actually holds is on the scaffolding, not the module's total
+size, since a rich algebra (domain-type's dimensional group, functional
+dependency's entailment closure) legitimately makes a file large. What should
+stay small and roughly constant is the kit wiring itself: the facts collector,
+the grounding fold, and the `Property` construction. A module whose *wiring*
+(as opposed to its transfer rules and discoverers) runs to dozens of lines is
+usually rebuilding something the kit already has a piece for.
 
 ## The property module
 
@@ -31,10 +36,15 @@ children (a comparison, in domain-type's reading), and `constant_aggregate` for
 an aggregate whose meaning discards its child entirely (`COUNT`, always safe,
 always the same answer whatever it counted).
 
-Budget: 150-350 lines. The four migrated properties range from nullability at
-about 300 (it also carries the outer-join taint and conditional-activation
-machinery, which are lineage concerns, not kit-shaped ones) down to
-functional-dependency's roughly 200 for the lattice plus entailment.
+Concretely, the wiring for a manifest-backed property is a `column_kit`/
+`relation_kit` call fixing the lattice and transfer catalogs, plus a
+constructor function that builds its discoverers, calls `.facts`, and returns
+`.property(facts)`: nullability's is one `column_kit(...)` call and four lines
+of `nullability_property`. Everything else in a property module (nullability's
+outer-join taint and conditional-activation carrying, domain-type's Kennedy
+arithmetic, functional-dependency's `determines`/`minimal_cover` entailment
+engine) is the detector's actual algebra, sized by what the detector needs to
+prove, not by the kit.
 
 ## The check reader
 
@@ -101,10 +111,12 @@ per-property wiring beyond that: no new `AnnotationStore`, no new
   soundness argument is symbolic rather than empirical (functional-dependency's
   two-row entailment proof) does not use this harness at all.
 
-Budget: propagation and lattice tests together land under 250 lines when the
-property fits the table shapes above; a check-table cluster is a handful of
-rows plus one parametrized test function, well under 100 lines for the part
-that used to be three or four near-duplicate ones.
+Domain-type's propagation-and-lattice tests together run to about 410 lines,
+but a good deal of that is the dimensional group's own algebraic laws
+(`Dimension.multiply`/`divide`), which a property with a flatter value type
+will not need; a check-table cluster replacing three or four near-duplicate
+functions is a handful of rows plus one parametrized test, typically under 60
+lines for the part that used to be spread across them.
 
 ## What is still bespoke, deliberately
 
