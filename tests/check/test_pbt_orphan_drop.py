@@ -1,19 +1,27 @@
 """Data-as-judge property test for the referential orphan-drop check.
 
-``orphan_drop_sites`` claims one thing structurally: a join's row effect discards
-a declared foreign key's unmatched child rows. This asks duckdb rather than
-re-deriving the rule: generate a parent table and a child table carrying one row
-that matches a parent (``matched``) and one that matches none (``orphan``),
-materialize the join, and assert that wherever the check fires, the warehouse
-confirms the drop really happened (``matched`` survives, ``orphan`` does not).
-``assert_no_over_claims`` is exactly this "the analysis never claims more than
-the data supports" shape.
+``orphan_drop_sites`` claims to decide one thing structurally: does a join's row
+effect discard a declared foreign key's unmatched child rows. This test asks
+duckdb rather than re-deriving the rule: generate a parent table, a child table
+carrying one row whose key matches a parent (``matched``) and one whose key
+matches none (``orphan``), materialize the join, and assert the check fires iff
+the materialized output keeps ``matched`` and lacks ``orphan``.
 
-The six shapes below are every ``(JoinSide, child position)`` combination
-``orphan_drop_sites`` claims fires (see ``test_orphan_drop.py``'s structural
-table for the full closed grammar, firing and silent alike); a silent shape has
-no drop to confirm against data, so it stays a structural fact pinned there and
-in ``test_join_row_effects.py``, not a data-as-judge claim here.
+The join is drawn from a closed grammar (enumerated, not sampled, since
+``JoinSide`` is a closed type): every side that carries an ``ON`` clause, crossed
+with the child on the accumulated-left side versus freshly joined in. ``CROSS``,
+``USING``, ``NATURAL``, and an equality under ``OR`` carry no ``ON`` this reader
+decodes, so they are outside this fragment and stay in ``test_orphan_drop.py``'s
+documented-miss rows instead.
+
+SEMI and ANTI with the child on the matched (freshly-joined) side never project a
+child column at all: the operator only ever returns probe-side rows, so there is
+no "this child row survived" fact for such a query's own output to carry. For
+those two cases the oracle is the same ``FROM``/``ON`` relaxed to a LEFT JOIN
+(which does expose the child column), used only to confirm the generated data is a
+genuine match-plus-orphan pair; the check itself must stay silent regardless,
+which the row-effect table already says (SEMI/ANTI only ever drop their probe's
+unmatched rows, never the matched side's).
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from dblect.lineage.facts.model import Declared, DeclaredSource
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.sql.parse import parse_sql
 from dblect.types import ForeignKeyEdge
-from tests.lineage._duckdb_oracle import Table, assert_no_over_claims
+from tests.lineage._duckdb_oracle import Table, materialized, scalar
 
 _PARENT = SourceRef(SourceKind.MODEL, "model.test.parent")
 _CHILD = SourceRef(SourceKind.MODEL, "model.test.child")
@@ -55,15 +63,33 @@ def _fires(sql: str) -> bool:
     return bool(orphan_drop_sites(tree, _EDGES_BY_CHILD, _ref_of))
 
 
-# every (JoinSide, child position) shape the structural table says fires, one
-# real query per row
-_FIRING_SQL: tuple[tuple[str, str], ...] = (
-    ("inner-child-left", "select c.id as id from c inner join p on c.fk = p.pk"),
-    ("right-child-left", "select c.id as id from c right join p on c.fk = p.pk"),
-    ("semi-child-left", "select c.id as id from c semi join p on c.fk = p.pk"),
-    ("inner-child-right", "select c.id as id from p inner join c on c.fk = p.pk"),
-    ("left-child-right", "select c.id as id from p left join c on c.fk = p.pk"),
+# id, child position, join keyword, whether this shape can project a child column
+_CASES: tuple[tuple[str, str, str, bool], ...] = (
+    ("inner-child-left", "left", "inner join", True),
+    ("left-child-left", "left", "left join", True),
+    ("right-child-left", "left", "right join", True),
+    ("full-child-left", "left", "full join", True),
+    ("semi-child-left", "left", "semi join", True),
+    ("anti-child-left", "left", "anti join", True),
+    ("inner-child-right", "right", "inner join", True),
+    ("left-child-right", "right", "left join", True),
+    ("right-child-right", "right", "right join", True),
+    ("full-child-right", "right", "full join", True),
+    ("semi-child-right", "right", "semi join", False),
+    ("anti-child-right", "right", "anti join", False),
 )
+
+
+def _real_sql(position: str, join: str, *, projectable: bool) -> str:
+    """The exact query ``orphan_drop_sites`` analyzes for one grammar case."""
+    if position == "left":
+        return f"select c.id as id from c {join} p on c.fk = p.pk"
+    if projectable:
+        return f"select c.id as id from p {join} c on c.fk = p.pk"
+    return f"select p.pk as pk from p {join} c on c.fk = p.pk"
+
+
+_LEFT_RELAXED_ORACLE = "select c.id as id from p left join c on c.fk = p.pk"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,25 +122,43 @@ def _tables(s: OrphanScenario) -> list[Table]:
 
 
 @pytest.mark.parametrize(
-    "sql", [sql for _id, sql in _FIRING_SQL], ids=[row[0] for row in _FIRING_SQL]
+    ("position", "join", "projectable"),
+    [(p, j, proj) for _id, p, j, proj in _CASES],
+    ids=[row[0] for row in _CASES],
 )
 @given(s=_orphan_scenario())
 @settings(max_examples=100, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-def test_orphan_drop_never_over_claims_a_drop_that_did_not_happen(
-    oracle_con: duckdb.DuckDBPyConnection, sql: str, s: OrphanScenario
+def test_orphan_drop_fires_iff_the_warehouse_drops_the_orphan(
+    oracle_con: duckdb.DuckDBPyConnection,
+    position: str,
+    join: str,
+    projectable: bool,
+    s: OrphanScenario,
 ) -> None:
-    assert _fires(sql), f"{sql!r} is expected to be in the firing grammar"
+    real_sql = _real_sql(position, join, projectable=projectable)
+    fires = _fires(real_sql)
 
-    def violations(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
-        matched_present = con.execute(
-            f"select count(*) from _m where id = {s.matched_id}"
-        ).fetchone()
-        orphan_present = con.execute(f"select count(*) from _m where id = {s.orphan_id}").fetchone()
-        assert matched_present is not None
-        assert orphan_present is not None
-        return {
-            "matched_row_wrongly_dropped": 0 if matched_present[0] > 0 else 1,
-            "orphan_row_wrongly_kept": 0 if orphan_present[0] == 0 else 1,
-        }
-
-    assert_no_over_claims(oracle_con, _tables(s), sql, violations)
+    if projectable:
+        with materialized(oracle_con, _tables(s), real_sql) as con:
+            matched_present = scalar(con, f"select count(*) from _m where id = {s.matched_id}") > 0
+            orphan_present = scalar(con, f"select count(*) from _m where id = {s.orphan_id}") > 0
+        assert fires == (matched_present and not orphan_present), (
+            f"orphan_drop_sites fired={fires} but the warehouse says matched_present="
+            f"{matched_present}, orphan_present={orphan_present} for sql={real_sql!r} "
+            f"scenario={s!r}"
+        )
+    else:
+        with materialized(oracle_con, _tables(s), _LEFT_RELAXED_ORACLE) as con:
+            matched_present = scalar(con, f"select count(*) from _m where id = {s.matched_id}") > 0
+            orphan_present = scalar(con, f"select count(*) from _m where id = {s.orphan_id}") > 0
+        degenerate = (
+            f"the LEFT-relaxed oracle should always show a genuine match-plus-orphan "
+            f"split; got matched_present={matched_present}, orphan_present={orphan_present} "
+            f"for scenario={s!r} (this would mean the fixture itself is degenerate)"
+        )
+        assert matched_present, degenerate
+        assert not orphan_present, degenerate
+        assert fires is False, (
+            f"{join} with the child on the matched side never exposes a child row to "
+            f"drop, so orphan_drop_sites must stay silent on sql={real_sql!r}"
+        )

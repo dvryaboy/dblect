@@ -352,10 +352,14 @@ def suppress_check_findings(
 
 
 def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
-    """The findings that vary by world: the domain-type contradictions and the
-    not-well-typed aggregations, read off one world's annotations. The
-    contract-resolution and resolution-floor findings are world-invariant and stay
-    ``run_check``'s to report once."""
+    """The per-model findings of one world: the domain-type contradictions, the
+    not-well-typed aggregations, the join-key and grain findings read off its
+    annotations, and the referential orphan drops. The flag-world enumerator reads
+    only this function per world, so a model-located finding belongs here even when
+    it comes out the same in every world (the orphan drop reads join structure and
+    declared edges, neither of which a flag changes). The contract-resolution and
+    resolution-floor findings are project-wide and stay ``run_check``'s to report
+    once."""
     findings: list[CheckFinding] = []
     # One source-map per model, shared across both finding kinds: a model that produces
     # both a contradiction and an aggregation finding builds its line map once.
@@ -391,10 +395,6 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             world.functional_dependency,
         )
     )
-    # The referential orphan-drop signal (join structure, declared edges, and the
-    # test-coverage guard) is itself world-invariant, unlike the domain-type and
-    # grain findings above; it lives here anyway, alongside the other tree-shaped
-    # reader it mirrors, rather than as a third top-level bucket in run_check.
     findings.extend(
         _referential_orphan_drop_findings(
             graphs.manifest,
