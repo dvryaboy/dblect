@@ -34,7 +34,8 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import DEDUP_STRATEGIES, AdapterProfile
-from dblect.lineage.facts.grounding import collect, grounding
+from dblect.lineage.facts.grounding import generic_test_source_ref, grounding
+from dblect.lineage.facts.kit import relation_kit
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
     BASE_WORLD,
@@ -167,28 +168,12 @@ def grain_preserved(keys: CandidateKeySet, origin_key: Key) -> bool:
 # Uniqueness grounds on any relation a downstream model can ref by name: models,
 # sources, seeds, and snapshots alike (a seed or snapshot feeds downstream SQL the
 # same way a source does, and the relation graph's name map registers all four).
-# The test-target resolution uses the shared default prefix set, which spans the
-# data-flow kinds, so the discoverers stay in step with the nullability siblings.
-_SOURCE_KIND: Mapping[ResourceType, SourceKind] = {
-    ResourceType.MODEL: SourceKind.MODEL,
-    ResourceType.SOURCE: SourceKind.SOURCE,
-    ResourceType.SEED: SourceKind.SEED,
-    ResourceType.SNAPSHOT: SourceKind.SNAPSHOT,
-}
+# Target resolution reuses the shared ``generic_test_source_ref``, so the
+# discoverers stay in step with the nullability siblings by construction.
 
 _KEY_CONSTRAINT_TYPES: frozenset[ConstraintType] = frozenset(
     {ConstraintType.PRIMARY_KEY, ConstraintType.UNIQUE}
 )
-
-
-def _source_ref(manifest: Manifest, target_uid: str) -> SourceRef | None:
-    """The graph-keyed ``SourceRef`` for a target node, or ``None`` if the node is
-    absent or not a relation uniqueness can address."""
-    node = manifest.nodes.get(target_uid)
-    if node is None:
-        return None
-    kind = _SOURCE_KIND.get(node.resource_type)
-    return SourceRef(kind, target_uid) if kind is not None else None
 
 
 def _single_key(*cols: str) -> CandidateKeySet:
@@ -215,7 +200,7 @@ class _UniqueTestDiscoverer:
             if not isinstance(col, str) or not col:
                 continue
             target = generic_test_target_uid(node)
-            scope = _source_ref(manifest, target) if target is not None else None
+            scope = generic_test_source_ref(manifest, target) if target is not None else None
             if scope is None:
                 continue
             out.append(
@@ -257,7 +242,7 @@ class _UniqueCombinationDiscoverer:
             if not cols or len(cols) != len(raw_list):
                 continue
             target = generic_test_target_uid(node)
-            scope = _source_ref(manifest, target) if target is not None else None
+            scope = generic_test_source_ref(manifest, target) if target is not None else None
             if scope is None:
                 continue
             out.append(
@@ -763,6 +748,21 @@ def relation_scope_facts(
 # --- the property ------------------------------------------------------------
 
 
+# The kit's facts collector, bound to this property's lattice and relation-algebra
+# reducer. Uniqueness's grounding carries a non-default piece (the conditional-key
+# payload, wired below in ``_grounding_with_conditional``), so it builds its
+# ``Property`` by hand rather than through ``.property``; the kit still derives
+# the facts collector, which is where the extra-facts merge duplication lived.
+_UNIQUENESS_KIT = relation_kit(
+    name="uniqueness",
+    lattice=UNIQUENESS_LATTICE,
+    operators={},
+    aggregates={},
+    reconcile_by_meet=True,
+    reducer=relation_reduce,
+)
+
+
 def uniqueness_facts(
     manifest: Manifest,
     profile: AdapterProfile,
@@ -785,15 +785,7 @@ def uniqueness_facts(
     )
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
-    collected = collect(manifest, discoverers, name_to_source={})
-    if not extra_facts:
-        return collected
-    merged: dict[SourceRef, list[Fact[CandidateKeySet, SourceRef]]] = {
-        scope: list(bucket) for scope, bucket in collected.items()
-    }
-    for fact in extra_facts:
-        merged.setdefault(fact.scope, []).append(fact)
-    return {scope: tuple(bucket) for scope, bucket in merged.items()}
+    return _UNIQUENESS_KIT.facts(manifest, discoverers, extra_facts=extra_facts)
 
 
 def uniqueness_property_from_facts(

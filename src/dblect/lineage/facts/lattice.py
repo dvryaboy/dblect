@@ -9,11 +9,11 @@ order resolution uses.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
-from dblect.lineage.facts.model import Fact
+from dblect.lineage.facts.model import Annotation, Fact, Opacity
 
 K = TypeVar("K")
 
@@ -71,3 +71,22 @@ def consistent(lat: Lattice[K]) -> Callable[[K, K], bool]:
         return lat.refines(inferred, declared)
 
     return check
+
+
+def annotate_fold(lat: Lattice[K], value: K, kids: Collection[Annotation[K]]) -> Annotation[K]:
+    """Wrap a transfer's already-folded ``value`` with the diagnostic bits derived
+    from its inputs: a non-top result is CONCRETE, a top result inherits EXPLICIT
+    from a declared opt-out among ``kids`` or is IMPLICIT, and ``provisional`` is
+    the OR of the inputs'.
+
+    Shared by every property whose transfer folds several children's values into
+    one: the propagator's own generic multi-child fold, and a property's custom
+    fold for a shape the generic one cannot handle alone (a domain tag's additive
+    combine, a ``CASE``'s THEN/ELSE union).
+    """
+    provisional = any(k.provisional for k in kids)
+    if value != lat.top:
+        return Annotation(value, Opacity.CONCRETE, provisional=provisional)
+    explicit = any(k.opacity is Opacity.EXPLICIT for k in kids)
+    opacity = Opacity.EXPLICIT if explicit else Opacity.IMPLICIT
+    return Annotation(value, opacity, provisional=provisional)
