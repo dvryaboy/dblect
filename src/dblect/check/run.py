@@ -20,14 +20,14 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.adapters import AdapterProfile
-from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
+from dblect.audit.sourcemap import LineMap
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
 from dblect.check.findings import (
@@ -38,6 +38,7 @@ from dblect.check.findings import (
     UnbuiltModel,
 )
 from dblect.check.grain import declared_grain_findings
+from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -51,7 +52,6 @@ from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
-    Derivation,
     SourceKind,
     SourceRef,
 )
@@ -489,6 +489,25 @@ def _issue_findings(resolved: ResolvedContracts) -> list[CheckFinding]:
     ]
 
 
+def _contradiction_rows(
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    column_graph: ColumnLineageGraph,
+) -> Iterator[LocatedRow]:
+    for ref, ann in _sorted(annotations):
+        if not ann.provisional or ann.value == NAKED:
+            continue
+        yield LocatedRow(
+            uid=ref.source.unique_id,
+            nodes=(column_graph.derivation(ref),),
+            kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
+            message=(
+                f"declared domain type for {ref.column!r} is contradicted by the type "
+                "that flows in from upstream"
+            ),
+            column=ref.column,
+        )
+
+
 def _contradiction_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
@@ -497,37 +516,19 @@ def _contradiction_findings(
 ) -> list[CheckFinding]:
     """One finding per column whose declared type the inferred one contradicts,
     reported wherever the disagreement flows downstream."""
-    out: list[CheckFinding] = []
-    for ref, ann in _sorted(annotations):
-        if not ann.provisional or ann.value == NAKED:
-            continue
-        line_start, line_end = _span_of(column_graph.derivation(ref))
-        uid = ref.source.unique_id
-        out.append(
-            CheckFinding(
-                kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
-                message=(
-                    f"declared domain type for {ref.column!r} is contradicted by the type "
-                    "that flows in from upstream"
-                ),
-                model_unique_id=uid,
-                file_path=_file_of(manifest, ref.source),
-                column=ref.column,
-                line_start=line_start,
-                line_end=line_end,
-                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
-            )
-        )
-    return out
+    return locate_findings(
+        manifest,
+        _contradiction_rows(annotations, column_graph),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.column or ""),
+    )
 
 
-def _aggregation_findings(
-    manifest: Manifest,
+def _aggregation_rows(
     clears: tuple[CoherenceClear[DomainTag], ...],
     column_graph: ColumnLineageGraph,
-    line_maps: dict[str, LineMap],
-) -> list[CheckFinding]:
-    """One finding per combining aggregate the coherence guard cleared: a reduction
+) -> Iterator[LocatedRow]:
+    """One row per combining aggregate the coherence guard cleared: a reduction
     over a value whose per-row companion nothing holds constant per group.
 
     The guard already decided this and recorded *why* in the clear, so the check reads
@@ -540,15 +541,13 @@ def _aggregation_findings(
     since the companion is no more held by a group the builder cannot enumerate than by a
     resolved one that omits it, and the guard recorded the clear rather than guessing."""
     if not clears:
-        return []
+        return
     owners = _aggregate_owners(column_graph)
-    out: list[CheckFinding] = []
     for clear in clears:
         agg = clear.aggregate
         if aggregate_behavior(agg) is not AggregateBehavior.COMBINE:
             continue
-        site = clear.site
-        if site is None:
+        if clear.site is None:
             continue
         owner = owners.get(id(agg))
         if owner is None:
@@ -556,23 +555,28 @@ def _aggregation_findings(
         # The aggregate node pins the line; the projection derivation is the fallback so
         # the finding still lands near the right place when the aggregate carries no
         # stamped line (a literal-only shape).
-        line_start, line_end = _span_of(agg, column_graph.derivation(owner))
-        uid = owner.source.unique_id
-        out.append(
-            CheckFinding(
-                kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
-                message=_aggregation_message(owner, clear),
-                model_unique_id=uid,
-                file_path=_file_of(manifest, owner.source),
-                column=owner.column,
-                line_start=line_start,
-                line_end=line_end,
-                source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
-            )
+        yield LocatedRow(
+            uid=owner.source.unique_id,
+            nodes=(agg, column_graph.derivation(owner)),
+            kind=CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,
+            message=_aggregation_message(owner, clear),
+            column=owner.column,
         )
+
+
+def _aggregation_findings(
+    manifest: Manifest,
+    clears: tuple[CoherenceClear[DomainTag], ...],
+    column_graph: ColumnLineageGraph,
+    line_maps: dict[str, LineMap],
+) -> list[CheckFinding]:
     # The clear order follows the propagation walk; sort so the report is deterministic.
-    out.sort(key=lambda f: (f.model_unique_id or "", f.column or "", f.line_start))
-    return out
+    return locate_findings(
+        manifest,
+        _aggregation_rows(clears, column_graph),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.column or "", f.line_start),
+    )
 
 
 def _aggregate_owners(column_graph: ColumnLineageGraph) -> dict[int, ColumnRef]:
@@ -631,14 +635,12 @@ def _operand_label(agg: exp.AggFunc) -> str:
     return this.name if isinstance(this, exp.Column) else sg.render_sql(this)
 
 
-def _join_key_findings(
-    manifest: Manifest,
+def _join_key_rows(
     parsed: Mapping[str, Expr],
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
-    line_maps: dict[str, LineMap],
-) -> list[CheckFinding]:
-    """One finding per ON-clause equality whose two columns carry conflicting domain
+) -> Iterator[LocatedRow]:
+    """One row per ON-clause equality whose two columns carry conflicting domain
     types: equating a ``MoneyUSD`` key against a ``MoneyEUR`` one, or two incompatible
     nominal tags, joins values that cannot mean the same thing.
 
@@ -647,37 +649,40 @@ def _join_key_findings(
     where the lineage reached it, falling back to its declared grounding for a join key
     that is never projected, so a key that appears only in the ON clause is still typed.
     A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps)."""
+    tag_ann_of = annotation_or_grounded(annotations, ground)
 
     def tag_of(col: exp.Column) -> DomainTag | None:
         ref = resolved_column_ref(col)
-        if ref is None:
-            return None
-        ann = annotations.get(ref)
-        return ann.value if ann is not None else ground(ref).value
+        return None if ref is None else tag_ann_of(ref).value
 
-    out: list[CheckFinding] = []
     for uid, tree in parsed.items():
-        source = SourceRef(SourceKind.MODEL, uid)
         for join in tree.find_all(exp.Join):
             on = join.args.get("on")
             if not isinstance(on, Expr):
                 continue
             for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
-                line_start, line_end = _span_of(left, right, on)
-                out.append(
-                    CheckFinding(
-                        kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
-                        message=_join_key_message(left, right, left_tag, right_tag),
-                        model_unique_id=uid,
-                        file_path=_file_of(manifest, source),
-                        column=left.name or None,
-                        line_start=line_start,
-                        line_end=line_end,
-                        source_span=_source_span(manifest, uid, line_start, line_end, line_maps),
-                    )
+                yield LocatedRow(
+                    uid=uid,
+                    nodes=(left, right, on),
+                    kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                    message=_join_key_message(left, right, left_tag, right_tag),
+                    column=left.name or None,
                 )
-    out.sort(key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""))
-    return out
+
+
+def _join_key_findings(
+    manifest: Manifest,
+    parsed: Mapping[str, Expr],
+    annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    line_maps: dict[str, LineMap],
+) -> list[CheckFinding]:
+    return locate_findings(
+        manifest,
+        _join_key_rows(parsed, annotations, ground),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
+    )
 
 
 def _join_key_message(
@@ -713,51 +718,3 @@ def _sorted(
     """Annotations in a stable order (by model then column) so the report is
     deterministic."""
     return sorted(annotations.items(), key=lambda kv: (kv[0].source.unique_id, kv[0].column))
-
-
-def _file_of(manifest: Manifest, source: SourceRef) -> str | None:
-    node = manifest.nodes.get(source.unique_id)
-    return node.original_file_path if node is not None else None
-
-
-def _source_span(
-    manifest: Manifest,
-    uid: str,
-    line_start: int,
-    line_end: int,
-    cache: dict[str, LineMap],
-) -> SourceSpan:
-    """Back-map a compiled span onto the model's source template (see
-    :mod:`dblect.audit.sourcemap`), reusing one line map per model across the world's
-    findings."""
-    # The "no line" sentinel has no source position; skip building the map for a model
-    # whose findings are all unlocated.
-    if line_start == 0:
-        return SourceSpan.compiled(line_start, line_end)
-    line_map = cache.get(uid)
-    if line_map is None:
-        node = manifest.nodes.get(uid)
-        compiled = node.analysis_sql if node is not None else None
-        raw = node.raw_code if node is not None else None
-        line_map = build_line_map(compiled, raw)
-        cache[uid] = line_map
-    return line_map.map_span(line_start, line_end)
-
-
-def _span_of(*nodes: Derivation | None) -> tuple[int, int]:
-    """The 1-indexed source-line span of the first ``nodes`` entry sqlglot stamped with
-    a usable line, falling back through the rest. ``(0, 0)`` when none carry one, the
-    convention a finding with no locatable line uses (never line-suppressible).
-
-    The span is in the compiled SQL's line space. The located finding kinds carry it
-    on ``line_start``/``line_end`` and additionally back-map it onto ``raw_code`` via
-    :func:`_source_span`, so the report can point at the source line the developer
-    wrote when the construct passes through verbatim. A non-``Expr`` derivation (a
-    ``UnionConfluence``) carries no line and is skipped like ``None``."""
-    for node in nodes:
-        if not isinstance(node, Expr):
-            continue
-        span = sg.line_range(node)
-        if span is not None:
-            return span
-    return (0, 0)
