@@ -107,6 +107,14 @@ _CHILD_RIGHT_PROBE_ONLY = (
 )
 _FIRING_SQL = _CHILD_LEFT.format(join="inner join")
 
+# The verdict is "not established", never "violated": the analysis is trusting
+# the FK forward, not disproving it, which is also why it warns rather than
+# errors. The remediation names the child relation as the side to preserve rather
+# than prescribing a join keyword: the finding fires on LEFT, RIGHT, and SEMI
+# joins too, where "switch to a LEFT JOIN" is already the case or the wrong fix.
+_WORDING = ("'orders' the preserved side",)
+_NEVER_SAID = ("violat", "switch to a", "also", "other conditions")
+
 # id, sql, extra nodes, whether it fires
 _StructuralCase = tuple[str, str, tuple[Node, ...], bool]
 _STRUCTURAL_CASES: tuple[_StructuralCase, ...] = (
@@ -203,7 +211,11 @@ _STRUCTURAL_CASES: tuple[_StructuralCase, ...] = (
     [
         (
             CheckCase(
-                id_, sql, expected=(CheckFindingKind.REFERENTIAL_ORPHAN_DROP,) if fires else ()
+                id_,
+                sql,
+                expected=(CheckFindingKind.REFERENTIAL_ORPHAN_DROP,) if fires else (),
+                wording=_WORDING if fires else (),
+                absent=_NEVER_SAID if fires else (),
             ),
             extra,
         )
@@ -216,35 +228,22 @@ def test_structural_shape(case: CheckCase, extra: tuple[Node, ...]) -> None:
     run_check_case(case, _manifest_for(case.sql, *extra), _DUCKDB)
 
 
-# --- the message wording contract --------------------------------------------------
-
-
-def test_message_names_child_as_preserved_side_and_never_claims_a_violation() -> None:
-    _declare_orders_fk()
-    (finding,) = _orphan_findings(_run(_FIRING_SQL))
-    # The verdict is "not established", never "violated": the analysis is
-    # trusting the FK forward, not disproving it, which is also why it warns
-    # rather than errors.
-    assert severity_of(finding) is Severity.WARN
-    assert "violat" not in finding.message.lower()
-    # The remediation names the child relation as the side to preserve rather than
-    # prescribing a join keyword: the finding fires on LEFT, RIGHT, and SEMI joins
-    # too, where "switch to a LEFT JOIN" is already the case or is the wrong fix.
-    assert "switch to a" not in finding.message
-    assert "'orders' the preserved side" in finding.message
-    assert "also" not in finding.message
-    assert "other conditions" not in finding.message
-
-
 def test_narrowed_on_clause_adds_the_narrowing_sentence() -> None:
     _declare_orders_fk()
-    sql = (
+    case = CheckCase(
+        "composite-on",
         "select o.order_id, o.amount, r.region_name from orders o inner join regions r "
-        "on o.region_id = r.region_id and o.data_source = r.data_source"
+        "on o.region_id = r.region_id and o.data_source = r.data_source",
+        expected=(CheckFindingKind.REFERENTIAL_ORPHAN_DROP,),
+        wording=(*_WORDING, "also", "other conditions"),
     )
-    (finding,) = _orphan_findings(_run(sql))
-    assert "also" in finding.message
-    assert "other conditions" in finding.message
+    run_check_case(case, _manifest_for(case.sql), _DUCKDB)
+
+
+def test_orphan_drop_warns_rather_than_errors() -> None:
+    _declare_orders_fk()
+    (finding,) = _orphan_findings(_run(_FIRING_SQL))
+    assert severity_of(finding) is Severity.WARN
 
 
 # --- edge declaration and test coverage --------------------------------------------
