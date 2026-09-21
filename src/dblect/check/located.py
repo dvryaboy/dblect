@@ -18,12 +18,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 from sqlglot import Expr
-
-if TYPE_CHECKING:
-    from _typeshed import SupportsRichComparison
 
 from dblect.audit.sourcemap import LineMap, SourceSpan, build_line_map
 from dblect.check.findings import CheckFinding, CheckFindingKind
@@ -70,13 +67,16 @@ def locate_findings(
     rows: Iterable[LocatedRow],
     *,
     line_maps: dict[str, LineMap],
-    sort_key: Callable[[CheckFinding], SupportsRichComparison],
+    sort_key: Callable[[CheckFinding], tuple[str | int, ...]],
 ) -> list[CheckFinding]:
     """Assemble ``rows`` into located findings: each gets its model's file path,
     the compiled span read off its nodes, and that span back-mapped onto the
     model's source template, sharing ``line_maps`` across every row from the same
     model. The result is sorted by ``sort_key``, since two located readers rarely
-    want the same order (one groups by column, another by line)."""
+    want the same order (one groups by column, another by line); the key is a
+    tuple of the plain fields every existing order sorts by (model, column,
+    line), not an open comparable type, so a new reader's key is checked the same
+    way its tuple literal already is."""
     out: list[CheckFinding] = []
     for row in rows:
         line_start, line_end = span_of(*row.nodes)

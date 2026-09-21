@@ -97,7 +97,7 @@ def test_locate_findings_resolves_file_and_span() -> None:
     model = _node("model.shop.m", "SELECT amount FROM t", path="models/m.sql")
     manifest = _manifest(model)
     rows = [_row("model.shop.m", column="amount", line=1)]
-    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: f.column or "")
+    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: (f.column or "",))
     assert len(findings) == 1
     found = findings[0]
     assert found.model_unique_id == "model.shop.m"
@@ -110,7 +110,7 @@ def test_locate_findings_unlocatable_row_gets_the_zero_span() -> None:
     model = _node("model.shop.m", "SELECT amount FROM t", path="models/m.sql")
     manifest = _manifest(model)
     rows = [_row("model.shop.m", column="amount", line=None)]
-    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: f.column or "")
+    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: (f.column or "",))
     assert findings[0].line_start == 0
     assert findings[0].line_end == 0
 
@@ -122,7 +122,7 @@ def test_locate_findings_sorts_by_the_given_key() -> None:
         _row("model.shop.m", column="b", line=1),
         _row("model.shop.m", column="a", line=1),
     ]
-    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: f.column or "")
+    findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: (f.column or "",))
     assert [f.column for f in findings] == ["a", "b"]
 
 
@@ -136,10 +136,10 @@ def test_locate_findings_shares_one_line_map_per_model() -> None:
         _row("model.shop.m", column="b", line=1),
     ]
     cache: dict[str, LineMap] = {}
-    locate_findings(manifest, rows, line_maps=cache, sort_key=lambda f: f.column or "")
+    locate_findings(manifest, rows, line_maps=cache, sort_key=lambda f: (f.column or "",))
     assert len(cache) == 1
 
 
 def test_locate_findings_empty_reader_yields_no_findings() -> None:
     manifest = _manifest()
-    assert locate_findings(manifest, [], line_maps={}, sort_key=lambda f: f.column or "") == []
+    assert locate_findings(manifest, [], line_maps={}, sort_key=lambda f: (f.column or "",)) == []
