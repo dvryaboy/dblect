@@ -46,9 +46,9 @@ from dblect.lineage.builder import (
     build_manifest_graph,
     build_relation_graph,
 )
-from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, WorldRef, by_scope
+from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, ScopeKind, WorldRef, by_scope
 from dblect.lineage.facts.property import CoherenceClear
-from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
+from dblect.lineage.facts.registry import PropertyRegistry
 from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
@@ -75,7 +75,7 @@ from dblect.lineage.properties.uniqueness import (
     uniqueness_facts,
     uniqueness_property_from_facts,
 )
-from dblect.lineage.property import propagate, resolved_column_ref
+from dblect.lineage.property import resolved_column_ref, run
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
@@ -203,39 +203,36 @@ def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
 def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     """Propagate uniqueness over the relation graph, then FD reading its key edge,
     then domain type over the column graph reading FD, grounding from one world's
-    ``facts``. Pure in ``graphs``: a fresh ``AnnotationStore`` per call and no
-    mutation of the shared build, so worlds re-run independently."""
+    ``facts``. Registers all three once and lets ``run`` walk them in dependency
+    order over their own graphs; pure in ``graphs`` (a fresh ``AnnotationStore``
+    per call, via ``run``, and no mutation of the shared build), so worlds re-run
+    independently."""
     uniqueness_prop = uniqueness_property_from_facts(graphs.uniqueness_facts)
-    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
-    uniqueness_flow = propagate(
-        graphs.relation_build.graph, uniqueness_prop, inferred_sink=uniqueness_inferred
-    )
-    store = AnnotationStore()
-    for scope, ann in uniqueness_flow.items():
-        store.record(uniqueness_prop.name, scope, ann)
-
     fd_prop = functional_dependency_property(
         functional_dependency_grounding(by_scope(facts.fd_facts)),
         uniqueness=uniqueness_prop.ref,
     )
-    fd_ctx = PropertyRegistry((uniqueness_prop, fd_prop)).dep_context(store)
-    fd_anns = dict(propagate(graphs.relation_build.graph, fd_prop, dep_context=fd_ctx))
-    for scope, ann in fd_anns.items():
-        store.record(fd_prop.name, scope, ann)
-
     dt_prop = domain_type_property(
         domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
     )
-    dt_ctx = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop)).dep_context(store)
+    registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop))
+    uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
     clears: list[CoherenceClear[DomainTag]] = []
-    domain_type = propagate(graphs.column_build.graph, dt_prop, dep_context=dt_ctx, sink=clears)
-
+    store = run(
+        {
+            ScopeKind.RELATION: graphs.relation_build.graph,
+            ScopeKind.COLUMN: graphs.column_build.graph,
+        },
+        registry,
+        sinks={dt_prop.name: clears},
+        inferred_sinks={uniqueness_prop.name: uniqueness_inferred},
+    )
     return WorldAnnotations(
         world=facts.world,
-        domain_type=domain_type,
+        domain_type=store.scoped(dt_prop.ref),
         coherence_clears=tuple(clears),
-        functional_dependency=fd_anns,
+        functional_dependency=store.scoped(fd_prop.ref),
         uniqueness_inferred=uniqueness_inferred,
     )
 

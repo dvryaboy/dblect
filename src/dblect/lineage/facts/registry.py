@@ -10,14 +10,17 @@ acyclic so the walk needs no fixpoint.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from dblect.lineage.facts.model import Annotation
 from dblect.lineage.facts.property import DepContext, Property, PropertyRef
 from dblect.lineage.graph import ColumnRef, SourceRef
 
 _Scope = ColumnRef | SourceRef
+K2 = TypeVar("K2")
+S2 = TypeVar("S2", ColumnRef, SourceRef)
 
 
 def _empty_index() -> dict[str, dict[_Scope, Annotation[Any]]]:
@@ -39,6 +42,14 @@ class AnnotationStore:
 
     def get(self, name: str, scope: _Scope) -> Annotation[Any] | None:
         return self._by_property.get(name, {}).get(scope)
+
+    def scoped(self, ref: PropertyRef[K2, S2]) -> Mapping[S2, Annotation[K2]]:
+        """Every annotation recorded for ``ref``'s property, typed to the value and
+        scope types its minted ref promises, for a caller that wants the whole map
+        rather than one scope at a time (a check reader iterating every column's
+        annotation). The store holds these erased internally; this is the one place
+        a caller recovers the precise types ``ref`` carries."""
+        return cast("Mapping[S2, Annotation[K2]]", self._by_property.get(ref.name, {}))
 
 
 @dataclass(frozen=True, slots=True)

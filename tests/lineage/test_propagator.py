@@ -21,7 +21,7 @@ import sqlglot.expressions as exp
 
 from dblect.lineage.builder import build_model_graph
 from dblect.lineage.facts.lattice import Lattice
-from dblect.lineage.facts.model import Annotation, Opacity
+from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     DepContext,
     OperatorTransfer,
@@ -385,9 +385,105 @@ def test_run_fills_store_for_every_property() -> None:
         aggregates={},
         ground=_concrete_for({leaf: frozenset({1})}),
     )
-    store = run(graph, PropertyRegistry((p1, p2)))
+    store = run({ScopeKind.COLUMN: graph}, PropertyRegistry((p1, p2)))
     assert store.get("p1", out) == Annotation(frozenset({0}), Opacity.CONCRETE)
     assert store.get("p2", out) == Annotation(frozenset({1}), Opacity.CONCRETE)
+    assert store.scoped(p1.ref)[out] == Annotation(frozenset({0}), Opacity.CONCRETE)
+
+
+def test_run_walks_column_and_relation_scoped_properties_each_against_their_own_graph() -> None:
+    """A registry is not one scope kind: uniqueness (relation) and domain-type
+    (column) sit in the same registry in production, each needing its own graph.
+    ``run`` dispatches by ``prop.scope_kind`` rather than assuming one graph fits
+    every registered property."""
+    column_graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    col_prop = column_property(
+        name="col_prop",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=_concrete_for({leaf: frozenset({0})}),
+    )
+
+    rel_model = SourceRef(SourceKind.MODEL, "model.test.rel")
+    relation_graph = RelationLineageGraph(derivations={rel_model: exp.select("id").from_("orders")})
+
+    def rel_reduce(
+        _deriv: object,
+        _prop: Property[frozenset[int], SourceRef],
+        _recurse: Callable[[SourceRef], Annotation[frozenset[int]]],
+        _ctx: DepContext,
+        default: Annotation[frozenset[int]],
+        _sink: object = None,
+    ) -> Annotation[frozenset[int]]:
+        return default
+
+    def rel_ground(_ref: SourceRef) -> Annotation[frozenset[int]]:
+        return Annotation(frozenset({7}), Opacity.CONCRETE)
+
+    rel_prop = relation_property(
+        name="rel_prop",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=rel_ground,
+        reducer=rel_reduce,
+    )
+    store = run(
+        {ScopeKind.COLUMN: column_graph, ScopeKind.RELATION: relation_graph},
+        PropertyRegistry((col_prop, rel_prop)),
+    )
+    assert store.get("col_prop", out) == Annotation(frozenset({0}), Opacity.CONCRETE)
+    assert store.get("rel_prop", rel_model) == Annotation(frozenset({7}), Opacity.CONCRETE)
+
+
+def test_run_raises_when_a_scope_kind_has_no_graph() -> None:
+    """A relation-scoped property with no relation graph supplied is a
+    construction error, not a silently empty result."""
+
+    def ground(_ref: SourceRef) -> Annotation[frozenset[int]]:
+        return Annotation(_UNIVERSE, Opacity.IMPLICIT)
+
+    prop = relation_property(
+        name="rel_only", lattice=_subset_lattice(), operators={}, aggregates={}, ground=ground
+    )
+    with pytest.raises(ValueError, match="relation"):
+        run({}, PropertyRegistry((prop,)))
+
+
+def test_run_threads_sinks_and_inferred_sinks_by_property_name() -> None:
+    """The per-call side channels ``propagate`` itself takes are still reachable
+    through ``run``, keyed by property name so a multi-property registry can wire
+    one property's diagnostics without touching the others'."""
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT u.id FROM users u",
+        name_to_source={"users": _src("users")},
+        schema={"users": {"id": "INT"}},
+    )
+    leaf = ColumnRef(_src("users"), "id")
+    out = ColumnRef(_model(), "id")
+    prop = column_property(
+        name="p",
+        lattice=_subset_lattice(),
+        operators={},
+        aggregates={},
+        ground=_concrete_for({leaf: frozenset({0})}),
+    )
+    inferred: dict[ColumnRef, Annotation[frozenset[int]]] = {}
+    run(
+        {ScopeKind.COLUMN: graph},
+        PropertyRegistry((prop,)),
+        inferred_sinks={"p": inferred},
+    )
+    assert out in inferred
 
 
 def test_lookup_subclass_walks_the_mro() -> None:
