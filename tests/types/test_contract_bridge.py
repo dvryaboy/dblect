@@ -312,6 +312,8 @@ def test_foreign_key_resolves_to_an_edge() -> None:
     assert edge == ForeignKeyEdge(
         child=ColumnRef(_CHARGES_SRC, "customer_id"),
         parent=ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.dim_customers"), "customer_id"),
+        provenance=Declared(DeclaredSource.USER_ASSERTED),
+        detail=f"{StgCharges.__qualname__}.customer_id",
     )
 
 
