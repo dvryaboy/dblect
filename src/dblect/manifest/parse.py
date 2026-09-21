@@ -156,14 +156,30 @@ class ConstraintSpec:
     expression: str | None = None
 
 
+class TestSeverity(StrEnum):
+    """A dbt test's configured failure severity.
+
+    ``ERROR`` fails the run; ``WARN`` surfaces the failure without failing it.
+    dbt's own default is ``error``, so a test with no explicit ``severity``
+    config reads as ``ERROR`` here too.
+    """
+
+    # Not a pytest test class; pytest's default collection otherwise tries (and
+    # fails) to collect any importable name starting with "Test".
+    __test__ = False
+
+    ERROR = "error"
+    WARN = "warn"
+
+
 @dataclass(frozen=True, slots=True)
 class DbtTestMetadata:
     """What dblect knows about a dbt test node.
 
     Mostly mirrors dbt's ``test_metadata`` block on the node (``name``,
     ``kwargs``, ``namespace``), enriched with the test-relevant slice of
-    node-level config (``enabled``, ``where``) so consumers can reason
-    about test semantics from one place.
+    node-level config (``enabled``, ``where``, ``severity``) so consumers can
+    reason about test semantics from one place.
 
     * ``name``: generic-test name (``"unique"``, ``"not_null"``,
       ``"dbt_utils.unique_combination_of_columns"``, etc.).
@@ -179,6 +195,8 @@ class DbtTestMetadata:
       under; a non-``None`` value means the test only asserts its
       property over rows matching ``where``, so any fact derived from it
       is conditional.
+    * ``severity``: from ``node.config.severity``, read case-insensitively.
+      Defaults to ``ERROR``, dbt's own default, when unset or unrecognized.
     """
 
     name: str
@@ -186,6 +204,7 @@ class DbtTestMetadata:
     namespace: str | None = None
     enabled: bool = True
     where: str | None = None
+    severity: TestSeverity = TestSeverity.ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,10 +789,25 @@ def _test_metadata_from_parsed(node: Any) -> DbtTestMetadata | None:
     enabled = bool(raw_enabled) if raw_enabled is not None else True
     raw_where = getattr(config, "where", None)
     where = raw_where if isinstance(raw_where, str) and raw_where else None
+    severity = _test_severity_of(getattr(config, "severity", None))
     return DbtTestMetadata(
         name=name,
         kwargs=kwargs,
         namespace=namespace,
         enabled=enabled,
         where=where,
+        severity=severity,
     )
+
+
+def _test_severity_of(raw: object) -> TestSeverity:
+    """``raw`` (``node.config.severity``) read case-insensitively into a
+    :class:`TestSeverity`, defaulting to ``ERROR`` when absent or unrecognized
+    (a templated value dbt left unrendered, or a manifest schema predating the
+    field)."""
+    if isinstance(raw, str):
+        try:
+            return TestSeverity(raw.strip().lower())
+        except ValueError:
+            pass
+    return TestSeverity.ERROR
