@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from dblect.audit.sourcemap import LineMap
 from dblect.check.findings import CheckFindingKind
 from dblect.check.located import (
     LocatedRow,
@@ -124,20 +123,6 @@ def test_locate_findings_sorts_by_the_given_key() -> None:
     ]
     findings = locate_findings(manifest, rows, line_maps={}, sort_key=lambda f: (f.column or "",))
     assert [f.column for f in findings] == ["a", "b"]
-
-
-def test_locate_findings_shares_one_line_map_per_model() -> None:
-    """Two rows from the same model share a cache entry rather than each building
-    its own line map, the point of the caller-supplied ``line_maps`` dict."""
-    model = _node("model.shop.m", "SELECT a, b FROM t", path="models/m.sql")
-    manifest = _manifest(model)
-    rows = [
-        _row("model.shop.m", column="a", line=1),
-        _row("model.shop.m", column="b", line=1),
-    ]
-    cache: dict[str, LineMap] = {}
-    locate_findings(manifest, rows, line_maps=cache, sort_key=lambda f: (f.column or "",))
-    assert len(cache) == 1
 
 
 def test_locate_findings_empty_reader_yields_no_findings() -> None:

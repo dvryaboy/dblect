@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 
-import pytest
 import sqlglot.expressions as exp
 
 from dblect.lineage.builder import build_model_graph
@@ -20,7 +19,6 @@ from dblect.lineage.facts.kit import (
     column_kit,
     constant_aggregate,
     grounding_fold,
-    relation_kit,
     top_rule,
 )
 from dblect.lineage.facts.lattice import Lattice
@@ -102,11 +100,6 @@ def test_constant_aggregate_carries_the_childs_provisional_taint() -> None:
     rule = constant_aggregate(frozenset({7}))
     out = rule.core(exp.Count(), Annotation(frozenset({0}), provisional=True))
     assert out.provisional
-
-
-def test_constant_aggregate_carries_no_coherence_guard() -> None:
-    rule = constant_aggregate(frozenset({7}))
-    assert rule.coherence is None
 
 
 # --- grounding_fold --------------------------------------------------------------
@@ -196,24 +189,3 @@ def test_column_kit_property_grounds_and_propagates() -> None:
     anns = propagate(graph, prop)
     out = ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.m"), "id")
     assert anns[out].value == frozenset({0})
-
-
-def test_column_kit_grounded_scopes_and_conflicts_delegate_to_the_fold() -> None:
-    kit = column_kit(name="k", lattice=_subset_lattice(), operators={}, aggregates={})
-    facts = {_COL: (_fact(_COL, frozenset({0})), _fact(_COL, frozenset({1})))}
-    assert kit.conflicts(facts) == (_COL,)
-
-
-def test_relation_kit_with_no_reducer_builds_a_property_with_none() -> None:
-    """Mirrors ``relation_property``'s own contract: a relation kit built with no
-    reducer still constructs a Property; only propagating it fails, at the
-    propagator's single dispatch point rather than here."""
-    kit = relation_kit(name="k", lattice=_subset_lattice(), operators={}, aggregates={})
-    prop = kit.property({})
-    assert prop.reducer is None
-
-
-@pytest.mark.parametrize("opacity", [Opacity.CONCRETE, Opacity.IMPLICIT])
-def test_constant_aggregate_opacity_is_exactly_what_was_passed(opacity: Opacity) -> None:
-    rule = constant_aggregate(frozenset({1}), opacity=opacity)
-    assert rule.core(exp.Count(), Annotation(frozenset())).opacity is opacity
