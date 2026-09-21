@@ -312,6 +312,14 @@ def _bounded_from_enum(enum: type[StrEnum]) -> Bounded:
     return Bounded(frozenset(Lit(LitKind.STR, member.value) for member in enum))
 
 
+def _scope(src: SourceRef, column: str) -> ColumnRef:
+    """The case-folded ``ColumnRef`` a declaration's column spelling grounds:
+    the lineage keys every column lowercase (``ColumnRef``'s own rule), so a
+    contract that spells the column as the warehouse does still meets its
+    propagated scope. Adopting this at the bridge's older sites is #291."""
+    return ColumnRef(src, column.lower())
+
+
 def _value_domain_facts_for_domain(
     decl_name: str,
     spec: DomainSpec,
@@ -335,7 +343,7 @@ def _value_domain_facts_for_domain(
             continue
         out.append(
             Fact(
-                scope=ColumnRef(src, column),
+                scope=_scope(src, column),
                 value=_bounded_from_enum(fdef.enum),
                 provenance=Declared(DeclaredSource.USER_ASSERTED),
                 detail=f"{contract}.{decl_name}",
@@ -461,7 +469,7 @@ def _resolve_one(
                 if fdef.enum is not None:
                     out.value_domain_facts.append(
                         Fact(
-                            scope=ColumnRef(src, fname),
+                            scope=_scope(src, fname),
                             value=_bounded_from_enum(fdef.enum),
                             provenance=Declared(DeclaredSource.USER_ASSERTED),
                             detail=f"{cspec.name}.{fname}",
