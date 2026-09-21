@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -168,13 +168,13 @@ def implies(strong: Expr, weak: Expr) -> bool:
     matches a conjunct syntactically, or if the conjuncts' interval on ``weak``'s
     term entails it.
     """
-    weak = _unparen(weak)
+    weak = unparen(weak)
     if isinstance(weak, exp.And):
         return implies(strong, weak.left) and implies(strong, weak.right)
     if isinstance(weak, exp.Or):
         return implies(strong, weak.left) or implies(strong, weak.right)
 
-    strong = _unparen(strong)
+    strong = unparen(strong)
     if isinstance(strong, exp.Or):
         return implies(strong.left, weak) and implies(strong.right, weak)
 
@@ -266,14 +266,18 @@ def _rename_term_column(t: Term, new_column: str) -> Term:
 # --- decomposition ---------------------------------------------------------------
 
 
-def _unparen(e: Expr) -> Expr:
+def unparen(e: Expr) -> Expr:
+    """Unwrap nested ``Paren`` wrappers down to the expression they enclose.
+    Public: :mod:`dblect.check.dead_predicate` reuses this to descend from an
+    ``exp.Not`` to whatever it negates (possibly parenthesized), rather than
+    hand-rolling its own paren-skipping walk."""
     while isinstance(e, exp.Paren) and isinstance(e.this, Expr):
         e = e.this
     return e
 
 
 def _conjuncts(e: Expr) -> list[Expr]:
-    e = _unparen(e)
+    e = unparen(e)
     if isinstance(e, exp.And):
         return _conjuncts(e.left) + _conjuncts(e.right)
     return [e]
@@ -293,57 +297,211 @@ def _canon(e: Expr) -> Canon:
     not_null_atom = _as_not_null(e)
     if not_null_atom is not None:
         return not_null_atom
-    return OpaqueAtom(_unparen(e).sql(dialect="duckdb").lower())
+    return OpaqueAtom(unparen(e).sql(dialect="duckdb").lower())
 
 
 # --- atom recognition ------------------------------------------------------------
 
 
-def _as_atom(e: Expr) -> CmpAtom | None:
-    e = _unparen(e)
-    op = _OP_BY_TYPE.get(type(e))
-    if op is None:
-        return None
+def _comparison_operands(e: Expr) -> tuple[Expr, Expr] | None:
+    """The two unwrapped operand expressions of a binary node, or ``None`` if
+    either is missing (defensive: every binary comparison node carries both)."""
     lhs, rhs = e.args.get("this"), e.args.get("expression")
     if not isinstance(lhs, Expr) or not isinstance(rhs, Expr):
         return None
-    left, right = _unparen(lhs), _unparen(rhs)
-    lterm, llit = _term(left), _lit(left)
-    rterm, rlit = _term(right), _lit(right)
-    if lterm is not None and rlit is not None and llit is None:
-        return CmpAtom(lterm, op, rlit)
-    if rterm is not None and llit is not None and rlit is None:
-        return CmpAtom(rterm, _FLIP[op], llit)
+    return unparen(lhs), unparen(rhs)
+
+
+def _subject_and_literal(e: Expr) -> tuple[Expr, Lit, bool] | None:
+    """Split a binary comparison into its non-literal side, the literal from
+    the other side, and whether the literal sat on the left (so a caller
+    keeping the subject on the left must flip an ordering operator, as
+    ``5 <= a`` becomes ``a``/``>=``/``5``). ``None`` when neither or both sides
+    are a literal, or a literal side is a bare ``NULL``: every comparison
+    operator returns UNKNOWN against NULL, so there is no interval bound or
+    membership fact to read off it. Shared by :func:`_as_atom` (whose subject
+    can also be a monotonic truncation term) and
+    :func:`column_literal_comparison` (whose subject must be a bare column)."""
+    operands = _comparison_operands(e)
+    if operands is None:
+        return None
+    left, right = operands
+    if isinstance(left, exp.Null) or isinstance(right, exp.Null):
+        return None
+    llit, rlit = lit_of(left), lit_of(right)
+    if rlit is not None and llit is None:
+        return left, rlit, False
+    if llit is not None and rlit is None:
+        return right, llit, True
     return None
 
 
-def _as_in(e: Expr) -> InAtom | None:
-    e = _unparen(e)
+def _as_atom(e: Expr) -> CmpAtom | None:
+    e = unparen(e)
+    op = _OP_BY_TYPE.get(type(e))
+    if op is None:
+        return None
+    split = _subject_and_literal(e)
+    if split is None:
+        return None
+    subject, lit, flipped = split
+    term = _term(subject)
+    if term is None:
+        return None
+    return CmpAtom(term, _FLIP[op] if flipped else op, lit)
+
+
+@dataclass(frozen=True, slots=True)
+class ColumnLiteralComparison:
+    """``column <comparison> literal``, normalised so the column reads on the
+    left (an ordering operator flips when the literal was written first, the
+    same normalisation :class:`CmpAtom` applies). ``comparison`` is the
+    sqlglot node class actually used, so a caller can recover ``EQ`` vs
+    ``NEQ`` vs the null-safe forms, which this module's own five-operator
+    :class:`Op` does not distinguish (it has no ``NEQ``: exclusion is not an
+    order comparison)."""
+
+    column: exp.Column
+    comparison: type[exp.Binary]
+    literal: Lit
+
+
+# The eight comparison operators recognised over a scalar: equality, its
+# null-safe form, inequality and its null-safe form, and the four order
+# comparisons. Doubling as the type-narrowing step for ``type(e)`` (a bare
+# ``type`` from sqlglot's own node), each key maps to itself so a lookup also
+# recovers a properly typed ``type[exp.Binary]`` to hand back unflipped.
+_COMPARISON_TYPES: dict[type, type[exp.Binary]] = {
+    t: t
+    for t in (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ, exp.LT, exp.LTE, exp.GT, exp.GTE)
+}
+# Flipped the way an ordering operator reads when the literal was written
+# first; equality and inequality (null-safe or not) are symmetric, so they
+# flip to themselves.
+_COMPARISON_FLIP: dict[type[exp.Binary], type[exp.Binary]] = {
+    exp.EQ: exp.EQ,
+    exp.NEQ: exp.NEQ,
+    exp.NullSafeEQ: exp.NullSafeEQ,
+    exp.NullSafeNEQ: exp.NullSafeNEQ,
+    exp.LT: exp.GT,
+    exp.GT: exp.LT,
+    exp.LTE: exp.GTE,
+    exp.GTE: exp.LTE,
+}
+
+
+def column_literal_comparison(e: Expr) -> ColumnLiteralComparison | None:
+    """``column <comparison> literal`` for the eight comparison operators SQL
+    defines over a scalar, normalised so the column reads on the left.
+    ``None`` for a column-to-column comparison, a ``NULL`` operand, or any
+    node outside the eight (arithmetic, ``LIKE``, ``IS``, an ordering
+    comparison against a non-literal, ...).
+
+    Unlike :func:`_as_atom`'s ``Term`` (which also recognises a monotonic
+    truncation of a column), the subject here must be a bare ``exp.Column``:
+    a caller such as the dead-predicate check needs the actual node to resolve
+    a :class:`~dblect.lineage.graph.ColumnRef` through
+    :func:`~dblect.lineage.property.resolved_column_ref` and to locate a
+    finding's line, neither of which a synthetic ``Term`` carries.
+    """
+    e = unparen(e)
+    kind = _COMPARISON_TYPES.get(type(e))
+    if kind is None:
+        return None
+    split = _subject_and_literal(e)
+    if split is None:
+        return None
+    subject, lit, flipped = split
+    if not isinstance(subject, exp.Column):
+        return None
+    return ColumnLiteralComparison(subject, _COMPARISON_FLIP[kind] if flipped else kind, lit)
+
+
+def _in_operands(e: Expr) -> tuple[Expr, list[object]] | None:
+    """The subject and raw list operands of ``e`` if it is ``term IN
+    (...)``, or ``None`` for ``IN (subquery)`` (whose operand lives in
+    ``query``, not ``expressions``) or a non-``IN`` node. Shared by
+    :func:`_as_in` and :func:`column_in_list`, which differ only in what
+    subject shape they accept and how they treat a ``NULL`` member."""
+    e = unparen(e)
     if not isinstance(e, exp.In) or not isinstance(e.this, Expr):
         return None
-    term = _term(e.this)
     exprs = e.args.get("expressions")
-    if term is None or not exprs:
-        return None  # IN (subquery) carries ``query`` not ``expressions``; skip
+    if not exprs:
+        return None
+    return e.this, cast("list[object]", exprs)
+
+
+def _as_in(e: Expr) -> InAtom | None:
+    operands = _in_operands(e)
+    if operands is None:
+        return None
+    subject, exprs = operands
+    term = _term(subject)
+    if term is None:
+        return None
     vals: set[Lit] = set()
     for x in exprs:
         if not isinstance(x, Expr):
             return None
-        v = _lit(x)
+        v = lit_of(x)
         if v is None:
             return None
         vals.add(v)
     return InAtom(term, frozenset(vals))
 
 
+@dataclass(frozen=True, slots=True)
+class ColumnInList:
+    """``column IN (literals...)``, or a ``NOT IN`` list a caller inspects the
+    same way (this module makes no claim about negation; that reading is the
+    caller's boolean structure, not this atom's). ``has_null`` flags a bare
+    ``NULL`` member: SQL's ``NOT IN`` never matches when the list carries a
+    NULL, a different hazard from a stray literal, so a caller needs to tell
+    the two apart rather than have the member silently dropped."""
+
+    column: exp.Column
+    literals: frozenset[Lit]
+    has_null: bool
+
+
+def column_in_list(e: Expr) -> ColumnInList | None:
+    """``column IN (literals...)`` with a bare column subject (the
+    equality-family sibling of :func:`column_literal_comparison`). ``None``
+    for ``IN (subquery)``, a non-column subject, or a member that is neither a
+    literal nor a bare ``NULL``: dropping just that member would silently
+    understate the list, so the whole match fails instead."""
+    operands = _in_operands(e)
+    if operands is None:
+        return None
+    subject, exprs = operands
+    subject = unparen(subject)
+    if not isinstance(subject, exp.Column):
+        return None
+    literals: set[Lit] = set()
+    has_null = False
+    for x in exprs:
+        if not isinstance(x, Expr):
+            return None
+        member = unparen(x)
+        if isinstance(member, exp.Null):
+            has_null = True
+            continue
+        lit = lit_of(member)
+        if lit is None:
+            return None
+        literals.add(lit)
+    return ColumnInList(subject, frozenset(literals), has_null)
+
+
 def _as_not_null(e: Expr) -> NotNullAtom | None:
-    e = _unparen(e)
+    e = unparen(e)
     if not isinstance(e, exp.Not):
         return None
     inner = e.this
     if not isinstance(inner, Expr):
         return None
-    inner = _unparen(inner)
+    inner = unparen(inner)
     if not isinstance(inner, exp.Is):
         return None
     rhs = inner.args.get("expression")
@@ -360,7 +518,7 @@ def _as_not_null(e: Expr) -> NotNullAtom | None:
 
 def _term(e: Expr) -> Term | None:
     """The orderable term of an atom: a column, or ``date_trunc(unit, column)``."""
-    e = _unparen(e)
+    e = unparen(e)
     if isinstance(e, exp.Column):
         return Column(e.name.lower())
     # duckdb compiles ``date_trunc(unit, col)`` to TimestampTrunc; other dialects
@@ -382,10 +540,15 @@ def _unit_text(unit: object) -> str | None:
     return None
 
 
-def _lit(e: Expr) -> Lit | None:
-    e = _unparen(e)
+def lit_of(e: Expr) -> Lit | None:
+    """The :class:`Lit` a literal expression denotes, or ``None`` when ``e`` is
+    not a literal (or is numeric text this engine cannot parse). Public: the
+    value-domain property reuses this to turn a SQL literal into the same
+    typed value this module's atoms carry, so ``1`` and ``'1'`` stay distinct
+    there too."""
+    e = unparen(e)
     if isinstance(e, exp.Neg) and isinstance(e.this, Expr):
-        inner = _lit(e.this)
+        inner = lit_of(e.this)
         if inner is not None and inner.kind is LitKind.NUM and isinstance(inner.value, Decimal):
             return Lit(LitKind.NUM, -inner.value)
         return None
