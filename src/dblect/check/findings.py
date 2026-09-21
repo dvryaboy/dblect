@@ -52,6 +52,31 @@ class CheckFindingKind(StrEnum):
     the analysis covers only a fraction of columns and a clean report would
     overstate what was checked. A capability gap, not a project defect."""
 
+    DEAD_PREDICATE = auto()
+    """A literal compared for equality against a column with a declared closed
+    set of values (an enum on a contract, an ``accepted_values`` test) is not one
+    of those values, so the comparison can never be true. The verdict follows
+    from the declaration alone and holds whatever the tables contain."""
+
+    DEAD_PREDICATE_CASE_ONLY = auto()
+    """A string literal differs from a declared value only by letter case. On a
+    case-sensitive warehouse (Snowflake and DuckDB by default) the comparison is
+    as dead as a ``DEAD_PREDICATE``; under a case-insensitive collation it is
+    live. Its own kind because the wording and the grade both differ."""
+
+    REDUNDANT_PREDICATE = auto()
+    """A ``!=`` or ``NOT IN`` against a value outside the column's declared set
+    excludes nothing a real value could have matched, so the filter removes only
+    NULL rows. The query is not wrong, only unfiltered: a real bug, but not a
+    wrong-rows one."""
+
+    CASE_LEAVES_ENUM_MEMBER_UNHANDLED = auto()
+    """A ``CASE`` with several arms over a column with a declared closed set
+    tests some of the values and not others, so an untested value falls silently
+    to the default, whether that default is absent, ``ELSE NULL``, or a literal.
+    A remap may lump a value into its default on purpose, so this says
+    "unhandled", never "wrong"."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:
