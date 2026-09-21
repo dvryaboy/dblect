@@ -206,17 +206,18 @@ def grounded_scopes(
 
 
 def conflicting_scopes(facts: Mapping[S, tuple[Fact[K, S], ...]], lat: Lattice[K]) -> tuple[S, ...]:
-    """The scopes whose unconditional facts share no value: two or more
-    declarations that cannot all be true of the same scope at once.
+    """The scopes whose unconditional facts fold to the lattice bottom: exactly
+    the scopes :func:`grounding` would raise :class:`FactConflictError` on,
+    whether two declarations disagree or one declaration is itself unsatisfiable.
 
-    A caller that wants to report these as findings (rather than let
-    :func:`grounding` raise :class:`FactConflictError` at fold time) scans for
-    them first and leaves the conflicting scopes out of the facts it then grounds,
-    so one contradiction cannot raise and hide every other scope's coverage."""
+    A caller that wants to report these as findings (rather than let the fold
+    raise) scans for them first and leaves the conflicting scopes out of the
+    facts it then grounds, so one contradiction cannot raise and hide every
+    other scope's coverage."""
     out: list[S] = []
     for scope, bucket in facts.items():
         unconditional = tuple(f for f in bucket if f.condition is None)
-        if len(unconditional) < 2:
+        if not unconditional:
             continue
         _, is_contradiction = resolve(lat, unconditional)
         if is_contradiction:

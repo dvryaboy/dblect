@@ -297,6 +297,16 @@ def test_conflicting_scopes_ignores_agreeing_declarations() -> None:
     assert conflicting_scopes(facts, _FLAT) == ()
 
 
+def test_conflicting_scopes_names_exactly_the_scopes_grounding_raises_on() -> None:
+    """A single declaration that is itself the lattice bottom (an empty accepted
+    value set) is a conflict too: the scan exists so a caller can leave out every
+    scope ``grounding`` would raise on, so the two must agree even here."""
+    facts = {_COL_A: (_fact(_COL_A, _BOTTOM),)}
+    with pytest.raises(FactConflictError):
+        grounding(facts, opaque=set(), lat=_FLAT)
+    assert conflicting_scopes(facts, _FLAT) == (_COL_A,)
+
+
 def test_conflicting_scopes_ignores_a_conditional_declaration() -> None:
     """A conditional fact never joins the unconditional fold, so it cannot itself
     manufacture a conflict with an unconditional one."""

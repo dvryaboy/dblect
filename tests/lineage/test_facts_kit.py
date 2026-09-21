@@ -4,7 +4,10 @@
 Uses the subset lattice (meet = intersection, join = union, top = the universe,
 bottom = the empty set) throughout, the same bona-fide bounded lattice
 ``test_facts_lattice.py`` and ``test_propagator.py`` use, so these pin the kit's
-own contract rather than any one property's semantics.
+own contract rather than any one property's semantics. The grounding fold's own
+rules (a declared fact grounds CONCRETE, an absent scope is IMPLICIT top, a
+contradiction is reported) are ``test_facts_grounding.py``'s to pin; here only
+what the kit adds on top is tested.
 """
 
 from __future__ import annotations
@@ -59,81 +62,25 @@ def _fact(scope: ColumnRef, value: _Set) -> Fact[_Set, ColumnRef]:
     return Fact(scope=scope, value=value, provenance=Declared(DeclaredSource.DBT_GENERIC_TEST))
 
 
-# --- top_rule ------------------------------------------------------------------
-
-
-def test_top_rule_returns_the_lattice_top_implicit() -> None:
+def test_top_rule_is_implicit_top_and_carries_provisional_through() -> None:
     rule = top_rule(_subset_lattice())
-    out = rule(exp.EQ(), (Annotation(frozenset({0})),), _NO_DEPS)
-    assert out == Annotation(_UNIVERSE, Opacity.IMPLICIT, provisional=False)
+    clean = (Annotation(frozenset({0})), Annotation(frozenset({1})))
+    assert rule(exp.EQ(), clean, _NO_DEPS) == Annotation(_UNIVERSE, Opacity.IMPLICIT)
+    tainted = (Annotation(frozenset({0}), provisional=True), Annotation(frozenset({1})))
+    assert rule(exp.EQ(), tainted, _NO_DEPS).provisional
 
 
-def test_top_rule_carries_provisional_through() -> None:
-    rule = top_rule(_subset_lattice())
-    kids = (Annotation(frozenset({0}), provisional=True), Annotation(frozenset({1})))
-    out = rule(exp.EQ(), kids, _NO_DEPS)
-    assert out.provisional
-
-
-def test_top_rule_with_no_children_is_not_provisional() -> None:
-    rule = top_rule(_subset_lattice())
-    out = rule(exp.EQ(), (), _NO_DEPS)
-    assert out == Annotation(_UNIVERSE, Opacity.IMPLICIT, provisional=False)
-
-
-# --- constant_aggregate ----------------------------------------------------------
-
-
-def test_constant_aggregate_ignores_the_child_value() -> None:
+def test_constant_aggregate_discards_the_child_value_but_keeps_its_taint() -> None:
     rule = constant_aggregate(frozenset({7}))
     out = rule.core(exp.Count(), Annotation(frozenset({0, 1})))
-    assert out.value == frozenset({7})
+    assert out == Annotation(frozenset({7}), Opacity.CONCRETE)
+    assert rule.core(exp.Count(), Annotation(frozenset({0}), provisional=True)).provisional
 
 
-def test_constant_aggregate_default_opacity_is_concrete() -> None:
-    rule = constant_aggregate(frozenset({7}))
-    out = rule.core(exp.Count(), Annotation(frozenset({0})))
-    assert out.opacity is Opacity.CONCRETE
-
-
-def test_constant_aggregate_carries_the_childs_provisional_taint() -> None:
-    rule = constant_aggregate(frozenset({7}))
-    out = rule.core(exp.Count(), Annotation(frozenset({0}), provisional=True))
-    assert out.provisional
-
-
-# --- grounding_fold --------------------------------------------------------------
-
-
-def test_grounding_fold_grounds_a_declared_fact() -> None:
-    fold: GroundingFold[_Set, ColumnRef] = grounding_fold(_subset_lattice())
-    facts = {_COL: (_fact(_COL, frozenset({0})),)}
-    ground = fold.ground(facts)
-    assert ground(_COL) == Annotation(frozenset({0}), Opacity.CONCRETE)
-
-
-def test_grounding_fold_undeclared_scope_is_implicit_top() -> None:
-    fold: GroundingFold[_Set, ColumnRef] = grounding_fold(_subset_lattice())
-    ground = fold.ground({})
-    assert ground(_COL) == Annotation(_UNIVERSE, Opacity.IMPLICIT)
-
-
-def test_grounding_fold_scopes_reports_what_actually_grounded() -> None:
-    fold: GroundingFold[_Set, ColumnRef] = grounding_fold(_subset_lattice())
-    facts = {_COL: (_fact(_COL, frozenset({0})),)}
-    assert fold.scopes(facts) == {_COL}
-
-
-def test_grounding_fold_conflicts_reports_a_contradiction() -> None:
-    fold: GroundingFold[_Set, ColumnRef] = grounding_fold(_subset_lattice())
-    facts = {_COL: (_fact(_COL, frozenset({0})), _fact(_COL, frozenset({1})))}
-    assert fold.conflicts(facts) == (_COL,)
-
-
-def test_grounding_fold_preprocess_runs_before_the_fold() -> None:
+def test_grounding_fold_preprocess_runs_before_every_reader() -> None:
     """The one hook a property passes explicitly (functional-dependency's
     declared-instance lift on main) runs on the facts before grounding, scoping,
-    and conflict-scanning alike."""
+    and conflict-scanning alike, so the three readers can never disagree."""
 
     def widen(facts: Mapping[ColumnRef, tuple[Fact[_Set, ColumnRef], ...]]):
         return {
@@ -143,11 +90,9 @@ def test_grounding_fold_preprocess_runs_before_the_fold() -> None:
 
     fold: GroundingFold[_Set, ColumnRef] = grounding_fold(_subset_lattice(), preprocess=widen)
     facts = {_COL: (_fact(_COL, frozenset({0})),)}
-    ground = fold.ground(facts)
-    assert ground(_COL).value == frozenset({0, 2})
-
-
-# --- column_kit / relation_kit / PropertyKit --------------------------------------
+    assert fold.ground(facts)(_COL).value == frozenset({0, 2})
+    assert fold.scopes(facts) == {_COL}
+    assert fold.conflicts({_COL: (_fact(_COL, frozenset()),)}) == ()
 
 
 class _StaticDiscoverer:
@@ -160,17 +105,11 @@ class _StaticDiscoverer:
         return self._facts
 
 
-def test_column_kit_facts_collects_from_its_discoverers() -> None:
+def test_column_kit_facts_collects_discoverers_and_extra_facts_into_one_map() -> None:
     kit = column_kit(name="k", lattice=_subset_lattice(), operators={}, aggregates={})
     discoverer = _StaticDiscoverer((_fact(_COL, frozenset({0})),))
-    facts = kit.facts(_EMPTY_MANIFEST, (discoverer,))
-    assert facts[_COL][0].value == frozenset({0})
-
-
-def test_column_kit_facts_folds_in_extra_facts() -> None:
-    kit = column_kit(name="k", lattice=_subset_lattice(), operators={}, aggregates={})
-    facts = kit.facts(_EMPTY_MANIFEST, (), extra_facts=(_fact(_COL, frozenset({1})),))
-    assert facts[_COL][0].value == frozenset({1})
+    facts = kit.facts(_EMPTY_MANIFEST, (discoverer,), extra_facts=(_fact(_COL, frozenset({1})),))
+    assert {f.value for f in facts[_COL]} == {frozenset({0}), frozenset({1})}
 
 
 def test_column_kit_property_grounds_and_propagates() -> None:
