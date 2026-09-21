@@ -25,6 +25,7 @@ from dblect.adapters import profile_for_adapter
 from dblect.analysis import analyze
 from dblect.check import CheckFinding, CheckFindingKind, CheckReport, run_check
 from dblect.manifest import Manifest, Node, TestSeverity
+from dblect.severity import Severity, severity_of
 from dblect.sql import FindingKind
 from dblect.types import ForeignKey, ModelContract
 from tests._manifest_builders import cols as _cols
@@ -222,7 +223,9 @@ def test_message_names_child_as_preserved_side_and_never_claims_a_violation() ->
     _declare_orders_fk()
     (finding,) = _orphan_findings(_run(_FIRING_SQL))
     # The verdict is "not established", never "violated": the analysis is
-    # trusting the FK forward, not disproving it (see the design's WARN grade).
+    # trusting the FK forward, not disproving it, which is also why it warns
+    # rather than errors.
+    assert severity_of(finding) is Severity.WARN
     assert "violat" not in finding.message.lower()
     # The remediation names the child relation as the side to preserve rather than
     # prescribing a join keyword: the finding fires on LEFT, RIGHT, and SEMI joins
