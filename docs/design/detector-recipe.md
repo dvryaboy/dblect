@@ -95,17 +95,21 @@ per-property wiring beyond that: no new `AnnotationStore`, no new
   generally, by the law test; it does not need its own function.
 - **Check**: a `CheckCase` table (`tests/check/_check_table.py`) through
   `run_check` for the cluster of tests that share one manifest template and
-  vary only the model's SQL, the expected finding kinds, and a wording
-  fragment. A silent row (`expected=()`) still asserts the model built, so "no
-  findings" is never confused with "nothing was analyzed". A test asserting
-  something the table's four fields cannot express (a suppression directive,
-  a coverage number, line provenance) stays its own function.
+  vary only the model's SQL, the expected finding kinds, and the wording
+  fragments the message must carry (`wording`) or must not (`absent`, for a
+  remediation that must never prescribe the wrong fix). A silent row
+  (`expected=()`) still asserts the model built, so "no findings" is never
+  confused with "nothing was analyzed". A test asserting something the
+  table's fields cannot express (a suppression directive, a coverage number,
+  line provenance) stays its own function.
 - **Empirical soundness**, when the property's claim is checkable against
-  materialized data: `tests/lineage/test_pbt_<name>_soundness.py`, generating
-  scenarios with Hypothesis and checking them through
-  `tests/lineage/_duckdb_oracle.py`'s `assert_no_over_claims`, which
-  materializes the generated tables and the model SQL once and asserts every
-  claim's violation count is zero. The property supplies the generator, the
+  materialized data: `tests/lineage/test_pbt_<name>_soundness.py` (or under
+  `tests/check/` for a check-level claim), generating scenarios with
+  Hypothesis and checking them through `tests/lineage/_duckdb_oracle.py`'s
+  `assert_no_over_claims` on the session-wide `oracle_con` fixture from the
+  root `tests/conftest.py`. The harness materializes the generated tables and
+  the model SQL once and asserts every claim's violation count is zero. The
+  property supplies the generator, the
   SQL grammar, and the query that counts a violation of one claim; the
   materialize/teardown dance is not the property's to write. A property whose
   soundness argument is symbolic rather than empirical (functional-dependency's

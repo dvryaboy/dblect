@@ -27,17 +27,23 @@ class CheckCase:
     wording: tuple[str, ...] = ()
     """Fragments the sole finding's message must contain; only checked when
     ``expected`` names exactly one kind."""
+    absent: tuple[str, ...] = ()
+    """Fragments the sole finding's message must not contain (a remediation that
+    must never prescribe the wrong fix, a verdict that must never say "violated");
+    checked under the same one-finding rule as ``wording``."""
 
 
 def run_check_case(case: CheckCase, manifest: Manifest, profile: AdapterProfile) -> None:
     report = run_check(manifest, profile)
     kinds = tuple(f.kind for f in report.findings)
     assert kinds == case.expected, f"{case.id}: got {kinds}, expected {case.expected}"
-    if case.wording:
+    if case.wording or case.absent:
         assert len(report.findings) == 1, f"{case.id}: wording needs exactly one finding"
         message = report.findings[0].message
         for fragment in case.wording:
             assert fragment in message, f"{case.id}: {fragment!r} missing from {message!r}"
+        for fragment in case.absent:
+            assert fragment not in message, f"{case.id}: {fragment!r} present in {message!r}"
     if not case.expected:
         assert report.models_analyzed > 0, f"{case.id}: silent row's model never built"
         assert report.unbuilt == (), (

@@ -348,12 +348,14 @@ _AGG_BEHAVIOR_CASES = (
         "SELECT country, AVG(amount) AS v FROM payments GROUP BY country",
         expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
         wording=("currency", "avg"),
+        absent=("sum",),
     ),
     CheckCase(
         "median_combines_and_is_flagged",
         "SELECT country, MEDIAN(amount) AS v FROM payments GROUP BY country",
         expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
         wording=("currency", "median"),
+        absent=("sum",),
     ),
     CheckCase(
         "count_ignores_values_and_is_silent",
@@ -377,6 +379,24 @@ def test_aggregate_behavior_over_mixed_currency(case: CheckCase) -> None:
         amount: Money.columns(amount="amount", currency="currency")
 
     run_check_case(case, _one_agg_manifest(case.sql), _DUCKDB)
+
+
+def test_check_table_absent_fragment_fails_the_row_when_present() -> None:
+    """The runner's negative wording check is live: a row naming a fragment the
+    message does carry fails, so a "never says X" contract can be a table row."""
+
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: Money.columns(amount="amount", currency="currency")
+
+    case = CheckCase(
+        "avg_message_names_the_currency",
+        "SELECT country, AVG(amount) AS v FROM payments GROUP BY country",
+        expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
+        absent=("currency",),
+    )
+    with pytest.raises(AssertionError, match="currency"):
+        run_check_case(case, _one_agg_manifest(case.sql), _DUCKDB)
 
 
 def test_collection_aggregate_over_a_tagged_column_is_not_flagged() -> None:
