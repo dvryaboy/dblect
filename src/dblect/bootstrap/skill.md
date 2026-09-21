@@ -36,9 +36,12 @@ Two kinds of meaning propagate today:
   `determines` and `grain` facts, **not** as types.
 
 Closed categories (`status`, `channel`, `platform`, `country`) usually need no
-declaration: an `accepted_values` test already guards the set for free, and a
-standalone category does not yet propagate on its own. A category earns a type only
-when it rides on a magnitude as its unit, as `currency` does on `Money`.
+declaration: an `accepted_values` test already grounds and propagates a value
+domain for free, so a stray or mistyped literal downstream (`WHERE status =
+'shipd'`) is caught without you writing anything. A bare `NominalEnum`/`UnitEnum`
+column declaration grounds the same fact directly, for a category with no dbt
+test to read. A category earns a full `DomainType` only when it rides on a
+magnitude as its unit, as `currency` does on `Money`.
 
 Restraint is part of the job. Type a column only when one of those two kinds
 genuinely lives in it. A bare identifier, a key already read from a dbt test, a
