@@ -54,17 +54,20 @@ Everything around it is shared. `src/dblect/lineage/facts/kit.py` provides:
   dependency get their facts from the contract bridge, so they use this and
   build their `Property` by hand with `column_property` / `relation_property`,
   which also lets them pass the pieces the kit has no default for. Those are:
-  a **semiring**, the property's own rule for how values combine where two
-  branches merge (a UNION) and where two relations cross (a JOIN), for a
-  property where the lattice join is not the right answer; a **coherence
-  guard**, a precondition an aggregate needs before its result means anything
-  (a sum of money is only a sum if every row in the group carries the same
-  currency, so the guard checks that and clears the result to "unknown" when
-  it cannot); and a **relation reducer**, the rule for computing a
-  relation-scoped value (a candidate-key set) from a model's joins, group-bys,
-  and unions. The lineage section of `docs/current_state/architecture.md`
+    - A **semiring**, the property's own rule for how values combine where two
+      branches merge (a UNION) and where two relations cross (a JOIN), for a
+      property where the lattice join is not the right answer;
+   - A **coherence guard**, a precondition an aggregate needs before its
+     result means anything (a sum of money is only a sum if every row in the
+     group carries the same currency, so the guard checks that and clears the
+     result to "unknown" when it cannot);
+   - And a **relation reducer**, the rule for computing a relation-scoped value
+     (a candidate-key set) from a model's joins, group-bys, and unions.
+  
+  The lineage section of `docs/current_state/architecture.md`
   explains the semiring and the reducer alongside the code; the guard is
   described on `CoherenceGuard` in `lineage/facts/property.py`.
+  
 - `top_rule(lattice)`, the transfer rule for a SQL node that says nothing about
   the property no matter what its inputs said. A comparison's result carries no
   currency, so domain type binds `top_rule` to comparisons.
