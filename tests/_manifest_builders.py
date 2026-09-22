@@ -25,6 +25,7 @@ from dblect.manifest import (
     ModelConfig,
     Node,
     ResourceType,
+    TestSeverity,
 )
 
 
@@ -109,6 +110,38 @@ def source(
         schema=schema,
         columns=columns,
         identifier=identifier,
+    )
+
+
+def relationships_test(
+    uid: str,
+    *,
+    child: str,
+    child_column: str,
+    parent: str,
+    parent_column: str | None,
+    to: str | None = None,
+    enabled: bool = True,
+    where: str | None = None,
+    severity: TestSeverity = TestSeverity.ERROR,
+) -> Node:
+    """A dbt ``relationships`` test node: ``child_column`` on ``child`` must match
+    ``parent_column`` on ``parent``. ``parent_column=None`` models a test whose
+    ``field`` kwarg is missing, so the parent column cannot be read."""
+    kwargs: dict[str, str] = {
+        "column_name": child_column,
+        "to": to or f"ref('{parent.split('.')[-1]}')",
+    }
+    if parent_column is not None:
+        kwargs["field"] = parent_column
+    return node(
+        uid,
+        kind=ResourceType.OTHER,
+        depends_on=frozenset({child, parent}),
+        test_metadata=DbtTestMetadata(
+            name="relationships", kwargs=kwargs, enabled=enabled, where=where, severity=severity
+        ),
+        attached_node=child,
     )
 
 

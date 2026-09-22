@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dblect.contracts import ContractSelf, ast, contract, models
 from dblect.lineage.facts.grounding import collect
+from dblect.lineage.facts.model import Declared, DeclaredSource
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
@@ -106,7 +107,12 @@ def test_references_becomes_a_foreign_key_edge() -> None:
     resolved = resolve_contracts(_shop_manifest())
     assert resolved.issues == ()
     assert resolved.foreign_keys == (
-        ForeignKeyEdge(child=ColumnRef(_ITEMS, "order_id"), parent=ColumnRef(_ORDERS, "order_id")),
+        ForeignKeyEdge(
+            child=ColumnRef(_ITEMS, "order_id"),
+            parent=ColumnRef(_ORDERS, "order_id"),
+            provenance=Declared(DeclaredSource.USER_ASSERTED),
+            detail=f"{StgOrderItems.__qualname__}.items_belong_to_orders",
+        ),
     )
 
 
