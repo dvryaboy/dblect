@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from dblect.lineage.facts.lattice import Lattice, resolve
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
-from dblect.lineage.graph import ColumnRef, SourceRef
+from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.manifest import ResourceType
 
 if TYPE_CHECKING:
     from dblect.lineage.facts.property import FactDiscoverer
@@ -74,8 +75,13 @@ def collect(
     discoverers: tuple[FactDiscoverer[K, S], ...],
     *,
     name_to_source: Mapping[str, SourceRef],
+    extra_facts: tuple[Fact[K, S], ...] = (),
 ) -> Mapping[S, tuple[Fact[K, S], ...]]:
-    """Run each discoverer and bucket its facts by scope.
+    """Run each discoverer and bucket its facts by scope, then fold in
+    ``extra_facts`` a caller already resolved by some other channel (a Python
+    contract read through the types bridge). The single collector every
+    manifest-backed property calls, so a property needing both a discoverer set
+    and a caller-supplied top-up never hand-rolls the merge loop.
 
     A discoverer that raises a ``DiscovererError`` contributes nothing and the
     others are unaffected; any other exception propagates, failing the build
@@ -89,7 +95,39 @@ def collect(
             continue
         for fact in found:
             buckets.setdefault(fact.scope, []).append(fact)
+    for fact in extra_facts:
+        buckets.setdefault(fact.scope, []).append(fact)
     return {scope: tuple(facts) for scope, facts in buckets.items()}
+
+
+# A dbt generic test's target resolves to a graph-keyed scope through this one
+# mapping; shared here rather than as a private copy per discoverer module
+# (nullability's not_null, uniqueness's unique/unique_combination_of_columns, and
+# any future closed-value-set test all read a test's target node the same way).
+_TEST_TARGET_KIND: Mapping[ResourceType, SourceKind] = {
+    ResourceType.MODEL: SourceKind.MODEL,
+    ResourceType.SOURCE: SourceKind.SOURCE,
+    ResourceType.SEED: SourceKind.SEED,
+    ResourceType.SNAPSHOT: SourceKind.SNAPSHOT,
+}
+
+
+def generic_test_source_ref(manifest: Manifest, target_uid: str) -> SourceRef | None:
+    """The graph-keyed ``SourceRef`` for the manifest node ``target_uid`` names, or
+    ``None`` if the node is absent or not a data-flow relation kind the lineage
+    graph tracks (a model, source, seed, or snapshot)."""
+    node = manifest.nodes.get(target_uid)
+    if node is None:
+        return None
+    kind = _TEST_TARGET_KIND.get(node.resource_type)
+    return SourceRef(kind, target_uid) if kind is not None else None
+
+
+def generic_test_column_ref(manifest: Manifest, target_uid: str, column: str) -> ColumnRef | None:
+    """:func:`generic_test_source_ref`'s column-scoped sibling: the same target
+    resolution, plus the case-folded column name the graph keys on."""
+    source = generic_test_source_ref(manifest, target_uid)
+    return ColumnRef(source, column.lower()) if source is not None else None
 
 
 def _ground(
@@ -165,6 +203,26 @@ def grounded_scopes(
         for scope, ann in _ground(facts, opaque, lat).items()
         if ann.opacity is Opacity.CONCRETE
     }
+
+
+def conflicting_scopes(facts: Mapping[S, tuple[Fact[K, S], ...]], lat: Lattice[K]) -> tuple[S, ...]:
+    """The scopes whose unconditional facts fold to the lattice bottom: exactly
+    the scopes :func:`grounding` would raise :class:`FactConflictError` on,
+    whether two declarations disagree or one declaration is itself unsatisfiable.
+
+    A caller that wants to report these as findings (rather than let the fold
+    raise) scans for them first and leaves the conflicting scopes out of the
+    facts it then grounds, so one contradiction cannot raise and hide every
+    other scope's coverage."""
+    out: list[S] = []
+    for scope, bucket in facts.items():
+        unconditional = tuple(f for f in bucket if f.condition is None)
+        if not unconditional:
+            continue
+        _, is_contradiction = resolve(lat, unconditional)
+        if is_contradiction:
+            out.append(scope)
+    return tuple(out)
 
 
 def combine(lat: Lattice[K], a: Annotation[K], b: Annotation[K]) -> Annotation[K]:

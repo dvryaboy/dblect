@@ -26,6 +26,7 @@ from dblect.types import IssueCode, ModelContract
 from tests._manifest_builders import cols as _cols
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
+from tests.check._check_table import CheckCase, run_check_case
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -317,7 +318,7 @@ def test_mixed_currency_sum_message_names_the_columns() -> None:
     assert "country" in agg.message  # the grouping that does not hold it constant
 
 
-def _one_agg_manifest(sql_fn: str) -> Manifest:
+def _one_agg_manifest(sql: str) -> Manifest:
     nodes = (
         _node(
             "source.shop.raw.payments",
@@ -328,52 +329,74 @@ def _one_agg_manifest(sql_fn: str) -> Manifest:
         _node(
             "model.shop.agg",
             kind=ResourceType.MODEL,
-            sql=f"SELECT country, {sql_fn}(amount) AS v FROM payments GROUP BY country",
+            sql=sql,
             columns=_cols(country="VARCHAR", v="DECIMAL"),
         ),
     )
     return _manifest(*nodes)
 
 
-# Two non-sum representatives: `avg` is a different sqlglot node than `sum`, and `median`
-# a structurally distinct one, enough to confirm the path fires and the message renders
-# the actual aggregate rather than a hard-coded "sum". The full breadth of which
+# Two non-sum combining representatives (`avg` and `median` are each a structurally
+# distinct sqlglot node from `sum`), enough to confirm the path fires and the message
+# renders the actual aggregate rather than a hard-coded "sum"; count and a selecting
+# aggregate (min) are the two behaviors that must stay quiet. The full breadth of which
 # aggregates combine is pinned cheaply at the classification boundary in
 # tests/sql/test_aggregates.py, so it is not re-run through the check pipeline here.
-@pytest.mark.parametrize("sql_fn", ["AVG", "MEDIAN"])
-def test_combining_aggregates_over_mixed_currency_are_flagged(sql_fn: str) -> None:
+_AGG_BEHAVIOR_CASES = (
+    CheckCase(
+        "avg_combines_and_is_flagged",
+        "SELECT country, AVG(amount) AS v FROM payments GROUP BY country",
+        expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
+        wording=("currency", "avg"),
+        absent=("sum",),
+    ),
+    CheckCase(
+        "median_combines_and_is_flagged",
+        "SELECT country, MEDIAN(amount) AS v FROM payments GROUP BY country",
+        expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
+        wording=("currency", "median"),
+        absent=("sum",),
+    ),
+    CheckCase(
+        "count_ignores_values_and_is_silent",
+        "SELECT country, COUNT(amount) AS v FROM payments GROUP BY country",
+    ),
+    CheckCase(
+        # min/max return a real input value rather than synthesizing one, so under the
+        # lenient default they do not raise the not-well-typed finding (their result tag
+        # widens to top and is caught later where a definite tag is required). An eager
+        # finding for the tag-blind comparison is the strict-mode question (#116).
+        "min_selects_and_is_silent_under_lenient",
+        "SELECT country, MIN(amount) AS v FROM payments GROUP BY country",
+    ),
+)
+
+
+@pytest.mark.parametrize("case", _AGG_BEHAVIOR_CASES, ids=lambda c: c.id)
+def test_aggregate_behavior_over_mixed_currency(case: CheckCase) -> None:
     class Payments(ModelContract):
         dbt_model = "payments"
         amount: Money.columns(amount="amount", currency="currency")
 
-    report = run_check(_one_agg_manifest(sql_fn), _DUCKDB)
-    [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
-    assert "currency" in agg.message
-    assert sql_fn.lower() in agg.message
+    run_check_case(case, _one_agg_manifest(case.sql), _DUCKDB)
 
 
-def test_counting_aggregate_is_not_flagged() -> None:
-    # Counting money is always well typed: count ignores values, so currency is
-    # irrelevant. Only the combining class carries the obligation.
+def test_check_table_absent_fragment_fails_the_row_when_present() -> None:
+    """The runner's negative wording check is live: a row naming a fragment the
+    message does carry fails, so a "never says X" contract can be a table row."""
+
     class Payments(ModelContract):
         dbt_model = "payments"
         amount: Money.columns(amount="amount", currency="currency")
 
-    report = run_check(_one_agg_manifest("COUNT"), _DUCKDB)
-    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
-
-
-def test_selecting_aggregate_is_not_flagged_under_lenient() -> None:
-    # min/max return a real input value rather than synthesizing one, so under the lenient
-    # default they do not raise the not-well-typed finding (their result tag widens to top
-    # and is caught later where a definite tag is required). An eager finding for the
-    # tag-blind comparison is the strict-mode question, tracked separately (#116).
-    class Payments(ModelContract):
-        dbt_model = "payments"
-        amount: Money.columns(amount="amount", currency="currency")
-
-    report = run_check(_one_agg_manifest("MIN"), _DUCKDB)
-    assert not [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
+    case = CheckCase(
+        "avg_message_names_the_currency",
+        "SELECT country, AVG(amount) AS v FROM payments GROUP BY country",
+        expected=(CheckFindingKind.AGGREGATION_NOT_WELL_TYPED,),
+        absent=("currency",),
+    )
+    with pytest.raises(AssertionError, match="currency"):
+        run_check_case(case, _one_agg_manifest(case.sql), _DUCKDB)
 
 
 def test_collection_aggregate_over_a_tagged_column_is_not_flagged() -> None:

@@ -53,7 +53,6 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
     AggregationSite,
-    ColumnLineageGraph,
     ColumnRef,
     Derivation,
     LineageView,
@@ -184,13 +183,43 @@ def _reducer_for(prop: Property[Any, Any]) -> Reducer:
     )
 
 
-def run(graph: ColumnLineageGraph, registry: PropertyRegistry) -> AnnotationStore:
-    """Walk ``graph`` for every property in dependency order, accumulating each
-    node's flow annotation into a shared store that later properties read."""
+def run(
+    graphs: Mapping[ScopeKind, LineageView[Any]],
+    registry: PropertyRegistry,
+    *,
+    sinks: Mapping[str, CoherenceSink[Any]] | None = None,
+    inferred_sinks: Mapping[str, MutableMapping[Any, Annotation[Any]]] | None = None,
+) -> AnnotationStore:
+    """Walk every property in dependency order against the lineage graph its scope
+    kind names, accumulating each one's flow annotation into a shared store that
+    later properties' ``DepContext`` reads, and a caller reads back by typed
+    ``PropertyRef`` (:meth:`AnnotationStore.scoped`).
+
+    ``graphs`` supplies one view per scope kind a registered property walks;
+    column-scoped and relation-scoped properties in the same registry each walk
+    their own graph. A property whose scope kind ``graphs`` carries no view for is
+    a construction error here, not a silent empty result.
+
+    ``sinks`` and ``inferred_sinks``, keyed by property name, are the same
+    per-call side channels :func:`propagate` itself takes: a coherence-clear
+    diagnostic collector, and the pre-reconciliation inferred value. A property
+    absent from either mapping simply gets neither, the same as calling
+    ``propagate`` for it directly with no sink."""
     store = AnnotationStore()
     for prop in registry.evaluation_order():
+        graph = graphs.get(prop.scope_kind)
+        if graph is None:
+            raise ValueError(
+                f"property {prop.name!r} is {prop.scope_kind}-scoped, but run() was not "
+                f"given a graph for {prop.scope_kind}"
+            )
         ctx = registry.dep_context(store)
-        for scope, annotation in propagate(graph, prop, dep_context=ctx).items():
+        sink = sinks.get(prop.name) if sinks is not None else None
+        inferred_sink = inferred_sinks.get(prop.name) if inferred_sinks is not None else None
+        annotations = propagate(
+            graph, prop, dep_context=ctx, sink=sink, inferred_sink=inferred_sink
+        )
+        for scope, annotation in annotations.items():
             store.record(prop.name, scope, annotation)
     return store
 

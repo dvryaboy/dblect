@@ -38,6 +38,7 @@ Specific things to keep out of comments, docstrings, and prose:
 ## Prose Style
 All narrative documents and comments should avoid em-dashes and "not x. not y. z" phrasing.
 We do not bash older or alternative approaches: we win by being clear and positive, and complimenting them / acknowledging good ideas and influences when appropriate. We are generous with compliments and praise. We put our work in the context of the broader field. 
+A doc under `docs/current_state/` teaches a new developer how the built system works and how to extend it; size arguments, line budgets, and other justifications aimed at a reviewer belong in the PR description, not in the doc.
 
 # Development
 We run Python and its tooling through `uv` (`uv run python`, `uv run pytest`, `uv run ruff`, `uv run pyright`); a bare `python` is not on PATH. Quick probes go through `uv run python -c "..."` rather than a throwaway file.

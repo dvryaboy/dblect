@@ -36,7 +36,7 @@ from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
 from tests._manifest_builders import source
-from tests.lineage._duckdb_oracle import Table, materialized, scalar
+from tests.lineage._duckdb_oracle import Table, assert_no_over_claims, scalar
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -128,10 +128,14 @@ def test_non_null_columns_are_never_null_over_materialized_rows(
         c for c in _OUTPUT_COLS if anns[ColumnRef(model, c)].value is Nullability.NON_NULL
     ]
     tables: list[Table] = [("bt", ("bk", "bv"), s.rows_bt), ("jt", ("jk", "jv"), s.rows_jt)]
-    with materialized(oracle_con, tables, _null_sql(s)) as con:
-        for col in non_null_cols:
-            nulls = scalar(con, f"SELECT COUNT(*) FROM _m WHERE {col} IS NULL")
-            assert nulls == 0, (
-                f"column {col} claimed NON_NULL but has {nulls} null rows "
-                f"for sql={_null_sql(s)!r} bt={s.rows_bt!r} jt={s.rows_jt!r}"
+    assert_no_over_claims(
+        oracle_con,
+        tables,
+        _null_sql(s),
+        lambda con: {
+            f"column {col} claimed NON_NULL": scalar(
+                con, f"SELECT COUNT(*) FROM _m WHERE {col} IS NULL"
             )
+            for col in non_null_cols
+        },
+    )

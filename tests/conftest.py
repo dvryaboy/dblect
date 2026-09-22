@@ -5,11 +5,27 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
+import duckdb
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session")
+def oracle_con() -> Iterator[duckdb.DuckDBPyConnection]:
+    """One in-memory duckdb connection reused across every empirical soundness PBT's
+    examples: opening a fresh in-memory database per example dominated their runtime,
+    so examples share one connection for the whole session and clean their tables up
+    between materializations (see ``tests.lineage._duckdb_oracle``). Session-scoped
+    here, at the root, so any data-as-judge PBT can use it, not only ``tests/lineage``'s."""
+    con = duckdb.connect(":memory:")
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 @pytest.fixture(scope="session")
