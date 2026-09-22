@@ -30,6 +30,7 @@ from dblect.adapters import AdapterProfile
 from dblect.audit.sourcemap import LineMap
 from dblect.audit.suppress import FramedDirectives, apply
 from dblect.check.coverage import GroundingCoverage, PropertyGrounding, ResolutionCoverage
+from dblect.check.dead_predicate import dead_predicate_verdicts
 from dblect.check.findings import (
     CheckFinding,
     CheckFindingKind,
@@ -75,12 +76,25 @@ from dblect.lineage.properties.uniqueness import (
     uniqueness_facts,
     uniqueness_property_from_facts,
 )
+from dblect.lineage.properties.value_domain import (
+    ValueDomain,
+    value_domain_conflicts,
+    value_domain_facts,
+    value_domain_grounding,
+    value_domain_property,
+)
 from dblect.lineage.property import resolved_column_ref, run
 from dblect.manifest import Manifest
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
 from dblect.sql.parse import parse_manifest_models
-from dblect.types import ContractRegistry, ResolvedContracts, active_registry, resolve_contracts
+from dblect.types import (
+    ContractRegistry,
+    IssueCode,
+    ResolvedContracts,
+    active_registry,
+    resolve_contracts,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +129,14 @@ class CheckGraphs:
     uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
     """Every declared key per relation, from every channel. Feeds both the uniqueness
     propagation and the grain check, so the two agree on what was claimed."""
+    value_domain_facts: Mapping[ColumnRef, tuple[Fact[ValueDomain, ColumnRef], ...]]
+    """Every declared value domain per column (contract enums and accepted_values
+    tests), with the columns in ``value_domain_conflicts`` already excluded so
+    grounding this never raises."""
+    value_domain_conflicts: tuple[ColumnRef, ...]
+    """Columns whose declarations disagree down to the empty set: reported once as
+    a ``CONTRACT_ISSUE`` rather than raising and hiding every other column's
+    grounding."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +171,8 @@ class WorldAnnotations:
     """Per-relation keys derived from the SQL alone, before declared keys are merged
     in. The grain check compares declarations against this; the merged value would
     contain the declaration itself."""
+    value_domain: Mapping[ColumnRef, Annotation[ValueDomain]]
+    """Per-column value domains, read by the dead-predicate check."""
 
 
 def build_check_graphs(
@@ -179,6 +203,10 @@ def build_check_graphs(
     # matches the build's rather than diverging onto an unvalidated one.
     unbuilt = {issue.model_unique_id for issue in column_build.issues}
     parsed = {uid: tree for uid, tree in trees.items() if uid not in unbuilt}
+    raw_vd_facts = value_domain_facts(manifest, extra_facts=resolved.value_domain_facts)
+    vd_conflicts = value_domain_conflicts(raw_vd_facts)
+    conflicting = set(vd_conflicts)
+    vd_facts = {scope: bucket for scope, bucket in raw_vd_facts.items() if scope not in conflicting}
     return CheckGraphs(
         manifest=manifest,
         profile=profile,
@@ -191,6 +219,8 @@ def build_check_graphs(
         uniqueness_facts=uniqueness_facts(
             manifest, profile, extra_facts=resolved.key_facts, parsed=trees
         ),
+        value_domain_facts=vd_facts,
+        value_domain_conflicts=vd_conflicts,
     )
 
 
@@ -216,7 +246,8 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
     )
-    registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop))
+    vd_prop = value_domain_property(graphs.value_domain_facts)
+    registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop, vd_prop))
     uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
     clears: list[CoherenceClear[DomainTag]] = []
     store = run(
@@ -234,6 +265,7 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         coherence_clears=tuple(clears),
         functional_dependency=store.scoped(fd_prop.ref),
         uniqueness_inferred=uniqueness_inferred,
+        value_domain=store.scoped(vd_prop.ref),
     )
 
 
@@ -275,6 +307,7 @@ def run_check(
 
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(graphs.resolved))
+    findings.extend(_value_domain_conflict_findings(graphs))
     findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
@@ -367,6 +400,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             world.functional_dependency,
         )
     )
+    findings.extend(_dead_predicate_findings(graphs, world, line_maps))
     return findings
 
 
@@ -483,6 +517,26 @@ def _issue_findings(resolved: ResolvedContracts) -> list[CheckFinding]:
             code=issue.code,
         )
         for issue in resolved.issues
+    ]
+
+
+def _value_domain_conflict_findings(graphs: CheckGraphs) -> list[CheckFinding]:
+    """One ``CONTRACT_ISSUE`` per column whose value-domain declarations share
+    no value (a contract enum, an accepted_values test, or one of each), found
+    at the check's grounding step rather than by contract resolution alone,
+    since the conflicting declarations can come from either channel."""
+    return [
+        CheckFinding(
+            kind=CheckFindingKind.CONTRACT_ISSUE,
+            code=IssueCode.VALUE_DOMAIN_CONFLICT,
+            message=(
+                f"declared value domains for {ref.column!r} disagree: two or more "
+                "trusted declarations share no common value"
+            ),
+            model_unique_id=ref.source.unique_id if ref.source.kind is SourceKind.MODEL else None,
+            column=ref.column,
+        )
+        for ref in graphs.value_domain_conflicts
     ]
 
 
@@ -704,6 +758,41 @@ def _join_key_message(
 def _qualified(col: exp.Column) -> str:
     """A column rendered with its table qualifier when it has one (``p.amount``)."""
     return f"{col.table}.{col.name}" if col.table else col.name
+
+
+def _dead_predicate_rows(graphs: CheckGraphs, world: WorldAnnotations) -> Iterator[LocatedRow]:
+    """One row per dead, redundant, case-only, or CASE-coverage verdict
+    :func:`dead_predicate_verdicts` reaches over each model's stamped tree. A
+    column's domain is its propagated value where the lineage reached it,
+    falling back to its own grounding for a column read only in a WHERE/JOIN
+    clause and never projected (the same fallback ``_join_key_rows`` uses for
+    domain types)."""
+    vd_ground = value_domain_grounding(graphs.value_domain_facts)
+    domain_ann_of = annotation_or_grounded(world.value_domain, vd_ground)
+
+    def domain_of(ref: ColumnRef) -> ValueDomain:
+        return domain_ann_of(ref).value
+
+    for uid, tree in graphs.parsed.items():
+        for node, verdict in dead_predicate_verdicts(tree, domain_of):
+            yield LocatedRow(
+                uid=uid,
+                nodes=(node,),
+                kind=verdict.kind,
+                message=verdict.message,
+                column=verdict.column,
+            )
+
+
+def _dead_predicate_findings(
+    graphs: CheckGraphs, world: WorldAnnotations, line_maps: dict[str, LineMap]
+) -> list[CheckFinding]:
+    return locate_findings(
+        graphs.manifest,
+        _dead_predicate_rows(graphs, world),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start),
+    )
 
 
 # --- helpers --------------------------------------------------------------------
