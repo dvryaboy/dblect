@@ -90,10 +90,11 @@ and `generic_test_source_ref`.
 
 Contract-declared facts come through `src/dblect/types/bridge.py`. If your
 property has a contract form (an enum field, a foreign key marker), add a case
-to the closed `match` in `_resolve_one` and produce facts there. Column names
-are lower-cased whenever a `ColumnRef` is built, because that is how the
-lineage keys them; a fact built with the contract's own spelling silently
-matches nothing (#291 brings the bridge's older sites in line).
+to the closed `match` in `_resolve_one` and produce facts there. The lineage
+keys every column by its lower-cased name, so lower-case the name when you
+build a `ColumnRef` from a declaration. `ColumnRef` itself does not normalize,
+and a fact built with the contract's own spelling silently matches nothing.
+The bridge's older sites do not yet do this (#291).
 
 Two declarations can disagree. `.conflicts(facts)` names the scopes whose
 declarations cannot all be true. Report those as a contract issue and leave
@@ -135,7 +136,9 @@ Wiring, all in `src/dblect/check/run.py`:
 ## Messages
 
 The message is the product. Write it for a dbt developer who has never read
-this repository: name the model, the column, the declared fact, and what to do.
+this repository: name the model, the column (or, for a relation-level finding,
+the relation and the declared grain or key), the declaration involved, and what
+to do.
 Do not say "lattice", "annotation", "meet", or "propagated". Never claim more
 than the analysis proved: a join that hides a foreign-key violation has not
 shown the key is broken, so its finding says the violation would be silent, not
