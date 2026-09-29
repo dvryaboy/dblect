@@ -1077,3 +1077,18 @@ def test_fanout_ungrouped_collapse_ignores_columns_of_nested_subquery() -> None:
         "from facts f join dim d on f.segment = d.segment"
     )
     assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
+def test_fanout_fires_for_duckdb_quoted_non_ascii_join_column_against_lowercase_key() -> None:
+    # duckdb folds identifier case ASCII-only, so "Ä" and "ä" are distinct columns and the
+    # join does not cover a key declared on `ä`.
+    profile = profile_for_adapter("duckdb")
+    parsed = parse_sql(
+        'select * from facts f left join dim d on d."Ä" = f.fk', dialect=profile.sqlglot_dialect
+    )
+    findings = detect_join_fanout(
+        parsed,
+        model_keys=_model_keys(dim=(("ä",),)),
+        fold=IdentifierFold.of_dialect(profile.sqlglot_dialect),
+    )
+    assert [f.kind for f in findings] == [FindingKind.JOIN_FANOUT]

@@ -13,6 +13,7 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
+import string
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -551,6 +552,20 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+class LetterFolding(StrEnum):
+    """Which letters a fold lowercases. Databases fold identifier case ASCII-only (duckdb keeps
+    ``"Ä"`` and ``"ä"`` distinct), so a fold answering "is this key covered" must not fold more
+    than they do: folding less only makes a join miss its key, which over-reports. A fold for a
+    lookup that triggers a finding may conflate more (Unicode), since that only over-reports too.
+    """
+
+    ASCII = "ascii"
+    UNICODE = "unicode"
+
+
 @dataclass(frozen=True)
 class IdentifierFold:
     """How a dialect decides whether two spellings of a column name are the same column, in the
@@ -564,10 +579,18 @@ class IdentifierFold:
     """
 
     strategy: NormalizationStrategy
+    letters: LetterFolding = LetterFolding.ASCII
 
     @classmethod
     def of_dialect(cls, dialect: str | None) -> IdentifierFold:
         return cls(Dialect.get_or_raise(dialect).normalization_strategy)
+
+    def _lower(self, name: str) -> str:
+        match self.letters:
+            case LetterFolding.ASCII:
+                return name.translate(_ASCII_LOWER)
+            case LetterFolding.UNICODE:
+                return name.lower()
 
     def name(self, c: exp.Column) -> str:
         quoted = isinstance(c.this, exp.Identifier) and bool(c.this.quoted)
@@ -576,9 +599,9 @@ class IdentifierFold:
                 NormalizationStrategy.CASE_INSENSITIVE
                 | NormalizationStrategy.CASE_INSENSITIVE_UPPERCASE
             ):
-                return c.name.lower()
+                return self._lower(c.name)
             case NormalizationStrategy.LOWERCASE | NormalizationStrategy.UPPERCASE:
-                return c.name if quoted else c.name.lower()
+                return c.name if quoted else self._lower(c.name)
             case NormalizationStrategy.CASE_SENSITIVE:
                 return c.name
 
@@ -587,9 +610,12 @@ class IdentifierFold:
 DEFAULT_FOLD = IdentifierFold.of_dialect(None)
 
 
-# Matches names case-insensitively even when quoted. For a lookup of a fact that TRIGGERS a finding
-# (a nullable column), conflating case-distinct names over-reports rather than hides.
-CASE_INSENSITIVE_FOLD = IdentifierFold(NormalizationStrategy.CASE_INSENSITIVE)
+# Matches names case-insensitively even when quoted, over all of Unicode. For a lookup of a fact
+# that TRIGGERS a finding (a nullable column), conflating case-distinct names over-reports rather
+# than hides.
+CASE_INSENSITIVE_FOLD = IdentifierFold(
+    NormalizationStrategy.CASE_INSENSITIVE, LetterFolding.UNICODE
+)
 
 
 def column_key(c: exp.Column) -> tuple[str | None, str]:

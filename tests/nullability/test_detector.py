@@ -735,3 +735,32 @@ def test_join_on_not_null_key_stays_clean_in_every_spelling(
 ) -> None:
     sql = f"SELECT p.k FROM other o JOIN pets p ON o.k = p.{_spelling(adapter, name, quoted)}"
     assert _mixed_case_kinds(adapter, sql, mixed_source_not_null=True) == []
+
+
+def test_join_on_nullable_non_ascii_key_fires_for_a_case_distinct_quoted_spelling() -> None:
+    # The nullable lookup conflates case over Unicode: over-reporting a case-distinct name is
+    # sound where dropping a real error is not.
+    sql = 'SELECT s.id FROM other o JOIN stg s ON o.k = s."Ä"'
+    nodes = [
+        _source("base"),
+        _source("lkp"),
+        _source("other"),
+        _not_null("base", "id"),
+        _not_null("base", "fk"),
+        _not_null("lkp", "id"),
+        _not_null("lkp", "tag"),
+        _not_null("other", "k"),
+        _model(
+            "stg",
+            'SELECT a.id AS id, b.tag AS "ä" FROM base a LEFT JOIN lkp b ON a.fk = b.id',
+            depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"}),
+        ),
+        _model("mart", sql, depends_on=frozenset({"model.shop.stg", "source.shop.raw.other"})),
+    ]
+    tree = parse_sql(sql, dialect="duckdb")
+    kinds = [
+        f.kind
+        for detector in make_nullability_detectors(_manifest(*nodes), _DUCKDB)
+        for f in detector(tree)
+    ]
+    assert FindingKind.JOIN_ON_NULLABLE_KEY in kinds
