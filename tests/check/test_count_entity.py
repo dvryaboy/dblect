@@ -125,6 +125,9 @@ _SINGLE_RELATION: list[tuple[str, Entity | None]] = [
     ("COUNT(pa.id)", Entity.ATTRIBUTE_SNAPSHOT),
     ("COUNT(*)", Entity.ATTRIBUTE_SNAPSHOT),
     ("COUNT(1)", Entity.ATTRIBUTE_SNAPSHOT),
+    ("COUNT(0)", Entity.ATTRIBUTE_SNAPSHOT),
+    ("COUNT('x')", Entity.ATTRIBUTE_SNAPSHOT),
+    ("COUNT(NULL)", None),  # always 0: counts no rows
     ("COUNT(pa.player_api_id)", None),  # non-key column: the rows are not identified by it
     ("COUNT(DISTINCT pa.rating)", None),  # a magnitude is not an entity
     ("COUNT(DISTINCT pa.player_api_id, pa.id)", None),  # a tuple names no one entity
@@ -172,3 +175,27 @@ def test_a_non_distinct_count_over_an_unkeyed_relation_makes_no_claim(agg: str) 
 def test_a_composite_key_names_no_single_row_entity() -> None:
     sql = f"SELECT COUNT(*) AS n {_FROM}"
     assert _contradictions(sql, Entity.PLAYER, keys=("id", "player_api_id")) == 0
+
+
+# A window is folded by the generic scalar join over its aggregate and its PARTITION BY
+# columns, so a partition column (no entity) widens the count's claim away. Only a
+# window with nothing else to fold keeps the DISTINCT claim.
+@pytest.mark.parametrize("declared", list(Entity))
+def test_an_unpartitioned_windowed_distinct_count_counts_its_operands_entity(
+    declared: Entity,
+) -> None:
+    sql = f"SELECT COUNT(DISTINCT pa.player_api_id) OVER () AS n {_FROM}"
+    assert _contradictions(sql, declared) == (declared is not Entity.PLAYER)
+
+
+@pytest.mark.parametrize("agg", ["COUNT(DISTINCT pa.player_api_id)", "COUNT(*)"])
+@pytest.mark.parametrize("declared", list(Entity))
+def test_a_partitioned_windowed_count_makes_no_claim(agg: str, declared: Entity) -> None:
+    sql = f"SELECT {agg} OVER (PARTITION BY pa.penalties) AS n {_FROM}"
+    assert _contradictions(sql, declared) == 0
+
+
+@pytest.mark.parametrize("declared", list(Entity))
+def test_an_unpartitioned_windowed_non_distinct_count_makes_no_claim(declared: Entity) -> None:
+    sql = f"SELECT COUNT(*) OVER () AS n {_FROM}"
+    assert _contradictions(sql, declared) == 0

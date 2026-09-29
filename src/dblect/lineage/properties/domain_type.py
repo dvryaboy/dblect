@@ -573,14 +573,18 @@ def _count_core_reading(
     safe; the claim is the only thing it adds.
 
     * ``COUNT(DISTINCT x)`` with ``x`` a plain column carrying an identifier tag counts
-      that entity, whatever the joins, because DISTINCT removes multiplicity.
-    * ``COUNT(*)``, ``COUNT(<literal>)`` or ``COUNT(k)`` counts rows, so it counts the
+      that entity, whatever the joins, because DISTINCT removes multiplicity (also
+      inside a window, where it counts distinct entities per window; but the generic
+      scalar fold joins a window's PARTITION BY columns in, so a partitioned window
+      widens to no claim).
+    * ``COUNT(*)``, ``COUNT(<non-null literal>)`` or ``COUNT(k)`` counts rows, so it counts the
       entity of the relation those rows come from, but only when the scope reads one
       relation with no joins (a join can repeat or drop rows) and that relation is
       identified by a single-column key whose tag names the entity. For ``COUNT(k)`` the
       column ``k`` must itself be that key.
-    * Everything else (a non-key column, a tuple, an expression, a magnitude, a count
-      after a join, an unstamped scope) stays ``NAKED``. Claiming less is the safe
+    * Everything else (a non-key column, a tuple, an expression, a magnitude, a
+      non-distinct count after a join or inside a window (its scope is unstamped), ``COUNT(NULL)``, which is
+      always 0) stays ``NAKED``. Claiming less is the safe
       direction: a missing claim can only hide a mismatch, never invent one.
 
     The claim is a nominal-only tag, the same shape an identifier carries, so a
