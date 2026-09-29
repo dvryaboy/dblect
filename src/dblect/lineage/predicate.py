@@ -128,11 +128,21 @@ class NotNullAtom:
 
 
 @dataclass(frozen=True, slots=True)
-class OpaqueAtom:
-    """Anything outside the fragment, keyed by its normalised SQL. It only ever
-    matches itself (a bare boolean column against the same column)."""
+class TreeKey:
+    """The key of an expression sqlglot cannot render back to SQL: its node-tree dump, which
+    spells out every node type and argument. A distinct type from the rendered-SQL key, so the
+    two key spaces can never collide."""
 
-    sql: str
+    tree: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueAtom:
+    """Anything outside the fragment, keyed by its normalised SQL, or by its node tree when
+    rendering fails. It only ever matches itself (a bare boolean column against the same
+    column)."""
+
+    key: str | TreeKey
 
 
 # A conjunct canonicalised for syntactic matching against ``weak``.
@@ -297,7 +307,18 @@ def _canon(e: Expr) -> Canon:
     not_null_atom = _as_not_null(e)
     if not_null_atom is not None:
         return not_null_atom
-    return OpaqueAtom(unparen(e).sql(dialect="duckdb").lower())
+    return _opaque(unparen(e))
+
+
+def _opaque(e: Expr) -> OpaqueAtom:
+    """Key ``e`` by its rendered SQL. sqlglot parses some expressions its generator cannot
+    render (an ``AtTimeZone`` missing an argument raises ``AttributeError``); the tree dump is
+    an exact structural key that cannot fail, and equal dumps mean equal trees, so no two
+    different expressions ever compare equal."""
+    try:
+        return OpaqueAtom(e.sql(dialect="duckdb").lower())
+    except Exception:
+        return OpaqueAtom(TreeKey(repr(e)))
 
 
 # --- atom recognition ------------------------------------------------------------

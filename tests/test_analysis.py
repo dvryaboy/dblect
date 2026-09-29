@@ -10,13 +10,15 @@ than discovering it by hand in each consumer.
 
 from __future__ import annotations
 
+from sqlglot import Expr
+
 from dblect.adapters import profile_for_adapter
 from dblect.analysis import analyze
 from dblect.audit import LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding
 from dblect.check.run import run_check
 from dblect.manifest import Manifest, Node
-from dblect.sql import FindingKind
+from dblect.sql import Finding, FindingKind
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
 
@@ -79,3 +81,44 @@ def test_analyze_exposes_each_familys_own_report() -> None:
     assert report.audit.findings == tuple(
         f for f in report.findings if isinstance(f, LocatedFinding)
     )
+
+
+# sqlglot parses this but its duckdb generator raises when rendering the AtTimeZone node back to SQL.
+_UNRENDERABLE_WHERE = (
+    "select player_name from raw_player "
+    "where (julianday(datetime('now')) - julianday(birthday)) / 365.25 >= 35"
+)
+
+
+def test_one_models_analysis_crash_is_a_coverage_miss_not_a_failed_run() -> None:
+    crashing = _model_node("model.pkg.crash", _UNRENDERABLE_WHERE)
+    innocent = _model_node(
+        "model.pkg.innocent", "select row_number() over (order by 1) as rn from raw_player"
+    )
+    report = analyze(_manifest(crashing, innocent), _DUCKDB)
+
+    assert any(
+        f.model_unique_id == "model.pkg.innocent"
+        and isinstance(f, LocatedFinding)
+        and f.finding.kind is FindingKind.UNORDERED_RANKING_WINDOW
+        for f in report.findings
+    )
+    analyzed_reasons = {s.unique_id: s.reason for s in report.audit.skipped}
+    assert "model.pkg.innocent" not in analyzed_reasons
+    assert "model.pkg.innocent" not in {u.unique_id for u in report.check.unbuilt}
+
+
+def test_detector_crash_names_the_model_and_the_exception() -> None:
+    def poisoned(tree: Expr) -> list[Finding]:
+        if "poison" in tree.sql():
+            raise AttributeError("boom")
+        return []
+
+    bad = _model_node("model.pkg.bad", "select 'poison' as x")
+    fine = _model_node("model.pkg.fine", "select 'ok' as x")
+    report = run_audit(_manifest(bad, fine), _DUCKDB, detectors=(poisoned,))
+    [skip] = report.skipped
+    assert skip.unique_id == "model.pkg.bad"
+    assert "AttributeError" in skip.reason
+    assert "boom" in skip.reason
+    assert report.models_scanned == 1

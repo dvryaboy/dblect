@@ -283,8 +283,17 @@ def _scan_one(
     tree = parse_outcome
 
     raw_findings: list[Finding] = []
-    for detector in detectors:
-        raw_findings.extend(detector(tree))
+    try:
+        for detector in detectors:
+            raw_findings.extend(detector(tree))
+    except Exception as e:
+        # Isolated at the model boundary so a sqlglot edge case in one model is a coverage miss
+        # for it, not an empty report for the project. ``Exception`` leaves KeyboardInterrupt
+        # and SystemExit propagating; the type and message stay in the reason so a genuine
+        # dblect bug is visible in the report rather than swallowed.
+        return SkippedModel(
+            unique_id=node.unique_id, reason=f"analysis error: {type(e).__name__}: {e}"
+        )
     directives = FramedDirectives.for_node(node)
     # Locate before suppressing: a `-- noqa` is matched against the line the report shows,
     # which can differ from the compiled line a macro expansion produced.

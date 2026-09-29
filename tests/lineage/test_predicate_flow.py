@@ -340,3 +340,17 @@ def test_filter_accumulates_down_a_passthrough_chain(specs: list[tuple[str, int]
     flow = _flow(src, *models)
     expected: frozenset[Canon] = frozenset[Canon]().union(*(_atoms(s) for s in atom_sqls))
     assert flow[f"model.shop.m{len(specs) - 1}"].atoms == expected
+
+
+# --- unrenderable conjuncts ------------------------------------------------------
+
+# sqlglot parses `datetime('now')` but its duckdb generator raises rendering it back.
+_UNRENDERABLE = "julianday(datetime('now')) - julianday(birthday) >= 35"
+
+
+def test_unrenderable_conjunct_is_an_atom_that_matches_only_itself() -> None:
+    same = _atoms(_UNRENDERABLE)
+    assert len(same) == 1
+    assert same == _atoms(_UNRENDERABLE)
+    assert same != _atoms(_UNRENDERABLE.replace("35", "36"))
+    assert same != _atoms(_UNRENDERABLE.replace("birthday", "deathday"))
