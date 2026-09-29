@@ -109,10 +109,10 @@ def test_one_models_analysis_crash_is_a_coverage_miss_not_a_failed_run() -> None
 
 
 def test_detector_crash_names_the_model_and_the_exception() -> None:
-    def poisoned(tree: Expr) -> list[Finding]:
+    def poisoned(tree: Expr) -> tuple[Finding, ...]:
         if "poison" in tree.sql():
             raise AttributeError("boom")
-        return []
+        return ()
 
     bad = _model_node("model.pkg.bad", "select 'poison' as x")
     fine = _model_node("model.pkg.fine", "select 'ok' as x")
