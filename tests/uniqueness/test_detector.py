@@ -804,9 +804,8 @@ def test_fanout_silent_when_collapsed_group_uses_distinct_aggregate() -> None:
     assert findings == ()
 
 
-def test_fanout_flagged_without_grouping_even_with_only_insensitive_aggregate() -> None:
-    # No GROUP BY: the multiplied rows flow straight to the output, so a windowed or
-    # ungrouped read is not collapsed. Raw passthrough keeps the finding firing.
+def test_fanout_flagged_for_plain_projection_without_aggregate() -> None:
+    # No GROUP BY and no aggregate: the multiplied rows flow straight to the output.
     parsed = _parse("select f.id, d.seen_at from facts f join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
@@ -984,3 +983,63 @@ def test_fd_annotations_by_name_wires_the_uniqueness_edge() -> None:
 
     assert with_edge["stg"] == FDSet.of(FD(frozenset({"id"}), "customer_id"))
     assert without_edge["stg"] == NO_FDS
+
+
+# --- an ungrouped aggregate select is one implicit group (#296) ---
+
+_FANOUT_AGGREGATES: tuple[tuple[str, bool], ...] = (
+    ("count(distinct d.kind)", False),
+    ("max(d.seen_at)", False),
+    ("count(*)", True),
+    ("sum(f.amount)", True),
+)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["no_group_by", "group_by"])
+@pytest.mark.parametrize(("aggregate", "sensitive"), _FANOUT_AGGREGATES)
+def test_fanout_fires_exactly_on_duplicate_sensitive_aggregates(
+    aggregate: str, sensitive: bool, grouped: bool
+) -> None:
+    key = "f.id, " if grouped else ""
+    tail = " group by f.id" if grouped else ""
+    parsed = _parse(
+        f"select {key}{aggregate} as v from facts f join dim d on f.segment = d.segment{tail}"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert [f.kind for f in findings] == ([FindingKind.JOIN_FANOUT] if sensitive else [])
+
+
+def test_fanout_ungrouped_having_forms_a_group_too() -> None:
+    join = "from facts f join dim d on f.segment = d.segment"
+    keys = _model_keys(dim=(("id",),))
+    safe = _parse(f"select 1 as one {join} having max(d.seen_at) > 0")
+    sensitive = _parse(f"select 1 as one {join} having sum(f.amount) > 0")
+    assert detect_join_fanout(safe, model_keys=keys) == ()
+    assert len(detect_join_fanout(sensitive, model_keys=keys)) == 1
+
+
+def test_fanout_ungrouped_mixed_aggregate_and_bare_column_keeps_firing() -> None:
+    # SQLite reads the bare column from an arbitrary row of the group, and the fan-out
+    # changes which rows there are, so the select is not collapsed to a safe value.
+    parsed = _parse(
+        "select f.id, max(d.seen_at) as last_seen from facts f join dim d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert len(findings) == 1
+
+
+def test_fanout_ungrouped_window_aggregate_is_not_a_collapse() -> None:
+    # A windowed aggregate preserves rows, so the multiplied rows still reach the output.
+    parsed = _parse(
+        "select max(d.seen_at) over () as last_seen from facts f join dim d on f.segment = d.segment"
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert len(findings) == 1
+
+
+def test_fanout_ungrouped_collapse_ignores_columns_of_nested_subquery() -> None:
+    parsed = _parse(
+        "select max(d.x) as mx, (select o.amt from other o where o.id = 1) as s "
+        "from facts f join dim d on f.segment = d.segment"
+    )
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()

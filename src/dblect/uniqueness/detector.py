@@ -925,23 +925,54 @@ def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
 
 
 def _collapsed_before_sensitive_consumer(sel: exp.Select, *, safe_builtins: frozenset[str]) -> bool:
-    """True when ``sel``'s GROUP BY collapses any fan-out before a duplicate-sensitive
+    """True when ``sel`` collapses any fan-out into a group before a duplicate-sensitive
     consumer reads the multiplied rows.
 
-    After a GROUP BY the output is one row per group, so a row multiplication changes an
-    output value only through a duplicate-sensitive aggregate (``sum``, ``count``,
-    ``array_agg``: it folds the duplicated rows). The collapse clears only when every
-    aggregate consumer of the grouped rows (a projection or a HAVING term) is positively
-    known to be duplicate-safe: an idempotent fold, a ``DISTINCT`` aggregate, or a UDF the
-    adapter named in ``safe_builtins``. An aggregate UDF sqlglot leaves as ``exp.Anonymous``
-    is sensitive by default, so an unknown fold keeps the finding firing. A scope with no
-    GROUP BY (the fan-out flows straight to the rows) is never collapsed here. The collapse
-    clears exactly when ``sel`` has no duplicate-sensitive consumer (see
-    :func:`_sensitive_aggregate_consumers` for which nodes count).
+    A group is a GROUP BY, or the implicit single group of an ungrouped aggregate select
+    (:func:`_is_single_row_scope`) that projects no bare column. After the collapse the output
+    is one row per group, so a row multiplication changes an output value only through a
+    duplicate-sensitive aggregate (``sum``, ``count``, ``array_agg``: it folds the duplicated
+    rows). The collapse clears only when every aggregate consumer of the grouped rows (a
+    projection or a HAVING term) is positively known to be duplicate-safe: an idempotent fold,
+    a ``DISTINCT`` aggregate, or a UDF the adapter named in ``safe_builtins``. An aggregate UDF
+    sqlglot leaves as ``exp.Anonymous`` is sensitive by default, so an unknown fold keeps the
+    finding firing (see :func:`_sensitive_aggregate_consumers` for which nodes count).
+
+    A scope with neither shape (the fan-out flows straight to the rows) is never collapsed. An
+    ungrouped select that mixes an aggregate with a bare column is not collapsed either:
+    SQLite reads that column from an arbitrary row of the group, and the fan-out changes which
+    rows exist.
     """
-    if sg.group_of(sel) is None:
+    if sg.group_of(sel) is None and not _is_implicit_single_group(sel):
         return False
     return next(_sensitive_aggregate_consumers(sel, safe_builtins=safe_builtins), None) is None
+
+
+def _is_implicit_single_group(sel: exp.Select) -> bool:
+    """True when ``sel`` is an ungrouped aggregate whose every column read in a projection or
+    HAVING term sits under a collapsing aggregate, so the whole select is one group with no
+    per-row value. Columns of a nested sub-SELECT belong to that scope and are not weighed."""
+    if not _is_single_row_scope(sel):
+        return False
+    roots: list[Expr] = list(sel.expressions)
+    having = sel.args.get("having")
+    if isinstance(having, exp.Having) and isinstance(having.this, Expr):
+        roots.append(having.this)
+    return not any(
+        _node_in_scope(col, sel) and not _under_collapsing_aggregate(col, sel)
+        for root in roots
+        for col in root.find_all(exp.Column)
+    )
+
+
+def _under_collapsing_aggregate(node: Expr, sel: exp.Select) -> bool:
+    """True when an aggregate of ``sel`` that is not a window function encloses ``node``."""
+    cur = node.parent
+    while cur is not None and cur is not sel:
+        if isinstance(cur, exp.AggFunc) and not _within_window(cur, sel):
+            return True
+        cur = cur.parent
+    return False
 
 
 def _sensitive_aggregate_consumers(
