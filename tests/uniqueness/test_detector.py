@@ -583,6 +583,25 @@ def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
     assert findings == ()
 
 
+@pytest.mark.parametrize("dialect", ["duckdb", "snowflake", "postgres", "bigquery", "redshift"])
+@pytest.mark.parametrize("spelling", ["id", "ID", "Id", '"id"', '"ID"', '"Id"'])
+def test_fanout_silent_when_join_column_spelling_differs_only_in_case(
+    dialect: str, spelling: str
+) -> None:
+    # Keys are stored case-folded, so the join column must compare case-insensitively.
+    parsed = parse_sql(
+        f"select * from facts f left join dim d on d.{spelling} = f.fk", dialect=dialect
+    )
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
+    assert findings == ()
+
+
+def test_fanout_silent_for_mixed_case_composite_join_columns() -> None:
+    parsed = _parse("select * from facts f join dim d on f.a = d.A and f.b = d.B")
+    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("a", "b"),)))
+    assert findings == ()
+
+
 def test_fanout_silent_when_join_key_is_a_superkey_of_declared_key() -> None:
     parsed = _parse(
         "select * from facts f left join dim d on f.id = d.id and f.segment = d.segment"

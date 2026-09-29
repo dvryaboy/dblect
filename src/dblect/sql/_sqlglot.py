@@ -550,6 +550,12 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
+def folded_column_name(c: exp.Column) -> str:
+    """The column name in the case-folded form uniqueness keys and FDs are stored in, so a
+    join column spelled ``PetID`` meets the declared key ``petid``."""
+    return c.name.lower()
+
+
 def column_key(c: exp.Column) -> tuple[str | None, str]:
     """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
 
@@ -712,7 +718,7 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(column_name(on_alias[0]))
+        cols.add(folded_column_name(on_alias[0]))
     return frozenset(cols)
 
 
@@ -735,7 +741,12 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append((column_key(left), column_key(right)))
+        sides.append(
+            (
+                (column_table(left), folded_column_name(left)),
+                (column_table(right), folded_column_name(right)),
+            )
+        )
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()
