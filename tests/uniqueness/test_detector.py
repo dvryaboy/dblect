@@ -18,6 +18,7 @@ from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.properties.functional_dependency import FD, NO_FDS, FDSet
 from dblect.manifest import DbtTestMetadata, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
+from dblect.sql._sqlglot import IdentifierFold
 from dblect.uniqueness.detector import (
     detect_join_fanout,
     detect_limit_without_deterministic_order,
@@ -583,20 +584,31 @@ def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
     assert findings == ()
 
 
-@pytest.mark.parametrize("dialect", ["duckdb", "snowflake", "postgres", "bigquery", "redshift"])
+# Adapters whose quoted identifiers resolve case-insensitively. Elsewhere ("ID" and id can be two
+# columns) a quoted spelling is kept exact and must not be taken as covering a key declared `id`.
+_QUOTED_CASE_INSENSITIVE = frozenset({"duckdb", "bigquery", "redshift"})
+
+
+@pytest.mark.parametrize("adapter", ["duckdb", "snowflake", "postgres", "bigquery", "redshift"])
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("name", ["id", "ID", "Id"])
-def test_fanout_silent_when_join_column_spelling_differs_only_in_case(
-    dialect: str, quoted: bool, name: str
+def test_fanout_verdict_for_join_column_spelling_against_lowercase_key(
+    adapter: str, quoted: bool, name: str
 ) -> None:
-    # Keys are stored case-folded, so the join column must compare case-insensitively. The quoted
-    # form is rendered per dialect (BigQuery quotes identifiers with backticks).
-    spelling = exp.to_identifier(name, quoted=quoted).sql(dialect=dialect)
+    profile = profile_for_adapter(adapter)
+    spelling = exp.to_identifier(name, quoted=quoted).sql(dialect=profile.sqlglot_dialect)
     parsed = parse_sql(
-        f"select * from facts f left join dim d on d.{spelling} = f.fk", dialect=dialect
+        f"select * from facts f left join dim d on d.{spelling} = f.fk",
+        dialect=profile.sqlglot_dialect,
     )
-    findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
-    assert findings == ()
+    findings = detect_join_fanout(
+        parsed,
+        model_keys=_model_keys(dim=(("id",),)),
+        fold=IdentifierFold.of_dialect(profile.sqlglot_dialect),
+    )
+    covered = name == "id" or not quoted or adapter in _QUOTED_CASE_INSENSITIVE
+    assert (findings == ()) is covered
+    assert covered or [f.kind for f in findings] == [FindingKind.JOIN_FANOUT]
 
 
 def test_fanout_silent_for_mixed_case_composite_join_columns() -> None:

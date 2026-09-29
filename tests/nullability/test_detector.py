@@ -654,18 +654,29 @@ def test_schema_qualified_reference_does_not_inherit_a_same_named_relations_null
     assert findings == []
 
 
-# Nullability facts are keyed case-folded, so a mixed-case spelling of the same column has to
-# reach them: a nullable key must still fire, and a declared not_null one must stay silent.
-_SPELLINGS = [
-    exp.to_identifier(name, quoted=quoted).sql(dialect="duckdb")
-    for name in ("PatientID", "patientid", "PATIENTID")
-    for quoted in (False, True)
-]
+# Nullability facts are keyed case-folded, so an unquoted mixed-case spelling of a column has to
+# reach them. A quoted spelling reaches them only where the dialect resolves quoted identifiers
+# case-insensitively; elsewhere `"PatientID"` is a different column from `patientid`.
+_ADAPTERS = ["duckdb", "snowflake", "postgres", "bigquery", "redshift"]
+_QUOTED_CASE_INSENSITIVE = frozenset({"duckdb", "bigquery", "redshift"})
+_NAMES = ["PatientID", "patientid", "PATIENTID"]
 
 _CASE_STG_SQL = "SELECT a.id AS id, b.tag AS PatientID FROM base a LEFT JOIN lkp b ON a.fk = b.id"
 
 
-def _mixed_case_kinds(mart_sql: str, *, mixed_source_not_null: bool = False) -> list[FindingKind]:
+def _spelling(adapter: str, name: str, quoted: bool) -> str:
+    dialect = profile_for_adapter(adapter).sqlglot_dialect
+    return exp.to_identifier(name, quoted=quoted).sql(dialect=dialect)
+
+
+def _resolves_to_column(adapter: str, name: str, quoted: bool) -> bool:
+    return name == "patientid" or not quoted or adapter in _QUOTED_CASE_INSENSITIVE
+
+
+def _mixed_case_kinds(
+    adapter: str, mart_sql: str, *, mixed_source_not_null: bool = False
+) -> list[FindingKind]:
+    profile = profile_for_adapter(adapter)
     nodes = [
         _source("base"),
         _source("lkp"),
@@ -692,27 +703,42 @@ def _mixed_case_kinds(mart_sql: str, *, mixed_source_not_null: bool = False) -> 
     if mixed_source_not_null:
         nodes.append(_not_null("pets", "PatientID"))
     manifest = _manifest(*nodes)
-    tree = parse_sql(mart_sql, dialect="duckdb")
+    tree = parse_sql(mart_sql, dialect=profile.sqlglot_dialect)
     return [
-        f.kind for detector in make_nullability_detectors(manifest, _DUCKDB) for f in detector(tree)
+        f.kind for detector in make_nullability_detectors(manifest, profile) for f in detector(tree)
     ]
 
 
-@pytest.mark.parametrize("spelling", _SPELLINGS)
-def test_join_on_mixed_case_nullable_key_fires_in_every_spelling(spelling: str) -> None:
-    sql = f"SELECT s.id FROM other o JOIN stg s ON o.k = s.{spelling}"
-    assert FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(sql)
+@pytest.mark.parametrize("adapter", _ADAPTERS)
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", _NAMES)
+def test_join_on_nullable_key_fires_exactly_when_spelling_resolves_to_the_column(
+    adapter: str, quoted: bool, name: str
+) -> None:
+    sql = f"SELECT s.id FROM other o JOIN stg s ON o.k = s.{_spelling(adapter, name, quoted)}"
+    fires = FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(adapter, sql)
+    assert fires is _resolves_to_column(adapter, name, quoted)
 
 
-@pytest.mark.parametrize("spelling", _SPELLINGS)
-def test_not_exists_on_mixed_case_nullable_key_fires_in_every_spelling(spelling: str) -> None:
-    sql = (
-        f"SELECT s.id FROM stg s WHERE NOT EXISTS (SELECT 1 FROM other o WHERE o.k = s.{spelling})"
-    )
-    assert FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(sql)
+@pytest.mark.parametrize("adapter", _ADAPTERS)
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", _NAMES)
+def test_not_exists_on_nullable_key_fires_whenever_spelling_resolves_to_the_column(
+    adapter: str, quoted: bool, name: str
+) -> None:
+    spelled = _spelling(adapter, name, quoted)
+    sql = f"SELECT s.id FROM stg s WHERE NOT EXISTS (SELECT 1 FROM other o WHERE o.k = s.{spelled})"
+    fires = FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(adapter, sql)
+    # Anti-join probe matching is case-insensitive by design, so a case-distinct quoted
+    # spelling may over-report; it must never be missed.
+    assert fires or not _resolves_to_column(adapter, name, quoted)
 
 
-@pytest.mark.parametrize("spelling", _SPELLINGS)
-def test_join_on_mixed_case_not_null_key_stays_clean_in_every_spelling(spelling: str) -> None:
-    sql = f"SELECT p.k FROM other o JOIN pets p ON o.k = p.{spelling}"
-    assert _mixed_case_kinds(sql, mixed_source_not_null=True) == []
+@pytest.mark.parametrize("adapter", _ADAPTERS)
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", _NAMES)
+def test_join_on_not_null_key_stays_clean_in_every_spelling(
+    adapter: str, quoted: bool, name: str
+) -> None:
+    sql = f"SELECT p.k FROM other o JOIN pets p ON o.k = p.{_spelling(adapter, name, quoted)}"
+    assert _mixed_case_kinds(adapter, sql, mixed_source_not_null=True) == []

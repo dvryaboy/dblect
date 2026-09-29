@@ -20,6 +20,7 @@ from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
 
 
 class JoinSide(StrEnum):
@@ -550,10 +551,40 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
-def folded_column_name(c: exp.Column) -> str:
-    """The column name in the case-folded form uniqueness keys and FDs are stored in, so a
-    join column spelled ``PetID`` meets the declared key ``petid``."""
-    return c.name.lower()
+@dataclass(frozen=True)
+class IdentifierFold:
+    """How a dialect decides whether two spellings of a column name are the same column, in the
+    lowercase form uniqueness keys and nullability facts are stored in.
+
+    An unquoted name is lowercased, except in a case-sensitive dialect where it is kept as
+    written. A quoted name is lowercased only where the dialect resolves quoted identifiers
+    case-insensitively (duckdb); elsewhere ``"ID"`` and ``id`` can be distinct columns, so a
+    quoted name stays exact and fails to meet a lowercase key, the sound direction for a
+    "is this join covered" question.
+    """
+
+    strategy: NormalizationStrategy
+
+    @classmethod
+    def of_dialect(cls, dialect: str | None) -> IdentifierFold:
+        return cls(Dialect.get_or_raise(dialect).normalization_strategy)
+
+    def name(self, c: exp.Column) -> str:
+        quoted = isinstance(c.this, exp.Identifier) and bool(c.this.quoted)
+        match self.strategy:
+            case (
+                NormalizationStrategy.CASE_INSENSITIVE
+                | NormalizationStrategy.CASE_INSENSITIVE_UPPERCASE
+            ):
+                return c.name.lower()
+            case NormalizationStrategy.LOWERCASE | NormalizationStrategy.UPPERCASE:
+                return c.name if quoted else c.name.lower()
+            case NormalizationStrategy.CASE_SENSITIVE:
+                return c.name
+
+
+# The fold for an unspecified dialect: unquoted names lowercase, quoted names exact.
+DEFAULT_FOLD = IdentifierFold.of_dialect(None)
 
 
 def column_key(c: exp.Column) -> tuple[str | None, str]:
@@ -692,7 +723,9 @@ def matches_typed_or_named(
     )
 
 
-def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None:
+def equality_cols_on_alias(
+    predicate: Expr, alias: str, *, fold: IdentifierFold
+) -> frozenset[str] | None:
     """Columns on `alias` appearing in conjunctive equalities in `predicate`.
 
     Walks the AND-conjunction of `predicate`; for each leaf, accepts only
@@ -718,11 +751,13 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(folded_column_name(on_alias[0]))
+        cols.add(fold.name(on_alias[0]))
     return frozenset(cols)
 
 
-def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
+def equality_cols_by_alias(
+    predicate: Expr, *, fold: IdentifierFold
+) -> dict[str, frozenset[str]] | None:
     """Per-alias join-key columns from a conjunction of column equalities, in one walk.
 
     The multi-alias companion to :func:`equality_cols_on_alias`: it flattens the conjunction
@@ -743,8 +778,8 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
             return None
         sides.append(
             (
-                (column_table(left), folded_column_name(left)),
-                (column_table(right), folded_column_name(right)),
+                (column_table(left), fold.name(left)),
+                (column_table(right), fold.name(right)),
             )
         )
     out: dict[str, frozenset[str]] = {}

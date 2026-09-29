@@ -24,6 +24,7 @@ from enum import StrEnum
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.dialect import NormalizationStrategy
 
 from dblect.sql import _sqlglot as sg
 
@@ -110,10 +111,15 @@ def anti_arm_ids(sel: exp.Select) -> set[int]:
     return {id(a.join) for a in anti_joins_of(sel) if a.join is not None}
 
 
+# Anti-join matching is deliberately case-insensitive: it only decides which side is the probe and
+# whether a probe key is nullable, where conflating case-distinct names over-reports rather than hides.
+_PROBE_FOLD = sg.IdentifierFold(NormalizationStrategy.CASE_INSENSITIVE)
+
+
 def _sides_of(on: Expr | None) -> dict[str, frozenset[str]]:
     """Per-alias equality columns of a join/correlation predicate, lower-cased, empty when the
     predicate is not a clean conjunction of column equalities."""
-    by_alias = sg.equality_cols_by_alias(on) if on is not None else None
+    by_alias = sg.equality_cols_by_alias(on, fold=_PROBE_FOLD) if on is not None else None
     if by_alias is None:
         return {}
     return {alias: frozenset(c.lower() for c in cols) for alias, cols in by_alias.items()}

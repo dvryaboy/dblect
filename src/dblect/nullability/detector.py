@@ -157,6 +157,7 @@ def detect_join_on_nullable_key(
     nullable_by_name: NullableByName,
     cause_by_name: CauseByName | None = None,
     fd_by_name: Mapping[str, FDSet] = {},
+    fold: sg.IdentifierFold = sg.DEFAULT_FOLD,
 ) -> tuple[Finding, ...]:
     """Flag a JOIN whose equality key is a column nullable in its upstream relation.
 
@@ -224,7 +225,7 @@ def detect_join_on_nullable_key(
                 if keys:
                     out.append(_join_finding(join, keys, determined=determined, side=side))
                 continue
-            cols_by_alias = sg.equality_cols_by_alias(on)
+            cols_by_alias = sg.equality_cols_by_alias(on, fold=fold)
             if cols_by_alias is None:  # not a clean conjunction of column equalities
                 continue
             keys: list[_NullableKey] = []
@@ -625,6 +626,7 @@ def make_nullability_detectors(
         manifest, activated_nullability(manifest, profile, parsed=parsed, column_graph=column_graph)
     )
     cause_by_name = _cause_by_name(manifest, parsed=parsed)
+    fold = sg.IdentifierFold.of_dialect(profile.sqlglot_dialect)
 
     def group_by_nullable(tree: Expr) -> tuple[Finding, ...]:
         return detect_null_group_on_nullable_key(tree, nullable_by_name=nullable_by_name)
@@ -635,6 +637,7 @@ def make_nullability_detectors(
             nullable_by_name=nullable_by_name,
             cause_by_name=cause_by_name,
             fd_by_name=fd_by_name,
+            fold=fold,
         )
 
     def not_in_nullable(tree: Expr) -> tuple[Finding, ...]:
