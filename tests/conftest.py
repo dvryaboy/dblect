@@ -11,6 +11,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from dblect.model_errors import ModelErrorPolicy, model_error_policy
+
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
@@ -109,3 +111,11 @@ def jaffle_snowflake_meta_manifest_path() -> Path:
             "run scripts/refresh_jaffle_fixtures.sh",
         )
     return path
+
+
+@pytest.fixture(autouse=True)
+def raise_on_model_errors() -> Iterator[None]:
+    """Under test a detector crash must fail the test, not become a skipped model that a
+    "no finding" assertion silently accepts. Isolation tests opt into SKIP explicitly."""
+    with model_error_policy(ModelErrorPolicy.RAISE):
+        yield

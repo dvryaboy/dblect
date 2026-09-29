@@ -34,6 +34,7 @@ from dblect.lineage.facts.model import Fact
 from dblect.lineage.graph import ColumnLineageGraph, RelationLineageGraph, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet
 from dblect.manifest import Manifest, Node, compilation_miss_reason
+from dblect.model_errors import coverage_miss_reason
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
 from dblect.sql import (
@@ -288,12 +289,8 @@ def _scan_one(
             raw_findings.extend(detector(tree))
     except Exception as e:
         # Isolated at the model boundary so a sqlglot edge case in one model is a coverage miss
-        # for it, not an empty report for the project. ``Exception`` leaves KeyboardInterrupt
-        # and SystemExit propagating; the type and message stay in the reason so a genuine
-        # dblect bug is visible in the report rather than swallowed.
-        return SkippedModel(
-            unique_id=node.unique_id, reason=f"analysis error: {type(e).__name__}: {e}"
-        )
+        # for it, not an empty report for the project.
+        return SkippedModel(unique_id=node.unique_id, reason=coverage_miss_reason(e))
     directives = FramedDirectives.for_node(node)
     # Locate before suppressing: a `-- noqa` is matched against the line the report shows,
     # which can differ from the compiled line a macro expansion produced.

@@ -18,6 +18,7 @@ from dblect.audit import LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding
 from dblect.check.run import run_check
 from dblect.manifest import Manifest, Node
+from dblect.model_errors import ModelErrorPolicy, model_error_policy
 from dblect.sql import Finding, FindingKind
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -116,7 +117,8 @@ def test_detector_crash_names_the_model_and_the_exception() -> None:
 
     bad = _model_node("model.pkg.bad", "select 'poison' as x")
     fine = _model_node("model.pkg.fine", "select 'ok' as x")
-    report = run_audit(_manifest(bad, fine), _DUCKDB, detectors=(poisoned,))
+    with model_error_policy(ModelErrorPolicy.SKIP):
+        report = run_audit(_manifest(bad, fine), _DUCKDB, detectors=(poisoned,))
     [skip] = report.skipped
     assert skip.unique_id == "model.pkg.bad"
     assert "AttributeError" in skip.reason
