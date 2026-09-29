@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from dblect.check.coverage import WorldCoverage
-from dblect.check.findings import CheckFinding
+from dblect.check.findings import CheckFinding, UnbuiltModel
 from dblect.check.run import (
     CheckGraphs,
     WorldFacts,
@@ -84,6 +84,7 @@ class WorldResult:
 
     world: WorldRef
     findings: tuple[CheckFinding, ...]
+    unbuilt: tuple[UnbuiltModel, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +97,15 @@ class EnumeratedFindings:
         """The world coverage this enumeration achieved: the world count and the flag
         axes swept."""
         return WorldCoverage.over(result.world for result in self.per_world)
+
+    def unbuilt(self) -> tuple[UnbuiltModel, ...]:
+        """The models whose scan failed in any world, one entry per model (the first
+        world's reason wins)."""
+        reasons: dict[str, str] = {}
+        for result in self.per_world:
+            for miss in result.unbuilt:
+                reasons.setdefault(miss.unique_id, miss.reason)
+        return tuple(UnbuiltModel(uid, reason) for uid, reason in sorted(reasons.items()))
 
     def by_finding(self) -> Mapping[CheckFinding, frozenset[WorldRef]]:
         """Each finding mapped to the worlds it fired in. When that set is a strict
@@ -140,6 +150,8 @@ def enumerate_worlds(
         annotations = propagate_world(graphs, _world_facts(graphs, world, compile_facts))
         # Apply -- noqa the same way single-world run_check does, so a triaged finding
         # stays silenced here rather than reappearing as active in every world.
-        active, _ = suppress_check_findings(world_findings(graphs, annotations), graphs.manifest)
-        results.append(WorldResult(world=world, findings=active))
+        misses: list[UnbuiltModel] = []
+        found = world_findings(graphs, annotations, misses)
+        active, _ = suppress_check_findings(found, graphs.manifest)
+        results.append(WorldResult(world=world, findings=active, unbuilt=tuple(misses)))
     return EnumeratedFindings(per_world=tuple(results))

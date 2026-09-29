@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum, auto
 
 
@@ -19,18 +20,19 @@ class ModelErrorPolicy(Enum):
     RAISE = auto()
 
 
-_policy = ModelErrorPolicy.SKIP
+_policy: ContextVar[ModelErrorPolicy] = ContextVar(
+    "model_error_policy", default=ModelErrorPolicy.SKIP
+)
 
 
 @contextmanager
 def model_error_policy(policy: ModelErrorPolicy) -> Generator[None, None, None]:
     """Run the enclosed analysis under ``policy``, restoring the previous one after."""
-    global _policy
-    previous, _policy = _policy, policy
+    token = _policy.set(policy)
     try:
         yield
     finally:
-        _policy = previous
+        _policy.reset(token)
 
 
 def coverage_miss_reason(error: Exception) -> str:
@@ -38,6 +40,6 @@ def coverage_miss_reason(error: Exception) -> str:
     under ``RAISE``. Called from an ``except Exception`` block, so ``KeyboardInterrupt`` and
     ``SystemExit`` are never absorbed. The type and message stay in the reason so a
     genuine dblect bug is visible in the report."""
-    if _policy is ModelErrorPolicy.RAISE:
+    if _policy.get() is ModelErrorPolicy.RAISE:
         raise error
     return f"analysis error: {type(error).__name__}: {error}"

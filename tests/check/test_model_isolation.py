@@ -8,7 +8,8 @@ from dataclasses import replace
 import pytest
 
 from dblect.adapters import profile_for_adapter
-from dblect.check import CheckGraphs, build_check_graphs, run_check
+from dblect.check import CheckGraphs, build_check_graphs, enumerate_worlds, run_check
+from dblect.lineage.facts.model import BASE_WORLD, WorldRef
 from dblect.lineage.graph import ColumnRef
 from dblect.lineage.properties.domain_type import DomainTag
 from dblect.lineage.property import Annotation
@@ -59,3 +60,12 @@ def test_join_key_scan_failure_propagates_under_the_raise_policy() -> None:
     graphs = _poisoning(_graphs())
     with pytest.raises(KeyError, match="boom"):
         run_check(graphs.manifest, _DUCKDB, graphs=graphs)
+
+
+def test_world_enumeration_surfaces_join_key_scan_failures_once_per_model() -> None:
+    graphs = _poisoning(_graphs())
+    other = WorldRef(frozenset({("flag", True)}))
+    with model_error_policy(ModelErrorPolicy.SKIP):
+        found = enumerate_worlds(graphs, {BASE_WORLD: (), other: ()})
+    assert [u.unique_id for u in found.unbuilt()] == ["model.shop.bad"]
+    assert all(result.unbuilt for result in found.per_world)

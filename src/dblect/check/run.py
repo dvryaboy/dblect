@@ -367,14 +367,14 @@ def suppress_check_findings(
 def world_findings(
     graphs: CheckGraphs,
     world: WorldAnnotations,
-    misses: list[UnbuiltModel] | None = None,
+    misses: list[UnbuiltModel],
 ) -> list[CheckFinding]:
     """The findings that vary by world: the domain-type contradictions and the
     not-well-typed aggregations, read off one world's annotations. The
     contract-resolution and resolution-floor findings are world-invariant and stay
     ``run_check``'s to report once. Models whose join-key scan failed are appended to
-    ``misses`` when given; ``run_check`` reports them as unbuilt."""
-    join_misses: list[UnbuiltModel] = [] if misses is None else misses
+    ``misses``, which every caller must place in its report: tags differ per world, so a
+    failure can be specific to one world."""
     findings: list[CheckFinding] = []
     # One source-map per model, shared across both finding kinds: a model that produces
     # both a contradiction and an aggregation finding builds its line map once.
@@ -399,7 +399,7 @@ def world_findings(
             world.domain_type,
             graphs.join_key_ground,
             line_maps,
-            join_misses,
+            misses,
         )
     )
     findings.extend(

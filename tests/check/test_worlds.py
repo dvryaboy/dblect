@@ -138,7 +138,7 @@ def test_base_world_alone_reproduces_run_checks_world_varying_findings() -> None
     base = result.per_world[0]
     assert [f.kind for f in base.findings] == _world_varying(report)
     # And it equals deriving from the base world directly.
-    direct = world_findings(graphs, propagate_world(graphs, base_world_facts(graphs.resolved)))
+    direct = world_findings(graphs, propagate_world(graphs, base_world_facts(graphs.resolved)), [])
     assert list(base.findings) == direct
 
 
