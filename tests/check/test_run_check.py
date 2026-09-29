@@ -22,7 +22,7 @@ from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
 from dblect.manifest import Manifest, ResourceType
-from dblect.types import IssueCode, ModelContract
+from dblect.types import DomainType, Integer, IssueCode, ModelContract, NominalEnum, Varchar
 from tests._manifest_builders import cols as _cols
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -602,6 +602,122 @@ def test_join_on_compatible_domain_types_is_quiet() -> None:
 
     report = run_check(_join_keys_manifest(), _DUCKDB)
     assert not [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
+
+
+# --- identifier join keys ---------------------------------------------------------
+
+
+class _Entity(NominalEnum):
+    PLAYER = "player"
+    PLAYER_ROW = "player_row"
+    ATTRIBUTE_SNAPSHOT = "attribute_snapshot"
+
+
+class _IntId(DomainType):
+    id: Integer
+    entity: _Entity
+
+
+class _StrId(DomainType):
+    id: Varchar
+    entity: _Entity
+
+
+def _identifier_join_manifest(on: str) -> Manifest:
+    return _manifest(
+        _node(
+            "source.shop.raw.player",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(id="INT", player_api_id="INT"),
+        ),
+        _node(
+            "source.shop.raw.player_attributes",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(id="INT", player_api_id="INT"),
+        ),
+        _node(
+            "model.shop.joined",
+            kind=ResourceType.MODEL,
+            sql=f"SELECT p.id AS pid FROM player_attributes AS pa JOIN player AS p ON {on}",
+            columns=_cols(pid="INT"),
+        ),
+    )
+
+
+@pytest.mark.parametrize("identifier", [_IntId, _StrId], ids=["integer", "varchar"])
+@pytest.mark.parametrize(
+    ("on", "flagged"),
+    [
+        ("pa.id = p.id", True),
+        ("pa.player_api_id = p.player_api_id", False),
+        ("pa.player_api_id = p.id", True),
+    ],
+)
+def test_identifier_types_catch_a_join_across_entities(
+    identifier: type[DomainType], on: str, flagged: bool
+) -> None:
+    # Built through the metaclass so the parametrized type reaches the annotations
+    # (a class body cannot see a test's locals under postponed evaluation).
+    def declare(model: str, row: _Entity) -> None:
+        type(
+            model,
+            (ModelContract,),
+            {
+                "dbt_model": model,
+                "__annotations__": {
+                    "id": identifier.refine(entity=row),
+                    "player_api_id": identifier.refine(entity=_Entity.PLAYER).columns(
+                        id="player_api_id"
+                    ),
+                },
+            },
+        )
+
+    declare("player", _Entity.PLAYER_ROW)
+    declare("player_attributes", _Entity.ATTRIBUTE_SNAPSHOT)
+
+    report = run_check(_identifier_join_manifest(on), _DUCKDB)
+    found = [f for f in report.findings if f.kind is CheckFindingKind.JOIN_KEY_TYPE_MISMATCH]
+    assert bool(found) is flagged
+    if flagged:
+        assert "magnitude" not in found[0].message
+
+
+def test_reducing_and_counting_a_fixed_entity_identifier_raises_no_typing_finding() -> None:
+    # A fixed entity is a pinned identity, so no per-row companion needs discharging.
+    class Player(ModelContract):
+        dbt_model = "player"
+        id: _IntId.refine(entity=_Entity.PLAYER_ROW)
+
+    manifest = _manifest(
+        _node(
+            "source.shop.raw.player",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(id="INT"),
+        ),
+        _node(
+            "model.shop.stats",
+            kind=ResourceType.MODEL,
+            sql="SELECT MAX(id) AS top_id, COUNT(id) AS n FROM player",
+            columns=_cols(top_id="INT", n="INT"),
+        ),
+    )
+    report = run_check(manifest, _DUCKDB)
+    assert CheckFindingKind.AGGREGATION_NOT_WELL_TYPED not in _kinds(report)
+    assert CheckFindingKind.CONTRACT_ISSUE not in _kinds(report)
+
+
+def test_an_identifier_type_with_nothing_to_tag_surfaces_a_contract_issue() -> None:
+    class Player(ModelContract):
+        dbt_model = "player"
+        id: _IntId
+
+    report = run_check(_identifier_join_manifest("pa.id = p.id"), _DUCKDB)
+    [issue] = [f for f in report.findings if f.kind is CheckFindingKind.CONTRACT_ISSUE]
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
 
 
 # --- coverage -------------------------------------------------------------------

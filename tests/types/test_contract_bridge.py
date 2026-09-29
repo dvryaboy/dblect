@@ -11,6 +11,8 @@ facts that merge with dbt-test-sourced ones in ``collect``.
 
 from collections.abc import Mapping
 
+import pytest
+
 from dblect.demo import Currency, Money
 from dblect.lineage.facts.grounding import collect
 from dblect.lineage.facts.model import Declared, DeclaredSource
@@ -26,13 +28,18 @@ from dblect.lineage.properties.uniqueness import CandidateKeySet, unique_test_di
 from dblect.manifest import Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata
 from dblect.types import (
+    Date,
     Decimal,
+    DomainType,
     Field,
     ForeignKey,
     ForeignKeyEdge,
+    Integer,
     IssueCode,
     ModelContract,
+    NominalEnum,
     PrimaryKey,
+    Varchar,
     contract_key_discoverer,
     contract_tag_discoverer,
     resolve_contracts,
@@ -117,20 +124,85 @@ def test_nominal_facets_ride_as_concrete_or_per_row_bindings() -> None:
     )
 
 
-def test_a_type_with_no_magnitude_grounds_nothing() -> None:
-    from dblect.demo import Country
-    from dblect.types import DomainType
+class _Entity(NominalEnum):
+    PLAYER = "player"
+    PLAYER_ROW = "player_row"
 
-    class Locale(DomainType):
-        country: Country
 
+class _IntId(DomainType):
+    id: Integer
+    entity: _Entity
+
+
+class _StrId(DomainType):
+    id: Varchar
+    entity: _Entity
+
+
+@pytest.mark.parametrize("identifier", [_IntId, _StrId], ids=["integer", "varchar"])
+def test_an_identifier_type_carries_its_fixed_facets_on_its_value_column(
+    identifier: type[DomainType],
+) -> None:
+    # The nominal-typed ``Varchar`` id must not tag itself: only the fixed entity is a
+    # facet, so two different id columns of the same entity carry equal tags.
     class M(ModelContract):
         dbt_model = "stg_charges"
-        locale: Locale
+        key: identifier.refine(entity=_Entity.PLAYER).columns(id="charge_id")
+
+    resolved = resolve_contracts(_CHARGES)
+    assert resolved.issues == ()
+    (fact,) = resolved.tag_facts
+    assert fact.scope == ColumnRef(_CHARGES_SRC, "charge_id")
+    assert fact.value == tagged(nominal={"entity": Concrete("player")})
+
+
+def test_an_identifier_type_with_an_open_facet_has_no_single_value_column() -> None:
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        key: _IntId
 
     resolved = resolve_contracts(_CHARGES)
     assert resolved.tag_facts == ()
-    assert resolved.issues == ()
+    [issue] = resolved.issues
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
+    assert issue.field == "key"
+
+
+def test_an_identifier_type_with_every_field_fixed_is_a_finding() -> None:
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        key: _StrId.refine(id="x", entity=_Entity.PLAYER)
+
+    resolved = resolve_contracts(_CHARGES)
+    assert resolved.tag_facts == ()
+    [issue] = resolved.issues
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
+
+
+def test_an_identifier_column_with_no_fixed_facet_is_a_finding() -> None:
+    class Bare(DomainType):
+        created: Date
+
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        made: Bare
+
+    resolved = resolve_contracts(_CHARGES)
+    assert resolved.tag_facts == ()
+    [issue] = resolved.issues
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
+
+
+def test_an_identifier_column_missing_from_the_model_is_unsourced() -> None:
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        key: _IntId.refine(entity=_Entity.PLAYER)
+
+    resolved = resolve_contracts(
+        _CHARGES, known_columns={_CHARGES_SRC: frozenset({"charge_amount"})}
+    )
+    [issue] = resolved.issues
+    assert issue.code is IssueCode.UNSOURCED_FIELD
 
 
 def test_a_type_with_two_magnitudes_is_malformed() -> None:

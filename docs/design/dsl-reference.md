@@ -87,6 +87,10 @@ Used directly as a column's type.
   domain claim. Spell a measure `Count` / `Decimal` and an identifier or year with its
   domain type. A future strict mode rejects a bare integer instead (see
   [domain-type-algebra.md](domain-type-algebra.md), "Lenient and strict modes").
+- A type with no magnitude (an identifier: `id: Integer` plus `entity: Entity`) tags its
+  one open field's column with the fixed facets (`.refine(entity=...)`), so
+  `join_key_type_mismatch` sees a join across entities. Zero or several open fields, or
+  no fixed facet, is a `malformed_declaration` contract issue rather than a silent drop.
 - `Uuid`, `Json`, and other semi-structured or specialized types (`interval`, `binary`,
   `geography`) are not yet accepted; their spellings are still open.
 
