@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import pytest
-from sqlglot import Expr
+from sqlglot import Expr, exp
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
@@ -584,11 +584,14 @@ def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
 
 
 @pytest.mark.parametrize("dialect", ["duckdb", "snowflake", "postgres", "bigquery", "redshift"])
-@pytest.mark.parametrize("spelling", ["id", "ID", "Id", '"id"', '"ID"', '"Id"'])
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", ["id", "ID", "Id"])
 def test_fanout_silent_when_join_column_spelling_differs_only_in_case(
-    dialect: str, spelling: str
+    dialect: str, quoted: bool, name: str
 ) -> None:
-    # Keys are stored case-folded, so the join column must compare case-insensitively.
+    # Keys are stored case-folded, so the join column must compare case-insensitively. The quoted
+    # form is rendered per dialect (BigQuery quotes identifiers with backticks).
+    spelling = exp.to_identifier(name, quoted=quoted).sql(dialect=dialect)
     parsed = parse_sql(
         f"select * from facts f left join dim d on d.{spelling} = f.fk", dialect=dialect
     )
