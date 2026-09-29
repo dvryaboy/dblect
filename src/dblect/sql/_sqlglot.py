@@ -587,6 +587,11 @@ class IdentifierFold:
 DEFAULT_FOLD = IdentifierFold.of_dialect(None)
 
 
+# Matches names case-insensitively even when quoted. For a lookup of a fact that TRIGGERS a finding
+# (a nullable column), conflating case-distinct names over-reports rather than hides.
+CASE_INSENSITIVE_FOLD = IdentifierFold(NormalizationStrategy.CASE_INSENSITIVE)
+
+
 def column_key(c: exp.Column) -> tuple[str | None, str]:
     """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
 

@@ -654,11 +654,10 @@ def test_schema_qualified_reference_does_not_inherit_a_same_named_relations_null
     assert findings == []
 
 
-# Nullability facts are keyed case-folded, so an unquoted mixed-case spelling of a column has to
-# reach them. A quoted spelling reaches them only where the dialect resolves quoted identifiers
-# case-insensitively; elsewhere `"PatientID"` is a different column from `patientid`.
+# Nullability facts are keyed case-folded and a nullable column triggers the finding, so every
+# spelling of the column reaches them, quoted or not, in every dialect: a case-distinct quoted
+# name over-reports rather than dropping a real error.
 _ADAPTERS = ["duckdb", "snowflake", "postgres", "bigquery", "redshift"]
-_QUOTED_CASE_INSENSITIVE = frozenset({"duckdb", "bigquery", "redshift"})
 _NAMES = ["PatientID", "patientid", "PATIENTID"]
 
 _CASE_STG_SQL = "SELECT a.id AS id, b.tag AS PatientID FROM base a LEFT JOIN lkp b ON a.fk = b.id"
@@ -667,10 +666,6 @@ _CASE_STG_SQL = "SELECT a.id AS id, b.tag AS PatientID FROM base a LEFT JOIN lkp
 def _spelling(adapter: str, name: str, quoted: bool) -> str:
     dialect = profile_for_adapter(adapter).sqlglot_dialect
     return exp.to_identifier(name, quoted=quoted).sql(dialect=dialect)
-
-
-def _resolves_to_column(adapter: str, name: str, quoted: bool) -> bool:
-    return name == "patientid" or not quoted or adapter in _QUOTED_CASE_INSENSITIVE
 
 
 def _mixed_case_kinds(
@@ -712,26 +707,24 @@ def _mixed_case_kinds(
 @pytest.mark.parametrize("adapter", _ADAPTERS)
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("name", _NAMES)
-def test_join_on_nullable_key_fires_exactly_when_spelling_resolves_to_the_column(
+def test_join_on_nullable_key_fires_in_every_spelling(
     adapter: str, quoted: bool, name: str
 ) -> None:
     sql = f"SELECT s.id FROM other o JOIN stg s ON o.k = s.{_spelling(adapter, name, quoted)}"
     fires = FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(adapter, sql)
-    assert fires is _resolves_to_column(adapter, name, quoted)
+    assert fires
 
 
 @pytest.mark.parametrize("adapter", _ADAPTERS)
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("name", _NAMES)
-def test_not_exists_on_nullable_key_fires_whenever_spelling_resolves_to_the_column(
+def test_not_exists_on_nullable_key_fires_in_every_spelling(
     adapter: str, quoted: bool, name: str
 ) -> None:
     spelled = _spelling(adapter, name, quoted)
     sql = f"SELECT s.id FROM stg s WHERE NOT EXISTS (SELECT 1 FROM other o WHERE o.k = s.{spelled})"
     fires = FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(adapter, sql)
-    # Anti-join probe matching is case-insensitive by design, so a case-distinct quoted
-    # spelling may over-report; it must never be missed.
-    assert fires or not _resolves_to_column(adapter, name, quoted)
+    assert fires
 
 
 @pytest.mark.parametrize("adapter", _ADAPTERS)
