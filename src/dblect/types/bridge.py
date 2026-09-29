@@ -278,15 +278,34 @@ def _identifier_carrier(decl_name: str, spec: DomainSpec) -> FieldDef | Contract
     currency. Zero or several physical fields leave nothing to bind unambiguously,
     and a unit field is a companion, never a value column."""
     physical = [f for f in spec.fields.values() if f.name not in spec.fixed]
-    if len(physical) != 1 or physical[0].kind not in (FieldKind.INERT, FieldKind.NOMINAL):
-        names = ", ".join(repr(f.name) for f in physical) or "none"
+    if not physical:
         return _malformed(
             decl_name,
-            f"declaration {decl_name!r} has no magnitude and does not have exactly one "
-            f"physical field to carry its tag (open fields: {names}); fix the other "
-            "fields with `.refine(...)` so one value column remains",
+            f"declaration {decl_name!r} has no magnitude and every field is fixed, so no "
+            "column is left to carry its tag; leave one value field open",
         )
-    return physical[0]
+    if len(physical) > 1:
+        names = ", ".join(repr(f.name) for f in physical)
+        return _malformed(
+            decl_name,
+            f"declaration {decl_name!r} has no magnitude and several open fields ({names}), "
+            "so the column its tag rides on is ambiguous; fix all but one with `.refine(...)`",
+        )
+    (only,) = physical
+    match only.kind:
+        case FieldKind.INERT | FieldKind.NOMINAL:
+            return only
+        case FieldKind.UNIT:
+            return _malformed(
+                decl_name,
+                f"declaration {decl_name!r} has no magnitude, and its only open field "
+                f"{only.name!r} is a unit, a magnitude's companion that cannot carry a tag; "
+                "add a magnitude or an identifier value field",
+            )
+        case FieldKind.MAGNITUDE:
+            raise AssertionError("a magnitude field is handled before the identifier carrier")
+        case _:
+            assert_never(only.kind)
 
 
 def _out_of_domain_field(spec: DomainSpec) -> tuple[str, object] | None:

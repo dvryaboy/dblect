@@ -179,6 +179,31 @@ def test_an_identifier_type_with_every_field_fixed_is_a_finding() -> None:
     assert issue.code is IssueCode.MALFORMED_DECLARATION
 
 
+def test_a_lone_open_unit_field_is_named_as_a_companion_that_cannot_carry_a_tag() -> None:
+    class UnitOnly(DomainType):
+        currency: Currency
+
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        cur: UnitOnly
+
+    [issue] = resolve_contracts(_CHARGES).issues
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
+    assert "companion" in issue.message
+    assert "fix all but one" not in issue.message
+
+
+def test_several_open_fields_and_no_open_fields_each_get_their_own_message() -> None:
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        several: _IntId
+        none: _StrId.refine(id="x", entity=_Entity.PLAYER)
+
+    issues = {i.field: i.message for i in resolve_contracts(_CHARGES).issues}
+    assert "several open fields" in issues["several"]
+    assert "every field is fixed" in issues["none"]
+
+
 def test_an_identifier_column_with_no_fixed_facet_is_a_finding() -> None:
     class Bare(DomainType):
         created: Date
