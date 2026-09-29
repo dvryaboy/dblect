@@ -44,6 +44,7 @@ from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     DepContext,
     Property,
     column_property,
@@ -160,7 +161,7 @@ def _ignore_nulls_rule(
 
 
 def _array_agg_core(
-    expr: exp.AggFunc, _child: Annotation[ArrayNonEmpty]
+    expr: exp.AggFunc, _child: Annotation[ArrayNonEmpty], _scope: AggregateScope[ArrayNonEmpty]
 ) -> Annotation[ArrayNonEmpty]:
     """The bare ``ARRAY_AGG`` (no ``IGNORE NULLS`` wrapper). Some dialects also spell
     the null-dropping form with a ``nulls_excluded`` flag on the call itself, so read

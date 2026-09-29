@@ -38,6 +38,7 @@ from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     AxisDisplay,
     DepContext,
     FactDiscoverer,
@@ -86,7 +87,7 @@ def constant_aggregate(value: K, *, opacity: Opacity = Opacity.CONCRETE) -> Aggr
     rides through, since a genuinely broken input should still taint the result.
     """
 
-    def core(_expr: exp.AggFunc, child: Annotation[K]) -> Annotation[K]:
+    def core(_expr: exp.AggFunc, child: Annotation[K], _scope: AggregateScope[K]) -> Annotation[K]:
         return Annotation(value, opacity, provisional=child.provisional)
 
     return AggregateRule(core=core)

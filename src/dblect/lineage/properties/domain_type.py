@@ -42,11 +42,12 @@ from typing import Final, assert_never, final
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
-from dblect.lineage.facts.kit import GroundingFold, constant_aggregate, grounding_fold, top_rule
+from dblect.lineage.facts.kit import GroundingFold, grounding_fold, top_rule
 from dblect.lineage.facts.lattice import Lattice, annotate_fold
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     AxisDisplay,
     CoherenceGuard,
     DepContext,
@@ -58,6 +59,8 @@ from dblect.lineage.facts.property import (
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OUTER_JOIN_NULL_META
+from dblect.lineage.properties.uniqueness import CandidateKeySet
+from dblect.lineage.property import resolved_column_ref
 from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
 
@@ -504,7 +507,9 @@ DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
 # --- aggregate transfers -----------------------------------------------------
 
 
-def _passthrough_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[DomainTag]:
+def _passthrough_core(
+    _expr: exp.AggFunc, child: Annotation[DomainTag], _scope: AggregateScope[DomainTag]
+) -> Annotation[DomainTag]:
     """``sum`` and ``avg`` accumulate the magnitude, ``min``/``max`` select one of its
     values; either way the result carries the child's tag. Whether the accumulation is
     *sound* (the tag constant per group) is the coherence guard's obligation, wired
@@ -512,20 +517,134 @@ def _passthrough_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annot
     return child
 
 
-# ``count`` does not inspect values, so it is always safe and yields a tag-free
-# ``Count`` whatever the child's tag: the kit's ``constant_aggregate``, aimed at
-# the no-claim top since a count carries no information about the magnitude.
-_COUNT_RULE: AggregateRule[DomainTag] = constant_aggregate(NAKED, opacity=Opacity.IMPLICIT)
+def _entity_facets(tag: DomainTag) -> dict[str, Concrete]:
+    """The pinned facets of an identifier tag: what a count of the identifier's values
+    counts. An identifier carries no dimension; a tag with one is a measure, not an
+    entity, and a conflict names nothing. A facet bound to a per-row companion varies
+    with the data, so it pins no single entity and is dropped. The tag cannot tell an
+    identifier's facets from a measure's flag (a magnitude with only ``contains_tax``
+    reads the same), so any pinned facet counts; a count of such a column then carries
+    that facet, which only ever conflicts with a declared count that says otherwise."""
+    match tag:
+        case _Conflict():
+            return {}
+        case Tagged(dimension=None):
+            return {
+                name: binding
+                for name, binding in tag.nominal_map().items()
+                if isinstance(binding, Concrete)
+            }
+        case Tagged():
+            return {}
+    assert_never(tag)
+
+
+def _row_entity_facets(
+    keys: CandidateKeySet | None, source: SourceRef, scope: AggregateScope[DomainTag]
+) -> tuple[dict[str, Concrete], bool]:
+    """The entity a relation's rows are, read off its single-column keys: the facets
+    of the key column's tag, and whether any annotation read was provisional. A
+    composite key names no single entity, and several single-column keys that
+    disagree on the entity are ambiguous; both yield no facets."""
+    if keys is None or keys.is_bottom:
+        return {}, False
+    claims: dict[frozenset[tuple[str, Concrete]], bool] = {}
+    for key in keys.keys:
+        if len(key) != 1:
+            continue
+        (column,) = key
+        ann = scope.annotate(ColumnRef(source, column.casefold()))
+        facets = _entity_facets(ann.value)
+        if facets:
+            claims[frozenset(facets.items())] = ann.provisional
+    if len(claims) != 1:
+        return {}, False
+    ((claim, provisional),) = claims.items()
+    return dict(claim), provisional
+
+
+def _count_core_reading(
+    uniqueness: PropertyRef[CandidateKeySet, SourceRef] | None,
+) -> Callable[
+    [exp.AggFunc, Annotation[DomainTag], AggregateScope[DomainTag]], Annotation[DomainTag]
+]:
+    """The ``COUNT`` transfer: a count of an entity where one is provable, no claim
+    otherwise. It never inspects the counted values beyond their tag, so it is always
+    safe; the claim is the only thing it adds.
+
+    * ``COUNT(DISTINCT x)`` with ``x`` a plain column carrying an identifier tag counts
+      that entity, whatever the joins, because DISTINCT removes multiplicity.
+    * ``COUNT(*)``, ``COUNT(<literal>)`` or ``COUNT(k)`` counts rows, so it counts the
+      entity of the relation those rows come from, but only when the scope reads one
+      relation with no joins (a join can repeat or drop rows) and that relation is
+      identified by a single-column key whose tag names the entity. For ``COUNT(k)`` the
+      column ``k`` must itself be that key.
+    * Everything else (a non-key column, a tuple, an expression, a magnitude, a count
+      after a join, an unstamped scope) stays ``NAKED``. Claiming less is the safe
+      direction: a missing claim can only hide a mismatch, never invent one.
+
+    The claim is a nominal-only tag, the same shape an identifier carries, so a
+    declared ``EntityCount`` meets it by the ordinary meet."""
+
+    def core(
+        expr: exp.AggFunc, child: Annotation[DomainTag], scope: AggregateScope[DomainTag]
+    ) -> Annotation[DomainTag]:
+        facets, provisional = _counted_entity(expr, child, scope, uniqueness)
+        provisional = provisional or child.provisional
+        if not facets:
+            return Annotation(NAKED, Opacity.IMPLICIT, provisional=provisional)
+        return Annotation(tagged(nominal=facets), Opacity.CONCRETE, provisional=provisional)
+
+    return core
+
+
+def _counted_entity(
+    expr: exp.AggFunc,
+    child: Annotation[DomainTag],
+    scope: AggregateScope[DomainTag],
+    uniqueness: PropertyRef[CandidateKeySet, SourceRef] | None,
+) -> tuple[dict[str, Concrete], bool]:
+    if not isinstance(expr, exp.Count):
+        return {}, False
+    operand = expr.this
+    if isinstance(operand, exp.Distinct):
+        distinct = operand.expressions
+        if len(distinct) == 1 and isinstance(distinct[0], exp.Column):
+            return _entity_facets(child.value), False
+        return {}, False
+    site = scope.site
+    if site is None or site.input_source is None or uniqueness is None or expr.expressions:
+        return {}, False
+    keys_ann = scope.dependencies.annotation(uniqueness, site.input_source)
+    keys = keys_ann.value if keys_ann is not None else None
+    match operand:
+        case exp.Star() | exp.Literal():
+            return _row_entity_facets(keys, site.input_source, scope)
+        case exp.Column():
+            ref = resolved_column_ref(operand)
+            if ref is not None and ref.source == site.input_source and _is_key(keys, ref.column):
+                return _row_entity_facets(keys, site.input_source, scope)
+            return {}, False
+        case _:
+            return {}, False
+
+
+def _is_key(keys: CandidateKeySet | None, column: str) -> bool:
+    return keys is not None and any(
+        {c.casefold() for c in key} == {column.casefold()} for key in keys.keys
+    )
 
 
 def _aggregate_rules(
     *,
     guard: CoherenceGuard[DomainTag, FDSet] | None,
+    uniqueness: PropertyRef[CandidateKeySet, SourceRef] | None,
 ) -> dict[type[exp.AggFunc], AggregateRule[DomainTag]]:
     """Turn the reduction-behavior classification into the property's aggregate rules.
 
-    ``COUNT`` yields a tag-free cardinality whatever it counts, so it has no companion
-    to discharge and never carries the guard. ``COMBINE`` and ``SELECT`` both keep the
+    ``COUNT`` yields a cardinality whatever it counts, so it has no companion
+    to discharge and never carries the guard; it may carry an entity (see
+    :func:`_count_core_reading`). ``COMBINE`` and ``SELECT`` both keep the
     magnitude's tag, and when ``guard`` is armed both clear it to top where a per-row
     companion is not held constant per group: for ``COMBINE`` that cleared result is the
     mixed-currency reduction the not-well-typed finding reports; for ``SELECT`` it is the
@@ -539,7 +658,7 @@ def _aggregate_rules(
         # typecheck error here rather than a silent fall-through into the guarded rule.
         match behavior:
             case AggregateBehavior.COUNT:
-                rules[agg_type] = _COUNT_RULE
+                rules[agg_type] = AggregateRule(core=_count_core_reading(uniqueness))
             case AggregateBehavior.COMBINE | AggregateBehavior.SELECT:
                 rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
             case _:
@@ -662,6 +781,7 @@ def domain_type_property(
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
     *,
     fd: PropertyRef[FDSet, SourceRef] | None = None,
+    uniqueness: PropertyRef[CandidateKeySet, SourceRef] | None = None,
 ) -> Property[DomainTag, ColumnRef]:
     """The column-scoped domain-type property over a caller-supplied grounding.
 
@@ -677,6 +797,9 @@ def domain_type_property(
     pin, or an FD entailment at the aggregation input) and clears to top otherwise. The
     edge is declared in ``depends_on``, so the registry evaluates dependencies first and
     the guard's read is always answered.
+
+    Passing the uniqueness property's ref lets a non-distinct ``COUNT`` read the key of
+    the relation it counts, so it can carry that key's entity.
     """
     guard = (
         None
@@ -687,9 +810,9 @@ def domain_type_property(
         name="domain_type",
         lattice=DOMAIN_TYPE_LATTICE,
         operators=DOMAIN_TYPE_OPERATORS,
-        aggregates=_aggregate_rules(guard=guard),
+        aggregates=_aggregate_rules(guard=guard, uniqueness=uniqueness),
         ground=ground,
         column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
         display=domain_type_display,
-        depends_on=() if fd is None else (fd,),
+        depends_on=tuple(ref for ref in (fd, uniqueness) if ref is not None),
     )

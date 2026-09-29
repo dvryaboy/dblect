@@ -40,6 +40,7 @@ from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     CoherenceClear,
     CoherenceGuard,
     CoherenceSink,
@@ -316,7 +317,7 @@ def _column_reduce(
             if child is None:
                 return default_ann
             child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann, sink)
-            return _apply_aggregate(rule, expr, child_ann, dep_context, lat, sink)
+            return _apply_aggregate(rule, expr, child_ann, dep_context, lat, annotate, sink)
         # An aggregate with no registered rule falls through to operator dispatch.
 
     op = _lookup_subclass(prop.operators, type(expr))
@@ -338,9 +339,10 @@ def _apply_aggregate(
     child: Annotation[K],
     dep_context: DepContext,
     lat: Lattice[K],
+    annotate: Callable[[ColumnRef], Annotation[K]],
     sink: CoherenceSink[K] | None = None,
 ) -> Annotation[K]:
-    """Apply an aggregate rule's pure ``core``, then its coherence guard.
+    """Apply an aggregate rule's ``core``, then its coherence guard.
 
     The guard is the one channel a dependency enters an aggregate through: where a
     per-row companion of the aggregated value is not provably constant per group,
@@ -350,11 +352,11 @@ def _apply_aggregate(
     and the undischarged companions with the paths checked) is recorded there, so the
     consumer reads the event rather than re-inferring it from the cleared output.
     """
-    result = rule.core(expr, child)
+    site = aggregation_site_meta(expr)
+    result = rule.core(expr, child, AggregateScope(site, dep_context, annotate))
     guard = rule.coherence
     if guard is None:
         return result
-    site = aggregation_site_meta(expr)
     undischarged = _undischarged(guard, child.value, site, dep_context)
     if not undischarged:
         return result

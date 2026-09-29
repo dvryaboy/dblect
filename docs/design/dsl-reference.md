@@ -91,6 +91,13 @@ Used directly as a column's type.
   one open field's column with the fixed facets (`.refine(entity=...)`), so
   `join_key_type_mismatch` sees a join across entities. Zero or several open fields, or
   no fixed facet, is a `malformed_declaration` contract issue rather than a silent drop.
+- A count of an entity is a `Count` magnitude plus the entity facet
+  (`class EntityCount(DomainType): n: Count; entity: Entity`, refined per use). The check
+  infers the entity a `COUNT` counts and reports a contradiction with the declared one.
+  `COUNT(DISTINCT x)` counts the entity of an identifier column `x`, whatever the joins.
+  `COUNT(*)`, `COUNT(1)` and `COUNT(k)` over one join-free relation count the entity of
+  that relation's single-column key `k` (a `unique` test, `PrimaryKey`, or a declared
+  grain). Every other count makes no claim.
 - `Uuid`, `Json`, and other semi-structured or specialized types (`interval`, `binary`,
   `geography`) are not yet accepted; their spellings are still open.
 

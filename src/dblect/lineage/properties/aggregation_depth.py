@@ -21,7 +21,7 @@ from sqlglot import expressions as exp
 
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Opacity
-from dblect.lineage.facts.property import AggregateRule, Property, column_property
+from dblect.lineage.facts.property import AggregateRule, AggregateScope, Property, column_property
 from dblect.lineage.graph import ColumnRef
 from dblect.lineage.semiring import Semiring
 
@@ -55,7 +55,9 @@ def _ground_zero(_: ColumnRef) -> Annotation[int]:
     return Annotation(0, Opacity.IMPLICIT)
 
 
-def _aggfunc_core(_expr: exp.AggFunc, child: Annotation[int]) -> Annotation[int]:
+def _aggfunc_core(
+    _expr: exp.AggFunc, child: Annotation[int], _scope: AggregateScope[int]
+) -> Annotation[int]:
     return Annotation(child.value + 1, provisional=child.provisional)
 
 
