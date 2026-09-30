@@ -35,7 +35,7 @@ _DUCKDB = profile_for_adapter("duckdb")
 
 _DIM_STG_SQL = "SELECT id, name FROM dim_src"
 _DIM_SQL = "SELECT id, name FROM dim_stg GROUP BY id, name"
-_FACT_SQL = "SELECT f.x, d.name FROM fact_src AS f JOIN dim AS d ON f.id = d.id"
+_FACT_SQL = "SELECT f.x FROM fact_src AS f JOIN dim AS d ON f.id = d.id"
 
 
 def _shop_manifest(*, declare_key: bool) -> Manifest:
