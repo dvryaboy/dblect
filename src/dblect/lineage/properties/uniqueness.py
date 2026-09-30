@@ -26,9 +26,9 @@ the discoverers that ground it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import assert_never, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -48,6 +48,7 @@ from dblect.lineage.facts.model import (
     NativeConstraint,
     Opacity,
     Predicate,
+    Provenance,
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
@@ -786,6 +787,30 @@ def uniqueness_facts(
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
     return _UNIQUENESS_KIT.facts(manifest, discoverers, extra_facts=extra_facts)
+
+
+def judged_provenance(provenance: Provenance) -> bool:
+    """Whether a key from this source claims something about the SELECT itself. A
+    native constraint is enforced on write, not by the query (#48 covers the
+    unenforced case); a compile-time value is config, not an assertion."""
+    match provenance:
+        case Declared():
+            return True
+        case NativeConstraint() | CompileValue():
+            return False
+    assert_never(provenance)
+
+
+def declared_grain_keys(facts: Iterable[Fact[CandidateKeySet, SourceRef]]) -> frozenset[Key]:
+    """The unconditional keys a relation's SQL is answerable for, lowercased: those declared by
+    a test, contract or config, not enforced by the warehouse. The grain check and the join
+    fan-out detector both read a declared key as the model's intent about its own rows."""
+    return frozenset(
+        frozenset(col.lower() for col in authored)
+        for fact in facts
+        if judged_provenance(fact.provenance) and fact.condition is None
+        for authored in fact.value.keys
+    )
 
 
 def uniqueness_property_from_facts(

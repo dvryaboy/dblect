@@ -9,9 +9,8 @@ to make a claim, and stay silent otherwise):
 * ``detect_non_unique_aggregate_order_keys``: the aggregate twin of the window check.
   A top-n ordered aggregate (``ARRAY_AGG(x ORDER BY k LIMIT n)``) whose (group, order)
   columns are not covered by a source key keeps an arbitrary winner among ties.
-* ``detect_join_fanout``: JOINs whose joined-in side has known keys, none of
-  which is covered by the join's equality predicate columns, so the join can
-  multiply rows.
+* ``detect_join_fanout``: JOINs that repeat a side's rows (the ON columns cover no known key
+  of the other side) where a duplicate-sensitive consumer reads the repeated side.
 * ``detect_limit_without_deterministic_order``: a persisted model whose top-scope
   ``LIMIT`` has no ``ORDER BY``, or one whose order keys are not covered by a known
   uniqueness key, so a re-run materializes a different slice of rows.
@@ -61,8 +60,10 @@ from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
     activate_conditional,
+    declared_grain_keys,
     grain_preserved,
     relation_scope_facts,
+    uniqueness_facts,
     uniqueness_property,
 )
 from dblect.lineage.property import propagate
@@ -217,49 +218,32 @@ def detect_join_fanout(
     model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
+    declared_keys: frozenset[Key] = frozenset(),
 ) -> tuple[Finding, ...]:
     """Flag JOINs that repeat the rows of a side a duplicate-sensitive consumer reads.
 
-    An equality join repeats a row of side ``A`` when it can match two rows of side ``B``,
-    which happens exactly when the ON columns cover no known key of ``B``. So one join can
-    repeat the probe side (the tables to its left) because the joined-in side is uncovered,
-    and the joined-in side because the probe side is uncovered. Each claim needs a known key
-    on the side that would do the repeating; a side with no known keys is never blamed
-    (firewall posture). The decision is the same for INNER, LEFT, RIGHT and FULL joins:
-    null-extension adds rows but never repeats a source row. Because the rule looks at
-    matching alone, ``FROM a JOIN b`` and ``FROM b JOIN a`` reach the same verdict.
+    A join repeats a row of side A when the ON columns cover no known key of side B (closure
+    under B's dependencies), so it can match two B rows. The joined-in side being uncovered
+    repeats the probe side (everything to its left); the probe being uncovered repeats the
+    joined-in side. A claim needs a known key on the side that would do the repeating. INNER,
+    LEFT, RIGHT and FULL decide alike, so ``a JOIN b`` and ``b JOIN a`` agree. An ON spanning
+    several left sides leaves the probe undecided, and then only an uncovered joined-in side is
+    blamed.
 
-    Coverage is closure-based: a known key ``K`` is covered when the join columns
-    functionally determine every column of ``K`` under that side's dependencies (plain
-    containment when none are known). So a join on ``(month, wiki_id)`` covers the key
-    ``(month, wiki_id, wiki_name)`` when ``wiki_id`` determines ``wiki_name``.
+    A repeated side is a hazard when a consumer reads it:
 
-    A repeated row is only a hazard when a consumer reads it (:class:`_Consumers`):
+    * an aggregate over columns fires when a column belongs to a repeated side;
+    * ``COUNT(*)`` counts join rows, which equal an unrepeated side's row count, so it fires
+      only when every side repeats (consistent with ``detect_cross_model_fanout``, #179);
+    * an ungrouped, non-``DISTINCT`` projection fires when every side it reads repeats;
+    * such a projection also fires when a key in ``declared_keys`` (the model's own, so the
+      tree's last SELECT) reads only sides one join repeats for a cause outside them, since two
+      output rows then share the key. A key that does not resolve through the projection is not
+      judged.
 
-    * a duplicate-sensitive aggregate over columns fires when any column belongs to a
-      repeated side (``sum(c.credit)`` over ``customers c JOIN orders o``, but not
-      ``sum(o.amount)``);
-    * ``COUNT(*)`` and its column-free kin count the join's rows, which equal the row count
-      of any side that is not repeated, so they fire only when every side is repeated
-      (many-to-many), keeping the cross-model position on COUNT (issue #179);
-    * a plain projection (no grouping) fires when every side it reads is repeated, since only
-      then are duplicate output rows certain; it is silent under ``SELECT DISTINCT``.
-
-    ``duplicate_safe_builtins`` lets the adapter name UDF aggregates the duplicate-sensitivity
-    predicate would otherwise treat as sensitive. A ``GROUP BY`` over aggregates that are all
-    duplicate-safe (``max``, ``min``, ``any_value``, the boolean folds, a ``DISTINCT``
-    aggregate) is not a consumer at all (issue #170).
-
-    In a chain, each side carries whether it can still appear more than once. A join from a
-    side whose repetition is not decided (it follows a join the detector could not read, or
-    the ON columns span several sides) keeps firing when the joined-in side is uncovered and
-    stays silent otherwise, so an undecided case never adds a finding the old check would
-    not have raised.
-
-    Silent on an ON predicate that is not a conjunction of equalities between bare columns
-    with exactly one side on the joined-in alias, on a ``CROSS`` join (an explicit cartesian
-    product), and on a join that filters rather than multiplies (a SEMI or ANTI join, and
-    the ``LEFT JOIN ... IS NULL`` anti-join idiom).
+    Duplicate-safe aggregates (and ``duplicate_safe_builtins`` UDFs) are not consumers (#170).
+    Silent on a non-equality ON, ``CROSS``, SEMI and ANTI joins and the ``LEFT JOIN ... IS NULL``
+    idiom.
     """
     scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
     out: list[Finding] = []
@@ -269,10 +253,16 @@ def detect_join_fanout(
             continue
         consumers = _consumers(sel, frozenset(repeat), safe_builtins=duplicate_safe_builtins)
         repeated = frozenset(a for a, r in repeat.items() if r is Repeat.MAY_REPEAT)
+        key_sides = (
+            _declared_key_sides(sel, declared_keys, frozenset(repeat))
+            if sel is tree and consumers.rows is not None
+            else ()
+        )
         out.extend(
             _fanout_finding(step)
             for step in steps
             if consumers.hurt_by(step.multiplied, repeated=repeated, sides=frozenset(repeat))
+            or any(_repeats_key(step, sides) for sides in key_sides)
         )
     return tuple(out)
 
@@ -526,6 +516,7 @@ def make_fact_grounded_detectors(
     relation_keys: RelationUniqueness | None = None,
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
     fd_by_name: Mapping[str, FDSet] | None = None,
+    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against the propagated uniqueness keys.
 
@@ -579,6 +570,7 @@ def make_fact_grounded_detectors(
     # shared graph and threads it in; a standalone caller lets it default and we propagate here.
     if fd_by_name is None:
         fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts, relation_keys=relation_keys)
+    declared_by_tree = _declared_keys_by_tree(manifest, profile, parsed, key_facts)
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -611,6 +603,7 @@ def make_fact_grounded_detectors(
             model_keys=model_keys,
             scope_index=scope_index(tree),
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
+            declared_keys=declared_by_tree.get(id(tree), frozenset()),
         )
 
     def limit_order(tree: Expr) -> tuple[Finding, ...]:
@@ -622,6 +615,25 @@ def make_fact_grounded_detectors(
         )
 
     return (window_keys, fanout, limit_order, aggregate_order_keys)
+
+
+def _declared_keys_by_tree(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    parsed: Mapping[str, Expr] | None,
+    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...],
+) -> dict[int, frozenset[Key]]:
+    """Each model tree's declared keys (see :func:`declared_grain_keys`), addressed by
+    ``id(tree)`` like the other per-tree maps."""
+    if not parsed:
+        return {}
+    by_uid = {
+        ref.unique_id: declared_grain_keys(bucket)
+        for ref, bucket in uniqueness_facts(
+            manifest, profile, extra_facts=key_facts, parsed=parsed
+        ).items()
+    }
+    return {id(tree): by_uid[uid] for uid, tree in parsed.items() if uid in by_uid}
 
 
 # Per-relation views the cross-model fan-out detector reads, all keyed by the relation's
@@ -935,7 +947,9 @@ class _JoinStep:
     target: exp.Table
     joined_cols: frozenset[str]
     target_keys: frozenset[Key]
+    alias: str
     multiplied: frozenset[str]
+    left_repeated: frozenset[str]
     target_uncovered: bool
     probe_not_unique: bool
 
@@ -943,22 +957,8 @@ class _JoinStep:
 def _join_steps(sel: exp.Select, scopes: ScopeIndex) -> tuple[list[_JoinStep], dict[str, Repeat]]:
     """The joins of ``sel`` that repeat some side, and each output side's final repeat state.
 
-    Walks the FROM/JOIN chain left to right. For a join to ``r`` with the accumulated sides
-    ``P`` to its left and ON columns ``C_r`` (on ``r``) and ``C_x`` (on the single left side
-    ``x`` when the predicate names one):
-
-    * every side of ``P`` is repeated when ``r`` has known keys none of which ``C_r`` covers,
-      since each left row can then match two ``r`` rows;
-    * ``r`` is repeated when the left rows are not unique on the ON columns. With one left
-      side ``x`` that is exact: ``x`` repeats already, or ``x`` appears once and its known
-      keys are not covered by ``C_x``. ``x`` with no known keys leaves ``r`` undecided;
-    * ``r`` known and covered proves the join leaves ``P`` single; ``r`` with no known keys
-      leaves a single side undecided.
-
-    A join the detector cannot read (non-equality ON, non-table target, ``CROSS``) leaves every
-    earlier side and ``r`` undecided; SEMI/ANTI joins and the anti-join idiom filter the left
-    rows and contribute no output side.
-    """
+    Unreadable joins (non-equality ON, non-table target, ``CROSS``) leave every side undecided;
+    SEMI/ANTI joins add no output side."""
     from_ = sg.from_of(sel)
     if from_ is None or from_.this is None:
         return [], {}
@@ -1016,7 +1016,9 @@ def _join_steps(sel: exp.Select, scopes: ScopeIndex) -> tuple[list[_JoinStep], d
                     target=target,
                     joined_cols=joined_cols,
                     target_keys=target_facts.keys,
+                    alias=r,
                     multiplied=multiplied,
+                    left_repeated=multiplied - {r} if uncovered else frozenset(),
                     target_uncovered=uncovered,
                     probe_not_unique=probe is _Probe.NOT_UNIQUE,
                 )
@@ -1032,14 +1034,8 @@ def _probe_uniqueness(
     *,
     target_uncovered: bool,
 ) -> _Probe:
-    """Whether the left rows are unique on the ON columns of the join to ``target``.
-
-    Exact when the predicate names one left side ``x``: ``x`` repeated already means two left
-    rows share the ON values, and a single ``x`` is unique on them exactly when its known keys
-    are covered. Anything else (several left sides, a side outside the chain, ``x`` of
-    undecided repetition) is undecided, and an undecided probe is blamed only when the
-    joined-in side is itself uncovered, which is the case the join has always reported.
-    """
+    """Whether the left rows are unique on the ON columns. Exact for one left side; otherwise
+    undecided, blamed only when the joined-in side is itself uncovered."""
     by_alias = sg.equality_cols_by_alias(on) if on is not None else None
     others = {a: c for a, c in (by_alias or {}).items() if a != target}
     if len(others) == 1:
@@ -1054,6 +1050,47 @@ def _probe_uniqueness(
             covered = covers(FDSet(x_facts.fds), x_cols, x_facts.keys)
             return _Probe.UNIQUE if covered else _Probe.NOT_UNIQUE
     return _Probe.NOT_UNIQUE if target_uncovered else _Probe.UNKNOWN
+
+
+def _repeats_key(step: _JoinStep, key_sides: frozenset[str]) -> bool:
+    """Whether this join makes two output rows agree on a key read from ``key_sides``: those
+    sides repeat because of a row outside them (both sides of a many-to-many pair do not)."""
+    return key_sides <= step.left_repeated or (
+        step.probe_not_unique and key_sides == frozenset({step.alias})
+    )
+
+
+def _declared_key_sides(
+    sel: exp.Select, declared_keys: frozenset[Key], sides: frozenset[str]
+) -> tuple[frozenset[str], ...]:
+    """The sides each declared key is read from in ``sel``'s projection (a bare or aliased column,
+    or the one qualified star); a key with a column that does not resolve is left out."""
+    if not declared_keys:
+        return ()
+    named = {
+        name.lower(): expr for name, expr in sg.projection_expressions_by_output_name(sel).items()
+    }
+    stars = [
+        p.table
+        for p in sel.expressions
+        if isinstance(p, exp.Column) and isinstance(p.this, exp.Star) and p.table
+    ]
+    bare_star = any(isinstance(p, exp.Star) for p in sel.expressions)
+    star = stars[0] if len(stars) == 1 and not bare_star else None
+    out: list[frozenset[str]] = []
+    for key in declared_keys:
+        key_sides: set[str] = set()
+        for col in key:
+            expr = named.get(col)
+            if isinstance(expr, exp.Column) and sg.column_table(expr) in sides:
+                key_sides.add(sg.column_table(expr) or "")
+            elif expr is None and star is not None and star in sides:
+                key_sides.add(star)
+            else:
+                break
+        else:
+            out.append(frozenset(key_sides))
+    return tuple(out)
 
 
 def _fanout_finding(step: _JoinStep) -> Finding:
@@ -1104,13 +1141,8 @@ class _Reads:
 
 @dataclass(frozen=True, slots=True)
 class _Consumers:
-    """What reads a select's joined rows: the three kinds the fan-out contract tells apart.
-
-    ``values`` are the column reads of duplicate-sensitive aggregates, ``counts_rows`` marks
-    a column-free aggregate (``COUNT(*)``, ``COUNT(1)``), and ``rows`` is the read set of a
-    plain projection whose rows reach the output un-grouped (``None`` when a GROUP BY, an
-    implicit single group, or ``DISTINCT`` collapses them).
-    """
+    """What reads a select's joined rows: aggregate column reads, a column-free count, and the
+    reads of an ungrouped projection (``None`` under GROUP BY or DISTINCT)."""
 
     values: tuple[_Reads, ...]
     counts_rows: bool
@@ -1119,13 +1151,8 @@ class _Consumers:
     def hurt_by(
         self, multiplied: frozenset[str], *, repeated: frozenset[str], sides: frozenset[str]
     ) -> bool:
-        """True when some consumer is hurt by the ``multiplied`` sides repeating.
-
-        ``repeated`` is every side that can repeat after the whole chain: a column-free
-        count needs all ``sides`` repeated (no side's row count then equals the join's), and
-        a plain projection needs every side it reads repeated (only then are duplicate output
-        rows certain).
-        """
+        """True when a consumer is hurt by the ``multiplied`` sides repeating. ``repeated`` is
+        every side repeating after the whole chain."""
         if any(r.sides & multiplied or r.unresolved for r in self.values):
             return True
         if self.counts_rows and sides <= repeated:
