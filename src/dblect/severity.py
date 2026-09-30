@@ -119,6 +119,7 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             | CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
             | CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
             | CheckFindingKind.JOIN_KEY_TYPE_MISMATCH
+            | CheckFindingKind.DEAD_PREDICATE
         ):
             return Severity.ERROR
         # A coverage gap, warned so thin coverage is visible without failing a run that
@@ -128,6 +129,16 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
         # One grade below a contradiction: the SQL does not guarantee the declared
         # grain, but the data may still hold it, so this warns rather than errors.
         case CheckFindingKind.GRAIN_NOT_ESTABLISHED:
+            return Severity.WARN
+        # Real hazards held at warn while they can over-fire on a legitimate
+        # reading: a case-only match depends on the warehouse's collation, a
+        # redundant filter is a bug but not a wrong-rows one, and a CASE
+        # coverage gap may be a deliberate lump into the default.
+        case (
+            CheckFindingKind.DEAD_PREDICATE_CASE_ONLY
+            | CheckFindingKind.REDUNDANT_PREDICATE
+            | CheckFindingKind.CASE_LEAVES_ENUM_MEMBER_UNHANDLED
+        ):
             return Severity.WARN
     assert_never(kind)
 

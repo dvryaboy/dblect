@@ -24,10 +24,12 @@ import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
+from typing import assert_never
 
 from dblect.contracts import CapturedContract, ast
 from dblect.lineage.facts.model import Declared, DeclaredSource, Fact
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
+from dblect.lineage.predicate import Lit, LitKind
 from dblect.lineage.properties.domain_type import (
     NAKED,
     Concrete,
@@ -40,6 +42,7 @@ from dblect.lineage.properties.domain_type import (
 )
 from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
+from dblect.lineage.properties.value_domain import Bounded, ValueDomain
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import generic_test_target_uid
 from dblect.types.contract import (
@@ -49,6 +52,7 @@ from dblect.types.contract import (
     DomainDecl,
     ForeignKeyDecl,
     PrimaryKeyDecl,
+    ScalarDecl,
     active_registry,
 )
 from dblect.types.domain import DomainSpec
@@ -67,6 +71,11 @@ class IssueCode(StrEnum):
     OUT_OF_DOMAIN_VALUE = auto()
     MALFORMED_DECLARATION = auto()
     UNRESOLVED_FOREIGN_KEY = auto()
+    VALUE_DOMAIN_CONFLICT = auto()
+    """Two or more trusted value-domain declarations on one column (a contract
+    enum, an accepted_values test) share no common value; raised at the check's
+    grounding step, not by resolve_contracts itself, since the conflicting
+    declarations can come from either or both channels."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +132,7 @@ class ResolvedContracts:
     """Everything the bridge derived from the registry against one manifest."""
 
     tag_facts: tuple[Fact[DomainTag, ColumnRef], ...]
+    value_domain_facts: tuple[Fact[ValueDomain, ColumnRef], ...]
     key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...]
     fd_facts: tuple[Fact[FDSet, SourceRef], ...]
     foreign_keys: tuple[ForeignKeyEdge, ...]
@@ -294,6 +304,54 @@ def domain_tag(spec: DomainSpec, src: SourceRef) -> BoundTag | None:
     return bound
 
 
+def _bounded_from_enum(enum: type[StrEnum]) -> Bounded:
+    """The closed set of every member's own string value, as ``Lit``s. Only a
+    ``NominalEnum`` or ``UnitEnum`` subtype ever reaches here (``FieldDef.enum``
+    is set for no other field kind), and both are plain ``StrEnum``s whose
+    members are their own literal values."""
+    return Bounded(frozenset(Lit(LitKind.STR, member.value) for member in enum))
+
+
+def _scope(src: SourceRef, column: str) -> ColumnRef:
+    """The case-folded ``ColumnRef`` a declaration's column spelling grounds:
+    the lineage keys every column lowercase (``ColumnRef``'s own rule), so a
+    contract that spells the column as the warehouse does still meets its
+    propagated scope. Adopting this at the bridge's older sites is #291."""
+    return ColumnRef(src, column.lower())
+
+
+def _value_domain_facts_for_domain(
+    decl_name: str,
+    spec: DomainSpec,
+    src: SourceRef,
+    known: frozenset[str] | None,
+    contract: str,
+) -> tuple[Fact[ValueDomain, ColumnRef], ...]:
+    """The value-domain facts a domain type's own enum facets ground, one per
+    *open* (unfixed) unit or nominal enum field bound to its companion column.
+    A fixed facet (``currency=Currency.USD``) pins a literal identity rather
+    than binding a column, so it grounds nothing here, the same open/fixed
+    split the tag algebra uses. A facet whose column is absent from ``known``
+    is skipped silently, since :func:`_build_tag` already raises the loud
+    finding for it."""
+    out: list[Fact[ValueDomain, ColumnRef]] = []
+    for fdef in spec.fields.values():
+        if fdef.name in spec.fixed or fdef.enum is None:
+            continue
+        column = _column_of(spec, fdef.name)
+        if known is not None and column not in known:
+            continue
+        out.append(
+            Fact(
+                scope=_scope(src, column),
+                value=_bounded_from_enum(fdef.enum),
+                provenance=Declared(DeclaredSource.USER_ASSERTED),
+                detail=f"{contract}.{decl_name}",
+            )
+        )
+    return tuple(out)
+
+
 # --- resolution -----------------------------------------------------------------
 
 
@@ -327,6 +385,7 @@ def resolve_contracts(
 
     return ResolvedContracts(
         tag_facts=tuple(out.tag_facts),
+        value_domain_facts=tuple(out.value_domain_facts),
         key_facts=tuple(out.key_facts),
         fd_facts=tuple(out.fd_facts),
         foreign_keys=tuple(out.foreign_keys),
@@ -347,10 +406,12 @@ class _Accumulator:
         "key_facts",
         "predicates",
         "tag_facts",
+        "value_domain_facts",
     )
 
     def __init__(self) -> None:
         self.tag_facts: list[Fact[DomainTag, ColumnRef]] = []
+        self.value_domain_facts: list[Fact[ValueDomain, ColumnRef]] = []
         self.key_facts: list[Fact[CandidateKeySet, SourceRef]] = []
         self.fd_facts: list[Fact[FDSet, SourceRef]] = []
         self.foreign_keys: list[ForeignKeyEdge] = []
@@ -369,34 +430,61 @@ def _resolve_one(
     key_columns: list[str] = []
     for fname, decl in cspec.declarations.items():
         form = decl.form
-        if isinstance(form, DomainDecl):
-            bound, found = _build_tag(fname, form.spec, src, known)
-            out.issues.extend(replace(issue, contract=cspec.name) for issue in found)
-            if bound is not None:
-                out.tag_facts.append(
-                    Fact(
-                        scope=bound.column,
-                        value=bound.tag,
-                        provenance=Declared(DeclaredSource.USER_ASSERTED),
-                        detail=f"{cspec.name}.{fname}",
+        match form:
+            case DomainDecl():
+                bound, found = _build_tag(fname, form.spec, src, known)
+                out.issues.extend(replace(issue, contract=cspec.name) for issue in found)
+                if bound is not None:
+                    out.tag_facts.append(
+                        Fact(
+                            scope=bound.column,
+                            value=bound.tag,
+                            provenance=Declared(DeclaredSource.USER_ASSERTED),
+                            detail=f"{cspec.name}.{fname}",
+                        )
                     )
+                    # A constraint can only attach where we have a resolved column to
+                    # anchor it, and the bound magnitude column is the only ColumnRef
+                    # this bridge derives. Constraints on every other declaration form
+                    # below (scalar, key) and on a domain type that produced no tag
+                    # (the bound-is-None skip above) are dropped here: the
+                    # constraint-checking work that consumes ColumnConstraint will
+                    # resolve a column for those forms and carry their constraints.
+                    if decl.constraints is not None:
+                        out.constraints.append(ColumnConstraint(bound.column, decl.constraints))
+                # A value-domain fact is orthogonal to the tag algebra above (a
+                # magnitude-less type such as a Locale still has real enum
+                # facets), so this runs unconditionally rather than gated on
+                # ``bound``.
+                out.value_domain_facts.extend(
+                    _value_domain_facts_for_domain(fname, form.spec, src, known, cspec.name)
                 )
-                # A constraint can only attach where we have a resolved column to
-                # anchor it, and the bound magnitude column is the only ColumnRef
-                # this bridge derives. Constraints on every other declaration form
-                # below (scalar, key) and on a domain type that produced no tag
-                # (the bound-is-None skip above) are dropped here: the
-                # constraint-checking work that consumes ColumnConstraint will
-                # resolve a column for those forms and carry their constraints.
-                if decl.constraints is not None:
-                    out.constraints.append(ColumnConstraint(bound.column, decl.constraints))
-        elif isinstance(form, PrimaryKeyDecl):
-            key_columns.append(fname)  # decl.constraints dropped (no anchor column yet)
-        elif isinstance(form, ForeignKeyDecl):
-            edge = _resolve_foreign_key(manifest, src, fname, form.target, cspec.name, out.issues)
-            if edge is not None:
-                out.foreign_keys.append(edge)  # decl.constraints dropped (no anchor column yet)
-        # ScalarDecl carries no fact, and no ColumnConstraint, in this build.
+            case ScalarDecl():
+                fdef = form.type
+                # A bare bool, str, date/timestamp, or inert integer carries no
+                # closed set to ground (bool's fixed {true, false} is rarely
+                # interesting on its own, a deliberate choice); an enum scalar
+                # (Nominal or Unit) does. No ColumnConstraint for a bare scalar
+                # in this build.
+                if fdef.enum is not None:
+                    out.value_domain_facts.append(
+                        Fact(
+                            scope=_scope(src, fname),
+                            value=_bounded_from_enum(fdef.enum),
+                            provenance=Declared(DeclaredSource.USER_ASSERTED),
+                            detail=f"{cspec.name}.{fname}",
+                        )
+                    )
+            case PrimaryKeyDecl():
+                key_columns.append(fname)  # decl.constraints dropped (no anchor column yet)
+            case ForeignKeyDecl():
+                edge = _resolve_foreign_key(
+                    manifest, src, fname, form.target, cspec.name, out.issues
+                )
+                if edge is not None:
+                    out.foreign_keys.append(edge)  # decl.constraints dropped (no anchor column yet)
+            case _:
+                assert_never(form)
 
     if key_columns:
         out.key_facts.append(
@@ -720,6 +808,17 @@ class _FdDiscoverer:
         return resolve_contracts(manifest).fd_facts
 
 
+class _ValueDomainDiscoverer:
+    """Yields the contract-sourced value-domain facts: a bare ``NominalEnum``/
+    ``UnitEnum`` scalar, or an open enum facet on a domain type, each grounding
+    its column to the enum's closed member set."""
+
+    def discover(
+        self, manifest: Manifest, *, name_to_source: Mapping[str, SourceRef]
+    ) -> Collection[Fact[ValueDomain, ColumnRef]]:
+        return resolve_contracts(manifest).value_domain_facts
+
+
 def contract_tag_discoverer() -> _TagDiscoverer:
     return _TagDiscoverer()
 
@@ -730,3 +829,7 @@ def contract_key_discoverer() -> _KeyDiscoverer:
 
 def contract_fd_discoverer() -> _FdDiscoverer:
     return _FdDiscoverer()
+
+
+def contract_value_domain_discoverer() -> _ValueDomainDiscoverer:
+    return _ValueDomainDiscoverer()

@@ -116,3 +116,21 @@ def test_join_key_type_mismatch_is_an_error() -> None:
         kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH, message="", model_unique_id="model.p.m"
     )
     assert severity_of(finding) is Severity.ERROR
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        # A stray literal against a declared set is a genuine contradiction,
+        # the same license DOMAIN_TYPE_CONTRADICTION uses.
+        (CheckFindingKind.DEAD_PREDICATE, Severity.ERROR),
+        # Held at warn while collation-dependent, redundant-but-not-wrong, or
+        # possibly-deliberate, the same posture the fanout pair calibrated to.
+        (CheckFindingKind.DEAD_PREDICATE_CASE_ONLY, Severity.WARN),
+        (CheckFindingKind.REDUNDANT_PREDICATE, Severity.WARN),
+        (CheckFindingKind.CASE_LEAVES_ENUM_MEMBER_UNHANDLED, Severity.WARN),
+    ],
+)
+def test_dead_predicate_family_severities(kind: CheckFindingKind, expected: Severity) -> None:
+    finding = CheckFinding(kind=kind, message="", model_unique_id="model.p.m")
+    assert severity_of(finding) is expected
