@@ -167,7 +167,7 @@ def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
     if group is None:
         return ()
     projections = cast("list[Expr]", sel.expressions)
-    projected = _projection_expressions_by_output_name(sel)
+    projected = projection_expressions_by_output_name(sel)
     return tuple(
         _resolve_group_target(target, projections, projected) for target in group.expressions
     )
@@ -219,7 +219,7 @@ def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> tuple[Expr, Gr
     return projection, GroupBinding.PRESUMED
 
 
-def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+def projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
     """Each output name in ``sel``'s projection mapped to the expression behind it.
 
     A name carried by two projections names neither unambiguously, so it is dropped rather than

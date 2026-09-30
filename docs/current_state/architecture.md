@@ -210,12 +210,11 @@ The facts themselves come from declarations (`unique`, dbt-utils `unique_combina
 - A key whose columns are a **subset** of the window's key set counts as coverage. Any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
 - Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
 
-**`detect_join_fanout`** flags JOINs that repeat the rows of a side a duplicate-sensitive consumer reads. An equality join repeats a row of side A when it can match two rows of side B, which is when the join columns cover no known key of B. So a join can repeat the probe side (the tables to its left) because the joined-in side is uncovered, and the joined-in side because the probe side is uncovered. `FROM a JOIN b` and `FROM b JOIN a` reach the same verdict, and INNER, LEFT, RIGHT and FULL joins decide alike, since null-extension adds rows without repeating a source row.
+**`detect_join_fanout`** flags JOINs that repeat the rows of a side a duplicate-sensitive consumer reads: a side repeats when the join columns cover no known key of the other side, and the verdict is the same whichever table is written first. The full contract is in the function's docstring.
 
 - Every SELECT is inspected (including JOINs inside CTEs).
-- A side is blamed only through a known key on the side that would do the repeating (a ref'd model, or an in-scope CTE via the scope index). A side with no known keys is never blamed.
-- Consumers: a duplicate-sensitive aggregate over columns fires when a column belongs to a repeated side (`sum(c.credit)` over `customers c JOIN orders o`, not `sum(o.amount)`); `COUNT(*)` counts the join's rows, so it fires only when every side repeats (many-to-many); a plain projection fires when every side it reads repeats, and never under `SELECT DISTINCT` or a grouping.
-- In a chain, each side carries whether it can still repeat. A step whose probe side is undecided keeps firing when the joined-in side is uncovered and stays silent otherwise.
+- A side is blamed only through a known key (a ref'd model, or an in-scope CTE via the scope index); a side with no known keys is never blamed.
+- A key declared on the model (`unique` test, contract grain) that a plain projection reads only from a repeated side also fires.
 - The ON predicate must be a **conjunction of equalities between bare columns**, exactly one of which is qualified by the joined-in side's alias. Disjunctions, function calls, and range comparisons are skipped conservatively.
 - A key whose columns are a **subset** of the join's right-side equality columns counts as coverage (superkey logic, same as window-keys).
 - `CROSS JOIN` is skipped (it's an explicit cartesian, not a fanout-by-accident).

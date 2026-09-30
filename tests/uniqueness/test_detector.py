@@ -1045,3 +1045,27 @@ def test_fanout_ungrouped_collapse_ignores_columns_of_nested_subquery() -> None:
         "from facts f join dim d on f.segment = d.segment"
     )
     assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
+@pytest.mark.parametrize("declared_column", ["customer_id", "order_id"])
+def test_a_unique_test_on_the_model_reaches_the_fanout_detector(declared_column: str) -> None:
+    """A dbt ``unique`` test on the model is the intent signal: a plain projection whose
+    declared key reads only the repeated side fires, one keyed on the other side stays silent."""
+    customers = _source("source.shop.raw.customers", name="customers")
+    orders = _source("source.shop.raw.orders", name="orders")
+    keys = (
+        _unique_test("test.shop.uc", column="customer_id", target=customers.unique_id),
+        _unique_test("test.shop.uo", column="order_id", target=orders.unique_id),
+    )
+    sql = (
+        "select c.customer_id, c.name, o.order_id, o.amount_cents "
+        "from customers c join orders o on o.customer_id = c.customer_id"
+    )
+    model = _node("model.shop.enriched", sql)
+    declared = _unique_test("test.shop.ud", column=declared_column, target=model.unique_id)
+    manifest = _manifest(customers, orders, *keys, model, declared)
+    tree = _parse(sql)
+    _window, fanout, _limit, _agg = make_fact_grounded_detectors(
+        manifest, _DUCKDB, parsed={model.unique_id: tree}
+    )
+    assert bool(fanout(tree)) is (declared_column == "customer_id")
