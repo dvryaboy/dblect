@@ -112,6 +112,49 @@ def source(
     )
 
 
+def unique_test(target: str, column: str, *, where: str | None = None) -> Node:
+    """A dbt ``unique`` test on ``target.column``, optionally ``where``-filtered."""
+    return node(
+        f"test.shop.unique_{target.split('.')[-1]}_{column}",
+        kind=ResourceType.OTHER,
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(name="unique", kwargs={"column_name": column}, where=where),
+        attached_node=target,
+    )
+
+
+def unique_combination_test(target: str, *columns: str) -> Node:
+    """A ``dbt_utils.unique_combination_of_columns`` test on ``target``."""
+    return node(
+        f"test.shop.unique_combination_{target.split('.')[-1]}_{'_'.join(columns)}",
+        kind=ResourceType.OTHER,
+        depends_on=frozenset({target}),
+        test_metadata=DbtTestMetadata(
+            name="dbt_utils.unique_combination_of_columns",
+            kwargs={"combination_of_columns": list(columns)},
+        ),
+        attached_node=target,
+    )
+
+
+def relationships_test(child: str, child_column: str, parent: str, parent_column: str) -> Node:
+    """A dbt ``relationships`` test: ``child.child_column`` references ``parent.parent_column``."""
+    return node(
+        f"test.shop.relationships_{child.split('.')[-1]}_{child_column}",
+        kind=ResourceType.OTHER,
+        depends_on=frozenset({child, parent}),
+        test_metadata=DbtTestMetadata(
+            name="relationships",
+            kwargs={
+                "column_name": child_column,
+                "to": f"ref('{parent.split('.')[-1]}')",
+                "field": parent_column,
+            },
+        ),
+        attached_node=child,
+    )
+
+
 def manifest(*nodes: Node, adapter_type: str = "duckdb", schema_version: str = "v12") -> Manifest:
     """A ``Manifest`` over ``nodes``, keyed by unique_id."""
     return Manifest(

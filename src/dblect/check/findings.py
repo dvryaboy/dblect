@@ -41,6 +41,12 @@ class CheckFindingKind(StrEnum):
     conflict (a ``MoneyUSD`` key against a ``MoneyEUR`` one, an ISO-2 country against an
     ISO-3), so the equated values cannot mean the same thing."""
 
+    JOIN_KEY_ENTITY_MISMATCH = auto()
+    """A join's ON-clause equality equates two key columns that identify different
+    entities, as inferred from declared keys and foreign keys (an order id against a
+    customer id). Nothing links the two, but a missing ``relationships`` test would
+    look the same, so this warns where a declared conflict errors."""
+
     GRAIN_NOT_ESTABLISHED = auto()
     """A model's SQL carries a strictly finer key than its declared grain (one row
     per order declared; one row per order line produced). The data may still satisfy

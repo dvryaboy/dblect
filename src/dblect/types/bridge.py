@@ -831,8 +831,14 @@ def foreign_key_edges(
     markers merged with dbt ``relationships`` tests, de-duplicated so an edge
     stated both ways appears once. The merge point a future fan-out finding or
     fixture generator reads from."""
-    contract_edges = resolve_contracts(manifest, registry=registry).foreign_keys
-    return tuple(dict.fromkeys((*contract_edges, *dbt_relationship_edges(manifest))))
+    return merged_foreign_keys(resolve_contracts(manifest, registry=registry), manifest)
+
+
+def merged_foreign_keys(
+    resolved: ResolvedContracts, manifest: Manifest
+) -> tuple[ForeignKeyEdge, ...]:
+    """:func:`foreign_key_edges` over contracts the caller already resolved."""
+    return tuple(dict.fromkeys((*resolved.foreign_keys, *dbt_relationship_edges(manifest))))
 
 
 # --- discoverers ----------------------------------------------------------------

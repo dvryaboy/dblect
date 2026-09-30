@@ -30,11 +30,12 @@ Three kinds of meaning propagate today:
   tag), with **refinements** fixing a meaning-bearing parameter (single currency, net
   vs gross, tax inclusive). This catches a unit changing upstream
   (`domain_type_contradiction`) and a mixed-unit sum (`aggregation_not_well_typed`).
-- **An identifier naming its entity.** A key column tagged with what it identifies,
-  so a join that equates an order id with a customer id stops looking like a clean
-  one-to-one join. Expressed as a `DomainType` with no magnitude: one open value
-  field (the id) plus a `NominalEnum` entity facet, refined per entity. This catches
-  a join across entities (`join_key_type_mismatch`).
+- **An identifier naming its entity.** dblect already infers which entity a key
+  identifies from the project's `unique` and `relationships` tests, and warns when a
+  join equates an order id with a customer id (`join_key_entity_mismatch`). A
+  `DomainType` with no magnitude (one open value field plus a `NominalEnum` entity
+  facet, refined per entity) states it outright where the inference falls short;
+  the declared form errors on a mismatch (`join_key_type_mismatch`).
 - **A structural invariant over columns.** A functional dependency (an
   `ad -> adset -> campaign` hierarchy, or every payment on an order sharing the
   order's currency) or the grain, which keep a rollup well typed. Expressed as
@@ -49,10 +50,12 @@ test to read. A category earns a full `DomainType` only when it rides on a
 magnitude as its unit, as `currency` does on `Money`.
 
 Restraint is part of the job. Type a column only when one of those kinds
-genuinely lives in it. Give an identifier an entity type when it is a join key and
-the project has several ids of different entities that could be confused; leave an
-id that is never joined, a free-text column, or a one-off numeric column as its SQL
-type. Uniqueness needs no type: a key is already read from its dbt test. Skip a
+genuinely lives in it. Give an identifier an entity type only where the inference
+falls short: a join key with no `unique` or `relationships` test behind it, or a table
+that shares its parent's key with no `relationships` test, which the inference reads
+as a different entity. Mention the missing test to the user too, since it fixes the
+inference and documents the key. Leave a free-text or one-off numeric column as its
+SQL type. Skip a
 **data-dependent unit** too, where the parameter fixing a magnitude's meaning lives
 in the data rather than in code or a companion column: a "season wins" figure whose
 basis is 80 games some seasons and 82 others has no column to bind to, and pinning it
@@ -280,7 +283,7 @@ is expected and right (you type only the columns that carry meaning). Chase the
 resolved-columns count up to what you declared; do not chase grounding up to the
 total.
 
-Then read the findings. Four kinds matter:
+Then read the findings. Five kinds matter:
 
 - **`contract_issue`**: a declaration does not line up with the manifest. The head
   names the precise cause in parentheses, e.g. `contract_issue (unsourced_field)`, and
@@ -300,10 +303,13 @@ Then read the findings. Four kinds matter:
   independent of the column it supposedly conflicts with, and does the lineage trace
   through a skipped model or unresolved group? If so it is a can't-prove artifact from
   a lineage gap; note it and move on rather than contorting declarations to chase it.
-
 - **`join_key_type_mismatch`**: a join equates two columns whose declared types
   conflict, most often ids of two different entities. This is nearly always a real
   bug in the join condition; show it to the user.
+- **`join_key_entity_mismatch`**: the same, inferred from `unique` and
+  `relationships` tests with nothing declared. Either the join is wrong or a
+  `relationships` test is missing (a 1:1 table sharing its parent's key); ask the
+  user which, and declare both sides one entity if the join is right.
 
 Iterate until contract issues are gone. A remaining `domain_type_contradiction` may
 be a true finding worth surfacing to the user; explain it and let them decide.
