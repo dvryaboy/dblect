@@ -12,8 +12,8 @@ from __future__ import annotations
 from hypothesis import given
 from hypothesis import strategies as st
 
-from dblect.lineage.facts.lattice import Lattice, consistent, resolve
-from dblect.lineage.facts.model import Declared, DeclaredSource, Fact
+from dblect.lineage.facts.lattice import Lattice, annotate_fold, consistent, resolve
+from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact, Opacity
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
 
@@ -111,3 +111,46 @@ def test_resolve_and_consistent_stay_sound_on_a_degenerate_lattice() -> None:
     assert not is_contradiction
     check = consistent(lat)
     assert check(frozenset({0, 1}), lat.top)
+
+
+# --- annotate_fold -------------------------------------------------------------
+#
+# The wrapper every transfer's multi-child fold uses to turn a folded *value* into
+# an Annotation: CONCRETE off top, otherwise IMPLICIT unless a child's opt-out
+# earns EXPLICIT, and provisional is the OR of the children's.
+
+
+def test_annotate_fold_non_top_value_is_concrete() -> None:
+    out = annotate_fold(_subset_lattice(), frozenset({0}), [Annotation(frozenset({0}))])
+    assert out == Annotation(frozenset({0}), Opacity.CONCRETE, provisional=False)
+
+
+def test_annotate_fold_top_is_implicit_by_default() -> None:
+    out = annotate_fold(_subset_lattice(), _UNIVERSE, [Annotation(_UNIVERSE, Opacity.IMPLICIT)])
+    assert out.opacity is Opacity.IMPLICIT
+
+
+def test_annotate_fold_top_inherits_explicit_from_a_child_opt_out() -> None:
+    kids = [Annotation(frozenset({0})), Annotation(_UNIVERSE, Opacity.EXPLICIT)]
+    out = annotate_fold(_subset_lattice(), _UNIVERSE, kids)
+    assert out.value == _UNIVERSE
+    assert out.opacity is Opacity.EXPLICIT
+
+
+def test_annotate_fold_provisional_is_the_or_of_the_children() -> None:
+    kids = [Annotation(frozenset({0}), provisional=True), Annotation(frozenset({0}))]
+    out = annotate_fold(_subset_lattice(), frozenset({0}), kids)
+    assert out.provisional
+
+
+@given(_subsets, st.lists(_subsets, max_size=4))
+def test_annotate_fold_never_reports_bottom_as_concrete_top(
+    value: frozenset[int], others: list[frozenset[int]]
+) -> None:
+    """The opacity/CONCRETE choice depends only on ``value == lat.top``; this pins
+    that ``annotate_fold`` never invents information the fold's value does not
+    carry, whatever the children's own opacities are."""
+    lat = _subset_lattice()
+    kids = [Annotation(o, Opacity.IMPLICIT) for o in others]
+    out = annotate_fold(lat, value, kids)
+    assert (out.opacity is Opacity.CONCRETE) == (value != lat.top)

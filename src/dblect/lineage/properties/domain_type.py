@@ -34,7 +34,7 @@ source will eventually be the contract bridge in the authoring layer.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
 from typing import Final, assert_never, final
@@ -42,9 +42,9 @@ from typing import Final, assert_never, final
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
-from dblect.lineage.facts.grounding import grounded_scopes, grounding
-from dblect.lineage.facts.lattice import Lattice
-from dblect.lineage.facts.model import Annotation, Fact, Opacity
+from dblect.lineage.facts.kit import GroundingFold, constant_aggregate, grounding_fold, top_rule
+from dblect.lineage.facts.lattice import Lattice, annotate_fold
+from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import (
     AggregateRule,
     AxisDisplay,
@@ -283,15 +283,9 @@ DOMAIN_TYPE_LATTICE: Final[Lattice[DomainTag]] = Lattice(
 
 
 def _annotate(value: DomainTag, kids: tuple[Annotation[DomainTag], ...]) -> Annotation[DomainTag]:
-    """Wrap a transfer's result value with the diagnostic bits derived from its inputs:
-    a non-top result is CONCRETE, a top result inherits EXPLICIT from a declared opt-out
-    or is IMPLICIT, and provisional is the OR of the inputs."""
-    provisional = any(k.provisional for k in kids)
-    if value != NAKED:
-        return Annotation(value, Opacity.CONCRETE, provisional=provisional)
-    explicit = any(k.opacity is Opacity.EXPLICIT for k in kids)
-    opacity = Opacity.EXPLICIT if explicit else Opacity.IMPLICIT
-    return Annotation(value, opacity, provisional=provisional)
+    """Wrap a transfer's result value with the diagnostic bits derived from its
+    inputs, via the shared :func:`~dblect.lineage.facts.lattice.annotate_fold`."""
+    return annotate_fold(DOMAIN_TYPE_LATTICE, value, kids)
 
 
 # --- operator transfers ------------------------------------------------------
@@ -439,16 +433,6 @@ def _dot_rule(
     return _annotate(reduce(_join, (k.value for k in kids)), kids)
 
 
-def _comparison_rule(
-    _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
-) -> Annotation[DomainTag]:
-    """A comparison such as ``a = b`` yields a boolean, which carries no magnitude
-    tag regardless of the operands' tags. Whether those tags actually agree is
-    checked separately, where a declared tag meets an inferred one; this rule
-    only fixes the comparison's own tag-free result."""
-    return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
-
-
 def _literal_rule(
     expr: Expr, _kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
@@ -493,6 +477,14 @@ def _outer_join_null_rule(
     return _annotate(widened, kids)
 
 
+# A comparison such as ``a = b`` yields a boolean, which carries no magnitude tag
+# regardless of the operands' tags; whether those tags actually agree is checked
+# separately, where a declared tag meets an inferred one. ``top_rule`` is the
+# kit's catch-all (no-claim top, IMPLICIT, provisional carried through), reused
+# here rather than a hand-written rule since that is exactly what a comparison's
+# own tag-free result is.
+_comparison_rule = top_rule(DOMAIN_TYPE_LATTICE)
+
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
     exp.Dot: _dot_rule,
@@ -520,10 +512,10 @@ def _passthrough_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annot
     return child
 
 
-def _count_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[DomainTag]:
-    """``count`` does not inspect values, so it is always safe and yields a tag-free
-    ``Count`` whatever the child's tag."""
-    return Annotation(NAKED, Opacity.IMPLICIT, provisional=child.provisional)
+# ``count`` does not inspect values, so it is always safe and yields a tag-free
+# ``Count`` whatever the child's tag: the kit's ``constant_aggregate``, aimed at
+# the no-claim top since a count carries no information about the magnitude.
+_COUNT_RULE: AggregateRule[DomainTag] = constant_aggregate(NAKED, opacity=Opacity.IMPLICIT)
 
 
 def _aggregate_rules(
@@ -547,7 +539,7 @@ def _aggregate_rules(
         # typecheck error here rather than a silent fall-through into the guarded rule.
         match behavior:
             case AggregateBehavior.COUNT:
-                rules[agg_type] = AggregateRule(core=_count_core)
+                rules[agg_type] = _COUNT_RULE
             case AggregateBehavior.COMBINE | AggregateBehavior.SELECT:
                 rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
             case _:
@@ -654,25 +646,13 @@ def join_key_conflicts(
 # --- the property ------------------------------------------------------------
 
 
-def domain_type_grounding(
-    facts: Mapping[ColumnRef, tuple[Fact[DomainTag, ColumnRef], ...]],
-    *,
-    opaque: Collection[ColumnRef] = (),
-) -> Callable[[ColumnRef], Annotation[DomainTag]]:
-    """Fold the per-column domain-type facts into grounded annotations. The same fold
-    every property uses: an opt-out grounds EXPLICIT top, a resolved bucket grounds its
-    value CONCRETE, everything else the IMPLICIT-top default."""
-    return grounding(facts, opaque, DOMAIN_TYPE_LATTICE)
-
-
-def domain_type_grounded_scopes(
-    facts: Mapping[ColumnRef, tuple[Fact[DomainTag, ColumnRef], ...]],
-    *,
-    opaque: Collection[ColumnRef] = (),
-) -> set[ColumnRef]:
-    """The columns a domain-type fact grounded, for coverage. Reads the same fold
-    ``domain_type_grounding`` does."""
-    return grounded_scopes(facts, opaque, DOMAIN_TYPE_LATTICE)
+# The kit's grounding fold, bound once to this property's lattice. Bound as plain
+# names rather than left as ``_DOMAIN_TYPE_FOLD.ground``/``.scopes`` so a caller
+# imports ``domain_type_grounding``/``domain_type_grounded_scopes`` exactly as it
+# always has; the derivation is now the kit's, not a hand-written wrapper.
+_DOMAIN_TYPE_FOLD: GroundingFold[DomainTag, ColumnRef] = grounding_fold(DOMAIN_TYPE_LATTICE)
+domain_type_grounding = _DOMAIN_TYPE_FOLD.ground
+domain_type_grounded_scopes = _DOMAIN_TYPE_FOLD.scopes
 
 
 def domain_type_property(

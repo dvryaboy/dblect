@@ -58,7 +58,7 @@ from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
-from tests.lineage._duckdb_oracle import Table, materialized, scalar
+from tests.lineage._duckdb_oracle import Table, assert_no_over_claims, scalar
 from tests.lineage._group_spelling import GroupSpelling
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -84,17 +84,24 @@ def _assert_keys_sound(
     model_sql: str,
     keys: frozenset[Key],
 ) -> None:
-    """Materialize ``tables`` and the model in duckdb; assert every key in ``keys`` has
-    as many distinct key tuples as the model has rows (so it is genuinely unique)."""
-    with materialized(con, tables, model_sql) as con:
-        total = scalar(con, "SELECT COUNT(*) FROM _m")
+    """Assert every key in ``keys`` has as many distinct key tuples as the model has
+    rows over the materialization (so it is genuinely unique)."""
+
+    def violations(c: duckdb.DuckDBPyConnection) -> dict[str, int]:
+        total = scalar(c, "SELECT COUNT(*) FROM _m")
+        out: dict[str, int] = {}
         for key in keys:
             cols = ", ".join(sorted(key))
-            distinct = scalar(con, f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)")
-            assert distinct == total, (
-                f"unsound key {sorted(key)}: {total} rows but {distinct} distinct tuples "
-                f"for sql={model_sql!r} tables={tables!r}"
+            distinct = scalar(c, f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)")
+            # The violation count is the shortfall: zero when every row's key tuple is
+            # distinct, positive when duplicates collapse the DISTINCT count below the
+            # row count.
+            out[f"unsound key {sorted(key)} ({total} rows, {distinct} distinct tuples)"] = (
+                total - distinct
             )
+        return out
+
+    assert_no_over_claims(con, tables, model_sql, violations)
 
 
 def _source_node(name: str, schema: str = "raw") -> Node:

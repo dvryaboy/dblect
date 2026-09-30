@@ -20,6 +20,7 @@ from typing import assert_never
 
 from dblect.adapters import AdapterProfile
 from dblect.check.findings import CheckFinding, CheckFindingKind
+from dblect.check.located import file_of
 from dblect.lineage.facts.model import (
     Annotation,
     CompileValue,
@@ -115,7 +116,6 @@ def _finding(
     declared_cols = ", ".join(sorted(declared))
     witness_cols = ", ".join(sorted(witness))
     attribution = f" (declared by {fact.detail})" if fact.detail else ""
-    node = manifest.nodes.get(scope.unique_id)
     single = next(iter(declared)) if len(declared) == 1 else None
     return CheckFinding(
         kind=CheckFindingKind.GRAIN_NOT_ESTABLISHED,
@@ -127,6 +127,6 @@ def _finding(
             "produces."
         ),
         model_unique_id=scope.unique_id,
-        file_path=node.original_file_path if node is not None else None,
+        file_path=file_of(manifest, scope.unique_id),
         column=single,
     )

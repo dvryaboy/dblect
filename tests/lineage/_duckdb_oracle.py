@@ -13,7 +13,7 @@ DDL here if a future PBT needs another type.
 
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 
 import duckdb
@@ -59,3 +59,25 @@ def scalar(con: duckdb.DuckDBPyConnection, query: str) -> int:
     row = con.execute(query).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def assert_no_over_claims(
+    con: duckdb.DuckDBPyConnection,
+    tables: Sequence[Table],
+    model_sql: str,
+    violations: Callable[[duckdb.DuckDBPyConnection], Mapping[str, int]],
+) -> None:
+    """Materialize ``tables`` and ``model_sql``, then assert every count ``violations``
+    reports is zero: the "annotation over-approximates the materialized truth" move
+    every empirical soundness PBT makes (a NON_NULL column with a null row, a claimed
+    key with duplicate tuples), whatever it is counting.
+
+    ``violations`` runs against the live materialization and returns one count per
+    claim, labelled for the assertion message; a property supplies only that (its
+    generator and grammar live in its own test, and how it counts a violation is
+    property-specific), not the materialize/teardown dance around it.
+    """
+    with materialized(con, tables, model_sql) as c:
+        counts = violations(c)
+    bad = {label: n for label, n in counts.items() if n != 0}
+    assert not bad, f"over-claimed: {bad} for sql={model_sql!r} tables={tables!r}"

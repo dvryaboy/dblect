@@ -30,7 +30,8 @@ from sqlglot import expressions as exp
 
 from dblect.adapters import AdapterProfile
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph
-from dblect.lineage.facts.grounding import collect, grounding
+from dblect.lineage.facts.grounding import collect, generic_test_column_ref
+from dblect.lineage.facts.kit import column_kit, constant_aggregate
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
     Annotation,
@@ -47,7 +48,6 @@ from dblect.lineage.facts.property import (
     FactDiscoverer,
     OperatorTransfer,
     Property,
-    column_property,
     relation_property,
 )
 from dblect.lineage.graph import (
@@ -193,10 +193,10 @@ def _outer_join_null_rule(
     return Annotation(Nullability.NULLABLE, provisional=any(k.provisional for k in kids))
 
 
-def _count_core(_expr: exp.AggFunc, child: Annotation[Nullability]) -> Annotation[Nullability]:
-    """COUNT returns 0 for empty groups, never NULL."""
-    return Annotation(Nullability.NON_NULL, provisional=child.provisional)
-
+# COUNT returns 0 for empty groups, never NULL: the kit's constant-aggregate rule,
+# aimed at NON_NULL since this is a positive structural claim rather than "no
+# information" (its default CONCRETE opacity is exactly right here).
+_COUNT_RULE: AggregateRule[Nullability] = constant_aggregate(Nullability.NON_NULL)
 
 # The transfer catalogs are the reusable axis surface: :func:`nullability_property`
 # and any custom-grounding caller (graph-only tests, transfer demos) build their
@@ -208,31 +208,11 @@ NULLABILITY_OPERATORS: Mapping[type[Expr], OperatorTransfer[Nullability]] = {
     exp.Null: _null_literal_rule,
 }
 NULLABILITY_AGGREGATES: Mapping[type[exp.AggFunc], AggregateRule[Nullability]] = {
-    exp.Count: AggregateRule(core=_count_core),
+    exp.Count: _COUNT_RULE,
 }
 
 
 # --- discoverers -------------------------------------------------------------
-
-_SOURCE_KIND: Mapping[ResourceType, SourceKind] = {
-    ResourceType.MODEL: SourceKind.MODEL,
-    ResourceType.SOURCE: SourceKind.SOURCE,
-    ResourceType.SEED: SourceKind.SEED,
-    ResourceType.SNAPSHOT: SourceKind.SNAPSHOT,
-}
-
-
-def _column_ref(manifest: Manifest, target_uid: str, column: str) -> ColumnRef | None:
-    """The graph-keyed ColumnRef for ``column`` on the target node, or None if the
-    node is absent or not a data-flow relation. Column names are case-folded to
-    match how the builder keys the graph."""
-    node = manifest.nodes.get(target_uid)
-    if node is None:
-        return None
-    kind = _SOURCE_KIND.get(node.resource_type)
-    if kind is None:
-        return None
-    return ColumnRef(SourceRef(kind, target_uid), column.lower())
 
 
 class _NotNullTestDiscoverer:
@@ -256,7 +236,7 @@ class _NotNullTestDiscoverer:
             target = generic_test_target_uid(node)
             if target is None:
                 continue
-            scope = _column_ref(manifest, target, col)
+            scope = generic_test_column_ref(manifest, target, col)
             if scope is None:
                 continue
             out.append(
@@ -322,6 +302,18 @@ def native_not_null_discoverer(profile: AdapterProfile) -> FactDiscoverer[Nullab
     return _NativeNotNullDiscoverer(profile)
 
 
+# The kit's derived surface: the facts collector, the grounding fold, and the
+# property constructor, all bound once to this property's fixed transfer rules.
+_NULLABILITY_KIT = column_kit(
+    name="nullability",
+    lattice=NULLABILITY_LATTICE,
+    operators=NULLABILITY_OPERATORS,
+    aggregates=NULLABILITY_AGGREGATES,
+    column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
+    semiring=NullabilitySemiring(),
+)
+
+
 def nullability_property(
     manifest: Manifest,
     profile: AdapterProfile,
@@ -339,16 +331,8 @@ def nullability_property(
         native_not_null_discoverer(profile),
         *extra,
     )
-    facts = collect(manifest, discoverers, name_to_source=name_to_source)
-    return column_property(
-        name="nullability",
-        lattice=NULLABILITY_LATTICE,
-        operators=NULLABILITY_OPERATORS,
-        aggregates=NULLABILITY_AGGREGATES,
-        ground=grounding(facts, opaque=set(), lat=NULLABILITY_LATTICE),
-        column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
-        semiring=NullabilitySemiring(),
-    )
+    facts = _NULLABILITY_KIT.facts(manifest, discoverers, name_to_source=name_to_source)
+    return _NULLABILITY_KIT.property(facts)
 
 
 # --- conditional activation --------------------------------------------------

@@ -59,6 +59,31 @@ def test_store_get_missing_is_none() -> None:
     assert store.get("nullability", _COL) is None
 
 
+def test_store_scoped_reads_by_typed_ref() -> None:
+    """A caller with a property's minted ref reads its whole scope map back typed,
+    rather than one scope at a time by name."""
+    prop = _prop("nullability")
+    store = AnnotationStore()
+    ann = Annotation(True)
+    store.record(prop.name, _COL, ann)
+    assert store.scoped(prop.ref) == {_COL: ann}
+
+
+def test_store_scoped_missing_property_is_empty() -> None:
+    prop = _prop("nullability")
+    store = AnnotationStore()
+    assert store.scoped(prop.ref) == {}
+
+
+def test_store_scoped_does_not_leak_another_propertys_annotations() -> None:
+    a, b = _prop("a"), _prop("b")
+    store = AnnotationStore()
+    store.record("a", _COL, Annotation(True))
+    store.record("b", _COL, Annotation(False))
+    assert store.scoped(a.ref) == {_COL: Annotation(True)}
+    assert store.scoped(b.ref) == {_COL: Annotation(False)}
+
+
 # --- evaluation order --------------------------------------------------------
 
 

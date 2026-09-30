@@ -120,12 +120,6 @@ def test_meet_of_disagreeing_nominal_is_conflict() -> None:
     assert DOMAIN_TYPE_LATTICE.meet(taxed, untaxed) is CONFLICT
 
 
-def test_meet_with_naked_keeps_the_known_tag() -> None:
-    usd = tagged(dimension=Dimension.of(Concrete("usd")))
-    assert DOMAIN_TYPE_LATTICE.meet(usd, NAKED) == usd
-    assert DOMAIN_TYPE_LATTICE.meet(NAKED, usd) == usd
-
-
 def test_join_widens_disagreement_to_naked() -> None:
     """Two known currencies at a confluence widen to ``NAKED``: the result is
     summable-by-omission only because the analyzer no longer knows the unit."""
@@ -147,12 +141,6 @@ def test_join_keeps_the_tags_both_sides_share() -> None:
     assert joined == tagged(
         dimension=Dimension.of(Concrete("usd")), nominal={"country": PerRow(_COUNTRY_COL)}
     )
-
-
-def test_known_tag_refines_naked() -> None:
-    usd = tagged(dimension=Dimension.of(Concrete("usd")))
-    assert DOMAIN_TYPE_LATTICE.refines(usd, NAKED)
-    assert not DOMAIN_TYPE_LATTICE.refines(NAKED, usd)
 
 
 def test_resolution_detects_a_currency_contradiction() -> None:

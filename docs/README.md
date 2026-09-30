@@ -10,6 +10,7 @@ Three buckets, each answering a different question.
 
 - [**current_state/capabilities.md**](current_state/capabilities.md): the status view. What works end to end today, what is scaffolded but not yet load-bearing, what the runtime half still lacks, and the concrete distance to a usable 0.1.0. Start here for "how far along is this."
 - [**current_state/architecture.md**](current_state/architecture.md): a walkthrough of the code as it stands: manifest ingestion (including dbt tests + constraints) → SQL parsing → structural detectors → the lineage substrate → uniqueness, nullability, and snapshot detectors → the domain-type declaration family → audit walker → CLI + reporters. Reads bottom-up from a fresh checkout. Start here if you want to navigate the source or extend a detector.
+- [**current_state/adding-a-detector.md**](current_state/adding-a-detector.md): how to add a detector. What a detector is made of, which pieces the property kit and the check helpers already provide, where a new one plugs in, what its messages must say, and how each level is tested.
 
 ## What's *designed but not built*: forward-looking
 

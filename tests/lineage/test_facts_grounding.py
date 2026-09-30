@@ -21,6 +21,9 @@ from dblect.lineage.facts.grounding import (
     SeamContradictionError,
     collect,
     combine,
+    conflicting_scopes,
+    generic_test_column_ref,
+    generic_test_source_ref,
     grounding,
 )
 from dblect.lineage.facts.lattice import Lattice
@@ -33,8 +36,10 @@ from dblect.lineage.facts.model import (
     Predicate,
 )
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
-from dblect.manifest import Manifest
+from dblect.manifest import Manifest, ResourceType
 from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _source
 
 # A flat lattice over a tiny domain: two committed values "A"/"B" that meet to
 # bottom, plus an explicit top and bottom sentinel.
@@ -202,6 +207,22 @@ def test_collect_propagates_unexpected_errors() -> None:
         collect(_EMPTY_MANIFEST, (bad,), name_to_source={})
 
 
+def test_collect_folds_extra_facts_into_the_discovered_buckets() -> None:
+    """A caller-supplied fact (a Python contract already resolved) lands in the
+    same bucket a discoverer's fact for that scope would, so a property needing
+    both a discoverer set and a top-up channel never hand-rolls the merge."""
+    discovered = _StaticDiscoverer((_fact(_COL_A, "A"),))
+    extra = (_fact(_COL_A, "B"), _fact(_COL_B, "B"))
+    buckets = collect(_EMPTY_MANIFEST, (discovered,), name_to_source={}, extra_facts=extra)
+    assert [f.value for f in buckets[_COL_A]] == ["A", "B"]
+    assert [f.value for f in buckets[_COL_B]] == ["B"]
+
+
+def test_collect_extra_facts_alone_still_bucket_without_a_discoverer() -> None:
+    buckets = collect(_EMPTY_MANIFEST, (), name_to_source={}, extra_facts=(_fact(_COL_A, "A"),))
+    assert set(buckets) == {_COL_A}
+
+
 # --- grounding ---------------------------------------------------------------
 
 
@@ -256,3 +277,81 @@ def test_grounding_folds_unconditional_and_ignores_conditional_in_one_bucket() -
     }
     ground = grounding(facts, opaque=set(), lat=_FLAT)
     assert ground(_COL_A) == Annotation("A", Opacity.CONCRETE)
+
+
+# --- conflicting_scopes --------------------------------------------------------
+
+
+def test_conflicting_scopes_finds_a_scope_whose_declarations_disagree() -> None:
+    facts = {_COL_A: (_fact(_COL_A, "A"), _fact(_COL_A, "B"))}
+    assert conflicting_scopes(facts, _FLAT) == (_COL_A,)
+
+
+def test_conflicting_scopes_ignores_a_single_declaration() -> None:
+    facts = {_COL_A: (_fact(_COL_A, "A"),)}
+    assert conflicting_scopes(facts, _FLAT) == ()
+
+
+def test_conflicting_scopes_ignores_agreeing_declarations() -> None:
+    facts = {_COL_A: (_fact(_COL_A, "A"), _fact(_COL_A, "A"))}
+    assert conflicting_scopes(facts, _FLAT) == ()
+
+
+def test_conflicting_scopes_names_exactly_the_scopes_grounding_raises_on() -> None:
+    """A single declaration that is itself the lattice bottom (an empty accepted
+    value set) is a conflict too: the scan exists so a caller can leave out every
+    scope ``grounding`` would raise on, so the two must agree even here."""
+    facts = {_COL_A: (_fact(_COL_A, _BOTTOM),)}
+    with pytest.raises(FactConflictError):
+        grounding(facts, opaque=set(), lat=_FLAT)
+    assert conflicting_scopes(facts, _FLAT) == (_COL_A,)
+
+
+def test_conflicting_scopes_ignores_a_conditional_declaration() -> None:
+    """A conditional fact never joins the unconditional fold, so it cannot itself
+    manufacture a conflict with an unconditional one."""
+    facts = {_COL_A: (_fact(_COL_A, "A"), _conditional_fact(_COL_A, "B", where="active"))}
+    assert conflicting_scopes(facts, _FLAT) == ()
+
+
+def test_conflicting_scopes_reads_the_same_fold_grounding_would_raise_on() -> None:
+    """A scope :func:`conflicting_scopes` flags is exactly one :func:`grounding`
+    would raise :class:`FactConflictError` on, so a caller can scan first and
+    leave the flagged scopes out rather than losing every other scope's fold."""
+    facts = {_COL_A: (_fact(_COL_A, "A"), _fact(_COL_A, "B")), _COL_B: (_fact(_COL_B, "A"),)}
+    conflicts = conflicting_scopes(facts, _FLAT)
+    assert conflicts == (_COL_A,)
+    clean = {k: v for k, v in facts.items() if k not in conflicts}
+    grounding(clean, opaque=set(), lat=_FLAT)  # does not raise
+
+
+# --- the generic-test target resolution ----------------------------------------
+
+
+def test_generic_test_source_ref_resolves_a_data_flow_node() -> None:
+    src = _source("source.shop.raw.orders")
+    manifest = _manifest(src)
+    ref = generic_test_source_ref(manifest, src.unique_id)
+    assert ref == SourceRef(SourceKind.SOURCE, src.unique_id)
+
+
+def test_generic_test_source_ref_is_none_for_an_absent_node() -> None:
+    assert generic_test_source_ref(_EMPTY_MANIFEST, "model.shop.missing") is None
+
+
+def test_generic_test_source_ref_is_none_for_a_non_data_flow_kind() -> None:
+    """A test node itself is not a relation the lineage graph tracks."""
+    test_node = _node("test.shop.t", kind=ResourceType.OTHER)
+    manifest = _manifest(test_node)
+    assert generic_test_source_ref(manifest, test_node.unique_id) is None
+
+
+def test_generic_test_column_ref_folds_the_column_case() -> None:
+    src = _source("source.shop.raw.orders")
+    manifest = _manifest(src)
+    ref = generic_test_column_ref(manifest, src.unique_id, "ID")
+    assert ref == ColumnRef(SourceRef(SourceKind.SOURCE, src.unique_id), "id")
+
+
+def test_generic_test_column_ref_is_none_when_the_source_ref_is_none() -> None:
+    assert generic_test_column_ref(_EMPTY_MANIFEST, "model.shop.missing", "id") is None

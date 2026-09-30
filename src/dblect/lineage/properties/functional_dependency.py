@@ -47,7 +47,7 @@ from typing import assert_never
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
-from dblect.lineage.facts.grounding import grounded_scopes, grounding
+from dblect.lineage.facts.kit import GroundingFold, grounding_fold
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import (
     Annotation,
@@ -186,26 +186,16 @@ def _lifted(
     return {scope: tuple(_lift_declared(f) for f in bucket) for scope, bucket in facts.items()}
 
 
-def functional_dependency_grounding(
-    facts: Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]],
-    *,
-    opaque: Collection[SourceRef] = (),
-) -> Callable[[SourceRef], Annotation[FDSet]]:
-    """Fold the per-relation dependency facts into grounded annotations. The same
-    fold every property uses (an opt-out grounds EXPLICIT top, a resolved bucket
-    grounds its value CONCRETE, everything else the IMPLICIT-top default), over
-    facts whose declarations are first lifted into grounded instances."""
-    return grounding(_lifted(facts), opaque, FUNCTIONAL_DEPENDENCY_LATTICE)
-
-
-def functional_dependency_grounded_scopes(
-    facts: Mapping[SourceRef, tuple[Fact[FDSet, SourceRef], ...]],
-    *,
-    opaque: Collection[SourceRef] = (),
-) -> set[SourceRef]:
-    """The relations a dependency fact grounded, for coverage. Reads the same fold
-    ``functional_dependency_grounding`` does."""
-    return grounded_scopes(_lifted(facts), opaque, FUNCTIONAL_DEPENDENCY_LATTICE)
+# The kit's grounding fold, bound to this property's lattice with the one piece
+# it needs beyond the plain fold: declarations lifted into grounded instances
+# first (``_lift_declared``'s explicit non-default piece). Bound as plain names so
+# a caller imports ``functional_dependency_grounding``/``_grounded_scopes`` exactly
+# as it always has.
+_FUNCTIONAL_DEPENDENCY_FOLD: GroundingFold[FDSet, SourceRef] = grounding_fold(
+    FUNCTIONAL_DEPENDENCY_LATTICE, preprocess=_lifted
+)
+functional_dependency_grounding = _FUNCTIONAL_DEPENDENCY_FOLD.ground
+functional_dependency_grounded_scopes = _FUNCTIONAL_DEPENDENCY_FOLD.scopes
 
 
 # --- the property ------------------------------------------------------------
