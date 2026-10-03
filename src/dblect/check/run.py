@@ -60,11 +60,12 @@ from dblect.lineage.graph import (
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
+    Tagged,
     domain_type_display,
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
-    join_key_conflicts,
+    tags_conflict,
 )
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -390,7 +391,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     )
     entity_of = key_entities(
         graphs.column_build.graph,
-        entity_keys(graphs.uniqueness_facts, world.uniqueness_inferred),
+        entity_keys(graphs.column_build.graph, graphs.uniqueness_facts),
         graphs.foreign_keys,
     )
     findings.extend(
@@ -699,6 +700,7 @@ def _operand_label(agg: exp.AggFunc) -> str:
 
 
 def _join_key_rows(
+    manifest: Manifest,
     parsed: Mapping[str, Expr],
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
@@ -729,17 +731,20 @@ def _join_key_rows(
             on = join.args.get("on")
             if not isinstance(on, Expr):
                 continue
-            for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
-                yield LocatedRow(
-                    uid=uid,
-                    nodes=(left, right, on),
-                    kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
-                    message=_join_key_message(left, right, left_tag, right_tag),
-                    column=left.name or None,
-                )
             for left, right in sg.equality_column_pairs(on):
-                if _tagged(tag_of(left)) and _tagged(tag_of(right)):
-                    continue
+                left_tag, right_tag = tag_of(left), tag_of(right)
+                if left_tag is not None and right_tag is not None:
+                    if tags_conflict(left_tag, right_tag):
+                        yield LocatedRow(
+                            uid=uid,
+                            nodes=(left, right, on),
+                            kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                            message=_join_key_message(left, right, left_tag, right_tag),
+                            column=left.name or None,
+                        )
+                        continue
+                    if _declares_entity(left_tag) and _declares_entity(right_tag):
+                        continue
                 left_ref, right_ref = resolved_column_ref(left), resolved_column_ref(right)
                 if left_ref is None or right_ref is None:
                     continue
@@ -750,31 +755,42 @@ def _join_key_rows(
                     uid=uid,
                     nodes=(left, right, on),
                     kind=CheckFindingKind.JOIN_KEY_ENTITY_MISMATCH,
-                    message=_entity_mismatch_message(left, right, left_entity, right_entity),
+                    message=_entity_mismatch_message(
+                        manifest, left, right, left_entity, right_entity
+                    ),
                     column=left.name or None,
                 )
 
 
-def _tagged(tag: DomainTag | None) -> bool:
-    return tag is not None and tag != NAKED
+def _declares_entity(tag: DomainTag) -> bool:
+    """Whether the tag binds a nominal facet (an entity or category): only then does a
+    declaration speak to what the key identifies. A bare dimension or a conflict does not."""
+    return isinstance(tag, Tagged) and bool(tag.nominal)
 
 
 def _entity_mismatch_message(
-    left: exp.Column, right: exp.Column, left_entity: KeyEntity, right_entity: KeyEntity
+    manifest: Manifest,
+    left: exp.Column,
+    right: exp.Column,
+    left_entity: KeyEntity,
+    right_entity: KeyEntity,
 ) -> str:
     return (
         f"join key {_qualified(left)} = {_qualified(right)} equates "
-        f"{_entity_label(left_entity)} with {_entity_label(right_entity)}, two keys no "
-        "relationships test or foreign key links; if they identify the same thing, add a "
-        "relationships test between them, otherwise the join condition is wrong"
+        f"{_entity_label(manifest, left_entity)} with {_entity_label(manifest, right_entity)}, "
+        "two keys no relationships test or foreign key links; if they identify the same "
+        "thing, add a relationships test between them, otherwise the join condition is wrong"
     )
 
 
-def _entity_label(entity: KeyEntity) -> str:
+def _entity_label(manifest: Manifest, entity: KeyEntity) -> str:
     """The declared keys that start ``entity`` as ``relation.column``, so the reader
     sees which table's rows each side of the join identifies."""
     return " / ".join(
-        sorted(f"{key.source.unique_id.split('.')[-1]}.{key.column}" for key in entity.keys)
+        sorted(
+            f"{manifest.nodes[key.source.unique_id].relation_name}.{key.column}"
+            for key in entity.keys
+        )
     )
 
 
@@ -788,7 +804,7 @@ def _join_key_findings(
 ) -> list[CheckFinding]:
     return locate_findings(
         manifest,
-        _join_key_rows(parsed, annotations, ground, entity_of),
+        _join_key_rows(manifest, parsed, annotations, ground, entity_of),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
     )

@@ -137,7 +137,9 @@ def unique_combination_test(target: str, *columns: str) -> Node:
     )
 
 
-def relationships_test(child: str, child_column: str, parent: str, parent_column: str) -> Node:
+def relationships_test(
+    child: str, child_column: str, parent: str, parent_column: str, *, where: str | None = None
+) -> Node:
     """A dbt ``relationships`` test: ``child.child_column`` references ``parent.parent_column``."""
     return node(
         f"test.shop.relationships_{child.split('.')[-1]}_{child_column}",
@@ -150,6 +152,7 @@ def relationships_test(child: str, child_column: str, parent: str, parent_column
                 "to": f"ref('{parent.split('.')[-1]}')",
                 "field": parent_column,
             },
+            where=where,
         ),
         attached_node=child,
     )

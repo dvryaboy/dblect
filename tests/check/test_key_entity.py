@@ -22,7 +22,7 @@ from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
 from dblect.manifest import Node, ResourceType
 from dblect.severity import Severity, severity_of
-from dblect.types import DomainType, Integer, ModelContract, NominalEnum
+from dblect.types import DomainType, ForeignKey, Integer, ModelContract, NominalEnum
 from tests._manifest_builders import cols, manifest, node, relationships_test, unique_test
 from tests._manifest_builders import unique_combination_test as unique_combination
 
@@ -38,6 +38,11 @@ _ATTRIBUTES = "source.shop.raw.player_attributes"
 _DAILY_ORDERS = "model.shop.daily_orders"
 _DAILY_SIGNUPS = "model.shop.daily_signups"
 _JOINED = "model.shop.joined"
+_APP_USERS = "source.shop.raw.app_users"
+
+
+def _model(name: str, sql: str, **dtypes: str) -> Node:
+    return node(f"model.shop.{name}", sql, columns=cols(**dtypes))
 
 
 def _project(sql: str, *extra: Node) -> list[Node]:
@@ -139,13 +144,13 @@ _CASES = (
     ),
     # A non-unique column with no foreign key has no entity, so it never conflicts.
     _Case("side with no entity", _ORDERS_CUSTOMERS.format("o.store_id = c.customer_id"), False),
-    # Grouping makes a column unique without making it an identifier: two daily
-    # rollups joined on their dates are a correct join.
+    # Known false positive: a rollup grouped by a plain column is a copy of that column,
+    # so its key is anchored at the base column, like any other natural key.
     _Case(
-        "keys made unique by grouping",
+        "keys made unique by grouping a plain column",
         "SELECT o.n AS x FROM daily_orders AS o "
         "JOIN daily_signups AS s ON o.ordered_at = s.signed_up_at",
-        False,
+        True,
     ),
     # A table sharing its parent's key is a correct 1:1 join, but without a
     # relationships test nothing says so. The test clears it.
@@ -183,11 +188,127 @@ _CASES = (
         "SELECT c.customer_id AS x FROM ids JOIN stg_customers AS c ON ids.id = c.customer_id",
         True,
     ),
+    # The outer union can be reached before the inner one it reads.
+    _Case(
+        "nested unions of one entity's keys",
+        "SELECT c.customer_id AS x FROM a_outer AS u JOIN stg_customers AS c ON u.id = c.customer_id",
+        True,
+        (
+            _model(
+                "a_outer",
+                "SELECT id FROM z_inner UNION ALL SELECT order_id FROM stg_orders",
+                id="INT",
+            ),
+            _model(
+                "z_inner",
+                "SELECT order_id AS id FROM stg_orders UNION ALL SELECT order_id FROM stg_orders",
+                id="INT",
+            ),
+        ),
+    ),
+    # A union output with a foreign key gets the parent's entity; its entity-less arms do not.
+    _Case(
+        "foreign key on a union of entity-less columns",
+        "SELECT o.order_id AS x FROM stg_orders AS o "
+        "JOIN stg_orders AS o2 ON o.store_id = o2.order_id",
+        False,
+        (
+            _model(
+                "store_ids",
+                "SELECT store_id AS id FROM stg_orders UNION ALL SELECT store_id FROM stg_orders",
+                id="INT",
+            ),
+            relationships_test("model.shop.store_ids", "id", _STG_CUSTOMERS, "customer_id"),
+        ),
+    ),
     _Case(
         "union of two entities' keys",
         "WITH ids AS (SELECT order_id AS id FROM stg_orders UNION ALL SELECT customer_id FROM stg_orders) "
         "SELECT c.customer_id AS x FROM ids JOIN stg_customers AS c ON ids.id = c.customer_id",
         False,
+    ),
+    # A computed key is not a copy of anything, so it makes no claim about which
+    # entity it identifies, even when it is declared unique.
+    _Case(
+        "key computed from another key",
+        "SELECT o.customer_id AS x FROM stg_orders AS o "
+        "JOIN cleaned_customers AS c ON o.customer_id = c.customer_id",
+        False,
+        (
+            _model(
+                "cleaned_customers",
+                "SELECT id + 0 AS customer_id FROM raw_customers",
+                customer_id="INT",
+            ),
+            unique_test("model.shop.cleaned_customers", "customer_id"),
+        ),
+    ),
+    _Case(
+        "coalesced key",
+        "SELECT o.customer_id AS x FROM stg_orders AS o "
+        "JOIN spine AS s ON o.customer_id = s.customer_id",
+        False,
+        (
+            _model(
+                "spine",
+                "SELECT COALESCE(c.id, o.customer_id) AS customer_id "
+                "FROM raw_customers AS c FULL JOIN raw_orders AS o ON c.id = o.customer_id",
+                customer_id="INT",
+            ),
+            unique_test("model.shop.spine", "customer_id"),
+        ),
+    ),
+    _Case(
+        "union of sources, declared unique",
+        "SELECT c.name AS x FROM all_users AS u JOIN raw_customers AS c ON u.id = c.id",
+        False,
+        (
+            node(_APP_USERS, kind=ResourceType.SOURCE, columns=cols(id="INT")),
+            _model(
+                "all_users",
+                "SELECT id FROM raw_customers UNION ALL SELECT id FROM app_users",
+                id="INT",
+            ),
+            unique_test("model.shop.all_users", "id"),
+            unique_test("source.shop.raw.raw_customers", "id"),
+            unique_test(_APP_USERS, "id"),
+        ),
+    ),
+    _Case(
+        "rollups grouped by a cast and by a truncation",
+        "SELECT o.n AS x FROM daily_cast AS o JOIN daily_trunc AS s ON o.d = s.d",
+        False,
+        (
+            _model(
+                "daily_cast",
+                "SELECT CAST(ordered_at AS DATE) AS d, COUNT(*) AS n FROM stg_orders GROUP BY 1",
+                d="DATE",
+                n="INT",
+            ),
+            unique_test("model.shop.daily_cast", "d"),
+            _model(
+                "daily_trunc",
+                "SELECT DATE_TRUNC('day', ordered_at) AS d, COUNT(*) AS n FROM stg_orders GROUP BY 1",
+                d="DATE",
+                n="INT",
+            ),
+            unique_test("model.shop.daily_trunc", "d"),
+        ),
+    ),
+    # Deduplicating a model on its key leaves the key in the same entity.
+    _Case(
+        "key through a ROW_NUMBER dedup",
+        "SELECT o.order_id AS x FROM stg_orders AS o JOIN latest AS l ON o.order_id = l.order_id",
+        False,
+        (
+            _model(
+                "latest",
+                "SELECT order_id FROM (SELECT order_id, ROW_NUMBER() OVER "
+                "(PARTITION BY order_id ORDER BY ordered_at) AS rn FROM stg_orders) WHERE rn = 1",
+                order_id="INT",
+            ),
+            unique_test("model.shop.latest", "order_id"),
+        ),
     ),
 )
 
@@ -200,6 +321,19 @@ def test_join_across_inferred_entities(case: _Case) -> None:
     assert bool(found) is case.flagged, [f.message for f in report.findings]
 
 
+def test_a_contract_foreign_key_gives_the_child_its_parents_entity() -> None:
+    class StgOrders(ModelContract):
+        dbt_model = "stg_orders"
+        store_id: ForeignKey("stg_customers.customer_id")
+
+    sql = (
+        "SELECT o.order_id AS x FROM stg_orders AS o "
+        "JOIN stg_orders AS o2 ON o.store_id = o2.order_id"
+    )
+    report = run_check(manifest(*_project(sql)), _DUCKDB)
+    assert [f for f in report.findings if f.kind is _ENTITY_MISMATCH]
+
+
 def test_the_finding_names_both_keys_and_the_fix() -> None:
     report = run_check(
         manifest(*_project(_ORDERS_CUSTOMERS.format("o.order_id = c.customer_id"))), _DUCKDB
@@ -209,8 +343,8 @@ def test_the_finding_names_both_keys_and_the_fix() -> None:
     assert severity_of(finding) is Severity.WARN
     for fragment in (
         "o.order_id = c.customer_id",
-        "stg_orders.order_id",
-        "stg_customers.customer_id",
+        "raw_orders.id",
+        "raw_customers.id",
         "relationships",
     ):
         assert fragment in finding.message, finding.message

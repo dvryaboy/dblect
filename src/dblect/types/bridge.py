@@ -682,8 +682,8 @@ def _lower_references(
         return
     out.foreign_keys.append(
         ForeignKeyEdge(
-            child=ColumnRef(src, fact.child.name),
-            parent=ColumnRef(parent_src, fact.parent.name),
+            child=_scope(src, fact.child.name),
+            parent=_scope(parent_src, fact.parent.name),
         )
     )
 
@@ -754,8 +754,8 @@ def _resolve_foreign_key(
         )
         return None
     return ForeignKeyEdge(
-        child=ColumnRef(child_src, fname),
-        parent=ColumnRef(parent_src, column),
+        child=_scope(child_src, fname),
+        parent=_scope(parent_src, column),
     )
 
 
@@ -776,6 +776,8 @@ def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
         tm = node.test_metadata
         if tm is None or not tm.enabled or tm.name != "relationships":
             continue
+        if tm.where is not None:
+            continue  # holds only over some rows, so it is no foreign key
         child_col = tm.kwargs.get("column_name")
         parent_col = tm.kwargs.get("field")
         if not isinstance(child_col, str) or not child_col:
@@ -790,8 +792,8 @@ def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
             continue
         edges.append(
             ForeignKeyEdge(
-                child=ColumnRef(_source_of(manifest.nodes[child_uid]), child_col),
-                parent=ColumnRef(_source_of(manifest.nodes[parent_uid]), parent_col),
+                child=_scope(_source_of(manifest.nodes[child_uid]), child_col),
+                parent=_scope(_source_of(manifest.nodes[parent_uid]), parent_col),
             )
         )
     return tuple(edges)

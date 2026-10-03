@@ -4,30 +4,34 @@ An order id and a customer id are both unique integers, so a join that equates t
 is a clean one-to-one join no test catches. The project already says which columns
 are keys and which reference which, and that is enough to tell the two apart:
 
-* A declared single-column key starts an entity, unless the SQL already makes the
-  column unique. Grouping on a date makes it unique without making it an identifier,
-  and a key carried through from upstream belongs to the upstream entity.
+* A declared single-column key starts an entity when the key column is a base
+  relation's column or an unchanged copy of one. The entity is anchored at that base
+  column, so a staging model's key on ``id AS customer_id`` and the source's key on
+  ``id`` are one entity. A computed key (an expression, a union, a dedup) says
+  nothing about which entity it identifies, so it starts none.
 * A column that copies another (a rename, a cast, a CTE or model boundary, a UNION
   whose arms all carry one entity) is in the same entity.
 * A foreign key puts the child column in the parent's entity.
 
 A column is in an entity only if one of these reaches it, so most columns have none.
 Two columns in different entities have no declared relationship; that is a strong
-hint the join is wrong, and exactly what an untested 1:1 table also looks like.
+hint the join is wrong, and exactly what an untested 1:1 table also looks like. Two
+natural keys with no relationships test between them (two date-keyed sources) look
+the same and are flagged too.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import assert_never
 
-import sqlglot.expressions as exp
-from sqlglot import Expr
-
-from dblect.lineage.facts.model import Annotation, Fact
+from dblect.lineage.facts.model import CompileValue, Declared, Fact, NativeConstraint, Provenance
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceRef, UnionConfluence
 from dblect.lineage.properties.uniqueness import CandidateKeySet
-from dblect.lineage.property import resolved_column_ref
+from dblect.lineage.property import copied_column, value_origin
+from dblect.lineage.union_find import UnionFind
+from dblect.sql._sqlglot import stored_column_name
 from dblect.types.bridge import ForeignKeyEdge
 
 
@@ -39,29 +43,34 @@ class KeyEntity:
 
 
 def entity_keys(
+    graph: ColumnLineageGraph,
     declared: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
-    inferred: Mapping[SourceRef, Annotation[CandidateKeySet]],
 ) -> frozenset[ColumnRef]:
-    """The declared keys that start an entity: single-column, unconditional, and not
-    already implied by the keys the SQL alone gives the relation."""
+    """The base columns whose declared single-column, unconditional keys start an
+    entity."""
     out: set[ColumnRef] = set()
     for scope, facts in declared.items():
-        sql_keys = inferred.get(scope)
         for fact in facts:
-            if fact.condition is not None:
+            if fact.condition is not None or not _states_identity(fact.provenance):
                 continue
             for key in fact.value.keys:
                 if len(key) != 1:
                     continue
-                if sql_keys is not None and _implies(sql_keys.value, key):
-                    continue
-                out.add(ColumnRef(scope, next(iter(key)).lower()))
+                origin = value_origin(graph, ColumnRef(scope, stored_column_name(next(iter(key)))))
+                if origin is not None:
+                    out.add(origin)
     return frozenset(out)
 
 
-def _implies(keys: CandidateKeySet, key: frozenset[str]) -> bool:
-    """Whether ``keys`` makes ``key`` unique: some known key is a subset of it."""
-    return keys.is_bottom or any(k <= key for k in keys.keys)
+def _states_identity(provenance: Provenance) -> bool:
+    """Whether a key from this source says what the column identifies. An incremental
+    model's ``unique_key`` is a merge key in config, not a statement about the entity."""
+    match provenance:
+        case Declared() | NativeConstraint():
+            return True
+        case CompileValue():
+            return False
+    assert_never(provenance)
 
 
 def key_entities(
@@ -70,14 +79,14 @@ def key_entities(
     foreign_keys: Iterable[ForeignKeyEdge],
 ) -> Callable[[ColumnRef], KeyEntity | None]:
     """The entity of each column, or ``None`` for a column no key reaches."""
-    classes = _UnionFind()
+    classes = UnionFind[ColumnRef]()
     for fk in foreign_keys:
-        classes.union(_folded(fk.child), _folded(fk.parent))
+        classes.union(fk.child, fk.parent)
     confluences: list[tuple[ColumnRef, tuple[ColumnRef, ...]]] = []
     for subject, derivation in graph.expressions.items():
         if isinstance(derivation, UnionConfluence):
             confluences.append((subject, derivation.arm_refs))
-        elif (source := _copied_column(derivation)) is not None:
+        elif (source := copied_column(derivation)) is not None:
             classes.union(subject, source)
     key_set = frozenset(keys)
     # A UNION output joins its arms' entity only when every arm has that one entity,
@@ -97,43 +106,10 @@ def key_entities(
 
 
 def _entities(
-    classes: _UnionFind, keys: frozenset[ColumnRef]
+    classes: UnionFind[ColumnRef], keys: frozenset[ColumnRef]
 ) -> Callable[[ColumnRef], KeyEntity | None]:
     by_root: dict[ColumnRef, set[ColumnRef]] = {}
     for key in keys:
         by_root.setdefault(classes.find(key), set()).add(key)
     entities = {root: KeyEntity(frozenset(members)) for root, members in by_root.items()}
     return lambda ref: entities.get(classes.find(ref))
-
-
-def _copied_column(derivation: Expr) -> ColumnRef | None:
-    """The column ``derivation`` copies unchanged, through renames, parentheses, and
-    casts; ``None`` for anything computed."""
-    node = derivation
-    while isinstance(node, (exp.Alias, exp.Paren, exp.Cast)):
-        node = node.this
-    return resolved_column_ref(node) if isinstance(node, exp.Column) else None
-
-
-def _folded(ref: ColumnRef) -> ColumnRef:
-    """``ref`` with its column case-folded, as the lineage keys columns. A contract's
-    foreign key keeps the spelling it was declared with."""
-    return ColumnRef(ref.source, ref.column.lower())
-
-
-class _UnionFind:
-    def __init__(self) -> None:
-        self._parent: dict[ColumnRef, ColumnRef] = {}
-
-    def find(self, ref: ColumnRef) -> ColumnRef:
-        root = ref
-        while (up := self._parent.get(root, root)) != root:
-            root = up
-        while ref != root:
-            self._parent[ref], ref = root, self._parent.get(ref, root)
-        return root
-
-    def union(self, a: ColumnRef, b: ColumnRef) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self._parent[ra] = rb

@@ -35,6 +35,7 @@ from sqlglot import Expr
 
 from dblect.lineage.graph import SourceRef
 from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
+from dblect.lineage.union_find import UnionFind
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
 
@@ -1133,24 +1134,13 @@ def _equivalence_classes(pairs: Sequence[QFD]) -> dict[Attr, frozenset[Attr]]:
     singles = {(next(iter(det)), dep) for det, dep in pairs if len(det) == 1}
     symmetric = {(a, b) for (a, b) in singles if (b, a) in singles}
 
-    parent: dict[Attr, Attr] = {}
-
-    def find(x: Attr) -> Attr:
-        root = x
-        while parent.get(root, root) != root:
-            root = parent[root]
-        while parent.get(x, x) != root:
-            parent[x], x = root, parent.get(x, root)
-        return root
-
+    uf = UnionFind[Attr]()
     for a, b in symmetric:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+        uf.union(a, b)
 
     members: dict[Attr, set[Attr]] = {}
     for a, b in symmetric:
-        members.setdefault(find(a), set()).update({a, b})
+        members.setdefault(uf.find(a), set()).update({a, b})
     classes: dict[Attr, frozenset[Attr]] = {}
     for group in members.values():
         frozen = frozenset(group)
