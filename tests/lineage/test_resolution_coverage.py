@@ -137,8 +137,8 @@ def test_inline_defined_function_call_resolves_to_its_argument_lineage() -> None
         "model.shop.doubled",
         kind=ResourceType.MODEL,
         sql=(
-            "CREATE TEMPORARY FUNCTION secret(x INT) AS (x * 2);\n"
-            "SELECT secret(amount) AS doubled FROM payments"
+            "CREATE TEMPORARY FUNCTION twice(x INT) AS (x * 2);\n"
+            "SELECT twice(amount) AS doubled FROM payments"
         ),
         columns=_cols(doubled="DECIMAL"),
     )
