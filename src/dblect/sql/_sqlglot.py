@@ -13,7 +13,6 @@ documents its key and what shape it returns.
 
 from __future__ import annotations
 
-import string
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -21,7 +20,7 @@ from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
-from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
+from sqlglot.dialects.dialect import Dialect
 
 
 class JoinSide(StrEnum):
@@ -558,6 +557,39 @@ def stored_column_name(name: str) -> str:
     return name.lower()
 
 
+ColumnFold = Callable[[exp.Column], str]
+"""Maps a column to the name it is looked up under, in the lowercase form keys and facts are stored."""
+
+
+def case_insensitive_column_fold(c: exp.Column) -> str:
+    """For lookups of a fact that TRIGGERS a finding: conflating case-distinct names over-reports
+    rather than hides."""
+    return stored_column_name(c.name)
+
+
+def dialect_column_fold(dialect: str | None) -> ColumnFold:
+    """For "is this join covered by a stored key": a column meets a key `k` only when it is the
+    same column as `k` written unquoted, per the dialect's own identifier normalization.
+
+    A column that is a different column gets its uppercased name, which no stored (lowercase) key
+    equals; folding it to the stored form would let Snowflake's ``"id"`` pass for ``id``.
+    """
+    d = Dialect.get_or_raise(dialect)
+
+    def fold(c: exp.Column) -> str:
+        stored = stored_column_name(c.name)
+        same_column = (
+            d.normalize_identifier(c.this.copy()).name
+            == d.normalize_identifier(exp.to_identifier(stored, quoted=False)).name
+        )
+        return stored if same_column else c.name.upper()
+
+    return fold
+
+
+DEFAULT_COLUMN_FOLD = dialect_column_fold(None)
+
+
 def column_key(c: exp.Column) -> tuple[str | None, str]:
     """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
 
@@ -695,7 +727,7 @@ def matches_typed_or_named(
 
 
 def equality_cols_on_alias(
-    predicate: Expr, alias: str, *, fold: IdentifierFold
+    predicate: Expr, alias: str, *, fold: ColumnFold
 ) -> frozenset[str] | None:
     """Columns on `alias` appearing in conjunctive equalities in `predicate`.
 
@@ -722,12 +754,12 @@ def equality_cols_on_alias(
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(fold.name(on_alias[0]))
+        cols.add(fold(on_alias[0]))
     return frozenset(cols)
 
 
 def equality_cols_by_alias(
-    predicate: Expr, *, fold: IdentifierFold
+    predicate: Expr, *, fold: ColumnFold
 ) -> dict[str, frozenset[str]] | None:
     """Per-alias join-key columns from a conjunction of column equalities, in one walk.
 
@@ -749,8 +781,8 @@ def equality_cols_by_alias(
             return None
         sides.append(
             (
-                (column_table(left), fold.name(left)),
-                (column_table(right), fold.name(right)),
+                (column_table(left), fold(left)),
+                (column_table(right), fold(right)),
             )
         )
     out: dict[str, frozenset[str]] = {}

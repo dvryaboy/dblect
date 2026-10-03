@@ -228,7 +228,7 @@ def detect_join_on_nullable_key(
             # match case-insensitively: a case-distinct quoted name over-reports rather than
             # dropping a real error. Nothing here suppresses on a not-null fact: non-null is the
             # absence of a nullable entry, so no dialect-exact lookup is needed.
-            cols_by_alias = sg.equality_cols_by_alias(on, fold=sg.CASE_INSENSITIVE_FOLD)
+            cols_by_alias = sg.equality_cols_by_alias(on, fold=sg.case_insensitive_column_fold)
             if cols_by_alias is None:  # not a clean conjunction of column equalities
                 continue
             keys: list[_NullableKey] = []

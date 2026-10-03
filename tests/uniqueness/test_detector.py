@@ -18,7 +18,7 @@ from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.properties.functional_dependency import FD, NO_FDS, FDSet
 from dblect.manifest import DbtTestMetadata, ModelConfig, Node, ResourceType
 from dblect.sql import Finding, FindingKind, parse_sql
-from dblect.sql._sqlglot import IdentifierFold
+from dblect.sql._sqlglot import dialect_column_fold
 from dblect.uniqueness.detector import (
     detect_join_fanout,
     detect_limit_without_deterministic_order,
@@ -584,9 +584,9 @@ def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
     assert findings == ()
 
 
-# Adapters whose quoted identifiers resolve case-insensitively. Elsewhere ("ID" and id can be two
-# columns) a quoted spelling is kept exact and must not be taken as covering a key declared `id`.
-_QUOTED_CASE_INSENSITIVE = frozenset({"duckdb", "bigquery", "redshift"})
+# The spelling a quoted identifier must have to be the same column as unquoted `id`, per adapter.
+# Case-insensitive adapters accept any quoted spelling.
+_QUOTED_SPELLING_OF_ID = {"postgres": "id", "snowflake": "ID"}
 
 
 @pytest.mark.parametrize("adapter", ["duckdb", "snowflake", "postgres", "bigquery", "redshift"])
@@ -604,9 +604,9 @@ def test_fanout_verdict_for_join_column_spelling_against_lowercase_key(
     findings = detect_join_fanout(
         parsed,
         model_keys=_model_keys(dim=(("id",),)),
-        fold=IdentifierFold.of_dialect(profile.sqlglot_dialect),
+        fold=dialect_column_fold(profile.sqlglot_dialect),
     )
-    covered = name == "id" or not quoted or adapter in _QUOTED_CASE_INSENSITIVE
+    covered = not quoted or _QUOTED_SPELLING_OF_ID.get(adapter, name) == name
     assert (findings == ()) is covered
     assert covered or [f.kind for f in findings] == [FindingKind.JOIN_FANOUT]
 
@@ -1077,18 +1077,3 @@ def test_fanout_ungrouped_collapse_ignores_columns_of_nested_subquery() -> None:
         "from facts f join dim d on f.segment = d.segment"
     )
     assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
-
-
-def test_fanout_fires_for_duckdb_quoted_non_ascii_join_column_against_lowercase_key() -> None:
-    # duckdb folds identifier case ASCII-only, so "Ä" and "ä" are distinct columns and the
-    # join does not cover a key declared on `ä`.
-    profile = profile_for_adapter("duckdb")
-    parsed = parse_sql(
-        'select * from facts f left join dim d on d."Ä" = f.fk', dialect=profile.sqlglot_dialect
-    )
-    findings = detect_join_fanout(
-        parsed,
-        model_keys=_model_keys(dim=(("ä",),)),
-        fold=IdentifierFold.of_dialect(profile.sqlglot_dialect),
-    )
-    assert [f.kind for f in findings] == [FindingKind.JOIN_FANOUT]

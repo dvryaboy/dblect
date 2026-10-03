@@ -215,7 +215,7 @@ def detect_join_fanout(
     model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
-    fold: sg.IdentifierFold = sg.DEFAULT_FOLD,
+    fold: sg.ColumnFold = sg.DEFAULT_COLUMN_FOLD,
 ) -> tuple[Finding, ...]:
     """Flag JOINs whose joined-in side has keys that don't cover the join.
 
@@ -625,7 +625,7 @@ def make_fact_grounded_detectors(
             model_keys=model_keys,
             scope_index=scope_index(tree),
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
-            fold=sg.IdentifierFold.of_dialect(profile.sqlglot_dialect),
+            fold=sg.dialect_column_fold(profile.sqlglot_dialect),
         )
 
     def limit_order(tree: Expr) -> tuple[Finding, ...]:
