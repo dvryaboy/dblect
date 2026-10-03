@@ -1,12 +1,5 @@
-"""An unqualified column no source in scope can supply makes the model unbuilt.
-
-The qualified form (``p.nosuch``) already fails qualification with ``Unknown column``.
-The unqualified form is the same broken SQL, and is reported the same way when the
-decision is exact: every source in the scope has a complete column set and none has the
-name. A set is complete when the catalog supplied it, or dblect derived it from a model's
-compiled SQL with no unexpanded star. Documented columns alone are a lower bound, so with
-any source incomplete the name may belong to it and the column stays blind.
-"""
+"""A bare column that every source in scope lacks makes the model unbuilt, but only when each
+source's column set is complete (catalogued, or derived with no unexpanded star)."""
 
 from __future__ import annotations
 
@@ -57,7 +50,6 @@ def _blind(manifest: Manifest) -> int:
 
 
 def _p_world(sql: str) -> Manifest:
-    """A model over source ``p``, whose catalog columns are ``id`` and ``v``."""
     return _catalogued(_manifest(_source_with("p", "id"), _model(sql)), p=("id", "v"))
 
 
@@ -69,6 +61,8 @@ def _p_world(sql: str) -> Manifest:
         "select id from raw.p where nosuch > 1",
         "with c as (select id from raw.p) select nosuch from c",
         "select * from (select id from raw.p) d where nosuch is not null",
+        # Every enclosing scope is complete and lacks the name too.
+        "select id from raw.p where exists (select 1 from raw.p where nosuch = 1)",
     ],
 )
 def test_a_name_no_complete_source_has_is_reported_with_the_qualified_reason(sql: str) -> None:
@@ -89,88 +83,58 @@ def test_a_known_column_is_fine(sql: str) -> None:
     assert _blind(manifest) == 0
 
 
-def test_a_documented_only_source_keeps_the_column_blind() -> None:
-    # Counterexample: schema.yml lists `id`, but docs are not the warehouse, so `closed_at`
-    # may be a real column. Dropping the model here would be the expensive direction.
-    manifest = _manifest(_source_with("p", "id"), _model("select closed_at from raw.p"))
-    assert _reasons(manifest) == {}
-    assert _blind(manifest) == 1
+@pytest.mark.parametrize(
+    ("documented", "catalogued", "reported"),
+    [
+        # Docs are not the warehouse: `nosuch` may be a real column, and dropping the model
+        # would be the expensive direction.
+        (("id",), None, False),
+        ((), None, False),
+        (("id",), ("id", "v"), True),
+    ],
+)
+def test_a_name_is_reported_only_against_a_catalogued_source(
+    documented: tuple[str, ...], catalogued: tuple[str, ...] | None, reported: bool
+) -> None:
+    manifest = _manifest(_source_with("p", *documented), _model("select nosuch from raw.p"))
+    if catalogued is not None:
+        manifest = _catalogued(manifest, p=catalogued)
+    assert _reasons(manifest) == ({_MODEL: _UNKNOWN} if reported else {})
 
 
-def test_a_catalogued_source_without_the_name_is_reported() -> None:
-    manifest = _catalogued(
-        _manifest(_source_with("p", "id"), _model("select closed_at from raw.p")), p=("id", "v")
+@pytest.mark.parametrize(
+    ("name", "q_catalogued", "reported"),
+    [("nosuch", True, True), ("w", True, False), ("nosuch", False, False)],
+)
+def test_a_join_reports_a_name_only_when_every_source_is_complete_and_lacks_it(
+    name: str, q_catalogued: bool, reported: bool
+) -> None:
+    manifest = _manifest(
+        _source_with("p"),
+        _source_with("q", "id"),
+        _model(f"select {name} from raw.p a join raw.q b on a.id = b.id"),
     )
-    assert _reasons(manifest) == {_MODEL: "sqlglot: Unknown column: closed_at"}
+    manifest = _catalogued(manifest, p=("id", "v"), **({"q": ("id", "w")} if q_catalogued else {}))
+    assert _reasons(manifest) == ({_MODEL: _UNKNOWN} if reported else {})
 
 
-def test_an_undocumented_uncatalogued_source_keeps_the_column_blind() -> None:
-    manifest = _manifest(_source("source.shop.raw.p", name="p"), _model("select nosuch from raw.p"))
-    assert _reasons(manifest) == {}
-    assert _blind(manifest) == 1
-
-
-def test_a_join_reports_a_name_none_of_its_complete_sources_has() -> None:
-    manifest = _catalogued(
-        _manifest(
-            _source_with("p"),
-            _source_with("q"),
-            _model("select nosuch from raw.p a join raw.q b on a.id = b.id"),
-        ),
-        p=("id", "v"),
-        q=("id", "w"),
-    )
-    assert _reasons(manifest) == {_MODEL: _UNKNOWN}
-
-
-def test_a_join_resolves_a_name_that_one_source_has() -> None:
-    manifest = _catalogued(
-        _manifest(
-            _source_with("p"),
-            _source_with("q"),
-            _model("select w from raw.p a join raw.q b on a.id = b.id"),
-        ),
-        p=("id", "v"),
-        q=("id", "w"),
-    )
-    assert _reasons(manifest) == {}
-    assert _blind(manifest) == 0
-
-
-def test_one_incomplete_source_in_scope_keeps_the_column_blind() -> None:
-    # Counterexample: p is complete and lacks the name, but the documented-only q may have it.
-    manifest = _catalogued(
-        _manifest(
-            _source_with("p"),
-            _source_with("q", "id"),
-            _model("select nosuch from raw.p a join raw.q b on a.id = b.id"),
-        ),
-        p=("id", "v"),
-    )
-    assert _reasons(manifest) == {}
-    assert _blind(manifest) == 1
-
-
-def test_a_model_derived_without_a_star_is_complete_even_when_nothing_is_catalogued() -> None:
-    upstream = _node("model.shop.up", "select id from raw.p", columns={})
+@pytest.mark.parametrize(
+    ("upstream_sql", "reported"),
+    [
+        ("select id from raw.p", True),
+        # `*` over an undocumented source hides columns the derivation cannot name.
+        ("select 1 as a, * from raw.p", False),
+    ],
+)
+def test_a_derived_model_is_complete_unless_it_hides_a_star(
+    upstream_sql: str, reported: bool
+) -> None:
     manifest = _manifest(
         _source("source.shop.raw.p", name="p"),
-        upstream,
+        _node("model.shop.up", upstream_sql, columns={}),
         _model("select nosuch from up", after="model.shop.up"),
     )
-    assert _reasons(manifest) == {_MODEL: _UNKNOWN}
-
-
-def test_a_model_with_an_unexpanded_star_is_incomplete() -> None:
-    # Counterexample: `*` over an undocumented source hides columns the derivation cannot name.
-    upstream = _node("model.shop.up", "select 1 as a, * from raw.p", columns={})
-    manifest = _manifest(
-        _source("source.shop.raw.p", name="p"),
-        upstream,
-        _model("select b from up", after="model.shop.up"),
-    )
-    assert _reasons(manifest) == {}
-    assert _blind(manifest) == 1
+    assert _reasons(manifest) == ({_MODEL: _UNKNOWN} if reported else {})
 
 
 @pytest.mark.parametrize(
@@ -182,7 +146,6 @@ def test_a_model_with_an_unexpanded_star_is_incomplete() -> None:
         "select list_transform(v, e -> e + 1) as x from raw.p",
         # A lateral source supplies `z`.
         "select * from raw.p cross join lateral (select v as z) l where z > 1",
-        # A VALUES source's columns are not read here.
         "select nosuch from raw.p, (values (1)) as t(a)",
         # No source at all.
         "select nosuch",
@@ -193,3 +156,25 @@ def test_a_scope_that_cannot_be_judged_is_not_reported(sql: str) -> None:
         _manifest(_source_with("p"), _source_with("q"), _model(sql)), p=("id", "v"), q=("k",)
     )
     assert _reasons(manifest) == {}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select (select max(k) from raw.q where k = closed_at) as x from raw.p",
+        "select id as x from raw.p where exists (select 1 from raw.q where k = closed_at)",
+    ],
+)
+def test_a_correlated_name_may_belong_to_an_incomplete_enclosing_source(sql: str) -> None:
+    manifest = _catalogued(
+        _manifest(_source_with("p", "id"), _source_with("q"), _model(sql)), q=("k",)
+    )
+    assert _reasons(manifest) == {}
+
+
+@pytest.mark.parametrize(
+    ("adapter", "name"), [("duckdb", "rowid"), ("postgres", "ctid"), ("redshift", "xmin")]
+)
+def test_an_implicit_column_is_never_reported(adapter: str, name: str) -> None:
+    report = run_check(_p_world(f"select {name} from raw.p"), profile_for_adapter(adapter))
+    assert not report.unbuilt

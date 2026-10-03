@@ -26,6 +26,7 @@ upstream model's SQL.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar, cast
 
@@ -54,6 +55,8 @@ from dblect.manifest import Manifest, ResourceType, compilation_miss_reason, rel
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import stored_column_name
+from dblect.sql.vocab import implicit_column_names
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,12 +200,8 @@ def build_manifest_graph(
     )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
-    # Unique ids of nodes whose column set is known complete: catalog-backed nodes, plus models derived here
-    # from compiled SQL with no unexpanded star. Documented columns alone are a lower bound, so an
-    # unqualified name is judged unknown only against complete sources.
-    complete_sources: set[str] = {
-        n.unique_id for n in manifest.nodes.values() if n.columns_complete
-    }
+    # Nodes whose column set is complete: catalogued, or models derived without an unexpanded star.
+    complete_sources = {n.unique_id for n in manifest.nodes.values() if n.columns_complete}
     # Accumulate into one pair of dicts and freeze once, rather than `graph.merge(per_model)` per
     # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
     # last-wins on expressions the same final map; each output column is built by one model anyway.
@@ -319,7 +318,7 @@ def _walk_model(
     schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
-    complete_sources: frozenset[str] | set[str] = frozenset(),
+    complete_sources: AbstractSet[str] = frozenset(),
 ) -> _Walker:
     """Parse, qualify, and walk one model, returning the populated walker.
 
@@ -355,6 +354,7 @@ def _walk_model(
         schema=ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect),
         name_to_source=name_to_source,
         complete_sources=complete_sources,
+        dialect=dialect,
     )
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
@@ -364,8 +364,7 @@ def _walk_model(
     return walker
 
 
-# Source scopes whose output columns are the named projections of a query. Anything else (an
-# unnest, lateral, VALUES or table function) is a source whose column set is not read here.
+# Source scopes whose columns are a query's named projections; any other source is unread.
 _PROJECTED_SOURCE_SCOPES = frozenset({ScopeType.CTE, ScopeType.DERIVED_TABLE})
 
 
@@ -374,29 +373,27 @@ def _reject_unknown_unqualified_columns(
     *,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
-    complete_sources: frozenset[str] | set[str],
+    complete_sources: AbstractSet[str],
+    dialect: str | None,
 ) -> None:
-    """Raise ``Unknown column`` for an unqualified name that no source in its scope can supply.
+    """Raise ``Unknown column`` for a bare name that every source in sight lacks.
 
-    ``qualify`` attaches a qualifier to every unqualified column it can place and raises for a
-    qualified one the source lacks, but leaves a name no source claims bare. That is a definite
-    error exactly when every source in the scope has a complete column set lacking the name; with
-    any source's columns incomplete (documented only, or hidden behind a star) the name may belong
-    to it, and the column stays blind. The error has the qualified case's shape so both surface as
-    the same unbuilt reason.
+    Exact only when each visible source (own and enclosing scopes', since a subquery can be
+    correlated) has a complete column set; any incomplete one may own the name, so it stays blind.
     """
+    implicit = implicit_column_names(dialect)
     for scope in root.traverse():
         if not isinstance(scope.expression, exp.Select):
             continue
-        bare = [c for c in scope.columns if not c.table and c.name]
-        if not bare:
-            continue
-        known = _known_source_columns(scope, schema, name_to_source, complete_sources)
+        bare = [c for c in scope.unqualified_columns if c.name]
+        known = (
+            _known_source_columns(scope, schema, name_to_source, complete_sources) if bare else None
+        )
         if known is None:
             continue
         for col in bare:
-            name = col.name.lower()
-            if name not in known:
+            name = stored_column_name(col.name)
+            if name not in known and name not in implicit:
                 raise SqlglotError(f"Unknown column: {col.name}")
 
 
@@ -404,26 +401,28 @@ def _known_source_columns(
     scope: Scope,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
-    complete_sources: frozenset[str] | set[str],
+    complete_sources: AbstractSet[str],
 ) -> frozenset[str] | None:
-    """Lower-cased union of the columns of every source in ``scope``, or ``None`` when any
-    source's column set is not known complete (no sources, a relation outside
-    ``complete_sources``, a ``*``, a pivot, a table function, lateral or unnest)."""
-    if not scope.sources:
-        return None
-    resolver = Resolver(scope, schema, infer_schema=False)
+    """Union of the columns of every source ``scope`` can see, or ``None`` when any is not
+    known complete (a relation outside ``complete_sources``, a star, pivot, lateral, unnest...)."""
     out: set[str] = set()
-    for alias, src in scope.sources.items():
-        if isinstance(src, exp.Table):
-            ref = name_to_source.get(sg.table_relation_key(src))
-            if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
+    visible: Scope | None = scope
+    while visible is not None:
+        if not visible.sources:
+            return None
+        resolver = Resolver(visible, schema, infer_schema=False)
+        for alias, src in visible.sources.items():
+            if isinstance(src, exp.Table):
+                ref = name_to_source.get(sg.table_relation_key(src))
+                if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
+                    return None
+            elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
                 return None
-        elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
-            return None
-        columns = resolver.get_source_columns(alias)
-        if not columns or "*" in columns:
-            return None
-        out.update(c.lower() for c in columns)
+            columns = resolver.get_source_columns(alias)
+            if not columns or "*" in columns:
+                return None
+            out.update(stored_column_name(c) for c in columns)
+        visible = visible.parent
     return frozenset(out)
 
 

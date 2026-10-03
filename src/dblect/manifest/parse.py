@@ -284,9 +284,8 @@ class Node:
     it feeds :attr:`compilation_status` directly rather than being inferred from the
     code fields."""
     columns_complete: bool = False
-    """True when :attr:`columns` is the warehouse's full column set, which only
-    :meth:`Manifest.merge_catalog` can establish. Documented columns alone are a lower
-    bound, so a name they lack is not thereby absent from the relation."""
+    """True when :attr:`columns` is the warehouse's full set (set by
+    :meth:`Manifest.merge_catalog`); documented columns alone are a lower bound."""
     language: str | None = None
     """dbt's node ``language`` (``"sql"`` or ``"python"``), or ``None`` on schemas that
     don't carry it. Only SQL nodes are assessed for the stale/absent-compile signal; a
@@ -457,8 +456,7 @@ class Manifest:
         carries keeps its declared :class:`Column` (matching by name
         case-insensitively, since a warehouse may report a different case than
         the project wrote), and the catalog adds only columns the node lacks.
-        Nodes the catalog does not cover pass through untouched. A covered node is marked
-        :attr:`Node.columns_complete`.
+        Nodes the catalog does not cover pass through untouched.
         """
         merged: dict[str, Node] = {}
         for uid, node in self.nodes.items():
