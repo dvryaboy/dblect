@@ -63,6 +63,7 @@ from dblect.lineage.properties.uniqueness import (
     relation_scope_facts,
     uniqueness_property,
 )
+from dblect.lineage.properties.where_provenance import value_origin
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Materialization
 from dblect.sql import (
@@ -641,6 +642,8 @@ def make_fact_grounded_detectors(
 # ``SourceRef`` so an origin recovered from a provenance ``ColumnRef`` needs no name lookup.
 KeysBySource = Mapping[SourceRef, CandidateKeySet]
 ProvenanceBySource = Mapping[SourceRef, Mapping[str, frozenset[ColumnRef]]]
+# Per relation, the columns that are value-functions of a single base column, mapped to it.
+OriginsBySource = Mapping[SourceRef, Mapping[str, ColumnRef]]
 NameToRef = Mapping[str, SourceRef]
 
 
@@ -650,6 +653,7 @@ def detect_cross_model_fanout(
     name_to_ref: NameToRef,
     keys_by_source: KeysBySource,
     provenance_by_source: ProvenanceBySource,
+    origins_by_source: OriginsBySource,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
 ) -> tuple[Finding, ...]:
     """Flag a duplicate-sensitive aggregate that folds a magnitude an upstream fan-out
@@ -689,6 +693,7 @@ def detect_cross_model_fanout(
         if ref is None:
             continue
         rel_prov = provenance_by_source.get(ref, {})
+        rel_origins = origins_by_source.get(ref, {})
         rel_keys = keys_by_source.get(ref, NO_KEYS)
         group_cols = _group_by_columns(sel)
         # Grain-collapse guard: when the relation is provably unique at the GROUP BY grain
@@ -699,7 +704,11 @@ def detect_cross_model_fanout(
             continue
         for agg in _sensitive_aggregate_consumers(sel, safe_builtins=duplicate_safe_builtins):
             origin = _replicated_origin(
-                agg, rel_keys=rel_keys, rel_prov=rel_prov, keys_by_source=keys_by_source
+                agg,
+                rel_keys=rel_keys,
+                rel_prov=rel_prov,
+                rel_origins=rel_origins,
+                keys_by_source=keys_by_source,
             )
             if origin is not None:
                 out.append(
@@ -753,6 +762,7 @@ def make_cross_model_fanout_detectors(
     )
     provenance = propagate(col_graph, where_provenance)
     provenance_by_source = _provenance_by_source(provenance)
+    origins_by_source = _origins_by_source(col_graph)
     name_to_ref = index_by_name(manifest, {ref: ref for ref in keys_by_source})
 
     def fanout(tree: Expr) -> tuple[Finding, ...]:
@@ -761,6 +771,7 @@ def make_cross_model_fanout_detectors(
             name_to_ref=name_to_ref,
             keys_by_source=keys_by_source,
             provenance_by_source=provenance_by_source,
+            origins_by_source=origins_by_source,
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
         )
 
@@ -806,6 +817,7 @@ def _replicated_origin(
     *,
     rel_keys: CandidateKeySet,
     rel_prov: Mapping[str, frozenset[ColumnRef]],
+    rel_origins: Mapping[str, ColumnRef],
     keys_by_source: KeysBySource,
 ) -> SourceRef | None:
     """The origin source whose grain the aggregated relation does not preserve, or ``None``.
@@ -836,46 +848,60 @@ def _replicated_origin(
         origin_keys = keys_by_source.get(origin)
         if origin_keys is None or not origin_keys.keys:
             continue
-        if not _origin_grain_preserved(rel_keys, rel_prov, origin, origin_keys):
+        if not _origin_grain_preserved(rel_keys, rel_origins, origin, origin_keys):
             return origin
     return None
 
 
 def _origin_grain_preserved(
     rel_keys: CandidateKeySet,
-    rel_prov: Mapping[str, frozenset[ColumnRef]],
+    rel_origins: Mapping[str, ColumnRef],
     origin: SourceRef,
     origin_keys: CandidateKeySet,
 ) -> bool:
     """True when the aggregated relation stays unique at some candidate grain of ``origin``.
 
-    Each of the origin's candidate keys is translated into the relation's column names through
-    provenance; the relation preserves the grain when a surviving key refines any translated
-    origin key. A key whose columns the relation does not carry cannot witness the grain and
-    is skipped.
+    Each of the origin's candidate keys is translated into the relation's column names; the
+    relation preserves the grain when a surviving key refines any translated origin key. A key
+    whose columns the relation does not carry cannot witness the grain and is skipped.
     """
     for okey in origin_keys.keys:
-        translated = _translate_key(okey, origin, rel_prov)
+        translated = _translate_key(okey, origin, rel_origins)
         if translated is not None and grain_preserved(rel_keys, translated):
             return True
     return False
 
 
 def _translate_key(
-    origin_key: Key, origin: SourceRef, rel_prov: Mapping[str, frozenset[ColumnRef]]
+    origin_key: Key, origin: SourceRef, rel_origins: Mapping[str, ColumnRef]
 ) -> Key | None:
     """``origin_key`` rewritten in the aggregated relation's column names, or ``None`` when the
-    relation carries no column tracing to one of the origin key's columns (so the relation
-    cannot be unique at that grain). A column is a carrier when the origin key column is in its
-    where-provenance; the lexicographically first carrier is chosen when several alias it."""
+    relation carries none of some origin key column.
+
+    A column carries an origin column when its value is a function of that column alone
+    (:func:`value_origin`), so a relation unique on the carrier is unique on the origin column.
+    Every carrier joins the translation: a computed carrier such as ``UPPER(line_id)`` sits
+    beside the bare ``line_id`` and must not displace it. A column that merely reads the origin
+    column (``CONCAT``, a window) is not a carrier, since uniqueness on it says nothing of the
+    origin's rows."""
     translated: set[str] = set()
     for origin_col in origin_key:
         target = ColumnRef(origin, origin_col)
-        carriers = sorted(name for name, prov in rel_prov.items() if target in prov)
+        carriers = {name for name, o in rel_origins.items() if o == target}
         if not carriers:
             return None
-        translated.add(carriers[0])
+        translated |= carriers
     return frozenset(translated)
+
+
+def _origins_by_source(graph: ColumnLineageGraph) -> dict[SourceRef, dict[str, ColumnRef]]:
+    """Group each column that is a value-function of one base column by its relation."""
+    out: dict[SourceRef, dict[str, ColumnRef]] = {}
+    for col in graph.subjects():
+        origin = value_origin(graph, col)
+        if origin is not None:
+            out.setdefault(col.source, {})[col.column] = origin
+    return out
 
 
 def _provenance_by_source(

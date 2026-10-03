@@ -390,6 +390,21 @@ def _predicate_is_exact(e: Expr) -> bool:
     return _leaf_is_exact(e)
 
 
+# Set-returning functions: in a projection each emits several rows per input row.
+_ROW_MULTIPLYING = (exp.Unnest, exp.Explode, exp.Posexplode, exp.Inline, exp.GenerateSeries)
+
+
+def _projection_multiplies_rows(sel: exp.Select) -> bool:
+    """Whether a projected expression is a set-returning function of this scope, which
+    repeats the input row once per element and so breaks every key. One inside a scalar
+    subquery belongs to that subquery's own scope and does not."""
+    return any(
+        node.find_ancestor(exp.Select) is sel
+        for proj in sel.expressions
+        for node in proj.find_all(*_ROW_MULTIPLYING)
+    )
+
+
 def _projection_is_exact(sel: exp.Select) -> bool:
     """Whether every projected expression stays inside the fragment: a star, a
     bare column, or an expression with no subquery and no window other than a
@@ -693,6 +708,8 @@ def _select_facts(
         return (
             _GIVE_UP  # an unqualified star over several inputs, or a star naming an unknown alias
         )
+    if _projection_multiplies_rows(sel):
+        return _GIVE_UP
     if not _projection_is_exact(sel):
         scope_exact = False
 
