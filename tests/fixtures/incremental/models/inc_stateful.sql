@@ -6,7 +6,6 @@ select
     e.amount
     {% if is_incremental() %}
     , s.last_seen
-    , sum(e.amount) over (partition by e.id) as id_total
     {% endif %}
 from {{ ref('events') }} e
 {% if is_incremental() %}

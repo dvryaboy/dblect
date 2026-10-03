@@ -226,12 +226,7 @@ def run_audit(
     contextual: tuple[Detector, ...] = (
         make_non_determinism_detector(profile.non_deterministic_builtins),
         *make_fact_grounded_detectors(
-            manifest,
-            profile,
-            parsed=trees,
-            relation_keys=rel_keys,
-            fd_by_name=fd_by_name,
-            key_facts=key_facts,
+            manifest, profile, parsed=trees, relation_keys=rel_keys, fd_by_name=fd_by_name
         ),
         *make_cross_model_fanout_detectors(
             manifest, profile, parsed=trees, relation_keys=rel_keys, column_graph=col_graph

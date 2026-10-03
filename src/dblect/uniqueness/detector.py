@@ -31,7 +31,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from enum import Enum
 from typing import assert_never
 
 import sqlglot.expressions as exp
@@ -42,7 +41,13 @@ from dblect.lineage.builder import build_manifest_graph, build_relation_graph, i
 from dblect.lineage.facts.model import Annotation, Fact, by_scope
 from dblect.lineage.facts.property import Property
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
+from dblect.lineage.graph import (
+    ColumnLineageGraph,
+    ColumnRef,
+    RelationLineageGraph,
+    SourceKind,
+    SourceRef,
+)
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -54,7 +59,7 @@ from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
 )
-from dblect.lineage.properties.scope_closure import Input
+from dblect.lineage.properties.scope_closure import Input, JoinChain
 from dblect.lineage.properties.uniqueness import (
     NO_KEYS,
     CandidateKeySet,
@@ -64,7 +69,7 @@ from dblect.lineage.properties.uniqueness import (
     grain_preserved,
     relation_scope_facts,
     uniqueness_facts,
-    uniqueness_property,
+    uniqueness_property_from_facts,
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Materialization
@@ -73,12 +78,10 @@ from dblect.sql import (
     Finding,
     FindingKind,
     aggregate_behavior,
-    anti_join,
     duplicate_sensitive,
     suppression_hint,
 )
 from dblect.sql import _sqlglot as sg
-from dblect.sql._sqlglot import JoinSide
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
@@ -246,25 +249,77 @@ def detect_join_fanout(
     idiom.
     """
     scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
+    outputs = {id(sel) for sel in _output_selects(tree)}
+    root = scopes.get(id(tree))
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        steps, repeat = _join_steps(sel, scopes)
-        if not steps:
+        chain = JoinChain(sel, lambda node: _source_facts(node, scopes))
+        if not chain.joins:
             continue
-        consumers = _consumers(sel, frozenset(repeat), safe_builtins=duplicate_safe_builtins)
-        repeated = frozenset(a for a, r in repeat.items() if r is Repeat.MAY_REPEAT)
+        consumers = _consumers(
+            sel,
+            frozenset(chain.sides),
+            safe_builtins=duplicate_safe_builtins,
+            is_output=id(sel) in outputs,
+        )
+        steps = range(len(chain.joins) + 1)
+        repeated = [chain.repeated(p) for p in steps]
         key_sides = (
-            _declared_key_sides(sel, declared_keys, frozenset(repeat))
+            _declared_key_sides(sel, chain, declared_keys, root)
             if sel is tree and consumers.rows is not None
             else ()
         )
-        out.extend(
-            _fanout_finding(step)
-            for step in steps
-            if consumers.hurt_by(step.multiplied, repeated=repeated, sides=frozenset(repeat))
-            or any(_repeats_key(step, sides) for sides in key_sides)
-        )
+        for p, join in enumerate(chain.joins, 1):
+            newly = repeated[p] - repeated[p - 1]
+            broken = [
+                s for s in key_sides if chain.key_broken(s, p) and not chain.key_broken(s, p - 1)
+            ]
+            if broken:
+                out.append(_fanout_finding(join, broken[0]))
+            elif newly and consumers.hurt_by(
+                newly, repeated=repeated[-1], sides=frozenset(chain.sides)
+            ):
+                out.append(_fanout_finding(join, newly))
     return tuple(out)
+
+
+def _declared_keys(
+    manifest: Manifest,
+    uid: str,
+    key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> frozenset[Key]:
+    """A model's declared keys (tests, contracts) plus its ``unique_key`` config, which claims
+    the grain whether or not the write path enforces it."""
+    keys = declared_grain_keys(key_facts.get(SourceRef(SourceKind.MODEL, uid), ()))
+    node = manifest.models.get(uid)
+    unique_key = node.config.unique_key if node is not None and node.config is not None else ()
+    return keys | {frozenset(col.lower() for col in unique_key)} if unique_key else keys
+
+
+def _output_selects(node: Expr) -> Iterator[exp.Select]:
+    """The SELECTs whose rows are the tree's output: the root, or the arms of a top-level set
+    operation. A CTE or subquery SELECT feeds another scope instead."""
+    if isinstance(node, exp.Select):
+        yield node
+    elif isinstance(node, exp.SetOperation | exp.Subquery):
+        for arm in (node.this, node.args.get("expression")):
+            if isinstance(arm, Expr):
+                yield from _output_selects(arm)
+
+
+def _declared_key_sides(
+    sel: exp.Select, chain: JoinChain, declared_keys: frozenset[Key], root: Input | None
+) -> list[frozenset[str]]:
+    """The sides each declared key is read from, for keys the scope's own derived keys do not
+    cover. A QUALIFY the derivation could not model may have deduplicated, so it judges nothing."""
+    if root is None or (not root.exact and sg.qualify_of(sel) is not None):
+        return []
+    sides = [
+        chain.projected_sides(key)
+        for key in declared_keys
+        if not covers(FDSet(root.fds), key, root.keys)
+    ]
+    return [s for s in sides if s]
 
 
 def detect_limit_without_deterministic_order(
@@ -445,6 +500,7 @@ RelationUniqueness = tuple[
     RelationLineageGraph,
     Mapping[SourceRef, Annotation[CandidateKeySet]],
     Property[CandidateKeySet, SourceRef],
+    Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
 ]
 
 
@@ -469,9 +525,9 @@ def relation_uniqueness(
     """
     if graph is None:
         graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    uniqueness = uniqueness_property(manifest, profile, parsed=parsed, extra_facts=key_facts)
-    keys = propagate(graph, uniqueness)
-    return graph, keys, uniqueness
+    facts = uniqueness_facts(manifest, profile, extra_facts=key_facts, parsed=parsed)
+    uniqueness = uniqueness_property_from_facts(facts)
+    return graph, propagate(graph, uniqueness), uniqueness, facts
 
 
 def fd_annotations_by_name(
@@ -498,7 +554,7 @@ def fd_annotations_by_name(
     if relation_keys is None:
         fd_anns = propagate(graph, functional_dependency_property(ground))
     else:
-        _, keys, uniqueness = relation_keys
+        _, keys, uniqueness, _ = relation_keys
         store = AnnotationStore()
         for scope, ann in keys.items():
             store.record(uniqueness.name, scope, ann)
@@ -516,7 +572,6 @@ def make_fact_grounded_detectors(
     relation_keys: RelationUniqueness | None = None,
     fd_facts: tuple[Fact[FDSet, SourceRef], ...] = (),
     fd_by_name: Mapping[str, FDSet] | None = None,
-    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...] = (),
 ) -> tuple[Detector, ...]:
     """Curry the fact-grounded detectors against the propagated uniqueness keys.
 
@@ -549,7 +604,7 @@ def make_fact_grounded_detectors(
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
     )
-    graph, keys, _uniqueness = relation_keys
+    graph, keys, _uniqueness, key_facts = relation_keys
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every
@@ -570,7 +625,9 @@ def make_fact_grounded_detectors(
     # shared graph and threads it in; a standalone caller lets it default and we propagate here.
     if fd_by_name is None:
         fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts, relation_keys=relation_keys)
-    declared_by_tree = _declared_keys_by_tree(manifest, profile, parsed, key_facts)
+    declared_by_tree = {
+        id(tree): _declared_keys(manifest, uid, key_facts) for uid, tree in (parsed or {}).items()
+    }
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -615,25 +672,6 @@ def make_fact_grounded_detectors(
         )
 
     return (window_keys, fanout, limit_order, aggregate_order_keys)
-
-
-def _declared_keys_by_tree(
-    manifest: Manifest,
-    profile: AdapterProfile,
-    parsed: Mapping[str, Expr] | None,
-    key_facts: tuple[Fact[CandidateKeySet, SourceRef], ...],
-) -> dict[int, frozenset[Key]]:
-    """Each model tree's declared keys (see :func:`declared_grain_keys`), addressed by
-    ``id(tree)`` like the other per-tree maps."""
-    if not parsed:
-        return {}
-    by_uid = {
-        ref.unique_id: declared_grain_keys(bucket)
-        for ref, bucket in uniqueness_facts(
-            manifest, profile, extra_facts=key_facts, parsed=parsed
-        ).items()
-    }
-    return {id(tree): by_uid[uid] for uid, tree in parsed.items() if uid in by_uid}
 
 
 # Per-relation views the cross-model fan-out detector reads, all keyed by the relation's
@@ -738,7 +776,7 @@ def make_cross_model_fanout_detectors(
     likewise lets the audit pass the manifest column graph it built once, so the heavy
     qualify-and-resolve walk is not repeated per fact family.
     """
-    _, keys, _uniqueness = (
+    _, keys, _uniqueness, _ = (
         relation_keys
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
@@ -923,198 +961,19 @@ def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
     return facts
 
 
-class Repeat(Enum):
-    """Whether a source's rows can appear in more than one output row of a join chain."""
-
-    SINGLE = "single"
-    MAY_REPEAT = "may_repeat"
-    UNDECIDED = "undecided"
-
-
-class _Probe(Enum):
-    """Whether the rows to the left of a join are unique on the join's ON columns."""
-
-    UNIQUE = "unique"
-    NOT_UNIQUE = "not_unique"
-    UNKNOWN = "unknown"
-
-
-@dataclass(frozen=True, slots=True)
-class _JoinStep:
-    """One analysed join and the sides it repeats."""
-
-    join: exp.Join
-    target: exp.Table
-    joined_cols: frozenset[str]
-    target_keys: frozenset[Key]
-    alias: str
-    multiplied: frozenset[str]
-    left_repeated: frozenset[str]
-    target_uncovered: bool
-    probe_not_unique: bool
-
-
-def _join_steps(sel: exp.Select, scopes: ScopeIndex) -> tuple[list[_JoinStep], dict[str, Repeat]]:
-    """The joins of ``sel`` that repeat some side, and each output side's final repeat state.
-
-    Unreadable joins (non-equality ON, non-table target, ``CROSS``) leave every side undecided;
-    SEMI/ANTI joins add no output side."""
-    from_ = sg.from_of(sel)
-    if from_ is None or from_.this is None:
-        return [], {}
-    base = from_.this
-    repeat: dict[str, Repeat] = {sg.name_of(base): Repeat.SINGLE}
-    facts: dict[str, Input | None] = {sg.name_of(base): _source_facts(base, scopes)}
-    anti_arms = anti_join.anti_arm_ids(sel)
-    steps: list[_JoinStep] = []
-    for j in sg.joins_of(sel):
-        side = sg.join_side_of(j)
-        if side in (JoinSide.SEMI, JoinSide.ANTI) or id(j) in anti_arms:
-            continue
-        target = j.this
-        r = sg.name_of(target)
-        on = sg.on_of(j)
-        joined_cols = (
-            sg.equality_cols_on_alias(on, r)
-            if on is not None and side is not JoinSide.CROSS
-            else None
-        )
-        if not isinstance(target, exp.Table) or not joined_cols:
-            repeat = {
-                a: s if s is Repeat.MAY_REPEAT else Repeat.UNDECIDED for a, s in repeat.items()
-            }
-            repeat[r] = Repeat.UNDECIDED
-            facts[r] = None
-            continue
-        target_facts = _source_facts(target, scopes)
-        facts[r] = target_facts
-        known = target_facts is not None and bool(target_facts.keys)
-        uncovered = (
-            target_facts is not None
-            and known
-            and not covers(FDSet(target_facts.fds), joined_cols, target_facts.keys)
-        )
-        probe = _probe_uniqueness(on, r, repeat, facts, target_uncovered=uncovered)
-        multiplied: frozenset[str] = frozenset(repeat) if uncovered else frozenset()
-        if probe is _Probe.NOT_UNIQUE:
-            multiplied |= {r}
-        repeat = {
-            a: Repeat.MAY_REPEAT
-            if a in multiplied or s is Repeat.MAY_REPEAT
-            else (s if known else Repeat.UNDECIDED)
-            for a, s in repeat.items()
-        }
-        repeat[r] = {
-            _Probe.UNIQUE: Repeat.SINGLE,
-            _Probe.NOT_UNIQUE: Repeat.MAY_REPEAT,
-            _Probe.UNKNOWN: Repeat.UNDECIDED,
-        }[probe]
-        if multiplied and target_facts is not None:
-            steps.append(
-                _JoinStep(
-                    join=j,
-                    target=target,
-                    joined_cols=joined_cols,
-                    target_keys=target_facts.keys,
-                    alias=r,
-                    multiplied=multiplied,
-                    left_repeated=multiplied - {r} if uncovered else frozenset(),
-                    target_uncovered=uncovered,
-                    probe_not_unique=probe is _Probe.NOT_UNIQUE,
-                )
-            )
-    return steps, repeat
-
-
-def _probe_uniqueness(
-    on: Expr | None,
-    target: str,
-    repeat: Mapping[str, Repeat],
-    facts: Mapping[str, Input | None],
-    *,
-    target_uncovered: bool,
-) -> _Probe:
-    """Whether the left rows are unique on the ON columns. Exact for one left side; otherwise
-    undecided, blamed only when the joined-in side is itself uncovered."""
-    by_alias = sg.equality_cols_by_alias(on) if on is not None else None
-    others = {a: c for a, c in (by_alias or {}).items() if a != target}
-    if len(others) == 1:
-        ((x, x_cols),) = others.items()
-        state = repeat.get(x)
-        if state is Repeat.MAY_REPEAT:
-            return _Probe.NOT_UNIQUE
-        x_facts = facts.get(x)
-        if state is Repeat.SINGLE:
-            if x_facts is None or not x_facts.keys:
-                return _Probe.UNKNOWN
-            covered = covers(FDSet(x_facts.fds), x_cols, x_facts.keys)
-            return _Probe.UNIQUE if covered else _Probe.NOT_UNIQUE
-    return _Probe.NOT_UNIQUE if target_uncovered else _Probe.UNKNOWN
-
-
-def _repeats_key(step: _JoinStep, key_sides: frozenset[str]) -> bool:
-    """Whether this join makes two output rows agree on a key read from ``key_sides``: those
-    sides repeat because of a row outside them (both sides of a many-to-many pair do not)."""
-    return key_sides <= step.left_repeated or (
-        step.probe_not_unique and key_sides == frozenset({step.alias})
-    )
-
-
-def _declared_key_sides(
-    sel: exp.Select, declared_keys: frozenset[Key], sides: frozenset[str]
-) -> tuple[frozenset[str], ...]:
-    """The sides each declared key is read from in ``sel``'s projection (a bare or aliased column,
-    or the one qualified star); a key with a column that does not resolve is left out."""
-    if not declared_keys:
-        return ()
-    named = {
-        name.lower(): expr for name, expr in sg.projection_expressions_by_output_name(sel).items()
-    }
-    stars = [
-        p.table
-        for p in sel.expressions
-        if isinstance(p, exp.Column) and isinstance(p.this, exp.Star) and p.table
-    ]
-    bare_star = any(isinstance(p, exp.Star) for p in sel.expressions)
-    star = stars[0] if len(stars) == 1 and not bare_star else None
-    out: list[frozenset[str]] = []
-    for key in declared_keys:
-        key_sides: set[str] = set()
-        for col in key:
-            expr = named.get(col)
-            if isinstance(expr, exp.Column) and sg.column_table(expr) in sides:
-                key_sides.add(sg.column_table(expr) or "")
-            elif expr is None and star is not None and star in sides:
-                key_sides.add(star)
-            else:
-                break
-        else:
-            out.append(frozenset(key_sides))
-    return tuple(out)
-
-
-def _fanout_finding(step: _JoinStep) -> Finding:
-    target_name = sg.table_relation_key(step.target)
-    cols = ", ".join(sorted(step.joined_cols))
-    reasons: list[str] = []
-    if step.target_uncovered:
-        known = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in step.target_keys)
-        reasons.append(
-            f"isn't covered by any known uniqueness key on {target_name} (known: {known})"
-        )
-    if step.probe_not_unique:
-        reasons.append("isn't known to be unique on the other side of the join")
+def _fanout_finding(join: exp.Join, repeated: frozenset[str]) -> Finding:
+    on = sg.on_of(join)
+    target = f"{sg.name_of(join.this)} on ({sg.render_sql(on)})" if on is not None else ""
     return Finding(
         kind=FindingKind.JOIN_FANOUT,
         message=(
-            f"JOIN to {target_name} on ({cols}) {' and '.join(reasons)}, so it can repeat "
-            f"rows of {', '.join(sorted(step.multiplied))}, and a duplicate-sensitive consumer "
-            f"reads them. Either pin the join to a unique key or aggregate the repeated "
-            f"side first."
+            f"JOIN to {target} can repeat rows of {', '.join(sorted(repeated))}, and a "
+            f"duplicate-sensitive consumer reads them. Either pin the join to a unique key or "
+            f"aggregate the repeated side first."
         ),
-        sql_snippet=sg.render_sql(step.join),
-        line_start=_line_start(step.join),
-        line_end=_line_end(step.join),
+        sql_snippet=sg.render_sql(join),
+        line_start=_line_start(join),
+        line_end=_line_end(join),
     )
 
 
@@ -1131,8 +990,8 @@ class _Reads:
         named: set[str] = set()
         unresolved = False
         for c in columns:
-            qualifier = sg.column_table(c)
-            if qualifier is not None and qualifier in sides:
+            qualifier = (sg.column_table(c) or "").lower()
+            if qualifier in sides:
                 named.add(qualifier)
             else:
                 unresolved = True
@@ -1164,21 +1023,25 @@ class _Consumers:
 
 
 def _consumers(
-    sel: exp.Select, sides: frozenset[str], *, safe_builtins: frozenset[str]
+    sel: exp.Select, sides: frozenset[str], *, safe_builtins: frozenset[str], is_output: bool
 ) -> _Consumers:
-    """Classify what reads ``sel``'s joined rows; see :class:`_Consumers`."""
+    """Classify what reads ``sel``'s joined rows; see :class:`_Consumers`. A select that is not
+    the model's output passes its rows to another scope, which may read any side."""
     values: list[_Reads] = []
     counts_rows = False
     for agg in _sensitive_aggregate_consumers(sel, safe_builtins=safe_builtins):
         columns = [c for c in sg.find_columns(agg) if _node_in_scope(c, sel)]
+        behavior = aggregate_behavior(agg) if isinstance(agg, exp.AggFunc) else None
         if columns:
             values.append(_Reads.of(columns, sides))
-        else:
+        elif behavior is AggregateBehavior.COUNT:
             counts_rows = True
+        else:
+            values.append(_Reads(unresolved=True))  # sum(1), a UDF: no side to name
     rows: _Reads | None = None
     grouped = sg.group_of(sel) is not None or _is_implicit_single_group(sel)
     if not grouped and not sel.args.get("distinct"):
-        rows = _row_reads(sel, sides)
+        rows = _row_reads(sel, sides) if is_output else _Reads(unresolved=True)
     return _Consumers(tuple(values), counts_rows, rows)
 
 
