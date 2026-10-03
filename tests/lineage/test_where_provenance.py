@@ -17,7 +17,11 @@ from dblect.lineage import propagate
 from dblect.lineage.builder import build_manifest_graph, build_model_graph
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties import where_provenance
+from dblect.lineage.property import value_origin
 from dblect.manifest import Manifest
+from tests._manifest_builders import manifest as _manifest
+from tests._manifest_builders import node as _node
+from tests._manifest_builders import source as _src_node
 
 
 def _source(name: str) -> SourceRef:
@@ -249,3 +253,43 @@ def test_jaffle_build_succeeds_and_chains_resolve_to_real_leaves(
         if leaf.source.kind not in manifest_kinds
     ]
     assert not synthetic_in_annotations, "\n".join(synthetic_in_annotations[:5])
+
+
+@pytest.mark.parametrize(
+    ("select", "origin"),
+    [
+        ("x AS o FROM t", "x"),
+        ("(x) AS o FROM t", "x"),
+        ("CAST(x AS BIGINT) AS o FROM t", "x"),
+        ("TRY_CAST(x AS BIGINT) AS o FROM t", "x"),
+        ("x + y AS o FROM t", None),
+        ("ABS(x) AS o FROM t", None),
+        ("x AS o FROM (SELECT x FROM t UNION ALL SELECT x FROM u) s", None),
+    ],
+)
+def test_value_origin_follows_copies_and_stops_at_computation(
+    select: str, origin: str | None
+) -> None:
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql="SELECT " + select,
+        name_to_source={"t": _source("t"), "u": _source("u")},
+        schema={"t": {"x": "INT", "y": "INT"}, "u": {"x": "INT"}},
+    )
+    out = ColumnRef(SourceRef(SourceKind.MODEL, "model.test.m"), "o")
+    expected = None if origin is None else ColumnRef(_source("t"), origin)
+    assert value_origin(graph, out) == expected
+
+
+def test_value_origin_chains_across_models_down_to_a_source() -> None:
+    manifest = _manifest(
+        _src_node("source.app.raw.t"),
+        _node("model.app.a", "SELECT x AS k FROM t"),
+        _node("model.app.b", "SELECT CAST(k AS BIGINT) AS j FROM a"),
+    )
+    graph = build_manifest_graph(manifest, dialect="duckdb").graph
+    j = ColumnRef(SourceRef(SourceKind.MODEL, "model.app.b"), "j")
+    origin = value_origin(graph, j)
+    assert origin is not None
+    assert origin.source.kind is SourceKind.SOURCE
+    assert origin.column == "x"
