@@ -165,3 +165,15 @@ def test_grouping_coarser_than_the_key_loses_it_whatever_is_computed() -> None:
         "FROM raw.lines GROUP BY order_id"
     )
     assert _fires_over(m0)
+
+
+def test_a_window_over_one_key_column_is_not_the_origin_grain() -> None:
+    """``ROW_NUMBER() OVER (ORDER BY line_id)`` reads one key column and is unique, yet it is
+    no function of ``line_id``: over a fanned-out join it numbers the repeated rows apart, so
+    uniqueness on it does not witness the line grain and the rollup double counts."""
+    m0 = (
+        "SELECT ROW_NUMBER() OVER (ORDER BY l.line_id) AS k, l.order_id, l.line_id, l.amt "
+        "FROM raw.lines AS l JOIN raw.fan AS f ON l.order_id = f.order_id"
+    )
+    fan = _source("source.shop.raw.fan", name="fan", columns=cols("order_id", "extra"))
+    assert _fires_over(m0, extra_nodes=(fan, _k_is_unique()))
