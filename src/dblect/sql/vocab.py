@@ -231,6 +231,9 @@ SURROGATE_HASH_FUNCTIONS: tuple[type[Expr], ...] = tuple(
 SURROGATE_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
     getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
 )
+# Wrappers that keep a column's value a function of that one column alone.
+VALUE_PRESERVING_WRAPPERS: tuple[type[Expr], ...] = (exp.Alias, exp.Paren, exp.Cast, exp.TryCast)
+
 # Structural combinators that assemble columns into the hashed value without making
 # the input anything other than those columns.
 SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
