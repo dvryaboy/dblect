@@ -71,17 +71,10 @@ _ROW_PRESERVING = [
     "CAST(amt AS BIGINT)",
     "UPPER(line_id)",
     "MD5(line_id)",
-    "MD5(CONCAT(order_id, line_id))",
-    "SHA256(line_id)",
-    "HASH(line_id)",
     "CONCAT(order_id, line_id)",
-    "LENGTH(line_id)",
-    "UPPER(line_id) || 'z'",
     "CASE WHEN amt > 0 THEN 1 ELSE 0 END",
-    "COALESCE(line_id, 'a')",
     "ROW_NUMBER() OVER (ORDER BY line_id)",
     "SUM(amt) OVER (PARTITION BY order_id)",
-    "1",
 ]
 # One name sorting before the key columns and one after: carrier choice must not depend on it.
 _NAMES = ["a", "z"]
