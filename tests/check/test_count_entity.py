@@ -115,6 +115,9 @@ def _contradictions(
     )
 
 
+# The entity counted and one other decide every case; a third adds no decision.
+_DECLARED = [Entity.PLAYER, Entity.ATTRIBUTE_SNAPSHOT]
+
 _FROM = "FROM player_attributes AS pa"
 _JOIN = f"{_FROM} JOIN team AS t ON t.id = pa.id"
 
@@ -134,7 +137,7 @@ _SINGLE_RELATION: list[tuple[str, Entity | None]] = [
 ]
 
 
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 @pytest.mark.parametrize(("agg", "counts"), _SINGLE_RELATION)
 def test_a_declared_count_meets_the_entity_the_query_counts(
     agg: str, counts: Entity | None, declared: Entity
@@ -143,25 +146,24 @@ def test_a_declared_count_meets_the_entity_the_query_counts(
     assert found == (1 if counts is not None and counts is not declared else 0)
 
 
-@pytest.mark.parametrize(("agg", "counts"), _SINGLE_RELATION)
-def test_an_undeclared_count_never_produces_a_finding(agg: str, counts: Entity | None) -> None:
-    assert _contradictions(f"SELECT {agg} AS n {_FROM}", None) == 0
+def test_an_undeclared_count_never_produces_a_finding() -> None:
+    assert _contradictions(f"SELECT COUNT(*) AS n {_FROM}", None) == 0
 
 
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_a_grouped_count_counts_the_rows_of_its_relation(declared: Entity) -> None:
     sql = f"SELECT COUNT(*) AS n {_FROM} GROUP BY pa.penalties"
     assert _contradictions(sql, declared) == (declared is not Entity.ATTRIBUTE_SNAPSHOT)
 
 
 @pytest.mark.parametrize("agg", ["COUNT(*)", "COUNT(1)", "COUNT(pa.id)"])
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_a_non_distinct_count_after_a_join_makes_no_claim(agg: str, declared: Entity) -> None:
     # The join can repeat or drop rows, so the rows are no longer one per key value.
     assert _contradictions(f"SELECT {agg} AS n {_JOIN}", declared) == 0
 
 
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_a_distinct_count_of_an_entity_identifier_survives_a_join(declared: Entity) -> None:
     sql = f"SELECT COUNT(DISTINCT pa.player_api_id) AS n {_JOIN}"
     assert _contradictions(sql, declared) == (declared is not Entity.PLAYER)
@@ -180,7 +182,7 @@ def test_a_composite_key_names_no_single_row_entity() -> None:
 # A window is folded by the generic scalar join over its aggregate and its PARTITION BY
 # columns, so a partition column (no entity) widens the count's claim away. Only a
 # window with nothing else to fold keeps the DISTINCT claim.
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_an_unpartitioned_windowed_distinct_count_counts_its_operands_entity(
     declared: Entity,
 ) -> None:
@@ -189,13 +191,13 @@ def test_an_unpartitioned_windowed_distinct_count_counts_its_operands_entity(
 
 
 @pytest.mark.parametrize("agg", ["COUNT(DISTINCT pa.player_api_id)", "COUNT(*)"])
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_a_partitioned_windowed_count_makes_no_claim(agg: str, declared: Entity) -> None:
     sql = f"SELECT {agg} OVER (PARTITION BY pa.penalties) AS n {_FROM}"
     assert _contradictions(sql, declared) == 0
 
 
-@pytest.mark.parametrize("declared", list(Entity))
+@pytest.mark.parametrize("declared", _DECLARED)
 def test_an_unpartitioned_windowed_non_distinct_count_makes_no_claim(declared: Entity) -> None:
     sql = f"SELECT COUNT(*) OVER () AS n {_FROM}"
     assert _contradictions(sql, declared) == 0

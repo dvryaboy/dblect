@@ -42,7 +42,7 @@ from typing import Final, assert_never, final
 from sqlglot import Expr
 from sqlglot import expressions as exp
 
-from dblect.lineage.facts.kit import GroundingFold, grounding_fold, top_rule
+from dblect.lineage.facts.kit import GroundingFold, constant_aggregate, grounding_fold, top_rule
 from dblect.lineage.facts.lattice import Lattice, annotate_fold
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import (
@@ -507,14 +507,18 @@ DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
 # --- aggregate transfers -----------------------------------------------------
 
 
-def _passthrough_core(
-    _expr: exp.AggFunc, child: Annotation[DomainTag], _scope: AggregateScope[DomainTag]
-) -> Annotation[DomainTag]:
+def _passthrough_core(_expr: exp.AggFunc, child: Annotation[DomainTag]) -> Annotation[DomainTag]:
     """``sum`` and ``avg`` accumulate the magnitude, ``min``/``max`` select one of its
     values; either way the result carries the child's tag. Whether the accumulation is
     *sound* (the tag constant per group) is the coherence guard's obligation, wired
     separately; the pure value-domain map keeps the tag."""
     return child
+
+
+# The count that claims nothing: the fallback ``core`` for a rule that reads its relation.
+_NO_ENTITY_COUNT: Final[AggregateRule[DomainTag]] = constant_aggregate(
+    NAKED, opacity=Opacity.IMPLICIT
+)
 
 
 def _entity_facets(tag: DomainTag) -> dict[str, Concrete]:
@@ -553,7 +557,7 @@ def _row_entity_facets(
         if len(key) != 1:
             continue
         (column,) = key
-        ann = scope.annotate(ColumnRef(source, column.casefold()))
+        ann = scope.annotate(ColumnRef(source, sg.stored_column_name(column)))
         facets = _entity_facets(ann.value)
         if facets:
             claims[frozenset(facets.items())] = ann.provisional
@@ -635,7 +639,8 @@ def _counted_entity(
 
 def _is_key(keys: CandidateKeySet | None, column: str) -> bool:
     return keys is not None and any(
-        {c.casefold() for c in key} == {column.casefold()} for key in keys.keys
+        {sg.stored_column_name(c) for c in key} == {sg.stored_column_name(column)}
+        for key in keys.keys
     )
 
 
@@ -662,7 +667,9 @@ def _aggregate_rules(
         # typecheck error here rather than a silent fall-through into the guarded rule.
         match behavior:
             case AggregateBehavior.COUNT:
-                rules[agg_type] = AggregateRule(core=_count_core_reading(uniqueness))
+                rules[agg_type] = AggregateRule(
+                    core=_NO_ENTITY_COUNT.core, reads_relation=_count_core_reading(uniqueness)
+                )
             case AggregateBehavior.COMBINE | AggregateBehavior.SELECT:
                 rules[agg_type] = AggregateRule(core=_passthrough_core, coherence=guard)
             case _:

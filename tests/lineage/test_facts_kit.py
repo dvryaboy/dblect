@@ -26,7 +26,7 @@ from dblect.lineage.facts.kit import (
 )
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact, Opacity
-from dblect.lineage.facts.property import AggregateScope, DepContext
+from dblect.lineage.facts.property import DepContext
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
@@ -72,12 +72,9 @@ def test_top_rule_is_implicit_top_and_carries_provisional_through() -> None:
 
 def test_constant_aggregate_discards_the_child_value_but_keeps_its_taint() -> None:
     rule = constant_aggregate(frozenset({7}))
-    scope = AggregateScope(
-        site=None, dependencies=_NO_DEPS, annotate=lambda _ref: Annotation(_UNIVERSE)
-    )
-    out = rule.core(exp.Count(), Annotation(frozenset({0, 1})), scope)
+    out = rule.core(exp.Count(), Annotation(frozenset({0, 1})))
     assert out == Annotation(frozenset({7}), Opacity.CONCRETE)
-    assert rule.core(exp.Count(), Annotation(frozenset({0}), provisional=True), scope).provisional
+    assert rule.core(exp.Count(), Annotation(frozenset({0}), provisional=True)).provisional
 
 
 def test_grounding_fold_preprocess_runs_before_every_reader() -> None:

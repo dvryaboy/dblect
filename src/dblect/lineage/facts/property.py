@@ -163,10 +163,10 @@ CoherenceSink = list[CoherenceClear[K]]
 
 @dataclass(frozen=True, slots=True)
 class AggregateScope(Generic[K]):
-    """What an aggregate's ``core`` may read beyond its own operand: the scope it
+    """What a ``reads_relation`` rule may read beyond its own operand: the scope it
     aggregates in (``site``, ``None`` where the builder stamped none, as for a windowed
     aggregate), the dependency annotations, and this property's annotation of any
-    column. A core that ignores it stays a pure value-domain map."""
+    column."""
 
     site: AggregationSite | None
     dependencies: DepContext
@@ -176,12 +176,18 @@ class AggregateScope(Generic[K]):
 @dataclass(frozen=True, slots=True)
 class AggregateRule(Generic[K]):
     """An aggregate transfer split so its soundness obligation stays checkable:
-    ``core`` is a value-domain map that reads a dependency only through its
-    :class:`AggregateScope`, and ``coherence`` is the optional clear-on-failure guard
-    through which a per-row companion's dependency enters."""
+    ``core`` is a pure value-domain map (no DepContext), and ``coherence`` is the
+    optional clear-on-failure guard through which a per-row companion's dependency enters.
 
-    core: Callable[[exp.AggFunc, Annotation[K], AggregateScope[K]], Annotation[K]]
+    ``reads_relation`` is the one other channel: a rule whose result depends on the
+    relation it aggregates (``COUNT`` counts that relation's rows) supplies it, and it
+    then replaces ``core`` with a map that also receives the :class:`AggregateScope`."""
+
+    core: Callable[[exp.AggFunc, Annotation[K]], Annotation[K]]
     coherence: CoherenceGuard[K, Any] | None = None
+    reads_relation: (
+        Callable[[exp.AggFunc, Annotation[K], AggregateScope[K]], Annotation[K]] | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)

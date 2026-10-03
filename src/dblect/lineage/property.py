@@ -344,9 +344,11 @@ def _apply_aggregate(
     annotate: Callable[[ColumnRef], Annotation[K]],
     sink: CoherenceSink[K] | None = None,
 ) -> Annotation[K]:
-    """Apply an aggregate rule's ``core``, then its coherence guard.
+    """Apply an aggregate rule's ``core`` (or its ``reads_relation`` variant), then its
+    coherence guard.
 
-    The guard is the one channel a dependency enters an aggregate through: where a
+    The guard is the one channel a dependency enters an aggregate through, bar a rule
+    that opts in to reading its relation: where a
     per-row companion of the aggregated value is not provably constant per group,
     the result clears to the lattice top. The cleared top is IMPLICIT, so a
     downstream consumer warns on it rather than reading it as a declared opt-out. When the
@@ -355,7 +357,10 @@ def _apply_aggregate(
     consumer reads the event rather than re-inferring it from the cleared output.
     """
     site = aggregation_site_meta(expr)
-    result = rule.core(expr, child, AggregateScope(site, dep_context, annotate))
+    if rule.reads_relation is None:
+        result = rule.core(expr, child)
+    else:
+        result = rule.reads_relation(expr, child, AggregateScope(site, dep_context, annotate))
     guard = rule.coherence
     if guard is None:
         return result
