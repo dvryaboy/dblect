@@ -53,6 +53,7 @@ from dblect.lineage.facts.property import (
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
+    BASE_SOURCE_KINDS,
     AggregationSite,
     ColumnRef,
     Derivation,
@@ -61,6 +62,7 @@ from dblect.lineage.graph import (
     UnionConfluence,
     aggregation_site_meta,
 )
+from dblect.sql.vocab import VALUE_PRESERVING_WRAPPERS
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
@@ -491,6 +493,35 @@ def resolved_column_ref(col: exp.Column) -> ColumnRef | None:
     return _column_ref_meta(col)
 
 
+def copied_column(derivation: Derivation) -> ColumnRef | None:
+    """The one column ``derivation`` copies unchanged, through renames, parentheses and
+    casts; ``None`` for anything computed (a call, a window) or a union."""
+    node = derivation
+    while isinstance(node, VALUE_PRESERVING_WRAPPERS) and isinstance(node.this, Expr):
+        node = node.this
+    return resolved_column_ref(node) if isinstance(node, exp.Column) else None
+
+
+def value_origin(graph: LineageView[ColumnRef], col: ColumnRef) -> ColumnRef | None:
+    """The base column ``col`` is an unchanged copy of, or ``None``.
+
+    Follows ``copied_column`` steps down to a source, seed or snapshot column. Where-provenance
+    cannot say this: it also lists every column an expression merely reads. A relation unique
+    on a copy of ``x`` is unique on ``x``, so a key can be re-expressed through it. Anything
+    computed, a union, or a cycle returns ``None``, the safe direction."""
+    seen: set[ColumnRef] = set()
+    while col not in seen:
+        seen.add(col)
+        derivation = graph.derivation(col)
+        if derivation is None:
+            return col if col.source.kind in BASE_SOURCE_KINDS else None
+        nxt = copied_column(derivation)
+        if nxt is None:
+            return None
+        col = nxt
+    return None
+
+
 # The operator-transfer alias re-exported for callers that build properties next
 # to the propagator; the canonical definition lives in dblect.lineage.facts.
 __all__ = [
@@ -498,7 +529,9 @@ __all__ = [
     "OperatorTransfer",
     "UnionConfluence",
     "attach_column_ref",
+    "copied_column",
     "propagate",
     "resolved_column_ref",
     "run",
+    "value_origin",
 ]

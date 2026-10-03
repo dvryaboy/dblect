@@ -20,14 +20,12 @@ from __future__ import annotations
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Opacity
 from dblect.lineage.facts.property import Property, column_property
-from dblect.lineage.graph import ColumnRef, SourceKind
+from dblect.lineage.graph import BASE_SOURCE_KINDS, ColumnRef
 from dblect.lineage.semiring import UnionSemiring
 
 WhereProvenance = frozenset[ColumnRef]
 
 _EMPTY: WhereProvenance = frozenset()
-# Base relations: a column on one of these traces to itself.
-_BASE_KINDS = frozenset({SourceKind.SOURCE, SourceKind.SEED, SourceKind.SNAPSHOT})
 
 # Nominal lattice: where-provenance is driven entirely by its union semiring. Only
 # ``top`` (the empty set) is read at runtime; meet/join/bottom are inert because
@@ -42,7 +40,7 @@ _PROVENANCE_LATTICE: Lattice[WhereProvenance] = Lattice(
 
 
 def _ground(col: ColumnRef) -> Annotation[WhereProvenance]:
-    if col.source.kind in _BASE_KINDS:
+    if col.source.kind in BASE_SOURCE_KINDS:
         return Annotation(frozenset({col}), Opacity.CONCRETE)
     return Annotation(_EMPTY, Opacity.IMPLICIT)
 
