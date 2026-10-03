@@ -197,9 +197,12 @@ def build_manifest_graph(
     )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
-    # Models whose derived output hides columns behind an unexpanded star: their recorded column
-    # set is a lower bound, so an unqualified name must not be judged unknown against it.
-    open_models: set[SourceRef] = set()
+    # Unique ids of nodes whose column set is known complete: catalog-backed nodes, plus models derived here
+    # from compiled SQL with no unexpanded star. Documented columns alone are a lower bound, so an
+    # unqualified name is judged unknown only against complete sources.
+    complete_sources: set[str] = {
+        n.unique_id for n in manifest.nodes.values() if n.columns_complete
+    }
     # Accumulate into one pair of dicts and freeze once, rather than `graph.merge(per_model)` per
     # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
     # last-wins on expressions the same final map; each output column is built by one model anyway.
@@ -225,7 +228,7 @@ def build_manifest_graph(
                 schema=mapping_schema,
                 dialect=dialect,
                 tree=parsed.get(uid) if parsed is not None else None,
-                open_models=open_models,
+                complete_sources=complete_sources,
             )
             per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
             _record_output_columns(schema, model.relation_name, uid, per_model)
@@ -248,8 +251,8 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
-        if walker.unexpanded_stars:
-            open_models.add(SourceRef(kind=SourceKind.MODEL, unique_id=uid))
+        if not walker.unexpanded_stars:
+            complete_sources.add(uid)
         resolution.append(
             ModelResolution(
                 unique_id=uid,
@@ -316,7 +319,7 @@ def _walk_model(
     schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
-    open_models: frozenset[SourceRef] | set[SourceRef] = frozenset(),
+    complete_sources: frozenset[str] | set[str] = frozenset(),
 ) -> _Walker:
     """Parse, qualify, and walk one model, returning the populated walker.
 
@@ -351,7 +354,7 @@ def _walk_model(
         root_scope,
         schema=ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect),
         name_to_source=name_to_source,
-        open_models=open_models,
+        complete_sources=complete_sources,
     )
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
@@ -371,15 +374,16 @@ def _reject_unknown_unqualified_columns(
     *,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
-    open_models: frozenset[SourceRef] | set[SourceRef],
+    complete_sources: frozenset[str] | set[str],
 ) -> None:
     """Raise ``Unknown column`` for an unqualified name that no source in its scope can supply.
 
     ``qualify`` attaches a qualifier to every unqualified column it can place and raises for a
     qualified one the source lacks, but leaves a name no source claims bare. That is a definite
-    error exactly when every source in the scope has a known column set lacking the name; with
-    any source's columns unknown the name may belong to it, and the column stays blind. The error has the qualified case's shape so both
-    surface as the same unbuilt reason.
+    error exactly when every source in the scope has a complete column set lacking the name; with
+    any source's columns incomplete (documented only, or hidden behind a star) the name may belong
+    to it, and the column stays blind. The error has the qualified case's shape so both surface as
+    the same unbuilt reason.
     """
     for scope in root.traverse():
         if not isinstance(scope.expression, exp.Select):
@@ -387,7 +391,7 @@ def _reject_unknown_unqualified_columns(
         bare = [c for c in scope.columns if not c.table and c.name]
         if not bare:
             continue
-        known = _known_source_columns(scope, schema, name_to_source, open_models)
+        known = _known_source_columns(scope, schema, name_to_source, complete_sources)
         if known is None:
             continue
         for col in bare:
@@ -400,21 +404,19 @@ def _known_source_columns(
     scope: Scope,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
-    open_models: frozenset[SourceRef] | set[SourceRef],
+    complete_sources: frozenset[str] | set[str],
 ) -> frozenset[str] | None:
     """Lower-cased union of the columns of every source in ``scope``, or ``None`` when any
-    source's column set is not fully known (no sources, an unknown or partially derived
-    relation, a ``*``, a pivot, a table function, lateral or unnest)."""
+    source's column set is not known complete (no sources, a relation outside
+    ``complete_sources``, a ``*``, a pivot, a table function, lateral or unnest)."""
     if not scope.sources:
         return None
     resolver = Resolver(scope, schema, infer_schema=False)
     out: set[str] = set()
     for alias, src in scope.sources.items():
         if isinstance(src, exp.Table):
-            if (
-                src.args.get("pivots")
-                or name_to_source.get(sg.table_relation_key(src)) in open_models
-            ):
+            ref = name_to_source.get(sg.table_relation_key(src))
+            if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
                 return None
         elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
             return None
