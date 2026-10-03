@@ -21,11 +21,11 @@ from dblect.manifest import (
     Column,
     ConstraintSpec,
     DbtTestMetadata,
+    DbtTestSeverity,
     Manifest,
     ModelConfig,
     Node,
     ResourceType,
-    TestSeverity,
 )
 
 
@@ -123,7 +123,7 @@ def relationships_test(
     to: str | None = None,
     enabled: bool = True,
     where: str | None = None,
-    severity: TestSeverity = TestSeverity.ERROR,
+    severity: DbtTestSeverity = DbtTestSeverity.ERROR,
 ) -> Node:
     """A dbt ``relationships`` test node: ``child_column`` on ``child`` must match
     ``parent_column`` on ``parent``. ``parent_column=None`` models a test whose

@@ -42,9 +42,9 @@ from dblect.check.grain import declared_grain_findings
 from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
 from dblect.check.referential import (
     OrphanDropSite,
-    edges_by_child,
+    UnguardedEdges,
+    copy_origin,
     orphan_drop_sites,
-    unguarded_edges,
 )
 from dblect.lineage.builder import (
     BuildIssue,
@@ -96,7 +96,6 @@ from dblect.sql import _sqlglot as sg
 from dblect.sql.parse import parse_manifest_models
 from dblect.types import (
     ContractRegistry,
-    ForeignKeyEdge,
     IssueCode,
     ResolvedContracts,
     active_registry,
@@ -146,14 +145,11 @@ class CheckGraphs:
     """Columns whose declarations disagree down to the empty set: reported once as
     a ``CONTRACT_ISSUE`` rather than raising and hiding every other column's
     grounding."""
-    foreign_key_edges: tuple[ForeignKeyEdge, ...]
-    """Every declared foreign-key edge (contract markers merged with dbt
-    ``relationships`` tests). Neither the edges nor the guard set below vary across
-    a flag enumeration, so both are built once here rather than per world."""
-    relationship_tested_edges: frozenset[tuple[ColumnRef, ColumnRef]]
-    """``(child, parent)`` pairs an enabled, unconditional, error-severity
-    ``relationships`` test already covers: the guard set the referential
-    orphan-drop check reads to stay silent on an edge that already fails loudly."""
+    unguarded_foreign_keys: UnguardedEdges
+    """Declared foreign-key edges (contract markers merged with dbt ``relationships``
+    tests) minus those an enabled, unconditional, error-severity ``relationships``
+    test already covers, keyed ``(child, parent)``. Neither input varies across a
+    flag enumeration, so this is built once here rather than per world."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,8 +234,7 @@ def build_check_graphs(
         ),
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
-        foreign_key_edges=foreign_key_edges(manifest, registry=reg),
-        relationship_tested_edges=relationship_tested_edges(manifest),
+        unguarded_foreign_keys=_unguarded_foreign_keys(manifest, reg),
     )
 
 
@@ -381,13 +376,10 @@ def suppress_check_findings(
 
 def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
     """The per-model findings of one world: the domain-type contradictions, the
-    not-well-typed aggregations, the join-key and grain findings read off its
-    annotations, and the referential orphan drops. The flag-world enumerator reads
-    only this function per world, so a model-located finding belongs here even when
-    it comes out the same in every world (the orphan drop reads join structure and
-    declared edges, neither of which a flag changes). The contract-resolution and
-    resolution-floor findings are project-wide and stay ``run_check``'s to report
-    once."""
+    not-well-typed aggregations, the join-key and grain findings, and the
+    referential orphan drops (join structure and declared edges do not vary by flag,
+    but the flag-world enumerator reads only this function). The contract-resolution
+    and resolution-floor findings are project-wide and stay ``run_check``'s."""
     findings: list[CheckFinding] = []
     # One source-map per model, shared across both finding kinds: a model that produces
     # both a contradiction and an aggregation finding builds its line map once.
@@ -428,8 +420,8 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
         _referential_orphan_drop_findings(
             graphs.manifest,
             graphs.parsed,
-            graphs.foreign_key_edges,
-            graphs.relationship_tested_edges,
+            graphs.unguarded_foreign_keys,
+            copy_origin(graphs.column_build.graph),
             line_maps,
         )
     )
@@ -827,22 +819,27 @@ def _dead_predicate_findings(
     )
 
 
+def _unguarded_foreign_keys(manifest: Manifest, registry: ContractRegistry) -> UnguardedEdges:
+    guarded = relationship_tested_edges(manifest)
+    return {
+        (edge.child, edge.parent): edge
+        for edge in foreign_key_edges(manifest, registry=registry)
+        if (edge.child, edge.parent) not in guarded
+    }
+
+
 def _referential_orphan_drop_rows(
     manifest: Manifest,
     parsed: Mapping[str, Expr],
-    edges: tuple[ForeignKeyEdge, ...],
-    guarded: frozenset[tuple[ColumnRef, ColumnRef]],
+    edges: UnguardedEdges,
+    ref_of: Callable[[exp.Column], ColumnRef | None],
 ) -> Iterator[LocatedRow]:
     """One row per join whose row effect drops a declared foreign key's unmatched
-    child rows, with no covering ``relationships`` test.
-
-    ``orphan_drop_sites`` is the pure signal; this locates each site on the join
-    node itself, the same way ``_join_key_rows`` locates a join-key conflict."""
-    by_child = edges_by_child(unguarded_edges(edges, guarded))
-    if not by_child:
+    child rows, located on the join node like a join-key conflict."""
+    if not edges:
         return
     for uid, tree in parsed.items():
-        for site in orphan_drop_sites(tree, by_child, resolved_column_ref):
+        for site in orphan_drop_sites(tree, edges, ref_of):
             yield LocatedRow(
                 uid=uid,
                 nodes=(site.join,),
@@ -855,13 +852,13 @@ def _referential_orphan_drop_rows(
 def _referential_orphan_drop_findings(
     manifest: Manifest,
     parsed: Mapping[str, Expr],
-    edges: tuple[ForeignKeyEdge, ...],
-    guarded: frozenset[tuple[ColumnRef, ColumnRef]],
+    edges: UnguardedEdges,
+    ref_of: Callable[[exp.Column], ColumnRef | None],
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     return locate_findings(
         manifest,
-        _referential_orphan_drop_rows(manifest, parsed, edges, guarded),
+        _referential_orphan_drop_rows(manifest, parsed, edges, ref_of),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
     )
@@ -873,7 +870,7 @@ def _orphan_drop_message(manifest: Manifest, site: OrphanDropSite) -> str:
     child_relation = _relation_name(manifest, site.edge.child.source)
     parent_relation = _relation_name(manifest, site.edge.parent.source)
     message = (
-        f"this {site.side.value.upper()} JOIN discards rows of {child_relation!r} whose "
+        f"this {sg.join_side_of(site.join).value.upper()} JOIN discards rows of {child_relation!r} whose "
         f"non-null {site.edge.child.column!r} has no match in {parent_relation!r}. "
         f"{site.edge.child.column!r} is declared a foreign key to "
         f"{parent_relation}.{site.edge.parent.column}, so no such rows are expected; if that "

@@ -496,13 +496,18 @@ class JoinRowEffect:
     side: JoinSide
     optional: frozenset[str]
     dropped_unmatched: frozenset[str]
+    outer_dropped: frozenset[str]
+    """The aliases an outer join (LEFT or RIGHT) drops by design: ``dropped_unmatched``
+    for those two sides, empty for the rest. The nullable-key detector skips a key on
+    this side, since the join's own semantics say its no-match is intended; INNER's
+    or SEMI's dropped rows must not silence it."""
 
 
 def _join_row_effect(
     side: JoinSide, *, right: str, accumulated_left: frozenset[str]
-) -> tuple[frozenset[str], frozenset[str]]:
-    """The ``(optional, dropped_unmatched)`` pair one join contributes, decided by
-    its side alone. See :class:`JoinRowEffect` for what each answers.
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """The ``(optional, dropped_unmatched, outer_dropped)`` triple one join
+    contributes, decided by its side alone. See :class:`JoinRowEffect`.
 
     Closed over every ``JoinSide`` so a side sqlglot adds later is a type error here
     rather than silently falling through to the wrong answer. CROSS has no match
@@ -513,21 +518,21 @@ def _join_row_effect(
         case JoinSide.INNER:
             # Neither side's unmatched row survives an inner join, whichever side
             # the row started on.
-            return frozenset(), frozenset({right}) | accumulated_left
+            return frozenset(), frozenset({right}) | accumulated_left, frozenset()
         case JoinSide.LEFT:
-            return frozenset({right}), frozenset({right})
+            return frozenset({right}), frozenset({right}), frozenset({right})
         case JoinSide.RIGHT:
-            return accumulated_left, accumulated_left
+            return accumulated_left, accumulated_left, accumulated_left
         case JoinSide.FULL:
-            return frozenset({right}) | accumulated_left, frozenset()
+            return frozenset({right}) | accumulated_left, frozenset(), frozenset()
         case JoinSide.CROSS:
-            return frozenset(), frozenset()
+            return frozenset(), frozenset(), frozenset()
         case JoinSide.SEMI:
             # A probe row (the accumulated left) with no match is dropped, the same
             # row-loss shape as an inner join's left side.
-            return frozenset(), accumulated_left
+            return frozenset(), accumulated_left, frozenset()
         case JoinSide.ANTI:
-            return frozenset(), frozenset()
+            return frozenset(), frozenset(), frozenset()
     assert_never(side)
 
 
@@ -545,10 +550,18 @@ def join_row_effects(sel: exp.Select) -> list[JoinRowEffect]:
     for j in joins_of(sel):
         right_name = name_of(j.this)
         side = join_side_of(j)
-        optional, dropped = _join_row_effect(
+        optional, dropped, outer_dropped = _join_row_effect(
             side, right=right_name, accumulated_left=frozenset(accumulated_left)
         )
-        out.append(JoinRowEffect(join=j, side=side, optional=optional, dropped_unmatched=dropped))
+        out.append(
+            JoinRowEffect(
+                join=j,
+                side=side,
+                optional=optional,
+                dropped_unmatched=dropped,
+                outer_dropped=outer_dropped,
+            )
+        )
         accumulated_left.add(right_name)
     return out
 
@@ -568,34 +581,6 @@ def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
     for effect in join_row_effects(sel):
         optional.update(effect.optional)
     return optional
-
-
-def joins_with_outer_dropped_aliases(
-    sel: exp.Select,
-) -> list[tuple[exp.Join, JoinSide, frozenset[str]]]:
-    """Each join in ``sel`` with its side and the aliases whose unmatched rows it drops.
-
-    A LEFT join drops its unmatched right rows; a RIGHT join its unmatched left rows (every
-    alias accumulated to its left). Every other side reports an empty set here, by design:
-    a FULL join drops nothing (both sides survive NULL-padded), and inner, cross, semi, and
-    anti joins now carry a non-empty ``dropped_unmatched`` on :class:`JoinRowEffect` (an
-    orphan-drop reader wants that), but ``detect_join_on_nullable_key`` gates on *this*
-    function to skip only the side an outer join intentionally drops; letting INNER's or
-    SEMI's dropped set through here would silence a nullable-key finding on every inner join.
-
-    This is a narrowing projection of :func:`join_row_effects`, not merely a filter on
-    ``side``: it reports ``dropped_unmatched`` unchanged for LEFT/RIGHT and the empty set
-    for every other side, discarding the row-loss fact those other sides now carry.
-    """
-    out: list[tuple[exp.Join, JoinSide, frozenset[str]]] = []
-    for effect in join_row_effects(sel):
-        dropped = (
-            effect.dropped_unmatched
-            if effect.side in (JoinSide.LEFT, JoinSide.RIGHT)
-            else frozenset[str]()
-        )
-        out.append((effect.join, effect.side, dropped))
-    return out
 
 
 def column_table(c: exp.Column) -> str | None:
@@ -860,7 +845,10 @@ def equality_column_pairs(predicate: Expr) -> tuple[tuple[exp.Column, exp.Column
 
 
 def conjunctive_leaves(predicate: Expr) -> list[Expr]:
-    """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
+    """Flatten an ``AND``-only conjunction into its leaves, looking through parentheses;
+    non-AND nodes are leaves."""
+    if isinstance(predicate, exp.Paren):
+        return conjunctive_leaves(predicate.this)
     if isinstance(predicate, exp.And):
         return [*conjunctive_leaves(predicate.this), *conjunctive_leaves(predicate.expression)]
     return [predicate]

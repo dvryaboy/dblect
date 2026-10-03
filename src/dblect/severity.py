@@ -112,10 +112,8 @@ def _structural_severity(kind: FindingKind) -> Severity:
 
 def _check_severity(kind: CheckFindingKind) -> Severity:
     """A declaration finding's default severity. error: the declared meaning and the
-    computed one disagree. warn: the analysis could not see enough to judge. A third
-    grade, also warn: the trigger is a data violation the SQL turns silent, so the
-    analysis has positive structural evidence of a hazard without evidence the
-    declared fact itself is wrong."""
+    computed one disagree. warn: the analysis could not see enough to judge, or found a
+    structural hazard without evidence the declared fact itself is wrong."""
     match kind:
         case (
             CheckFindingKind.CONTRACT_ISSUE
@@ -143,11 +141,7 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             | CheckFindingKind.CASE_LEAVES_ENUM_MEMBER_UNHANDLED
         ):
             return Severity.WARN
-        # The foreign key is trusted forward, never refuted by the join: the data may
-        # satisfy it everywhere the pipeline runs, in which case the inner join is
-        # simply correct code. What the join changes is the failure mode (loud test
-        # failure versus silent drop), not the key's truth, so this warns rather than
-        # errors.
+        # The join never refutes the key; it only turns a loud failure into a silent drop.
         case CheckFindingKind.REFERENTIAL_ORPHAN_DROP:
             return Severity.WARN
     assert_never(kind)

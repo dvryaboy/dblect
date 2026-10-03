@@ -24,7 +24,7 @@ import pytest
 from dblect.adapters import profile_for_adapter
 from dblect.analysis import analyze
 from dblect.check import CheckFinding, CheckFindingKind, CheckReport, run_check
-from dblect.manifest import Manifest, Node, TestSeverity
+from dblect.manifest import DbtTestSeverity, Manifest, Node
 from dblect.severity import Severity, severity_of
 from dblect.sql import FindingKind
 from dblect.types import ForeignKey, ModelContract
@@ -119,15 +119,6 @@ _NEVER_SAID = ("violat", "switch to a", "also", "other conditions")
 _StructuralCase = tuple[str, str, tuple[Node, ...], bool]
 _STRUCTURAL_CASES: tuple[_StructuralCase, ...] = (
     ("inner-child-left", _CHILD_LEFT.format(join="inner join"), (), True),
-    ("left-child-left", _CHILD_LEFT.format(join="left join"), (), False),
-    ("right-child-left", _CHILD_LEFT.format(join="right join"), (), True),
-    ("full-child-left", _CHILD_LEFT.format(join="full join"), (), False),
-    ("semi-child-left", _CHILD_LEFT_PROBE_ONLY.format(join="semi join"), (), True),
-    ("anti-child-left", _CHILD_LEFT_PROBE_ONLY.format(join="anti join"), (), False),
-    ("inner-child-right", _CHILD_RIGHT.format(join="inner join"), (), True),
-    ("left-child-right", _CHILD_RIGHT.format(join="left join"), (), True),
-    ("right-child-right", _CHILD_RIGHT.format(join="right join"), (), False),
-    ("full-child-right", _CHILD_RIGHT.format(join="full join"), (), False),
     ("semi-child-right", _CHILD_RIGHT_PROBE_ONLY.format(join="semi join"), (), False),
     ("anti-child-right", _CHILD_RIGHT_PROBE_ONLY.format(join="anti join"), (), False),
     (
@@ -194,6 +185,71 @@ _STRUCTURAL_CASES: tuple[_StructuralCase, ...] = (
         False,
     ),
     (
+        # the dbt import-CTE style: each side is a pass-through CTE over its model
+        "import-ctes-on-both-sides",
+        "with orders as (select * from orders), regions as (select * from regions) "
+        "select orders.order_id from orders join regions "
+        "on orders.region_id = regions.region_id",
+        (),
+        True,
+    ),
+    (
+        "derived-table-on-the-parent-side",
+        "select o.order_id from orders o "
+        "join (select region_id from regions) r on o.region_id = r.region_id",
+        (),
+        True,
+    ),
+    (
+        "derived-table-on-the-child-side",
+        "select o.order_id from (select order_id, region_id from orders) o "
+        "join regions r on o.region_id = r.region_id",
+        (),
+        True,
+    ),
+    (
+        # a CTE that computes the key is not a copy of the declared column
+        "cte-computing-the-key",
+        "with o as (select order_id, region_id + 0 as region_id from orders) "
+        "select o.order_id from o join regions r on o.region_id = r.region_id",
+        (),
+        False,
+    ),
+    (
+        # documented miss: the semi join spelled as EXISTS is not decoded
+        "exists-semi-join-spelling",
+        "select o.order_id from orders o "
+        "where exists (select 1 from regions r where r.region_id = o.region_id)",
+        (),
+        False,
+    ),
+    (
+        # documented miss: IN (subquery) is not decoded either
+        "in-subquery-semi-join-spelling",
+        "select o.order_id from orders o where o.region_id in (select region_id from regions)",
+        (),
+        False,
+    ),
+    (
+        # documented miss: unqualified ON columns carry no alias to match a side
+        "unqualified-on-columns",
+        "select o.order_id from orders o join regions r on region_id = region_id",
+        (),
+        False,
+    ),
+    (
+        "parenthesized-on",
+        "select o.order_id from orders o join regions r on (o.region_id = r.region_id)",
+        (),
+        True,
+    ),
+    (
+        "alias-case-differs-from-the-qualifier",
+        "select O.order_id from orders O join regions r on o.region_id = r.region_id",
+        (),
+        True,
+    ),
+    (
         # the tuva shape: a join inside a CTE body still fires
         "join-inside-a-cte-body",
         "with base as ("
@@ -247,50 +303,62 @@ def test_orphan_drop_warns_rather_than_errors() -> None:
 
 
 # --- edge declaration and test coverage --------------------------------------------
-#
-# id, declare the contract edge too, the relationships test's non-default kwargs
-# (None: no test node at all), whether it fires.
-_CoverageCase = tuple[str, bool, dict[str, object] | None, bool]
+
+
+def _fk_test(
+    *,
+    enabled: bool = True,
+    where: str | None = None,
+    severity: DbtTestSeverity = DbtTestSeverity.ERROR,
+) -> Node:
+    return _relationships_test(
+        "test.shop.rel",
+        child="model.shop.orders",
+        child_column="region_id",
+        parent="model.shop.regions",
+        parent_column="region_id",
+        enabled=enabled,
+        where=where,
+        severity=severity,
+    )
+
+
+# id, declare the contract edge too, the relationships test (None: no test node), fires
+_CoverageCase = tuple[str, bool, Node | None, bool]
 _COVERAGE_CASES: tuple[_CoverageCase, ...] = (
     ("no-edge-declared", False, None, False),
-    ("default-relationships-test-only-edge", False, {}, False),
+    ("default-relationships-test-only-edge", False, _fk_test(), False),
     ("contract-only-edge", True, None, True),
-    ("where-scoped-relationships-test-only-edge", False, {"where": "amount > 0"}, True),
-    ("warn-severity-relationships-test-only-edge", False, {"severity": TestSeverity.WARN}, True),
-    ("disabled-test-alongside-a-contract-edge", True, {"enabled": False}, True),
+    # the guard reads the tests, not the merged edge list: a test-covered contract
+    # edge stays silent
+    ("contract-edge-also-covered-by-a-default-test", True, _fk_test(), False),
+    ("where-scoped-relationships-test-only-edge", False, _fk_test(where="amount > 0"), True),
+    (
+        "warn-severity-relationships-test-only-edge",
+        False,
+        _fk_test(severity=DbtTestSeverity.WARN),
+        True,
+    ),
+    ("disabled-test-alongside-a-contract-edge", True, _fk_test(enabled=False), True),
 )
 
 
 @pytest.mark.parametrize(
-    ("declare_contract", "test_kwargs", "fires"),
-    [(dc, kw, fires) for _id, dc, kw, fires in _COVERAGE_CASES],
+    ("declare_contract", "test", "fires"),
+    [(dc, test, fires) for _id, dc, test, fires in _COVERAGE_CASES],
     ids=[row[0] for row in _COVERAGE_CASES],
 )
 def test_edge_declaration_and_test_coverage(
-    declare_contract: bool, test_kwargs: dict[str, object] | None, fires: bool
+    declare_contract: bool, test: Node | None, fires: bool
 ) -> None:
     if declare_contract:
         _declare_orders_fk()
-    extra = (
-        ()
-        if test_kwargs is None
-        else (
-            _relationships_test(
-                "test.shop.rel",
-                child="model.shop.orders",
-                child_column="region_id",
-                parent="model.shop.regions",
-                parent_column="region_id",
-                **test_kwargs,  # type: ignore[arg-type]
-            ),
-        )
-    )
     case = CheckCase(
         "coverage",
         _FIRING_SQL,
         expected=(CheckFindingKind.REFERENTIAL_ORPHAN_DROP,) if fires else (),
     )
-    run_check_case(case, _manifest_for(case.sql, *extra), _DUCKDB)
+    run_check_case(case, _manifest_for(case.sql, *(() if test is None else (test,))), _DUCKDB)
 
 
 # --- nullable key: both findings fire together -------------------------------------

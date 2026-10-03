@@ -156,17 +156,13 @@ class ConstraintSpec:
     expression: str | None = None
 
 
-class TestSeverity(StrEnum):
+class DbtTestSeverity(StrEnum):
     """A dbt test's configured failure severity.
 
     ``ERROR`` fails the run; ``WARN`` surfaces the failure without failing it.
     dbt's own default is ``error``, so a test with no explicit ``severity``
     config reads as ``ERROR`` here too.
     """
-
-    # Not a pytest test class; pytest's default collection otherwise tries (and
-    # fails) to collect any importable name starting with "Test".
-    __test__ = False
 
     ERROR = "error"
     WARN = "warn"
@@ -204,7 +200,7 @@ class DbtTestMetadata:
     namespace: str | None = None
     enabled: bool = True
     where: str | None = None
-    severity: TestSeverity = TestSeverity.ERROR
+    severity: DbtTestSeverity = DbtTestSeverity.ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,14 +796,14 @@ def _test_metadata_from_parsed(node: Any) -> DbtTestMetadata | None:
     )
 
 
-def _test_severity_of(raw: object) -> TestSeverity:
+def _test_severity_of(raw: object) -> DbtTestSeverity:
     """``raw`` (``node.config.severity``) read case-insensitively into a
-    :class:`TestSeverity`, defaulting to ``ERROR`` when absent or unrecognized
+    :class:`DbtTestSeverity`, defaulting to ``ERROR`` when absent or unrecognized
     (a templated value dbt left unrendered, or a manifest schema predating the
     field)."""
     if isinstance(raw, str):
         try:
-            return TestSeverity(raw.strip().lower())
+            return DbtTestSeverity(raw.strip().lower())
         except ValueError:
             pass
-    return TestSeverity.ERROR
+    return DbtTestSeverity.ERROR

@@ -43,7 +43,7 @@ from dblect.lineage.properties.domain_type import (
 from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.lineage.properties.value_domain import Bounded, ValueDomain
-from dblect.manifest import Manifest, Node, ResourceType, TestSeverity
+from dblect.manifest import DbtTestSeverity, Manifest, Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata, generic_test_target_uid
 from dblect.sql._sqlglot import stored_column_name
 from dblect.types.contract import (
@@ -104,26 +104,10 @@ class BoundTag:
 
 @dataclass(frozen=True, slots=True)
 class ForeignKeyEdge:
-    """A resolved foreign-key edge from a child column to a parent column.
-
-    ``provenance`` names the declaration that grounds the edge: a contract's
-    ``ForeignKey`` marker or ``references()`` method, or a dbt ``relationships``
-    test read as one. ``detail`` is a short label for it (a ``Contract.field``
-    path, or the test's own name), the same convention every other
-    :class:`~dblect.lineage.facts.model.Fact` detail follows.
-
-    ``condition`` carries a ``relationships`` test's ``where``, when the edge
-    comes from one scoped to a filter. The edge still stands (a conditional test
-    still declares the relationship), but a consumer deciding whether the edge
-    already has a loud failure mode must not treat a conditional test as covering
-    the unconditional case; see :func:`relationship_tested_edges`.
-    """
+    """A resolved foreign-key edge from a child column to a parent column."""
 
     child: ColumnRef
     parent: ColumnRef
-    provenance: Declared
-    detail: str | None = None
-    condition: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,8 +684,6 @@ def _lower_references(
         ForeignKeyEdge(
             child=ColumnRef(src, fact.child.name),
             parent=ColumnRef(parent_src, fact.parent.name),
-            provenance=Declared(DeclaredSource.USER_ASSERTED),
-            detail=f"{contract}.{method.name}",
         )
     )
 
@@ -774,8 +756,6 @@ def _resolve_foreign_key(
     return ForeignKeyEdge(
         child=ColumnRef(child_src, fname),
         parent=ColumnRef(parent_src, column),
-        provenance=Declared(DeclaredSource.USER_ASSERTED),
-        detail=f"{contract}.{fname}",
     )
 
 
@@ -784,11 +764,8 @@ def _resolve_foreign_key(
 
 @dataclass(frozen=True, slots=True)
 class _RelationshipTest:
-    """One enabled ``relationships`` test that resolved to an edge: the edge
-    itself plus the test metadata a caller grades to decide whether the edge's
-    failure mode is already loud. Read once so :func:`dbt_relationship_edges` and
-    :func:`relationship_tested_edges` never duplicate the child/parent resolution.
-    """
+    """An enabled ``relationships`` test and the edge it resolved to, read once for
+    both :func:`dbt_relationship_edges` and :func:`relationship_tested_edges`."""
 
     test_metadata: DbtTestMetadata
     edge: ForeignKeyEdge
@@ -815,9 +792,6 @@ def _relationship_tests(manifest: Manifest) -> list[_RelationshipTest]:
         edge = ForeignKeyEdge(
             child=ColumnRef(_source_of(manifest.nodes[child_uid]), child_col),
             parent=ColumnRef(_source_of(manifest.nodes[parent_uid]), parent_col),
-            provenance=Declared(DeclaredSource.DBT_GENERIC_TEST),
-            detail=node.name,
-            condition=tm.where,
         )
         out.append(_RelationshipTest(test_metadata=tm, edge=edge))
     return out
@@ -833,11 +807,8 @@ def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
     pinned that way is skipped rather than guessed.
 
     A ``where``-scoped test still contributes an edge here: a conditional test
-    still declares the relationship, and a join across it is still worth reading.
-    The condition rides on the edge (:attr:`ForeignKeyEdge.condition`) rather than
-    excluding the edge; whether a conditional test counts as *covering* the edge
-    for a guard's purposes is a separate, stricter question, answered by
-    :func:`relationship_tested_edges`.
+    still declares the relationship. Whether it counts as *covering* the edge is a
+    stricter question, answered by :func:`relationship_tested_edges`.
     """
     return tuple(rt.edge for rt in _relationship_tests(manifest))
 
@@ -853,16 +824,11 @@ def relationship_tested_edges(manifest: Manifest) -> frozenset[tuple[ColumnRef, 
     :func:`dbt_relationship_edges`), since the relationship is genuinely declared,
     but neither gives the edge a build-failing check over the whole child
     relation, so neither counts as coverage here.
-
-    Computed straight from the tests rather than from :func:`foreign_key_edges`'s
-    merged, de-duplicated list: that list keeps one edge per pair regardless of
-    provenance, so a pair stated by both a contract and a test would otherwise
-    lose the fact that it is also test-covered.
     """
     return frozenset(
         (rt.edge.child, rt.edge.parent)
         for rt in _relationship_tests(manifest)
-        if rt.test_metadata.where is None and rt.test_metadata.severity is TestSeverity.ERROR
+        if rt.test_metadata.where is None and rt.test_metadata.severity is DbtTestSeverity.ERROR
     )
 
 
@@ -897,17 +863,11 @@ def foreign_key_edges(
     manifest: Manifest, *, registry: ContractRegistry | None = None
 ) -> tuple[ForeignKeyEdge, ...]:
     """Every foreign-key edge the project declares: contract ``ForeignKey``
-    markers merged with dbt ``relationships`` tests, de-duplicated by
-    ``(child, parent)`` so an edge stated both ways appears once. Contract edges
-    are folded in first, so when both sources state the same pair the contract
-    edge's provenance and detail win: a contract author's own label is more
-    specific than a generic "read from this test" note. The merge point a future
-    fan-out finding or fixture generator reads from."""
+    markers merged with dbt ``relationships`` tests, de-duplicated so an edge
+    stated both ways appears once. The merge point a future fan-out finding or
+    fixture generator reads from."""
     contract_edges = resolve_contracts(manifest, registry=registry).foreign_keys
-    merged: dict[tuple[ColumnRef, ColumnRef], ForeignKeyEdge] = {}
-    for edge in (*contract_edges, *dbt_relationship_edges(manifest)):
-        merged.setdefault((edge.child, edge.parent), edge)
-    return tuple(merged.values())
+    return tuple(dict.fromkeys((*contract_edges, *dbt_relationship_edges(manifest))))
 
 
 # --- discoverers ----------------------------------------------------------------
