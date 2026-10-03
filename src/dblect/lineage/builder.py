@@ -51,6 +51,7 @@ from dblect.lineage.graph import (
 from dblect.lineage.property import attach_column_ref
 from dblect.manifest import Manifest, ResourceType, compilation_miss_reason, relation_lookup_keys
 from dblect.manifest import Node as ManifestNode
+from dblect.model_errors import error_reason
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
 
@@ -241,7 +242,7 @@ def build_manifest_graph(
             # sqlglot; not every failure subclasses SqlglotError (KeyError,
             # AttributeError, RecursionError). One bad model shouldn't
             # blank lineage for every downstream model.
-            issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
+            issues.append(BuildIssue(model_unique_id=uid, message=error_reason(e)))
             continue
         resolution.append(
             ModelResolution(

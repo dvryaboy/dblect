@@ -34,6 +34,7 @@ from dblect.lineage.facts.model import Fact
 from dblect.lineage.graph import ColumnLineageGraph, RelationLineageGraph, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet
 from dblect.manifest import Manifest, Node, compilation_miss_reason
+from dblect.model_errors import reason_or_reraise
 from dblect.nullability.detector import make_nullability_detectors
 from dblect.snapshot import make_snapshot_detectors
 from dblect.sql import (
@@ -283,8 +284,13 @@ def _scan_one(
     tree = parse_outcome
 
     raw_findings: list[Finding] = []
-    for detector in detectors:
-        raw_findings.extend(detector(tree))
+    try:
+        for detector in detectors:
+            raw_findings.extend(detector(tree))
+    except Exception as e:
+        # Isolated at the model boundary so a sqlglot edge case in one model is a coverage miss
+        # for it, not an empty report for the project.
+        return SkippedModel(unique_id=node.unique_id, reason=reason_or_reraise(e))
     directives = FramedDirectives.for_node(node)
     # Locate before suppressing: a `-- noqa` is matched against the line the report shows,
     # which can differ from the compiled line a macro expansion produced.
