@@ -607,7 +607,10 @@ def domain_type_display(tag: DomainTag) -> AxisDisplay:
     )
     if not pieces:
         return AxisDisplay(name="an untagged magnitude")
-    return AxisDisplay(name="a magnitude in " + ", ".join(pieces))
+    # Only a dimension makes the column a measure; a nominal-only tag also rides on
+    # identifiers, which are not magnitudes.
+    lead = "a magnitude in " if dim is not None else "a column tagged "
+    return AxisDisplay(name=lead + ", ".join(pieces))
 
 
 # --- join-key type compatibility (a signal, not a finding) -----------------------

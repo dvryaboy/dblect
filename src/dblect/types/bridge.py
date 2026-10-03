@@ -45,6 +45,7 @@ from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.lineage.properties.value_domain import Bounded, ValueDomain
 from dblect.manifest import Manifest, Node, ResourceType, TestSeverity
 from dblect.manifest.parse import DbtTestMetadata, generic_test_target_uid
+from dblect.sql._sqlglot import stored_column_name
 from dblect.types.contract import (
     Constraints,
     ContractRegistry,
@@ -94,7 +95,8 @@ class ContractIssue:
 
 @dataclass(frozen=True, slots=True)
 class BoundTag:
-    """A domain tag bound to the magnitude column it rides on."""
+    """A domain tag bound to the carrier column it rides on: a magnitude, or the one
+    value column of an identifier type."""
 
     column: ColumnRef
     tag: DomainTag
@@ -203,26 +205,23 @@ def _build_tag(
     """Derive the bound tag for one domain-typed column, or the findings that
     keep it from becoming a fact.
 
-    Returns ``(None, [])`` when the type carries no magnitude (nothing to tag,
-    and nothing wrong). Validation against a known column set runs only when one
+    The tag rides on the type's carrier column: its magnitude, or, for a type with
+    no magnitude (an identifier), its one physical field. A magnitude type whose
+    facets are all open and unmapped yields no tag and no finding (a plain
+    magnitude makes no claim). A carrier that is not a magnitude has nothing to
+    say without a tag, so a type that cannot produce one there is a finding rather
+    than a silent drop. Validation against a known column set runs only when one
     is supplied.
     """
     magnitudes = [f for f in spec.fields.values() if f.kind is FieldKind.MAGNITUDE]
-    if not magnitudes:
-        return None, []
     if len(magnitudes) > 1:
         return None, [
-            ContractIssue(
-                IssueCode.MALFORMED_DECLARATION,
-                contract="",
-                field=decl_name,
-                message=(
-                    f"declaration {decl_name!r} has {len(magnitudes)} magnitude fields; "
-                    "a domain type carries at most one"
-                ),
+            _malformed(
+                decl_name,
+                f"declaration {decl_name!r} has {len(magnitudes)} magnitude fields; "
+                "a domain type carries at most one",
             )
         ]
-    magnitude = magnitudes[0]
 
     out_of_domain = _out_of_domain_field(spec)
     if out_of_domain is not None:
@@ -236,8 +235,16 @@ def _build_tag(
             )
         ]
 
+    if magnitudes:
+        carrier = magnitudes[0]
+    else:
+        carrier_or_issue = _identifier_carrier(decl_name, spec)
+        if isinstance(carrier_or_issue, ContractIssue):
+            return None, [carrier_or_issue]
+        carrier = carrier_or_issue
+
     if known is not None:
-        missing = _missing_column(spec, known)
+        missing = _missing_column(spec, known, carrier)
         if missing is not None:
             fname, column, code = missing
             return None, [
@@ -251,19 +258,71 @@ def _build_tag(
 
     dimension: Dimension | None = None
     for fdef in spec.fields.values():
-        if fdef.kind is FieldKind.UNIT:
+        if fdef.kind is FieldKind.UNIT and fdef is not carrier:
             unit = _unit_coordinate(fdef, spec, src)
             term = Dimension.of(unit)
             dimension = term if dimension is None else dimension.multiply(term)
     nominal: dict[str, Nominal] = {
         fdef.name: _nominal_coordinate(fdef, spec, src)
         for fdef in spec.fields.values()
-        if fdef.kind is FieldKind.NOMINAL
+        if fdef.kind is FieldKind.NOMINAL and fdef is not carrier
     }
     tag = tagged(dimension=dimension, nominal=nominal)
     if tag == NAKED:
-        return None, []
-    return BoundTag(ColumnRef(src, _column_of(spec, magnitude.name)), tag), []
+        if magnitudes:
+            return None, []
+        return None, [
+            _malformed(
+                decl_name,
+                f"declaration {decl_name!r} binds column {_column_of(spec, carrier.name)!r} "
+                "but fixes no facet to tag it with; refine the type (for example "
+                "`.refine(entity=...)`) so the column carries a domain tag",
+            )
+        ]
+    return BoundTag(ColumnRef(src, _column_of(spec, carrier.name)), tag), []
+
+
+def _malformed(decl_name: str, message: str) -> ContractIssue:
+    return ContractIssue(
+        IssueCode.MALFORMED_DECLARATION, contract="", field=decl_name, message=message
+    )
+
+
+def _identifier_carrier(decl_name: str, spec: DomainSpec) -> FieldDef | ContractIssue:
+    """The column a magnitude-less type's tag rides on: its one physical field (open,
+    so it binds a warehouse column), which must be inert or nominal. Every other
+    field is a fixed facet the tag carries, the way a magnitude carries its
+    currency. Zero or several physical fields leave nothing to bind unambiguously,
+    and a unit field is a companion, never a value column."""
+    physical = [f for f in spec.fields.values() if f.name not in spec.fixed]
+    if not physical:
+        return _malformed(
+            decl_name,
+            f"declaration {decl_name!r} has no magnitude and every field is fixed, so no "
+            "column is left to carry its tag; leave one value field open",
+        )
+    if len(physical) > 1:
+        names = ", ".join(repr(f.name) for f in physical)
+        return _malformed(
+            decl_name,
+            f"declaration {decl_name!r} has no magnitude and several open fields ({names}), "
+            "so the column its tag rides on is ambiguous; fix all but one with `.refine(...)`",
+        )
+    (only,) = physical
+    match only.kind:
+        case FieldKind.INERT | FieldKind.NOMINAL:
+            return only
+        case FieldKind.UNIT:
+            return _malformed(
+                decl_name,
+                f"declaration {decl_name!r} has no magnitude, and its only open field "
+                f"{only.name!r} is a unit, a magnitude's companion that cannot carry a tag; "
+                "add a magnitude or an identifier value field",
+            )
+        case FieldKind.MAGNITUDE:
+            raise AssertionError("a magnitude field is handled before the identifier carrier")
+        case _:
+            assert_never(only.kind)
 
 
 def _out_of_domain_field(spec: DomainSpec) -> tuple[str, object] | None:
@@ -279,15 +338,18 @@ def _out_of_domain_field(spec: DomainSpec) -> tuple[str, object] | None:
     return None
 
 
-def _missing_column(spec: DomainSpec, known: frozenset[str]) -> tuple[str, str, IssueCode] | None:
+def _missing_column(
+    spec: DomainSpec, known: frozenset[str], carrier: FieldDef
+) -> tuple[str, str, IssueCode] | None:
     """The first physical field whose backing column is absent from ``known``.
 
-    A field is physical when it is neither fixed (logical) nor inert. An
+    A field is physical when it is not fixed (logical) and either is not inert or
+    is the ``carrier`` the tag rides on (an inert identifier column is real). An
     explicitly mapped column that is missing is an unknown column; an open field
     whose like-named column is missing is an unsourced field, the difference the
     finding names."""
     for fdef in spec.fields.values():
-        if fdef.kind is FieldKind.INERT or fdef.name in spec.fixed:
+        if (fdef.kind is FieldKind.INERT and fdef is not carrier) or fdef.name in spec.fixed:
             continue
         column = _column_of(spec, fdef.name)
         if column not in known:
@@ -314,7 +376,7 @@ def domain_tag(spec: DomainSpec, src: SourceRef) -> BoundTag | None:
     """The bound tag a well-formed domain spec contributes on ``src``, or ``None``.
 
     A thin public view of the binding rule: it returns the tag for a valid spec
-    and ``None`` for one that carries no magnitude or an out-of-domain fixing.
+    and ``None`` for one that yields none (no carrier column, or an out-of-domain fixing).
     The bridge uses the richer :func:`_build_tag` to also surface why."""
     bound, _ = _build_tag("", spec, src, None)
     return bound
@@ -329,11 +391,10 @@ def _bounded_from_enum(enum: type[StrEnum]) -> Bounded:
 
 
 def _scope(src: SourceRef, column: str) -> ColumnRef:
-    """The case-folded ``ColumnRef`` a declaration's column spelling grounds:
-    the lineage keys every column lowercase (``ColumnRef``'s own rule), so a
-    contract that spells the column as the warehouse does still meets its
+    """The ``ColumnRef`` a declaration's column spelling grounds, under the stored
+    (lowercase) name, so a contract spelled as the warehouse does still meets its
     propagated scope. Adopting this at the bridge's older sites is #291."""
-    return ColumnRef(src, column.lower())
+    return ColumnRef(src, stored_column_name(column))
 
 
 def _value_domain_facts_for_domain(
@@ -460,7 +521,7 @@ def _resolve_one(
                         )
                     )
                     # A constraint can only attach where we have a resolved column to
-                    # anchor it, and the bound magnitude column is the only ColumnRef
+                    # anchor it, and the bound carrier column is the only ColumnRef
                     # this bridge derives. Constraints on every other declaration form
                     # below (scalar, key) and on a domain type that produced no tag
                     # (the bound-is-None skip above) are dropped here: the

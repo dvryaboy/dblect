@@ -607,6 +607,12 @@ def column_name(c: exp.Column) -> str:
     return c.name
 
 
+def stored_column_name(name: str) -> str:
+    """The form the lineage keys a column under: lowercase, so a name spelled as the
+    warehouse does still meets its propagated scope."""
+    return name.lower()
+
+
 def column_key(c: exp.Column) -> tuple[str | None, str]:
     """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
 
