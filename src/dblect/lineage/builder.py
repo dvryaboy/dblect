@@ -33,8 +33,9 @@ from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.resolver import Resolver
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
-from sqlglot.schema import MappingSchema, Schema
+from sqlglot.schema import MappingSchema, Schema, ensure_schema
 
 from dblect.lineage.graph import (
     AggregationSite,
@@ -196,6 +197,9 @@ def build_manifest_graph(
     )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
+    # Models whose derived output hides columns behind an unexpanded star: their recorded column
+    # set is a lower bound, so an unqualified name must not be judged unknown against it.
+    open_models: set[SourceRef] = set()
     # Accumulate into one pair of dicts and freeze once, rather than `graph.merge(per_model)` per
     # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
     # last-wins on expressions the same final map; each output column is built by one model anyway.
@@ -221,6 +225,7 @@ def build_manifest_graph(
                 schema=mapping_schema,
                 dialect=dialect,
                 tree=parsed.get(uid) if parsed is not None else None,
+                open_models=open_models,
             )
             per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
             _record_output_columns(schema, model.relation_name, uid, per_model)
@@ -243,6 +248,8 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
+        if walker.unexpanded_stars:
+            open_models.add(SourceRef(kind=SourceKind.MODEL, unique_id=uid))
         resolution.append(
             ModelResolution(
                 unique_id=uid,
@@ -309,6 +316,7 @@ def _walk_model(
     schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
+    open_models: frozenset[SourceRef] | set[SourceRef] = frozenset(),
 ) -> _Walker:
     """Parse, qualify, and walk one model, returning the populated walker.
 
@@ -339,12 +347,82 @@ def _walk_model(
     root_scope = build_scope(expression)
     if root_scope is None:
         raise SqlglotError("Cannot build scope from SQL")
+    _reject_unknown_unqualified_columns(
+        root_scope,
+        schema=ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect),
+        name_to_source=name_to_source,
+        open_models=open_models,
+    )
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
     walker.walk(root_scope, scope_path=())
     if original is not None:
         walker.stamp_original(originals, root_scope)
     return walker
+
+
+# Source scopes whose output columns are the named projections of a query. Anything else (an
+# unnest, lateral, VALUES or table function) is a source whose column set is not read here.
+_PROJECTED_SOURCE_SCOPES = frozenset({ScopeType.CTE, ScopeType.DERIVED_TABLE})
+
+
+def _reject_unknown_unqualified_columns(
+    root: Scope,
+    *,
+    schema: Schema,
+    name_to_source: Mapping[str, SourceRef],
+    open_models: frozenset[SourceRef] | set[SourceRef],
+) -> None:
+    """Raise ``Unknown column`` for an unqualified name that no source in its scope can supply.
+
+    ``qualify`` attaches a qualifier to every unqualified column it can place and raises for a
+    qualified one the source lacks, but leaves a name no source claims bare. That is a definite
+    error exactly when every source in the scope has a known column set lacking the name; with
+    any source's columns unknown the name may belong to it, and the column stays blind. The error has the qualified case's shape so both
+    surface as the same unbuilt reason.
+    """
+    for scope in root.traverse():
+        if not isinstance(scope.expression, exp.Select):
+            continue
+        bare = [c for c in scope.columns if not c.table and c.name]
+        if not bare:
+            continue
+        known = _known_source_columns(scope, schema, name_to_source, open_models)
+        if known is None:
+            continue
+        for col in bare:
+            name = col.name.lower()
+            if name not in known:
+                raise SqlglotError(f"Unknown column: {col.name}")
+
+
+def _known_source_columns(
+    scope: Scope,
+    schema: Schema,
+    name_to_source: Mapping[str, SourceRef],
+    open_models: frozenset[SourceRef] | set[SourceRef],
+) -> frozenset[str] | None:
+    """Lower-cased union of the columns of every source in ``scope``, or ``None`` when any
+    source's column set is not fully known (no sources, an unknown or partially derived
+    relation, a ``*``, a pivot, a table function, lateral or unnest)."""
+    if not scope.sources:
+        return None
+    resolver = Resolver(scope, schema, infer_schema=False)
+    out: set[str] = set()
+    for alias, src in scope.sources.items():
+        if isinstance(src, exp.Table):
+            if (
+                src.args.get("pivots")
+                or name_to_source.get(sg.table_relation_key(src)) in open_models
+            ):
+                return None
+        elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
+            return None
+        columns = resolver.get_source_columns(alias)
+        if not columns or "*" in columns:
+            return None
+        out.update(c.lower() for c in columns)
+    return frozenset(out)
 
 
 # Meta key carrying the reference-id tag that lets the builder map a column on its
