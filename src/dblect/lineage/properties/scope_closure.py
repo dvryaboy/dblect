@@ -155,6 +155,16 @@ class DeclaredFD:
 Key = frozenset[str]
 
 
+def render_key(key: Key) -> str:
+    """A key as sorted, comma-separated columns, so finding text never depends on hash order."""
+    return ", ".join(sorted(key))
+
+
+def render_keys(keys: Collection[Key]) -> str:
+    """Keys as ``(a, b); (c)``, each key rendered by :func:`render_key` and the keys sorted."""
+    return "; ".join(f"({rendered})" for rendered in sorted(render_key(k) for k in keys))
+
+
 @dataclass(frozen=True, slots=True)
 class ConditionalKey:
     """A candidate key that holds only over rows matching ``predicate`` (a

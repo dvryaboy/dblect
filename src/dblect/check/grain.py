@@ -23,6 +23,7 @@ from dblect.check.located import file_of
 from dblect.lineage.facts.model import Annotation, Fact
 from dblect.lineage.graph import SourceRef
 from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, covers
+from dblect.lineage.properties.scope_closure import render_key
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
@@ -98,8 +99,8 @@ def _finding(
     declared: Key,
     witness: Key,
 ) -> CheckFinding:
-    declared_cols = ", ".join(sorted(declared))
-    witness_cols = ", ".join(sorted(witness))
+    declared_cols = render_key(declared)
+    witness_cols = render_key(witness)
     attribution = f" (declared by {fact.detail})" if fact.detail else ""
     single = next(iter(declared)) if len(declared) == 1 else None
     return CheckFinding(

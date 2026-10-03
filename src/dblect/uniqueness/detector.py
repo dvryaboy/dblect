@@ -54,7 +54,7 @@ from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
 )
-from dblect.lineage.properties.scope_closure import Input
+from dblect.lineage.properties.scope_closure import Input, render_keys
 from dblect.lineage.properties.uniqueness import (
     NO_KEYS,
     CandidateKeySet,
@@ -1098,7 +1098,7 @@ def _fanout_finding(step: _JoinStep) -> Finding:
     cols = ", ".join(sorted(step.joined_cols))
     reasons: list[str] = []
     if step.target_uncovered:
-        known = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in step.target_keys)
+        known = render_keys(step.target_keys)
         reasons.append(
             f"isn't covered by any known uniqueness key on {target_name} (known: {known})"
         )
