@@ -5,7 +5,8 @@ is a clean one-to-one join no test catches. The project already says which colum
 are keys and which reference which, and that is enough to tell the two apart:
 
 * A declared single-column key starts an entity when the key column is a base
-  relation's column or an unchanged copy of one. The entity is anchored at that base
+  relation's column or an unchanged copy of one, and the SQL does not already make it
+  unique (grouping on a date makes it unique without making it an identifier). The entity is anchored at that base
   column, so a staging model's key on ``id AS customer_id`` and the source's key on
   ``id`` are one entity. A computed key (an expression, a union, a dedup) says
   nothing about which entity it identifies, so it starts none.
@@ -26,11 +27,17 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import assert_never
 
-from dblect.lineage.facts.model import CompileValue, Declared, Fact, NativeConstraint, Provenance
+from dblect.lineage.facts.model import (
+    Annotation,
+    CompileValue,
+    Declared,
+    Fact,
+    NativeConstraint,
+    Provenance,
+)
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceRef, UnionConfluence
-from dblect.lineage.properties.uniqueness import CandidateKeySet
+from dblect.lineage.properties.uniqueness import CandidateKeySet, grain_preserved
 from dblect.lineage.property import copied_column, value_origin
-from dblect.lineage.union_find import UnionFind
 from dblect.sql._sqlglot import stored_column_name
 from dblect.types.bridge import ForeignKeyEdge
 
@@ -45,18 +52,23 @@ class KeyEntity:
 def entity_keys(
     graph: ColumnLineageGraph,
     declared: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+    inferred: Mapping[SourceRef, Annotation[CandidateKeySet]],
 ) -> frozenset[ColumnRef]:
     """The base columns whose declared single-column, unconditional keys start an
-    entity."""
+    entity, unless the SQL alone already makes the column unique (grouping on a date)."""
     out: set[ColumnRef] = set()
     for scope, facts in declared.items():
+        sql_keys = inferred.get(scope)
         for fact in facts:
             if fact.condition is not None or not _states_identity(fact.provenance):
                 continue
             for key in fact.value.keys:
                 if len(key) != 1:
                     continue
-                origin = value_origin(graph, ColumnRef(scope, stored_column_name(next(iter(key)))))
+                (column,) = (stored_column_name(c) for c in key)
+                if sql_keys is not None and grain_preserved(sql_keys.value, frozenset({column})):
+                    continue
+                origin = value_origin(graph, ColumnRef(scope, column))
                 if origin is not None:
                     out.add(origin)
     return frozenset(out)
@@ -79,7 +91,7 @@ def key_entities(
     foreign_keys: Iterable[ForeignKeyEdge],
 ) -> Callable[[ColumnRef], KeyEntity | None]:
     """The entity of each column, or ``None`` for a column no key reaches."""
-    classes = UnionFind[ColumnRef]()
+    classes = _UnionFind()
     for fk in foreign_keys:
         classes.union(fk.child, fk.parent)
     confluences: list[tuple[ColumnRef, tuple[ColumnRef, ...]]] = []
@@ -106,10 +118,28 @@ def key_entities(
 
 
 def _entities(
-    classes: UnionFind[ColumnRef], keys: frozenset[ColumnRef]
+    classes: _UnionFind, keys: frozenset[ColumnRef]
 ) -> Callable[[ColumnRef], KeyEntity | None]:
     by_root: dict[ColumnRef, set[ColumnRef]] = {}
     for key in keys:
         by_root.setdefault(classes.find(key), set()).add(key)
     entities = {root: KeyEntity(frozenset(members)) for root, members in by_root.items()}
     return lambda ref: entities.get(classes.find(ref))
+
+
+class _UnionFind:
+    def __init__(self) -> None:
+        self._parent: dict[ColumnRef, ColumnRef] = {}
+
+    def find(self, ref: ColumnRef) -> ColumnRef:
+        root = ref
+        while (up := self._parent.get(root, root)) != root:
+            root = up
+        while ref != root:
+            self._parent[ref], ref = root, self._parent.get(ref, root)
+        return root
+
+    def union(self, a: ColumnRef, b: ColumnRef) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb

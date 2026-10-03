@@ -1,22 +1,24 @@
 # pyright: reportInvalidTypeForm=false, reportUnusedClass=false
 """Joins that equate keys of two different entities, inferred with no declaration.
 
-A declared single-column key starts an entity where the SQL does not already make the
-column unique. The entity follows the column through renames, CTEs, and model
-boundaries, and a foreign key (a ``relationships`` test) puts the child column in the
-parent's entity. A join equating two columns in different entities is flagged; a side
-with no entity stays quiet.
+A declared single-column key starts an entity where the key is a base column or an
+unchanged copy of one and the SQL does not already make it unique. The entity follows
+copies, and a foreign key puts the child column in the parent's entity. A join
+equating two entities is flagged; a side with no entity stays quiet.
 
-The project below is a small jaffle shop: ``stg_customers`` and ``stg_orders`` rename
-source ids, ``stg_orders.customer_id`` is tested against ``stg_customers``, and each
-row varies only the model that joins them.
+The project is a small jaffle shop: ``stg_customers`` and ``stg_orders`` rename source
+ids and ``stg_orders.customer_id`` is tested against ``stg_customers``. Each row adds
+the models it needs and the join it checks.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
+import sqlglot
+import sqlglot.expressions as exp
 
 from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
@@ -27,79 +29,77 @@ from tests._manifest_builders import cols, manifest, node, relationships_test, u
 from tests._manifest_builders import unique_combination_test as unique_combination
 
 _DUCKDB = profile_for_adapter("duckdb")
-
 _ENTITY_MISMATCH = CheckFindingKind.JOIN_KEY_ENTITY_MISMATCH
+
+_SOURCES = {
+    "raw_customers": ("id", "name", "signed_up_at"),
+    "raw_orders": ("id", "customer_id", "store_id", "ordered_at"),
+    "customer_details": ("customer_id", "tier"),
+    "player": ("id",),
+    "player_attributes": ("id",),
+    "app_users": ("id",),
+}
+
+
+def _m(name: str, sql: str, key: str | None = None) -> tuple[Node, ...]:
+    """A model, with a ``unique`` test on ``key`` when given."""
+    uid = f"model.shop.{name}"
+    columns = cols(**dict.fromkeys(cast(exp.Query, sqlglot.parse_one(sql)).named_selects, "INT"))
+    return (node(uid, sql, columns=columns), *((unique_test(uid, key),) if key else ()))
+
+
+def _src(name: str, key: str | None = None) -> tuple[Node, ...]:
+    uid = f"source.shop.raw.{name}"
+    columns = cols(**dict.fromkeys(_SOURCES[name], "INT"))
+    return (
+        node(uid, kind=ResourceType.SOURCE, columns=columns),
+        *((unique_test(uid, key),) if key else ()),
+    )
+
 
 _STG_CUSTOMERS = "model.shop.stg_customers"
 _STG_ORDERS = "model.shop.stg_orders"
 _DETAILS = "source.shop.raw.customer_details"
-_PLAYER = "source.shop.raw.player"
-_ATTRIBUTES = "source.shop.raw.player_attributes"
-_DAILY_ORDERS = "model.shop.daily_orders"
-_DAILY_SIGNUPS = "model.shop.daily_signups"
-_JOINED = "model.shop.joined"
-_APP_USERS = "source.shop.raw.app_users"
-
-
-def _model(name: str, sql: str, **dtypes: str) -> Node:
-    return node(f"model.shop.{name}", sql, columns=cols(**dtypes))
 
 
 def _project(sql: str, *extra: Node) -> list[Node]:
     return [
-        node(
-            "source.shop.raw.raw_customers",
-            kind=ResourceType.SOURCE,
-            columns=cols(id="INT", name="VARCHAR", signed_up_at="DATE"),
+        *(n for name in _SOURCES for n in _src(name)),
+        *_m(
+            "stg_customers",
+            "SELECT id AS customer_id, signed_up_at FROM raw_customers",
+            "customer_id",
         ),
-        node(
-            "source.shop.raw.raw_orders",
-            kind=ResourceType.SOURCE,
-            columns=cols(id="INT", customer_id="INT", store_id="INT", ordered_at="DATE"),
-        ),
-        node(
-            _DETAILS,
-            kind=ResourceType.SOURCE,
-            columns=cols(customer_id="INT", tier="VARCHAR"),
-        ),
-        node(
-            _PLAYER,
-            kind=ResourceType.SOURCE,
-            columns=cols(id="INT", player_api_id="INT"),
-        ),
-        node(
-            _ATTRIBUTES,
-            kind=ResourceType.SOURCE,
-            columns=cols(id="INT", player_api_id="INT"),
-        ),
-        node(
-            _STG_CUSTOMERS,
-            "SELECT id AS customer_id, name, signed_up_at FROM raw_customers",
-            columns=cols(customer_id="INT", name="VARCHAR", signed_up_at="DATE"),
-        ),
-        node(
-            _STG_ORDERS,
+        *_m(
+            "stg_orders",
             "SELECT id AS order_id, customer_id, store_id, ordered_at FROM raw_orders",
-            columns=cols(order_id="INT", customer_id="INT", store_id="INT", ordered_at="DATE"),
+            "order_id",
         ),
-        node(
-            _DAILY_ORDERS,
-            "SELECT ordered_at, COUNT(*) AS n FROM stg_orders GROUP BY ordered_at",
-            columns=cols(ordered_at="DATE", n="INT"),
-        ),
-        node(
-            _DAILY_SIGNUPS,
-            "SELECT signed_up_at, COUNT(*) AS n FROM stg_customers GROUP BY signed_up_at",
-            columns=cols(signed_up_at="DATE", n="INT"),
-        ),
-        unique_test(_STG_CUSTOMERS, "customer_id"),
-        unique_test(_STG_ORDERS, "order_id"),
         relationships_test(_STG_ORDERS, "customer_id", _STG_CUSTOMERS, "customer_id"),
-        unique_test(_DAILY_ORDERS, "ordered_at"),
-        unique_test(_DAILY_SIGNUPS, "signed_up_at"),
-        node(_JOINED, sql, columns=cols(x="INT")),
+        *_m("daily_orders", "SELECT ordered_at FROM stg_orders GROUP BY ordered_at", "ordered_at"),
+        *_m(
+            "daily_signups",
+            "SELECT signed_up_at FROM stg_customers GROUP BY signed_up_at",
+            "signed_up_at",
+        ),
+        *_m("joined", sql),
         *extra,
     ]
+
+
+def _join(left: str, right: str, on: str) -> str:
+    return f"SELECT 1 AS x FROM {left} JOIN {right} ON {on}"
+
+
+_OC = ("stg_orders o", "stg_customers c")
+_OO = ("stg_orders o", "stg_orders o2")
+_DETAILS_JOIN = _join("stg_customers c", "customer_details d", "c.customer_id = d.customer_id")
+_IDS = "SELECT order_id AS id FROM stg_orders UNION ALL SELECT {} FROM stg_orders"
+_IDS_JOIN = (
+    f"WITH ids AS ({_IDS}) SELECT 1 AS x FROM ids JOIN stg_customers c ON ids.id = c.customer_id"
+)
+_STORE_JOIN = _join(*_OO, "o.store_id = o2.order_id")
+_ROLLUP = "SELECT {} AS d FROM stg_orders GROUP BY 1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,215 +110,141 @@ class _Case:
     extra: tuple[Node, ...] = ()
 
 
-_ORDERS_CUSTOMERS = "SELECT c.customer_id AS x FROM stg_orders AS o JOIN stg_customers AS c ON {}"
-_CUSTOMERS_DETAILS = (
-    "SELECT c.customer_id AS x FROM stg_customers AS c "
-    "JOIN customer_details AS d ON c.customer_id = d.customer_id"
-)
-
 _CASES = (
-    _Case("order id to customer id", _ORDERS_CUSTOMERS.format("o.order_id = c.customer_id"), True),
-    _Case(
-        "foreign key to its parent",
-        _ORDERS_CUSTOMERS.format("o.customer_id = c.customer_id"),
-        False,
-    ),
-    # The foreign key alone gives the non-unique child its parent's entity.
-    _Case(
-        "foreign key to a different entity",
-        "SELECT o.order_id AS x FROM stg_orders AS o "
-        "JOIN stg_orders AS o2 ON o.customer_id = o2.order_id",
-        True,
-    ),
+    _Case("order id to customer id", _join(*_OC, "o.order_id = c.customer_id"), True),
+    _Case("foreign key to its parent", _join(*_OC, "o.customer_id = c.customer_id"), False),
+    _Case("foreign key to another entity", _join(*_OO, "o.customer_id = o2.order_id"), True),
+    _Case("side with no entity", _join(*_OC, "o.store_id = c.customer_id"), False),
     _Case(
         "renamed through a CTE",
         "WITH oc AS (SELECT order_id AS oid FROM stg_orders) "
-        "SELECT c.customer_id AS x FROM oc JOIN stg_customers AS c ON oc.oid = c.customer_id",
+        "SELECT 1 AS x FROM oc JOIN stg_customers c ON oc.oid = c.customer_id",
         True,
     ),
     _Case(
         "source keys joined directly",
-        "SELECT p.id AS x FROM player_attributes AS pa JOIN player AS p ON pa.id = p.id",
+        _join("player_attributes a", "player p", "a.id = p.id"),
         True,
-        (unique_test(_PLAYER, "id"), unique_test(_ATTRIBUTES, "id")),
+        (*_src("player", "id"), *_src("player_attributes", "id")),
     ),
-    # A non-unique column with no foreign key has no entity, so it never conflicts.
-    _Case("side with no entity", _ORDERS_CUSTOMERS.format("o.store_id = c.customer_id"), False),
-    # Known false positive: a rollup grouped by a plain column is a copy of that column,
-    # so its key is anchored at the base column, like any other natural key.
     _Case(
-        "keys made unique by grouping a plain column",
-        "SELECT o.n AS x FROM daily_orders AS o "
-        "JOIN daily_signups AS s ON o.ordered_at = s.signed_up_at",
-        True,
+        "keys made unique by grouping",
+        _join("daily_orders o", "daily_signups s", "o.ordered_at = s.signed_up_at"),
+        False,
     ),
-    # A table sharing its parent's key is a correct 1:1 join, but without a
-    # relationships test nothing says so. The test clears it.
+    # A correct 1:1 join that nothing declares; the relationships test clears it.
     _Case(
         "shared key, no relationships test",
-        _CUSTOMERS_DETAILS,
+        _DETAILS_JOIN,
         True,
         (unique_test(_DETAILS, "customer_id"),),
     ),
     _Case(
         "shared key with a relationships test",
-        _CUSTOMERS_DETAILS,
+        _DETAILS_JOIN,
         False,
         (
             unique_test(_DETAILS, "customer_id"),
             relationships_test(_DETAILS, "customer_id", _STG_CUSTOMERS, "customer_id"),
         ),
     ),
-    # Only a single-column key that always holds identifies rows on its own.
     _Case(
-        "composite key starts no entity",
-        _CUSTOMERS_DETAILS,
+        "composite key",
+        _DETAILS_JOIN,
         False,
         (unique_combination(_DETAILS, "customer_id", "tier"),),
     ),
     _Case(
-        "conditional key starts no entity",
-        _CUSTOMERS_DETAILS,
+        "conditional key",
+        _DETAILS_JOIN,
         False,
         (unique_test(_DETAILS, "customer_id", where="tier = 'gold'"),),
     ),
-    _Case(
-        "union of one entity's keys",
-        "WITH ids AS (SELECT order_id AS id FROM stg_orders UNION ALL SELECT order_id FROM stg_orders) "
-        "SELECT c.customer_id AS x FROM ids JOIN stg_customers AS c ON ids.id = c.customer_id",
-        True,
-    ),
-    # The outer union can be reached before the inner one it reads.
+    _Case("union of one entity's keys", _IDS_JOIN.format("order_id"), True),
+    _Case("union of two entities' keys", _IDS_JOIN.format("customer_id"), False),
     _Case(
         "nested unions of one entity's keys",
-        "SELECT c.customer_id AS x FROM a_outer AS u JOIN stg_customers AS c ON u.id = c.customer_id",
+        _join("a_outer u", "stg_customers c", "u.id = c.customer_id"),
         True,
         (
-            _model(
-                "a_outer",
-                "SELECT id FROM z_inner UNION ALL SELECT order_id FROM stg_orders",
-                id="INT",
-            ),
-            _model(
-                "z_inner",
-                "SELECT order_id AS id FROM stg_orders UNION ALL SELECT order_id FROM stg_orders",
-                id="INT",
-            ),
-        ),
-    ),
-    # A union output with a foreign key gets the parent's entity; its entity-less arms do not.
-    _Case(
-        "foreign key on a union of entity-less columns",
-        "SELECT o.order_id AS x FROM stg_orders AS o "
-        "JOIN stg_orders AS o2 ON o.store_id = o2.order_id",
-        False,
-        (
-            _model(
-                "store_ids",
-                "SELECT store_id AS id FROM stg_orders UNION ALL SELECT store_id FROM stg_orders",
-                id="INT",
-            ),
-            relationships_test("model.shop.store_ids", "id", _STG_CUSTOMERS, "customer_id"),
+            *_m("a_outer", "SELECT id FROM z_inner UNION ALL SELECT order_id FROM stg_orders"),
+            *_m("z_inner", _IDS.format("order_id")),
         ),
     ),
     _Case(
-        "union of two entities' keys",
-        "WITH ids AS (SELECT order_id AS id FROM stg_orders UNION ALL SELECT customer_id FROM stg_orders) "
-        "SELECT c.customer_id AS x FROM ids JOIN stg_customers AS c ON ids.id = c.customer_id",
+        "computed key",
+        _join("stg_orders o", "cleaned c", "o.customer_id = c.customer_id"),
         False,
-    ),
-    # A computed key is not a copy of anything, so it makes no claim about which
-    # entity it identifies, even when it is declared unique.
-    _Case(
-        "key computed from another key",
-        "SELECT o.customer_id AS x FROM stg_orders AS o "
-        "JOIN cleaned_customers AS c ON o.customer_id = c.customer_id",
-        False,
-        (
-            _model(
-                "cleaned_customers",
-                "SELECT id + 0 AS customer_id FROM raw_customers",
-                customer_id="INT",
-            ),
-            unique_test("model.shop.cleaned_customers", "customer_id"),
-        ),
+        _m("cleaned", "SELECT id + 0 AS customer_id FROM raw_customers", "customer_id"),
     ),
     _Case(
         "coalesced key",
-        "SELECT o.customer_id AS x FROM stg_orders AS o "
-        "JOIN spine AS s ON o.customer_id = s.customer_id",
+        _join("stg_orders o", "spine s", "o.customer_id = s.customer_id"),
         False,
-        (
-            _model(
-                "spine",
-                "SELECT COALESCE(c.id, o.customer_id) AS customer_id "
-                "FROM raw_customers AS c FULL JOIN raw_orders AS o ON c.id = o.customer_id",
-                customer_id="INT",
-            ),
-            unique_test("model.shop.spine", "customer_id"),
+        _m(
+            "spine",
+            "SELECT COALESCE(c.id, o.customer_id) AS customer_id "
+            "FROM raw_customers c FULL JOIN raw_orders o ON c.id = o.customer_id",
+            "customer_id",
         ),
     ),
     _Case(
-        "union of sources, declared unique",
-        "SELECT c.name AS x FROM all_users AS u JOIN raw_customers AS c ON u.id = c.id",
+        "union of sources declared unique",
+        _join("all_users u", "raw_customers c", "u.id = c.id"),
         False,
         (
-            node(_APP_USERS, kind=ResourceType.SOURCE, columns=cols(id="INT")),
-            _model(
-                "all_users",
-                "SELECT id FROM raw_customers UNION ALL SELECT id FROM app_users",
-                id="INT",
+            *_m(
+                "all_users", "SELECT id FROM raw_customers UNION ALL SELECT id FROM app_users", "id"
             ),
-            unique_test("model.shop.all_users", "id"),
-            unique_test("source.shop.raw.raw_customers", "id"),
-            unique_test(_APP_USERS, "id"),
+            *_src("raw_customers", "id"),
+            *_src("app_users", "id"),
         ),
     ),
     _Case(
-        "rollups grouped by a cast and by a truncation",
-        "SELECT o.n AS x FROM daily_cast AS o JOIN daily_trunc AS s ON o.d = s.d",
+        "rollups grouped by a cast and a truncation",
+        _join("daily_cast a", "daily_trunc b", "a.d = b.d"),
         False,
         (
-            _model(
-                "daily_cast",
-                "SELECT CAST(ordered_at AS DATE) AS d, COUNT(*) AS n FROM stg_orders GROUP BY 1",
-                d="DATE",
-                n="INT",
-            ),
-            unique_test("model.shop.daily_cast", "d"),
-            _model(
-                "daily_trunc",
-                "SELECT DATE_TRUNC('day', ordered_at) AS d, COUNT(*) AS n FROM stg_orders GROUP BY 1",
-                d="DATE",
-                n="INT",
-            ),
-            unique_test("model.shop.daily_trunc", "d"),
+            *_m("daily_cast", _ROLLUP.format("CAST(ordered_at AS DATE)"), "d"),
+            *_m("daily_trunc", _ROLLUP.format("DATE_TRUNC('day', ordered_at)"), "d"),
         ),
     ),
-    # Deduplicating a model on its key leaves the key in the same entity.
+    # A foreign key that holds only over some rows must not merge the entities.
     _Case(
-        "key through a ROW_NUMBER dedup",
-        "SELECT o.order_id AS x FROM stg_orders AS o JOIN latest AS l ON o.order_id = l.order_id",
+        "conditional foreign key",
+        _STORE_JOIN,
         False,
         (
-            _model(
-                "latest",
-                "SELECT order_id FROM (SELECT order_id, ROW_NUMBER() OVER "
-                "(PARTITION BY order_id ORDER BY ordered_at) AS rn FROM stg_orders) WHERE rn = 1",
-                order_id="INT",
+            relationships_test(
+                _STG_ORDERS, "store_id", _STG_CUSTOMERS, "customer_id", where="store_id < 10"
             ),
-            unique_test("model.shop.latest", "order_id"),
+        ),
+    ),
+    # The union output takes the parent's entity; its entity-less arms do not.
+    _Case(
+        "foreign key on a union of entity-less columns",
+        _STORE_JOIN,
+        False,
+        (
+            *_m(
+                "store_ids",
+                "SELECT store_id AS id FROM stg_orders UNION ALL SELECT store_id FROM stg_orders",
+            ),
+            relationships_test("model.shop.store_ids", "id", _STG_CUSTOMERS, "customer_id"),
         ),
     ),
 )
 
 
+def _entity_findings(sql: str, *extra: Node) -> list[str]:
+    report = run_check(manifest(*_project(sql, *extra)), _DUCKDB)
+    assert report.unbuilt == ()
+    return [f.message for f in report.findings if f.kind is _ENTITY_MISMATCH]
+
+
 @pytest.mark.parametrize("case", _CASES, ids=lambda c: c.id)
 def test_join_across_inferred_entities(case: _Case) -> None:
-    report = run_check(manifest(*_project(case.sql, *case.extra)), _DUCKDB)
-    assert report.unbuilt == ()
-    found = [f for f in report.findings if f.kind is _ENTITY_MISMATCH]
-    assert bool(found) is case.flagged, [f.message for f in report.findings]
+    assert bool(_entity_findings(case.sql, *case.extra)) is case.flagged
 
 
 def test_a_contract_foreign_key_gives_the_child_its_parents_entity() -> None:
@@ -326,20 +252,13 @@ def test_a_contract_foreign_key_gives_the_child_its_parents_entity() -> None:
         dbt_model = "stg_orders"
         store_id: ForeignKey("stg_customers.customer_id")
 
-    sql = (
-        "SELECT o.order_id AS x FROM stg_orders AS o "
-        "JOIN stg_orders AS o2 ON o.store_id = o2.order_id"
-    )
-    report = run_check(manifest(*_project(sql)), _DUCKDB)
-    assert [f for f in report.findings if f.kind is _ENTITY_MISMATCH]
+    assert _entity_findings(_STORE_JOIN)
 
 
 def test_the_finding_names_both_keys_and_the_fix() -> None:
-    report = run_check(
-        manifest(*_project(_ORDERS_CUSTOMERS.format("o.order_id = c.customer_id"))), _DUCKDB
-    )
+    report = run_check(manifest(*_project(_join(*_OC, "o.order_id = c.customer_id"))), _DUCKDB)
     [finding] = [f for f in report.findings if f.kind is _ENTITY_MISMATCH]
-    assert finding.model_unique_id == _JOINED
+    assert finding.model_unique_id == "model.shop.joined"
     assert severity_of(finding) is Severity.WARN
     for fragment in (
         "o.order_id = c.customer_id",
@@ -370,10 +289,7 @@ def test_declared_entities_decide_over_inferred_ones() -> None:
         dbt_model = "customer_details"
         customer_id: _EntityId.refine(entity=_Entity.CUSTOMER).columns(id="customer_id")
 
-    report = run_check(
-        manifest(*_project(_CUSTOMERS_DETAILS, unique_test(_DETAILS, "customer_id"))), _DUCKDB
-    )
-    assert not [f for f in report.findings if f.kind is _ENTITY_MISMATCH]
+    assert not _entity_findings(_DETAILS_JOIN, unique_test(_DETAILS, "customer_id"))
 
 
 def test_a_declared_conflict_is_reported_once() -> None:
@@ -385,9 +301,7 @@ def test_a_declared_conflict_is_reported_once() -> None:
         dbt_model = "stg_orders"
         order_id: _EntityId.refine(entity=_Entity.ORDER).columns(id="order_id")
 
-    report = run_check(
-        manifest(*_project(_ORDERS_CUSTOMERS.format("o.order_id = c.customer_id"))), _DUCKDB
-    )
+    report = run_check(manifest(*_project(_join(*_OC, "o.order_id = c.customer_id"))), _DUCKDB)
     kinds = [f.kind for f in report.findings]
     assert kinds.count(CheckFindingKind.JOIN_KEY_TYPE_MISMATCH) == 1
     assert _ENTITY_MISMATCH not in kinds

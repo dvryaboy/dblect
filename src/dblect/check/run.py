@@ -391,7 +391,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     )
     entity_of = key_entities(
         graphs.column_build.graph,
-        entity_keys(graphs.column_build.graph, graphs.uniqueness_facts),
+        entity_keys(graphs.column_build.graph, graphs.uniqueness_facts, world.uniqueness_inferred),
         graphs.foreign_keys,
     )
     findings.extend(
@@ -716,10 +716,8 @@ def _join_key_rows(
     that is never projected, so a key that appears only in the ON clause is still typed.
     A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps).
 
-    An equality without a declared type on both sides falls to the inferred entities
-    instead: two key columns in different entities are equated with nothing linking
-    them. Where both sides are declared, the declaration decides, so a user can clear
-    an inferred mismatch (an untested 1:1 table) by declaring both sides one entity."""
+    Without a declared entity on both sides, two key columns in different inferred
+    entities are flagged too; declaring both sides clears an inferred mismatch."""
     tag_ann_of = annotation_or_grounded(annotations, ground)
 
     def tag_of(col: exp.Column) -> DomainTag | None:
@@ -763,34 +761,24 @@ def _join_key_rows(
 
 
 def _declares_entity(tag: DomainTag) -> bool:
-    """Whether the tag binds a nominal facet (an entity or category): only then does a
-    declaration speak to what the key identifies. A bare dimension or a conflict does not."""
+    """Only a nominal facet says what a key identifies; a bare dimension or conflict does not."""
     return isinstance(tag, Tagged) and bool(tag.nominal)
 
 
 def _entity_mismatch_message(
-    manifest: Manifest,
-    left: exp.Column,
-    right: exp.Column,
-    left_entity: KeyEntity,
-    right_entity: KeyEntity,
+    manifest: Manifest, left: exp.Column, right: exp.Column, *entities: KeyEntity
 ) -> str:
+    def label(entity: KeyEntity) -> str:
+        names = (
+            f"{manifest.nodes[k.source.unique_id].relation_name}.{k.column}" for k in entity.keys
+        )
+        return " / ".join(sorted(names))
+
     return (
         f"join key {_qualified(left)} = {_qualified(right)} equates "
-        f"{_entity_label(manifest, left_entity)} with {_entity_label(manifest, right_entity)}, "
-        "two keys no relationships test or foreign key links; if they identify the same "
-        "thing, add a relationships test between them, otherwise the join condition is wrong"
-    )
-
-
-def _entity_label(manifest: Manifest, entity: KeyEntity) -> str:
-    """The declared keys that start ``entity`` as ``relation.column``, so the reader
-    sees which table's rows each side of the join identifies."""
-    return " / ".join(
-        sorted(
-            f"{manifest.nodes[key.source.unique_id].relation_name}.{key.column}"
-            for key in entity.keys
-        )
+        f"{label(entities[0])} with {label(entities[1])}, two keys no relationships test or "
+        "foreign key links; if they identify the same thing, add a relationships test "
+        "between them, otherwise the join condition is wrong"
     )
 
 
