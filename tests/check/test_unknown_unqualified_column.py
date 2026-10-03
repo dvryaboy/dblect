@@ -80,7 +80,6 @@ def test_a_name_no_complete_source_has_is_reported_with_the_qualified_reason(sql
     [
         "select ID from raw.p",
         "select id as k from raw.p where k > 1",
-        "select * from raw.p cross join lateral (select v as z) l where z > 1",
         "select id from raw.p qualify row_number() over (order by v) = 1",
     ],
 )
@@ -181,6 +180,8 @@ def test_a_model_with_an_unexpanded_star_is_incomplete() -> None:
         "select (select max(k) from raw.q where k = v) as m from raw.p",
         # A lambda parameter is not a column.
         "select list_transform(v, e -> e + 1) as x from raw.p",
+        # A lateral source supplies `z`.
+        "select * from raw.p cross join lateral (select v as z) l where z > 1",
         # A VALUES source's columns are not read here.
         "select nosuch from raw.p, (values (1)) as t(a)",
         # No source at all.
