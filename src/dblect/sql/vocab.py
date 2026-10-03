@@ -231,6 +231,9 @@ SURROGATE_HASH_FUNCTIONS: tuple[type[Expr], ...] = tuple(
 SURROGATE_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
     getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
 )
+# Wrappers that keep a column's value a function of that one column alone.
+VALUE_PRESERVING_WRAPPERS: tuple[type[Expr], ...] = (exp.Alias, exp.Paren, exp.Cast, exp.TryCast)
+
 # Structural combinators that assemble columns into the hashed value without making
 # the input anything other than those columns.
 SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
@@ -238,3 +241,47 @@ SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
     for n in ("Concat", "DPipe", "Cast", "TryCast", "Coalesce", "Lower", "Upper", "Trim", "Paren")
     if hasattr(exp, n)
 )
+
+# Set-returning functions: in a projection each emits several rows per input row.
+_ROW_MULTIPLYING_CLASSES: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n)
+    for n in ("Unnest", "Explode", "Posexplode", "Inline", "GenerateSeries", "Stack")
+    if hasattr(exp, n)
+)
+# The rest parse as ``exp.Anonymous``, so they are matched by lowercase name.
+_ROW_MULTIPLYING_NAMES: frozenset[str] = frozenset(
+    {
+        # postgres
+        "generate_subscripts",
+        "json_array_elements",
+        "json_array_elements_text",
+        "json_each",
+        "json_each_text",
+        "json_object_keys",
+        "jsonb_array_elements",
+        "jsonb_array_elements_text",
+        "jsonb_each",
+        "jsonb_each_text",
+        "jsonb_object_keys",
+        "jsonb_path_query",
+        "regexp_matches",
+        "regexp_split_to_table",
+        "string_to_table",
+        # spark
+        "explode_outer",
+        "inline_outer",
+        "posexplode_outer",
+        "stack",
+        # snowflake
+        "flatten",
+        "split_to_table",
+        "strtok_split_to_table",
+    }
+)
+
+
+def is_row_multiplying(node: Expr) -> bool:
+    """Whether ``node`` is a set-returning function call."""
+    if isinstance(node, _ROW_MULTIPLYING_CLASSES):
+        return True
+    return isinstance(node, exp.Anonymous) and node.name.lower() in _ROW_MULTIPLYING_NAMES

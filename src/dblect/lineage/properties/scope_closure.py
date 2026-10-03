@@ -37,6 +37,7 @@ from dblect.lineage.graph import SourceRef
 from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
+from dblect.sql.vocab import is_row_multiplying
 
 # --- attributes ------------------------------------------------------------
 
@@ -390,10 +391,6 @@ def _predicate_is_exact(e: Expr) -> bool:
     return _leaf_is_exact(e)
 
 
-# Set-returning functions: in a projection each emits several rows per input row.
-_ROW_MULTIPLYING = (exp.Unnest, exp.Explode, exp.Posexplode, exp.Inline, exp.GenerateSeries)
-
-
 def _projection_multiplies_rows(sel: exp.Select) -> bool:
     """Whether a projected expression is a set-returning function of this scope, which
     repeats the input row once per element and so breaks every key. One inside a scalar
@@ -401,7 +398,8 @@ def _projection_multiplies_rows(sel: exp.Select) -> bool:
     return any(
         node.find_ancestor(exp.Select) is sel
         for proj in sel.expressions
-        for node in proj.find_all(*_ROW_MULTIPLYING)
+        for node in proj.walk()
+        if is_row_multiplying(node)
     )
 
 

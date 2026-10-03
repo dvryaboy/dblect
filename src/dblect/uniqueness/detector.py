@@ -63,8 +63,7 @@ from dblect.lineage.properties.uniqueness import (
     relation_scope_facts,
     uniqueness_property,
 )
-from dblect.lineage.properties.where_provenance import value_origin
-from dblect.lineage.property import propagate
+from dblect.lineage.property import propagate, value_origin
 from dblect.manifest import Manifest, Materialization
 from dblect.sql import (
     AggregateBehavior,
