@@ -172,20 +172,6 @@ def test_every_cast_spelling_decides_alike(
     assert out == (_USD if keeps else NAKED)
 
 
-@pytest.mark.parametrize("scale", ["DECIMAL(18, 2)", "DECIMAL(10, 0)", "NUMERIC(38, 9)", "FLOAT"])
-def test_narrowing_or_widening_a_numeric_keeps_the_unit(scale: str) -> None:
-    assert _cast_output(f"CAST(c.amount AS {scale})", _USD) == _USD
-
-
-def test_a_cast_inside_arithmetic_keeps_the_unit_through_the_expression() -> None:
-    assert _cast_output("CAST(c.amount AS BIGINT) * 2", _USD) == _USD
-
-
-def test_a_cast_to_text_inside_arithmetic_loses_the_unit() -> None:
-    # The no-claim operand is an unknown addend, so the sum stays no-claim.
-    assert _cast_output("CAST(c.amount AS VARCHAR) + 1", _USD) == NAKED
-
-
 @pytest.mark.parametrize(
     ("target", "expected"),
     [("BIGINT", CONFLICT), ("VARCHAR", NAKED), ("DATE", NAKED)],

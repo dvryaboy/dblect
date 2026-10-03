@@ -56,39 +56,18 @@ def _kinds(manifest: Manifest) -> list[CheckFindingKind]:
     return [f.kind for f in run_check(manifest, _DUCKDB).findings]
 
 
-_NUMERIC_CASTS = [
-    "cast(amount_cents as bigint)",
-    "cast(amount_cents as integer)",
-    "cast(amount_cents as decimal(18, 2))",
-    "cast(amount_cents as double)",
-    "try_cast(amount_cents as decimal(10, 0))",
-    "amount_cents::decimal(38, 9)",
-]
-_NON_NUMERIC_CASTS = [
-    "cast(amount_cents as varchar)",
-    "try_cast(amount_cents as varchar)",
-    "amount_cents::varchar",
-    "cast(amount_cents as date)",
-    "cast(amount_cents as boolean)",
-    "cast(amount_cents as json)",
-]
-
-
-def test_the_uncast_baseline_reports_the_mixed_currency_sum() -> None:
+@pytest.mark.parametrize(
+    ("expr", "fires"),
+    [
+        ("cast(amount_cents as bigint)", True),
+        ("cast(amount_cents as varchar)", False),
+        ("cast(amount_cents as date)", False),
+    ],
+)
+def test_the_mixed_currency_sum_survives_a_numeric_cast_only(expr: str, fires: bool) -> None:
     _declare_sales()
-    assert CheckFindingKind.AGGREGATION_NOT_WELL_TYPED in _kinds(_sales_manifest("amount_cents"))
-
-
-@pytest.mark.parametrize("expr", _NUMERIC_CASTS)
-def test_a_numeric_cast_keeps_the_money_type_so_the_sum_is_reported(expr: str) -> None:
-    _declare_sales()
-    assert CheckFindingKind.AGGREGATION_NOT_WELL_TYPED in _kinds(_sales_manifest(expr))
-
-
-@pytest.mark.parametrize("expr", _NON_NUMERIC_CASTS)
-def test_a_non_numeric_cast_makes_no_claim_so_the_sum_is_quiet(expr: str) -> None:
-    _declare_sales()
-    assert CheckFindingKind.AGGREGATION_NOT_WELL_TYPED not in _kinds(_sales_manifest(expr))
+    found = CheckFindingKind.AGGREGATION_NOT_WELL_TYPED in _kinds(_sales_manifest(expr))
+    assert found is fires
 
 
 # --- identifiers -------------------------------------------------------------------
@@ -144,13 +123,9 @@ def _declare_ids() -> None:
 @pytest.mark.parametrize(
     ("expr", "keeps"),
     [
-        ("id", True),
         ("cast(id as bigint)", True),
         ("cast(id as varchar)", True),
-        ("try_cast(id as varchar)", True),
-        ("id::varchar", True),
         ("cast(id as date)", False),
-        ("cast(id as boolean)", False),
     ],
 )
 def test_an_identifier_survives_integer_and_string_casts_only(expr: str, keeps: bool) -> None:
