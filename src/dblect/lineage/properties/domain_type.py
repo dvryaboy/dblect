@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum, auto
 from functools import reduce
 from typing import Final, assert_never, final
 
@@ -477,6 +478,80 @@ def _outer_join_null_rule(
     return _annotate(widened, kids)
 
 
+# --- cast ----------------------------------------------------------------------
+
+
+@final
+class CastTarget(Enum):
+    """What a cast's target type can still hold of a tagged value. Closed over every
+    ``DataType.Type``: a target is a number, a string, or neither."""
+
+    NUMERIC = auto()
+    TEXT = auto()
+    OTHER = auto()
+
+
+# sqlglot's groups are the base; they miss a few spellings (``BPCHAR``, MySQL's sized
+# text, ``SERIAL``) and count ``BIT`` as numeric although it holds a flag, not a magnitude.
+_DType = exp.DType
+_NUMERIC_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    (
+        exp.DataType.NUMERIC_TYPES
+        | {_DType.BIGNUM, _DType.SERIAL, _DType.SMALLSERIAL, _DType.BIGSERIAL}
+    )
+    - {_DType.BIT}
+)
+_TEXT_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    exp.DataType.TEXT_TYPES
+    | {_DType.BPCHAR, _DType.TINYTEXT, _DType.MEDIUMTEXT, _DType.LONGTEXT, _DType.FIXEDSTRING}
+)
+
+
+def cast_target(to: object) -> CastTarget:
+    """Classify a cast's target type. Anything that is not a plain ``DataType`` (a
+    missing target, a user-defined name) is ``OTHER``, the no-claim side."""
+    if not isinstance(to, exp.DataType) or not isinstance(to.this, exp.DType):
+        return CastTarget.OTHER
+    if to.this in _NUMERIC_TARGETS:
+        return CastTarget.NUMERIC
+    if to.this in _TEXT_TARGETS:
+        return CastTarget.TEXT
+    return CastTarget.OTHER
+
+
+def _cast_rule(
+    expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
+) -> Annotation[DomainTag]:
+    """``CAST``, ``TRY_CAST``, ``SAFE_CAST`` and ``::`` all parse to ``Cast`` or its
+    subclass ``TryCast``, so one rule covers them.
+
+    A cast changes storage, not meaning. To a numeric target the tag survives whole: the
+    unit, the per-row companions and the nominal bindings do not depend on the storage
+    type (``cast(cents as decimal(18, 2))`` is still cents of that currency). To text, only
+    a tag with no dimensional claim survives: an identifier (nominal only) is still that
+    entity's id as a string, while a magnitude is no longer a number and a string cannot
+    be summed. Any other target (date, boolean, json) holds neither. A ``CONFLICT``
+    already reported at its source does not ride into a non-numeric value.
+
+    The operand is the first child; the target ``DataType`` and any ``FORMAT`` literal
+    come after it and carry no tag."""
+    if not kids:
+        return Annotation(NAKED, Opacity.IMPLICIT)
+    operand = kids[0].value
+    match cast_target(expr.args.get("to")):
+        case CastTarget.NUMERIC:
+            kept = operand
+        case CastTarget.TEXT:
+            kept = operand if isinstance(operand, Tagged) and operand.dimension is None else NAKED
+        case CastTarget.OTHER:
+            kept = NAKED
+        case _ as unreachable:
+            assert_never(unreachable)
+    if kept == NAKED:
+        return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
+    return _annotate(kept, kids[:1])
+
+
 # A comparison such as ``a = b`` yields a boolean, which carries no magnitude tag
 # regardless of the operands' tags; whether those tags actually agree is checked
 # separately, where a declared tag meets an inferred one. ``top_rule`` is the
@@ -488,6 +563,7 @@ _comparison_rule = top_rule(DOMAIN_TYPE_LATTICE)
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
     exp.Dot: _dot_rule,
+    exp.Cast: _cast_rule,
     exp.Add: _additive_rule,
     exp.Sub: _additive_rule,
     exp.Mul: _multiplicative_rule(_multiply_tags),
