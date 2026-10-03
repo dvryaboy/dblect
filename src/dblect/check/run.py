@@ -20,7 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
 import sqlglot.expressions as exp
@@ -85,7 +85,6 @@ from dblect.lineage.properties.value_domain import (
 )
 from dblect.lineage.property import resolved_column_ref, run
 from dblect.manifest import Manifest
-from dblect.model_errors import coverage_miss_reason
 from dblect.sql import AggregateBehavior, aggregate_behavior
 from dblect.sql import _sqlglot as sg
 from dblect.sql.parse import parse_manifest_models
@@ -309,8 +308,7 @@ def run_check(
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(graphs.resolved))
     findings.extend(_value_domain_conflict_findings(graphs))
-    scan_misses: list[UnbuiltModel] = []
-    findings.extend(world_findings(graphs, world, scan_misses))
+    findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
     active, suppressed = suppress_check_findings(findings, manifest)
@@ -318,9 +316,7 @@ def run_check(
     return CheckReport(
         findings=active,
         load_issues=(),
-        unbuilt=_unbuilt(
-            graphs.relation_build.issues, graphs.column_build.issues, scan_misses=scan_misses
-        ),
+        unbuilt=_unbuilt(graphs.relation_build.issues, graphs.column_build.issues),
         suppressed=suppressed,
         contracts_resolved=graphs.contracts_resolved,
         models_propagated=len(manifest.models),
@@ -364,17 +360,11 @@ def suppress_check_findings(
     return tuple(active), tuple(suppressed)
 
 
-def world_findings(
-    graphs: CheckGraphs,
-    world: WorldAnnotations,
-    misses: list[UnbuiltModel],
-) -> list[CheckFinding]:
+def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
     """The findings that vary by world: the domain-type contradictions and the
     not-well-typed aggregations, read off one world's annotations. The
     contract-resolution and resolution-floor findings are world-invariant and stay
-    ``run_check``'s to report once. Models whose join-key scan failed are appended to
-    ``misses``, which every caller must place in its report: tags differ per world, so a
-    failure can be specific to one world."""
+    ``run_check``'s to report once."""
     findings: list[CheckFinding] = []
     # One source-map per model, shared across both finding kinds: a model that produces
     # both a contradiction and an aggregation finding builds its line map once.
@@ -399,7 +389,6 @@ def world_findings(
             world.domain_type,
             graphs.join_key_ground,
             line_maps,
-            misses,
         )
     )
     findings.extend(
@@ -415,9 +404,7 @@ def world_findings(
     return findings
 
 
-def _unbuilt(
-    *issue_groups: tuple[BuildIssue, ...], scan_misses: Sequence[UnbuiltModel] = ()
-) -> tuple[UnbuiltModel, ...]:
+def _unbuilt(*issue_groups: tuple[BuildIssue, ...]) -> tuple[UnbuiltModel, ...]:
     """The models no graph could analyze, one entry per model. A model can fail in
     both the relation and column builds; the first reason seen wins, and the column
     build (the domain-type path) is passed first so its reason is preferred."""
@@ -425,8 +412,6 @@ def _unbuilt(
     for group in issue_groups:
         for issue in group:
             reasons.setdefault(issue.model_unique_id, issue.message)
-    for miss in scan_misses:
-        reasons.setdefault(miss.unique_id, miss.reason)
     return tuple(UnbuiltModel(uid, reason) for uid, reason in sorted(reasons.items()))
 
 
@@ -705,7 +690,6 @@ def _join_key_rows(
     parsed: Mapping[str, Expr],
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
-    misses: list[UnbuiltModel],
 ) -> Iterator[LocatedRow]:
     """One row per ON-clause equality whose two columns carry conflicting domain
     types: equating a ``MoneyUSD`` key against a ``MoneyEUR`` one, or two incompatible
@@ -715,9 +699,7 @@ def _join_key_rows(
     derivation alone does not carry the join. A column's tag is its propagated value
     where the lineage reached it, falling back to its declared grounding for a join key
     that is never projected, so a key that appears only in the ON clause is still typed.
-    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps).
-
-    A model whose scan raises contributes none of its rows and is appended to ``misses``."""
+    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps)."""
     tag_ann_of = annotation_or_grounded(annotations, ground)
 
     def tag_of(col: exp.Column) -> DomainTag | None:
@@ -725,26 +707,18 @@ def _join_key_rows(
         return None if ref is None else tag_ann_of(ref).value
 
     for uid, tree in parsed.items():
-        model_rows: list[LocatedRow] = []
-        try:
-            for join in tree.find_all(exp.Join):
-                on = join.args.get("on")
-                if not isinstance(on, Expr):
-                    continue
-                for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
-                    model_rows.append(
-                        LocatedRow(
-                            uid=uid,
-                            nodes=(left, right, on),
-                            kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
-                            message=_join_key_message(left, right, left_tag, right_tag),
-                            column=left.name or None,
-                        )
-                    )
-        except Exception as e:
-            misses.append(UnbuiltModel(uid, coverage_miss_reason(e)))
-            continue
-        yield from model_rows
+        for join in tree.find_all(exp.Join):
+            on = join.args.get("on")
+            if not isinstance(on, Expr):
+                continue
+            for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
+                yield LocatedRow(
+                    uid=uid,
+                    nodes=(left, right, on),
+                    kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                    message=_join_key_message(left, right, left_tag, right_tag),
+                    column=left.name or None,
+                )
 
 
 def _join_key_findings(
@@ -753,11 +727,10 @@ def _join_key_findings(
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
     line_maps: dict[str, LineMap],
-    misses: list[UnbuiltModel],
 ) -> list[CheckFinding]:
     return locate_findings(
         manifest,
-        _join_key_rows(parsed, annotations, ground, misses),
+        _join_key_rows(parsed, annotations, ground),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
     )

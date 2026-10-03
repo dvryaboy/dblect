@@ -1,10 +1,8 @@
-"""How a failure inside one model's analysis is handled.
+"""How a failure inside one model's analysis is reported.
 
-A run over a whole project should not lose every model to one model's exotic SQL, so
-production skips the failing model and reports it as a coverage miss. The same absorption
-would hide dblect's own bugs from the test suite (a "no finding" assertion passes when the
-detector crashed), so the suite runs under ``RAISE`` and only the isolation tests opt into
-``SKIP``.
+Production absorbs it as a coverage miss so one model's exotic SQL cannot blank a whole
+run. The test suite re-raises instead, so a detector crash cannot hide behind a "no
+finding" assertion; the isolation tests opt back into absorbing.
 """
 
 from __future__ import annotations
@@ -12,34 +10,26 @@ from __future__ import annotations
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from enum import Enum, auto
+
+_reraise: ContextVar[bool] = ContextVar("reraise_model_errors", default=False)
 
 
-class ModelErrorPolicy(Enum):
-    SKIP = auto()
-    RAISE = auto()
-
-
-_policy: ContextVar[ModelErrorPolicy] = ContextVar(
-    "model_error_policy", default=ModelErrorPolicy.SKIP
-)
+def error_reason(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
 
 
 @contextmanager
-def model_error_policy(policy: ModelErrorPolicy) -> Generator[None, None, None]:
-    """Run the enclosed analysis under ``policy``, restoring the previous one after."""
-    token = _policy.set(policy)
+def reraising_model_errors(reraise: bool) -> Generator[None, None, None]:
+    token = _reraise.set(reraise)
     try:
         yield
     finally:
-        _policy.reset(token)
+        _reraise.reset(token)
 
 
-def coverage_miss_reason(error: Exception) -> str:
-    """The reason to report for a model whose analysis raised ``error``, or re-raise it
-    under ``RAISE``. Called from an ``except Exception`` block, so ``KeyboardInterrupt`` and
-    ``SystemExit`` are never absorbed. The type and message stay in the reason so a
-    genuine dblect bug is visible in the report."""
-    if _policy.get() is ModelErrorPolicy.RAISE:
+def reason_or_reraise(error: Exception) -> str:
+    """The coverage-miss reason for ``error``, or ``error`` itself raised when the suite
+    asked for that. Call from an ``except Exception`` block."""
+    if _reraise.get():
         raise error
-    return f"analysis error: {type(error).__name__}: {error}"
+    return f"analysis error: {error_reason(error)}"

@@ -18,7 +18,7 @@ from dblect.audit import LocatedFinding, run_audit
 from dblect.check.findings import CheckFinding
 from dblect.check.run import run_check
 from dblect.manifest import Manifest, Node
-from dblect.model_errors import ModelErrorPolicy, model_error_policy
+from dblect.model_errors import reraising_model_errors
 from dblect.sql import Finding, FindingKind
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -91,22 +91,21 @@ _UNRENDERABLE_WHERE = (
 )
 
 
-def test_one_models_analysis_crash_is_a_coverage_miss_not_a_failed_run() -> None:
-    crashing = _model_node("model.pkg.crash", _UNRENDERABLE_WHERE)
+def test_unrenderable_predicate_does_not_abort_the_run() -> None:
+    unrenderable = _model_node("model.pkg.unrenderable", _UNRENDERABLE_WHERE)
     innocent = _model_node(
         "model.pkg.innocent", "select row_number() over (order by 1) as rn from raw_player"
     )
-    report = analyze(_manifest(crashing, innocent), _DUCKDB)
+    report = analyze(_manifest(unrenderable, innocent), _DUCKDB)
 
+    assert report.audit.models_scanned == 2
+    assert not report.audit.skipped
     assert any(
         f.model_unique_id == "model.pkg.innocent"
         and isinstance(f, LocatedFinding)
         and f.finding.kind is FindingKind.UNORDERED_RANKING_WINDOW
         for f in report.findings
     )
-    analyzed_reasons = {s.unique_id: s.reason for s in report.audit.skipped}
-    assert "model.pkg.innocent" not in analyzed_reasons
-    assert "model.pkg.innocent" not in {u.unique_id for u in report.check.unbuilt}
 
 
 def test_detector_crash_names_the_model_and_the_exception() -> None:
@@ -117,7 +116,7 @@ def test_detector_crash_names_the_model_and_the_exception() -> None:
 
     bad = _model_node("model.pkg.bad", "select 'poison' as x")
     fine = _model_node("model.pkg.fine", "select 'ok' as x")
-    with model_error_policy(ModelErrorPolicy.SKIP):
+    with reraising_model_errors(False):
         report = run_audit(_manifest(bad, fine), _DUCKDB, detectors=(poisoned,))
     [skip] = report.skipped
     assert skip.unique_id == "model.pkg.bad"
