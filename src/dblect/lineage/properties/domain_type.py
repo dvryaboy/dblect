@@ -36,7 +36,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from enum import Enum, auto
 from functools import reduce
 from typing import Final, assert_never, final
 
@@ -61,6 +60,7 @@ from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OUTER_JOIN_NULL_META
 from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
+from dblect.sql.vocab import CastTarget, cast_target
 
 # --- unit and tag identities -------------------------------------------------
 
@@ -481,44 +481,6 @@ def _outer_join_null_rule(
 # --- cast ----------------------------------------------------------------------
 
 
-@final
-class CastTarget(Enum):
-    """What a cast's target type can still hold of a tagged value. Closed over every
-    ``DataType.Type``: a target is a number, a string, or neither."""
-
-    NUMERIC = auto()
-    TEXT = auto()
-    OTHER = auto()
-
-
-# sqlglot's groups are the base; they miss a few spellings (``BPCHAR``, MySQL's sized
-# text, ``SERIAL``) and count ``BIT`` as numeric although it holds a flag, not a magnitude.
-_DType = exp.DType
-_NUMERIC_TARGETS: Final[frozenset[exp.DType]] = frozenset(
-    (
-        exp.DataType.NUMERIC_TYPES
-        | {_DType.BIGNUM, _DType.SERIAL, _DType.SMALLSERIAL, _DType.BIGSERIAL}
-    )
-    - {_DType.BIT}
-)
-_TEXT_TARGETS: Final[frozenset[exp.DType]] = frozenset(
-    exp.DataType.TEXT_TYPES
-    | {_DType.BPCHAR, _DType.TINYTEXT, _DType.MEDIUMTEXT, _DType.LONGTEXT, _DType.FIXEDSTRING}
-)
-
-
-def cast_target(to: object) -> CastTarget:
-    """Classify a cast's target type. Anything that is not a plain ``DataType`` (a
-    missing target, a user-defined name) is ``OTHER``, the no-claim side."""
-    if not isinstance(to, exp.DataType) or not isinstance(to.this, exp.DType):
-        return CastTarget.OTHER
-    if to.this in _NUMERIC_TARGETS:
-        return CastTarget.NUMERIC
-    if to.this in _TEXT_TARGETS:
-        return CastTarget.TEXT
-    return CastTarget.OTHER
-
-
 def _cast_rule(
     expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
@@ -536,7 +498,7 @@ def _cast_rule(
     The operand is the first child; the target ``DataType`` and any ``FORMAT`` literal
     come after it and carry no tag."""
     if not kids:
-        return Annotation(NAKED, Opacity.IMPLICIT)
+        return _no_claim_rule(expr, kids, _ctx)
     operand = kids[0].value
     match cast_target(expr.args.get("to")):
         case CastTarget.NUMERIC:
@@ -548,17 +510,14 @@ def _cast_rule(
         case _ as unreachable:
             assert_never(unreachable)
     if kept == NAKED:
-        return Annotation(NAKED, Opacity.IMPLICIT, provisional=any(k.provisional for k in kids))
+        return _no_claim_rule(expr, kids, _ctx)
     return _annotate(kept, kids[:1])
 
 
-# A comparison such as ``a = b`` yields a boolean, which carries no magnitude tag
-# regardless of the operands' tags; whether those tags actually agree is checked
-# separately, where a declared tag meets an inferred one. ``top_rule`` is the
-# kit's catch-all (no-claim top, IMPLICIT, provisional carried through), reused
-# here rather than a hand-written rule since that is exactly what a comparison's
-# own tag-free result is.
-_comparison_rule = top_rule(DOMAIN_TYPE_LATTICE)
+# The kit's catch-all (no-claim top, IMPLICIT, provisional carried through): a comparison
+# yields a boolean with no magnitude tag, and a cast to a non-value type likewise. Whether
+# a comparison's tags agree is checked separately, where a declared tag meets an inferred one.
+_no_claim_rule = top_rule(DOMAIN_TYPE_LATTICE)
 
 DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Literal: _literal_rule,
@@ -568,12 +527,12 @@ DOMAIN_TYPE_OPERATORS: Mapping[type[Expr], OperatorTransfer[DomainTag]] = {
     exp.Sub: _additive_rule,
     exp.Mul: _multiplicative_rule(_multiply_tags),
     exp.Div: _multiplicative_rule(_divide_tags),
-    exp.EQ: _comparison_rule,
-    exp.NEQ: _comparison_rule,
-    exp.LT: _comparison_rule,
-    exp.LTE: _comparison_rule,
-    exp.GT: _comparison_rule,
-    exp.GTE: _comparison_rule,
+    exp.EQ: _no_claim_rule,
+    exp.NEQ: _no_claim_rule,
+    exp.LT: _no_claim_rule,
+    exp.LTE: _no_claim_rule,
+    exp.GT: _no_claim_rule,
+    exp.GTE: _no_claim_rule,
 }
 
 

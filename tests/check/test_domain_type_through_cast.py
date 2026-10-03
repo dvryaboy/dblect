@@ -6,7 +6,7 @@
 Staging models routinely cast every column. A money column typed at the source must still
 be money after ``cast(amount_cents as bigint)``, so the mart's sum over a per-row currency
 is still reported; cast to text it is no longer a magnitude, so the finding goes quiet.
-An entity id keeps its identity through int and string casts and loses it into a date.
+The per-type decisions are pinned in ``tests/lineage/test_domain_type_cast.py``.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from dblect.adapters import profile_for_adapter
 from dblect.check import CheckFindingKind, run_check
 from dblect.demo import Money
 from dblect.manifest import Manifest, ResourceType
-from dblect.types import DomainType, Integer, ModelContract, NominalEnum
+from dblect.types import ModelContract
 from tests._manifest_builders import cols as _cols
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -61,74 +61,9 @@ def _kinds(manifest: Manifest) -> list[CheckFindingKind]:
     [
         ("cast(amount_cents as bigint)", True),
         ("cast(amount_cents as varchar)", False),
-        ("cast(amount_cents as date)", False),
     ],
 )
 def test_the_mixed_currency_sum_survives_a_numeric_cast_only(expr: str, fires: bool) -> None:
     _declare_sales()
     found = CheckFindingKind.AGGREGATION_NOT_WELL_TYPED in _kinds(_sales_manifest(expr))
     assert found is fires
-
-
-# --- identifiers -------------------------------------------------------------------
-
-
-class _Entity(NominalEnum):
-    PLAYER = "player"
-    TEAM = "team"
-
-
-class _IntId(DomainType):
-    id: Integer
-    entity: _Entity
-
-
-def _id_join_manifest(stg_expr: str) -> Manifest:
-    return _manifest(
-        _node(
-            "source.shop.raw.player",
-            kind=ResourceType.SOURCE,
-            sql=None,
-            columns=_cols(id="INT"),
-        ),
-        _node(
-            "source.shop.raw.team",
-            kind=ResourceType.SOURCE,
-            sql=None,
-            columns=_cols(id="INT"),
-        ),
-        _node(
-            "model.shop.stg_player",
-            sql=f"SELECT {stg_expr} AS id FROM player",
-            columns=_cols(id="INT"),
-        ),
-        _node(
-            "model.shop.joined",
-            sql="SELECT p.id AS pid FROM stg_player AS p JOIN team AS t ON p.id = t.id",
-            columns=_cols(pid="INT"),
-        ),
-    )
-
-
-def _declare_ids() -> None:
-    class Player(ModelContract):
-        dbt_model = "player"
-        id: _IntId.refine(entity=_Entity.PLAYER)
-
-    class Team(ModelContract):
-        dbt_model = "team"
-        id: _IntId.refine(entity=_Entity.TEAM)
-
-
-@pytest.mark.parametrize(
-    ("expr", "keeps"),
-    [
-        ("cast(id as bigint)", True),
-        ("cast(id as varchar)", True),
-        ("cast(id as date)", False),
-    ],
-)
-def test_an_identifier_survives_integer_and_string_casts_only(expr: str, keeps: bool) -> None:
-    _declare_ids()
-    flagged = CheckFindingKind.JOIN_KEY_TYPE_MISMATCH in _kinds(_id_join_manifest(expr))
-    assert flagged is keeps

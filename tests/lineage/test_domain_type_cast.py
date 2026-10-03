@@ -6,8 +6,7 @@ non-numeric type (text, date, json) no longer holds a magnitude, so it makes no 
 An identifier tag (nominal only, no dimension) is the one case that also survives a
 cast to text, because an entity's id is still that entity's id as a string.
 
-The decision is made over the closed space of ``DataType.Type`` (one test per value
-through the classifier) and over the tag shapes (one row per shape and target class,
+The decision is made over the closed classifier and over the tag shapes (one row per shape and target class,
 through propagation). Casts spelled ``CAST``, ``TRY_CAST``, ``::`` and BigQuery's
 ``SAFE_CAST`` parse to the same two node types and must agree.
 """
@@ -50,35 +49,27 @@ _MONEY_WITH_NOMINAL = tagged(
 
 # --- the closed space of cast targets ---------------------------------------------
 
-_NUMERIC = frozenset(
-    {
-        _DType.TINYINT, _DType.SMALLINT, _DType.INT, _DType.BIGINT, _DType.MEDIUMINT,
-        _DType.INT128, _DType.INT256, _DType.UTINYINT, _DType.USMALLINT, _DType.UINT,
-        _DType.UBIGINT, _DType.UMEDIUMINT, _DType.UINT128, _DType.UINT256, _DType.BIGNUM,
-        _DType.SERIAL, _DType.SMALLSERIAL, _DType.BIGSERIAL,
-        _DType.FLOAT, _DType.DOUBLE, _DType.UDOUBLE, _DType.DECFLOAT,
-        _DType.DECIMAL, _DType.DECIMAL32, _DType.DECIMAL64, _DType.DECIMAL128,
-        _DType.DECIMAL256, _DType.UDECIMAL, _DType.BIGDECIMAL,
-        _DType.MONEY, _DType.SMALLMONEY,
-    }
-)  # fmt: skip
-_TEXT = frozenset(
-    {
-        _DType.TEXT, _DType.CHAR, _DType.VARCHAR, _DType.NAME, _DType.NVARCHAR, _DType.NCHAR,
-        _DType.BPCHAR, _DType.TINYTEXT, _DType.MEDIUMTEXT, _DType.LONGTEXT, _DType.FIXEDSTRING,
-    }
-)  # fmt: skip
+# Departures from sqlglot's groups are named; the rest are plain representatives. The
+# match in the transfer rule makes the classification total over ``DataType.Type``.
+_CLASSIFIED = {
+    CastTarget.NUMERIC: [
+        _DType.INT,
+        _DType.DECIMAL,
+        _DType.SERIAL,
+        _DType.BIGSERIAL,
+        _DType.BIGNUM,
+    ],
+    CastTarget.TEXT: [_DType.VARCHAR, _DType.BPCHAR, _DType.LONGTEXT, _DType.FIXEDSTRING],
+    CastTarget.OTHER: [_DType.BIT, _DType.DATE, _DType.BOOLEAN, _DType.JSON],
+}
 
 
-@pytest.mark.parametrize("dtype", list(_DType), ids=[t.name for t in _DType])
-def test_every_cast_target_is_classified(dtype: exp.DType) -> None:
-    expected = (
-        CastTarget.NUMERIC
-        if dtype in _NUMERIC
-        else CastTarget.TEXT
-        if dtype in _TEXT
-        else CastTarget.OTHER
-    )
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [(t, target) for target, types in _CLASSIFIED.items() for t in types],
+    ids=lambda v: v.name,
+)
+def test_cast_target_classification(dtype: exp.DType, expected: CastTarget) -> None:
     assert cast_target(exp.DataType(this=dtype)) is expected
 
 
@@ -158,6 +149,8 @@ def test_cast_transfer_by_tag_shape_and_target_class(shape: str, target: CastTar
     [
         ("duckdb", "CAST(c.amount AS {t})", "BIGINT", "VARCHAR"),
         ("duckdb", "TRY_CAST(c.amount AS {t})", "BIGINT", "VARCHAR"),
+        ("duckdb", "CAST(c.amount AS {t})", "DECIMAL(10, 0)", "VARCHAR"),
+        ("duckdb", "CAST(c.amount AS {t}) * 2", "BIGINT", "VARCHAR"),
         ("duckdb", "c.amount::{t}", "BIGINT", "VARCHAR"),
         ("postgres", "c.amount::{t}", "NUMERIC", "TEXT"),
         ("bigquery", "SAFE_CAST(c.amount AS {t})", "INT64", "STRING"),
