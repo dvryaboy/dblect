@@ -21,7 +21,7 @@ general idea.
 
 ## What is in scope
 
-Two kinds of meaning propagate today:
+Three kinds of meaning propagate today:
 
 - **A magnitude carrying a unit.** A summable quantity plus the tag saying what it is
   measured in, so values in different units stop being interchangeable. Money in a
@@ -30,19 +30,29 @@ Two kinds of meaning propagate today:
   tag), with **refinements** fixing a meaning-bearing parameter (single currency, net
   vs gross, tax inclusive). This catches a unit changing upstream
   (`domain_type_contradiction`) and a mixed-unit sum (`aggregation_not_well_typed`).
+- **An identifier naming its entity.** A key column tagged with what it identifies,
+  so a join that equates an order id with a customer id stops looking like a clean
+  one-to-one join. Expressed as a `DomainType` with no magnitude: one open value
+  field (the id) plus a `NominalEnum` entity facet, refined per entity. This catches
+  a join across entities (`join_key_type_mismatch`).
 - **A structural invariant over columns.** A functional dependency (an
   `ad -> adset -> campaign` hierarchy, or every payment on an order sharing the
   order's currency) or the grain, which keep a rollup well typed. Expressed as
   `determines` and `grain` facts, **not** as types.
 
 Closed categories (`status`, `channel`, `platform`, `country`) usually need no
-declaration: an `accepted_values` test already guards the set for free, and a
-standalone category does not yet propagate on its own. A category earns a type only
-when it rides on a magnitude as its unit, as `currency` does on `Money`.
+declaration: an `accepted_values` test already grounds and propagates a value
+domain for free, so a stray or mistyped literal downstream (`WHERE status =
+'shipd'`) is caught without you writing anything. A bare `NominalEnum`/`UnitEnum`
+column declaration grounds the same fact directly, for a category with no dbt
+test to read. A category earns a full `DomainType` only when it rides on a
+magnitude as its unit, as `currency` does on `Money`.
 
-Restraint is part of the job. Type a column only when one of those two kinds
-genuinely lives in it. A bare identifier, a key already read from a dbt test, a
-free-text or one-off numeric column: leave them as their SQL type. Skip a
+Restraint is part of the job. Type a column only when one of those kinds
+genuinely lives in it. Give an identifier an entity type when it is a join key and
+the project has several ids of different entities that could be confused; leave an
+id that is never joined, a free-text column, or a one-off numeric column as its SQL
+type. Uniqueness needs no type: a key is already read from its dbt test. Skip a
 **data-dependent unit** too, where the parameter fixing a magnitude's meaning lives
 in the data rather than in code or a companion column: a "season wins" figure whose
 basis is 80 games some seasons and 82 others has no column to bind to, and pinning it
@@ -208,6 +218,33 @@ class Orders(ModelContract):
 Bare type only when the column is named after the facet; otherwise
 `.columns(amount="real_column")`.
 
+**An identifier is a type with no magnitude.** Its one open field is the column, and
+the facets you pin with `refine` become the column's tag. The binding rule is the
+same: `id` binds to a column named `id` unless `.columns(id=...)` says otherwise.
+Pin the entity on every use. A type left with no pinned facet, or with more than one
+open field, is a `contract_issue (malformed_declaration)`.
+
+```python
+from dblect import ModelContract
+from dblect.types import DomainType, Integer, NominalEnum
+
+class Entity(NominalEnum):
+    CUSTOMER = "customer"
+    ORDER = "order"
+
+class EntityId(DomainType):
+    id: Integer
+    entity: Entity
+
+CustomerId = EntityId.refine(entity=Entity.CUSTOMER)
+OrderId = EntityId.refine(entity=Entity.ORDER)
+
+class StgOrders(ModelContract):
+    dbt_model = "stg_orders"
+    order_id: OrderId.columns(id="order_id")
+    customer_id: CustomerId.columns(id="customer_id")  # a foreign key keeps its parent's entity
+```
+
 **Add a fact when a rollup needs it.** A `@contract` method returning a fact
 discharges an obligation the analyzer cannot see on its own. The vocabulary is small
 and structural: `determines` (a functional dependency), `key`, `references`, `grain`.
@@ -243,7 +280,7 @@ is expected and right (you type only the columns that carry meaning). Chase the
 resolved-columns count up to what you declared; do not chase grounding up to the
 total.
 
-Then read the findings. Three kinds matter:
+Then read the findings. Four kinds matter:
 
 - **`contract_issue`**: a declaration does not line up with the manifest. The head
   names the precise cause in parentheses, e.g. `contract_issue (unsourced_field)`, and
@@ -263,6 +300,10 @@ Then read the findings. Three kinds matter:
   independent of the column it supposedly conflicts with, and does the lineage trace
   through a skipped model or unresolved group? If so it is a can't-prove artifact from
   a lineage gap; note it and move on rather than contorting declarations to chase it.
+
+- **`join_key_type_mismatch`**: a join equates two columns whose declared types
+  conflict, most often ids of two different entities. This is nearly always a real
+  bug in the join condition; show it to the user.
 
 Iterate until contract issues are gone. A remaining `domain_type_contradiction` may
 be a true finding worth surfacing to the user; explain it and let them decide.
