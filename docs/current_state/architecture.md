@@ -214,7 +214,7 @@ The facts themselves come from declarations (`unique`, dbt-utils `unique_combina
 
 - Every SELECT is inspected (including JOINs inside CTEs).
 - A side is blamed only through a known key (a ref'd model, or an in-scope CTE via the scope index); a side with no known keys is never blamed.
-- A key declared on the model (`unique` test, contract grain) that a plain projection reads only from a repeated side also fires.
+- A key declared on the model (`unique` test, contract grain, `unique_key` config) that a plain projection reads only from a repeated side also fires.
 - The ON predicate must be a **conjunction of equalities between bare columns**, exactly one of which is qualified by the joined-in side's alias. Disjunctions, function calls, and range comparisons are skipped conservatively.
 - A key whose columns are a **subset** of the join's right-side equality columns counts as coverage (superkey logic, same as window-keys).
 - `CROSS JOIN` is skipped (it's an explicit cartesian, not a fanout-by-accident).

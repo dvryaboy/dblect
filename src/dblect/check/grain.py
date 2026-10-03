@@ -26,7 +26,7 @@ from dblect.lineage.properties.functional_dependency import NO_FDS, FDSet, cover
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     Key,
-    judged_provenance,
+    declared_grain_claims,
     model_dedups_on_write,
 )
 from dblect.manifest import Manifest
@@ -72,22 +72,17 @@ def declared_grain_findings(
             continue  # the formal universal element already carries every key
         fd_ann = fd.get(scope)
         fds = fd_ann.value if fd_ann is not None else NO_FDS
-        for fact in bucket:
-            if not judged_provenance(fact.provenance):
+        for fact, authored in declared_grain_claims(bucket):
+            declared = frozenset(col.lower() for col in authored)
+            if (scope, declared) in judged:
                 continue
-            if fact.condition is not None:
-                continue  # a conditional key holds only over a row filter; activation owns it
-            for authored in fact.value.keys:
-                declared = frozenset(col.lower() for col in authored)
-                if (scope, declared) in judged:
-                    continue
-                judged.add((scope, declared))
-                if covers(fds, declared, derived.keys):
-                    continue
-                witness = grain_witness(declared, derived.keys)
-                if witness is None:
-                    continue
-                out.append(_finding(manifest, scope, fact, authored, witness))
+            judged.add((scope, declared))
+            if covers(fds, declared, derived.keys):
+                continue
+            witness = grain_witness(declared, derived.keys)
+            if witness is None:
+                continue
+            out.append(_finding(manifest, scope, fact, authored, witness))
     return out
 
 

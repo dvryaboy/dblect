@@ -26,7 +26,7 @@ the discoverers that ground it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from typing import assert_never, cast
 
@@ -789,10 +789,10 @@ def uniqueness_facts(
     return _UNIQUENESS_KIT.facts(manifest, discoverers, extra_facts=extra_facts)
 
 
-def judged_provenance(provenance: Provenance) -> bool:
-    """Whether a key from this source claims something about the SELECT itself. A
-    native constraint is enforced on write, not by the query (#48 covers the
-    unenforced case); a compile-time value is config, not an assertion."""
+def _claims_grain(provenance: Provenance) -> bool:
+    """Whether a key from this source claims something about the SELECT itself. A native
+    constraint is enforced on write, not by the query (#48 covers the unenforced case); a
+    compile-time value is config, not an assertion."""
     match provenance:
         case Declared():
             return True
@@ -801,15 +801,22 @@ def judged_provenance(provenance: Provenance) -> bool:
     assert_never(provenance)
 
 
+def declared_grain_claims(
+    facts: Iterable[Fact[CandidateKeySet, SourceRef]],
+) -> Iterator[tuple[Fact[CandidateKeySet, SourceRef], Key]]:
+    """Each unconditional key a relation's SQL is answerable for, with the fact declaring it. A
+    conditional key holds only over a row filter, which activation owns. The grain check and the
+    join fan-out detector both read these as the model's intent about its own rows."""
+    for fact in facts:
+        if _claims_grain(fact.provenance) and fact.condition is None:
+            for authored in fact.value.keys:
+                yield fact, authored
+
+
 def declared_grain_keys(facts: Iterable[Fact[CandidateKeySet, SourceRef]]) -> frozenset[Key]:
-    """The unconditional keys a relation's SQL is answerable for, lowercased: those declared by
-    a test, contract or config, not enforced by the warehouse. The grain check and the join
-    fan-out detector both read a declared key as the model's intent about its own rows."""
+    """The keys of :func:`declared_grain_claims`, lowercased."""
     return frozenset(
-        frozenset(col.lower() for col in authored)
-        for fact in facts
-        if judged_provenance(fact.provenance) and fact.condition is None
-        for authored in fact.value.keys
+        frozenset(col.lower() for col in authored) for _, authored in declared_grain_claims(facts)
     )
 
 

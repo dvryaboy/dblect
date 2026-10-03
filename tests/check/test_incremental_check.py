@@ -6,7 +6,7 @@ here we pin the end-to-end behavior against a real ``dbt compile``.
 
 The fixture carries the classic incremental hazard. ``inc_stateful`` claims grain
 ``id`` (``unique_key='id'``) and, only in its steady-state branch, enriches each
-row by joining the ``state`` history log on ``id`` alone and totals ``amount`` per ``id``. ``state`` has its own
+row by joining the ``state`` history log on ``id`` alone. ``state`` has its own
 surrogate key ``state_id`` and several rows per ``id``, so that join can multiply
 rows: ``id`` is unique in the full-refresh build and fanned out in the steady-state
 build. The join-fan-out detector fires in steady-state alone, which is exactly the

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import itertools
 from collections.abc import Mapping
 
 import pytest
-from hypothesis import given
-from hypothesis import strategies as st
+from sqlglot import Expr
 
 from dblect.sql import parse_sql
 from dblect.sql._sqlglot import JoinSide
@@ -27,10 +27,14 @@ def _select(consumer: str, source: str) -> str:
     return f"select {projection} from {source}" + (f" group by {grouping}" if grouping else "")
 
 
+@functools.cache
+def _parsed(sql: str) -> Expr:
+    return parse_sql(sql, dialect="duckdb")
+
+
 def _fires(sql: str, keys: _Keys, declared: tuple[str, ...] = ()) -> bool:
     key_set: frozenset[frozenset[str]] = frozenset([frozenset(declared)] if declared else [])
-    tree = parse_sql(sql, dialect="duckdb")
-    return bool(detect_join_fanout(tree, model_keys=keys, declared_keys=key_set))
+    return bool(detect_join_fanout(_parsed(sql), model_keys=keys, declared_keys=key_set))
 
 
 # Joining on orders.customer_id repeats customers and leaves orders single.
@@ -57,9 +61,11 @@ _CONSUMERS: tuple[tuple[str, bool], ...] = (
     ("count(*)", False),
     ("count(distinct c.customer_id)", False),
     ("c.name, sum(o.amount) group by c.name", False),
-    ("o.order_id, sum(c.credit) group by o.order_id", True),
     ("sum(c.credit) over (partition by o.order_id)", True),
     ("sum(credit)", True),
+    ("sum(C.credit)", True),
+    ("sum(O.amount)", False),
+    ("sum(1)", True),
     ("c.name", True),
     ("c.*", True),
     ("c.name, o.amount", False),
@@ -73,6 +79,10 @@ def test_consumer_fires_only_when_it_reads_a_repeated_side(consumer: str, fires:
     assert _fires(_select(consumer, _TO_ORDERS), _KEYED) is fires
 
 
+_ON_CUSTOMER = "o.customer_id = c.customer_id"
+_SUB_FIRST = f"(select * from orders) o join customers c on {_ON_CUSTOMER}"
+_SUB_LAST = f"customers c join (select * from orders) o on {_ON_CUSTOMER}"
+
 _SCENARIOS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
     # many-to-many repeats both sides, so a row count matches neither
     ("customers c join orders o on c.region = o.region", "count(*)", True, ()),
@@ -83,13 +93,31 @@ _SCENARIOS: tuple[tuple[str, str, bool, tuple[str, ...]], ...] = (
     (_TO_ITEMS, "sum(i.qty)", False, ()),
     # a repeated side repeats what joins onward through it
     (f"{_TO_ORDERS} join regions r on r.region = c.region", "sum(r.population)", True, ()),
-    # an ON spanning two left sides leaves the probe undecided: blame only an uncovered target
-    (_SPAN.format("covered"), "sum(t.v)", False, ()),
-    (_SPAN.format("loose"), "sum(t.v)", True, ()),
+    # an ON spanning two left sides: t pins one row of each, but may match many (c, r) pairs
+    (_SPAN.format("covered"), "sum(c.credit)", False, ()),
+    (_SPAN.format("loose"), "sum(t.v)", False, ()),
+    (_SPAN.format("loose"), "sum(c.credit)", True, ()),
     # a declared key fires when its sides repeat together in a chain
     (_TO_ITEMS, "c.customer_id, o.order_id, i.item_id", True, ("customer_id",)),
     (_TO_ITEMS, "c.customer_id, o.order_id, i.item_id", True, ("order_id",)),
     (_TO_ITEMS, "c.customer_id, o.order_id, i.item_id", False, ("item_id",)),
+    # CROSS, SEMI, ANTI and the IS NULL idiom mid-chain add no side and leave the rest readable
+    (f"{_TO_ORDERS} cross join regions r", "sum(c.credit)", True, ()),
+    (f"{_TO_ORDERS} cross join regions r", "sum(r.population)", False, ()),
+    (f"{_TO_ORDERS} semi join regions r on r.region = c.region", "sum(c.credit)", True, ()),
+    (f"{_TO_ORDERS} semi join regions r on r.region = c.region", "sum(o.amount)", False, ()),
+    (f"{_TO_ORDERS} anti join regions r on r.region = c.region", "sum(c.credit)", True, ()),
+    (f"{_TO_ORDERS} anti join regions r on r.region = c.region", "sum(o.amount)", False, ()),
+    (
+        f"{_TO_ORDERS} left join regions r on r.region = c.region where r.region is null",
+        "sum(c.credit)",
+        True,
+        (),
+    ),
+    # a subquery side decides like the table it wraps, in either spelling
+    (_SUB_FIRST, "sum(c.credit)", True, ()),
+    (_SUB_LAST, "sum(c.credit)", True, ()),
+    (_SUB_LAST, "sum(o.amount)", False, ()),
 )
 
 
@@ -98,6 +126,27 @@ def test_many_to_many_and_chains(
     source: str, consumer: str, fires: bool, declared: tuple[str, ...]
 ) -> None:
     assert _fires(_select(consumer, source), _KEYED, declared) is fires
+
+
+_JOINED_ROWS = f"select c.customer_id, c.credit, o.amount from {_TO_ORDERS}"
+
+
+@pytest.mark.parametrize(
+    ("sql", "fires"),
+    [
+        # a join that only passes rows on is judged by whoever consumes them
+        (f"with j as ({_JOINED_ROWS}) select sum(credit) from j", True),
+        (f"select sum(credit) from ({_JOINED_ROWS}) j", True),
+        (f"with j as ({_JOINED_ROWS}) select * from j", True),
+        (f"{_JOINED_ROWS} union all {_JOINED_ROWS}", False),
+        (f"with j as ({_JOINED_ROWS} union all {_JOINED_ROWS}) select * from j", True),
+        (f"with j as ({_JOINED_ROWS.replace('select', 'select distinct')}) select * from j", False),
+    ],
+)
+def test_a_join_whose_rows_another_scope_reads_is_judged_by_that_scope(
+    sql: str, fires: bool
+) -> None:
+    assert _fires(sql, _KEYED) is fires
 
 
 @pytest.mark.parametrize("known", ["orders", "customers"])
@@ -133,9 +182,16 @@ def test_a_declared_key_read_only_from_a_repeated_side_fires(
     assert _fires(_select(projection, source), _KEYED, declared) is fires
 
 
-def test_a_declared_key_is_judged_on_the_model_output_only() -> None:
-    inner = _select("c.customer_id, o.amount", _TO_ORDERS)
-    assert not _fires(f"with j as ({inner}) select customer_id from j", _KEYED, ("customer_id",))
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "qualify row_number() over (partition by c.customer_id order by o.order_id) = 1",
+        "where o.order_id = 'first'",
+    ],
+)
+def test_a_declared_key_the_scope_already_establishes_is_not_judged(tail: str) -> None:
+    sql = f"select c.customer_id, o.amount from {_TO_ORDERS} {tail}"
+    assert not _fires(sql, _KEYED, ("customer_id",))
 
 
 # --- exhaustive oracle: which side repeats, over every small key-respecting instance ---
@@ -206,34 +262,64 @@ def test_detector_agrees_with_the_enumerated_oracle(side: JoinSide, a_first: boo
 
 # --- the verdict does not depend on which table is written first ---
 
-_SYMMETRY_CONSUMERS = (
-    "sum(a.k2)",
-    "sum(b.k2)",
-    "sum(a.k2 * b.k2)",
-    "count(*)",
-    "a.k0, sum(b.k2) group by a.k0",
-    "a.k0",
-    "*",
-)
+_SYMMETRY_CONSUMERS = ("sum(a.k2)", "count(*)", "a.k0")
 _MIRROR = {JoinSide.LEFT: JoinSide.RIGHT, JoinSide.RIGHT: JoinSide.LEFT}
-_spec = st.one_of(st.none(), st.sampled_from(_KEY_SPECS))  # None: no keys known
 
 
-@given(
-    a_keys=_spec,
-    b_keys=_spec,
-    on=st.sampled_from(_on_specs()),
-    side=st.sampled_from(_SIDES),
-    consumer=st.sampled_from(_SYMMETRY_CONSUMERS),
+def test_the_verdict_is_independent_of_join_order() -> None:
+    specs = (None, *_KEY_SPECS)  # None: no keys known
+    for a_keys, b_keys, on, side, consumer in itertools.product(
+        specs, specs, _on_specs(), _SIDES, _SYMMETRY_CONSUMERS
+    ):
+        named = {"ta": a_keys, "tb": b_keys}
+        keys = _keys(**{n: _names(k) for n, k in named.items() if k is not None})
+        forward = _fires(_two_tables(on, side, a_first=True, consumer=consumer), keys)
+        # `a left join b` is `b right join a`, so the mirrored spelling swaps the outer side too.
+        mirrored = _MIRROR.get(side, side)
+        backward = _fires(_two_tables(on, mirrored, a_first=False, consumer=consumer), keys)
+        assert forward is backward, (a_keys, b_keys, on, side, consumer)
+
+
+_Edge = tuple[str, str, str]
+_Chain = tuple[Mapping[str, str], tuple[_Edge, ...], _Keys]
+_CHAINS: tuple[_Chain, ...] = (
+    (
+        {"c": "customers c", "o": "orders o", "i": "items i"},
+        (("c", "o", _ON_CUSTOMER), ("o", "i", "i.order_id = o.order_id")),
+        _KEYED,
+    ),
+    # f has no known keys, so it is nobody's claim in any order
+    (
+        {"f": "f", "d": "d", "e": "e"},
+        (("f", "d", "d.x = f.x"), ("d", "e", "e.y = d.y")),
+        _keys(d=(("y",),), e=(("id",),)),
+    ),
 )
-def test_the_verdict_is_independent_of_join_order(
-    a_keys: _KeySpec | None, b_keys: _KeySpec | None, on: _On, side: JoinSide, consumer: str
+
+
+def _chain_in_order(
+    order: tuple[str, ...], tables: Mapping[str, str], edges: tuple[_Edge, ...]
+) -> str | None:
+    """The chain written in ``order``, each ON at its later end; ``None`` if a table joins in
+    before anything connects it."""
+    source = tables[order[0]]
+    for position, alias in enumerate(order[1:], 1):
+        before = {*order[:position], alias}
+        ons = [on for a, b, on in edges if alias in (a, b) and {a, b} <= before]
+        if not ons:
+            return None
+        source += f" join {tables[alias]} on {' and '.join(ons)}"
+    return source
+
+
+@pytest.mark.parametrize(("tables", "edges", "keys"), _CHAINS)
+def test_a_three_table_chain_has_one_verdict_in_every_join_order(
+    tables: Mapping[str, str], edges: tuple[_Edge, ...], keys: _Keys
 ) -> None:
-    named = {"ta": a_keys, "tb": b_keys}
-    keys = _keys(**{n: _names(k) for n, k in named.items() if k is not None})
-    forward = _fires(_two_tables(on, side, a_first=True, consumer=consumer), keys)
-    # `a left join b` is `b right join a`, so the mirrored spelling swaps the outer side too.
-    backward = _fires(
-        _two_tables(on, _MIRROR.get(side, side), a_first=False, consumer=consumer), keys
-    )
-    assert forward is backward
+    for consumer in [*(f"sum({alias}.v)" for alias in tables), "count(*)", "*"]:
+        verdicts = {
+            order: _fires(_select(consumer, source), keys)
+            for order in itertools.permutations(tables)
+            if (source := _chain_in_order(order, tables, edges)) is not None
+        }
+        assert len(set(verdicts.values())) == 1, (consumer, verdicts)

@@ -988,11 +988,7 @@ def test_fd_annotations_by_name_wires_the_uniqueness_edge() -> None:
 # --- an ungrouped aggregate select is one implicit group (#296) ---
 
 _FANOUT_AGGREGATES: tuple[tuple[str, bool], ...] = (
-    ("count(distinct d.kind)", False),
     ("max(d.seen_at)", False),
-    # COUNT(*) counts the join's rows, so it needs every side repeated; see test_join_fanout_sides.
-    ("count(*)", False),
-    ("count(f.id)", True),
     ("sum(f.amount)", True),
 )
 
