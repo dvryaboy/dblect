@@ -45,6 +45,7 @@ from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.lineage.properties.value_domain import Bounded, ValueDomain
 from dblect.manifest import Manifest, Node, ResourceType
 from dblect.manifest.parse import generic_test_target_uid
+from dblect.sql._sqlglot import stored_column_name
 from dblect.types.contract import (
     Constraints,
     ContractRegistry,
@@ -374,11 +375,10 @@ def _bounded_from_enum(enum: type[StrEnum]) -> Bounded:
 
 
 def _scope(src: SourceRef, column: str) -> ColumnRef:
-    """The case-folded ``ColumnRef`` a declaration's column spelling grounds:
-    the lineage keys every column lowercase (``ColumnRef``'s own rule), so a
-    contract that spells the column as the warehouse does still meets its
+    """The ``ColumnRef`` a declaration's column spelling grounds, under the stored
+    (lowercase) name, so a contract spelled as the warehouse does still meets its
     propagated scope. Adopting this at the bridge's older sites is #291."""
-    return ColumnRef(src, column.lower())
+    return ColumnRef(src, stored_column_name(column))
 
 
 def _value_domain_facts_for_domain(

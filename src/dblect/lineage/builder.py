@@ -836,7 +836,7 @@ class _Walker:
         binds to the same output column. Arms shorter than arm 0 (malformed
         SQL) contribute nothing for the missing positions.
         """
-        arm_scopes = list(union_scope.union_scopes)
+        arm_scopes = list(union_scope.set_operation_scopes)
         if not arm_scopes:
             return
         first_arm = arm_scopes[0].expression

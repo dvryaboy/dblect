@@ -89,3 +89,29 @@ jobs:
 
       - name: Tests (pytest, compiled sqlglot)
         run: uv run --no-sync pytest -n auto --dist loadscope
+
+  latest-sqlglot:
+    # The lockfile pins one sqlglot, so a release that renames or removes an API we use
+    # would pass CI while breaking fresh installs. This job runs the tests against the
+    # newest sqlglot the pyproject range allows, which keeps the declared floor honest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --frozen --python 3.13
+
+      - name: Upgrade sqlglot to the newest allowed release
+        run: uv pip install --upgrade sqlglot
+
+      - name: Tests (pytest, newest sqlglot)
+        run: uv run --no-sync pytest -n auto --dist loadscope
