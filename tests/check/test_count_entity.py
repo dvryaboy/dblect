@@ -179,25 +179,20 @@ def test_a_composite_key_names_no_single_row_entity() -> None:
     assert _contradictions(sql, Entity.PLAYER, keys=("id", "player_api_id")) == 0
 
 
-# A window is folded by the generic scalar join over its aggregate and its PARTITION BY
-# columns, so a partition column (no entity) widens the count's claim away. Only a
-# window with nothing else to fold keeps the DISTINCT claim.
+# A window folds its PARTITION BY columns into the count's tag, so a partitioned window
+# widens the claim away; an unpartitioned DISTINCT window keeps it.
+@pytest.mark.parametrize(
+    ("window", "claims_player"),
+    [
+        ("COUNT(DISTINCT pa.player_api_id) OVER ()", True),
+        ("COUNT(DISTINCT pa.player_api_id) OVER (PARTITION BY pa.penalties)", False),
+        ("COUNT(*) OVER ()", False),
+        ("COUNT(*) OVER (PARTITION BY pa.penalties)", False),
+    ],
+)
 @pytest.mark.parametrize("declared", _DECLARED)
-def test_an_unpartitioned_windowed_distinct_count_counts_its_operands_entity(
-    declared: Entity,
+def test_a_windowed_count_claims_only_an_unpartitioned_distinct_entity(
+    window: str, claims_player: bool, declared: Entity
 ) -> None:
-    sql = f"SELECT COUNT(DISTINCT pa.player_api_id) OVER () AS n {_FROM}"
-    assert _contradictions(sql, declared) == (declared is not Entity.PLAYER)
-
-
-@pytest.mark.parametrize("agg", ["COUNT(DISTINCT pa.player_api_id)", "COUNT(*)"])
-@pytest.mark.parametrize("declared", _DECLARED)
-def test_a_partitioned_windowed_count_makes_no_claim(agg: str, declared: Entity) -> None:
-    sql = f"SELECT {agg} OVER (PARTITION BY pa.penalties) AS n {_FROM}"
-    assert _contradictions(sql, declared) == 0
-
-
-@pytest.mark.parametrize("declared", _DECLARED)
-def test_an_unpartitioned_windowed_non_distinct_count_makes_no_claim(declared: Entity) -> None:
-    sql = f"SELECT COUNT(*) OVER () AS n {_FROM}"
-    assert _contradictions(sql, declared) == 0
+    found = _contradictions(f"SELECT {window} AS n {_FROM}", declared)
+    assert found == (1 if claims_player and declared is not Entity.PLAYER else 0)
