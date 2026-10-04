@@ -61,6 +61,11 @@ _CONSUMERS: tuple[tuple[str, bool], ...] = (
     ("count(*)", False),
     ("count(distinct c.customer_id)", False),
     ("c.name, sum(o.amount) group by c.name", False),
+    # each group is one order row, hence one customer row: nothing to over-count
+    ("o.order_id, sum(c.credit) group by o.order_id", False),
+    ("c.customer_id, sum(c.credit) group by c.customer_id", True),
+    # an unqualified grouping column names no side, so the collapse is not proven
+    ("order_id, sum(c.credit) group by order_id", True),
     ("sum(c.credit) over (partition by o.order_id)", True),
     ("sum(credit)", True),
     ("sum(C.credit)", True),

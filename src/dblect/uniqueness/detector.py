@@ -256,6 +256,9 @@ def detect_join_fanout(
         chain = JoinChain(sel, lambda node: _source_facts(node, scopes))
         if not chain.joins:
             continue
+        group = sg.group_of(sel)
+        if group is not None and chain.grouped_to_one_row(group):
+            continue
         consumers = _consumers(
             sel,
             frozenset(chain.sides),
