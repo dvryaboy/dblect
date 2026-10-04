@@ -91,6 +91,9 @@ Used directly as a column's type.
   one open field's column with the fixed facets (`.refine(entity=...)`), so
   `join_key_type_mismatch` sees a join across entities. Zero or several open fields, or
   no fixed facet, is a `malformed_declaration` contract issue rather than a silent drop.
+  With nothing declared, `join_key_entity_mismatch` infers entities from `unique` and
+  `relationships` tests and warns; a join whose two sides are both declared is decided
+  by the declaration instead.
 - `Uuid`, `Json`, and other semi-structured or specialized types (`interval`, `binary`,
   `geography`) are not yet accepted; their spellings are still open.
 

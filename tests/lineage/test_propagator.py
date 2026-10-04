@@ -148,6 +148,32 @@ def test_confluence_without_semiring_uses_lattice_join() -> None:
     assert anns[out].value == frozenset({0, 1})
 
 
+def test_confluence_inside_a_cte_reaches_its_readers() -> None:
+    """A UNION ALL that is a CTE's body feeds the columns that read the CTE, the
+    same as one written as a derived table."""
+    sql = """
+        WITH u AS (
+            SELECT t1.a AS x FROM t1
+            UNION ALL
+            SELECT t2.b AS x FROM t2
+        )
+        SELECT u.x AS out FROM u
+    """
+    graph = build_model_graph(
+        model_uid="model.test.m",
+        sql=sql,
+        name_to_source={"t1": _src("t1"), "t2": _src("t2")},
+        schema={"t1": {"a": "INT"}, "t2": {"b": "INT"}},
+    )
+    ground = _concrete_for(
+        {ColumnRef(_src("t1"), "a"): frozenset({0}), ColumnRef(_src("t2"), "b"): frozenset({1})}
+    )
+    anns = propagate(graph, _subset_prop(ground))
+    assert anns[ColumnRef(_model(), "out")].value == frozenset({0, 1})
+    # The CTE's output is not one of the model's columns.
+    assert ColumnRef(_model(), "x") not in graph.expressions
+
+
 def test_confluence_with_semiring_uses_plus() -> None:
     """With a semiring present the confluence folds with semiring.plus. For the
     union semiring that is also set union, so the arms merge."""

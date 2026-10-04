@@ -558,7 +558,7 @@ class _Walker:
 
         scope_expr = scope.expression
         if isinstance(scope_expr, exp.Union):
-            self._register_top_level_union(scope, scope_path=scope_path)
+            self._register_scope_union(scope, scope_path=scope_path)
             return
         if not register_projections or not isinstance(scope_expr, exp.Selectable):
             return
@@ -805,17 +805,19 @@ class _Walker:
             on_output_registered=on_registered,
         )
 
-    def _register_top_level_union(
+    def _register_scope_union(
         self,
         union_scope: Scope,
         *,
         scope_path: tuple[str, ...],
     ) -> None:
-        # Combined output IS the model column; no synthetic UNION node needed.
+        # Combined output IS the scope's column (the model's at the root, the CTE's when
+        # the union is a CTE body); no synthetic UNION node needed.
+        output_source = self._source_ref_for_scope(union_scope)
         self._emit_union_nodes(
             union_scope,
             scope_path=scope_path,
-            output_source_for=lambda _: self._self_ref,
+            output_source_for=lambda _: output_source,
             on_output_registered=None,
         )
 

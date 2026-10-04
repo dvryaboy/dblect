@@ -33,7 +33,7 @@ customer_payments as (
 
 The `left join` keeps every payment, even ones whose `order_id` finds no matching order. For those, `orders.customer_id` is `NULL`, so the `group by` rakes all of them into one `NULL` bucket and sums unrelated payments together. The total looks like a real customer's lifetime value. It belongs to nobody. No test fails.
 
-The same pass also flags a `WHERE` on the nullable side of an outer join (silently inverts it to an inner join, dropping the very rows the outer join meant to keep), `COALESCE` on a join key (masks "no match" as a real value), window and `array_agg`/`string_agg` calls with no `ORDER BY` (nondeterministic output), nondeterministic builtins like `current_timestamp()` in join keys or partition clauses, joins that fan out because the joined-in side is not unique on the join key, and reads of a dbt snapshot with no temporal filter (you get every historical version of every row, not the current state). These need nothing declared: dblect uses whatever keys your `schema.yml` and native constraints already assert and stays quiet where it has no grounds to speak.
+The same pass also flags a `WHERE` on the nullable side of an outer join (silently inverts it to an inner join, dropping the very rows the outer join meant to keep), `COALESCE` on a join key (masks "no match" as a real value), window and `array_agg`/`string_agg` calls with no `ORDER BY` (nondeterministic output), nondeterministic builtins like `current_timestamp()` in join keys or partition clauses, joins that fan out because the joined-in side is not unique on the join key, joins that equate keys of two different tables (an order id with a customer id) when no `relationships` test links them, and reads of a dbt snapshot with no temporal filter (you get every historical version of every row, not the current state). These need nothing declared: dblect uses whatever keys your `schema.yml` and native constraints already assert and stays quiet where it has no grounds to speak.
 
 ```
 $ dblect check .
@@ -129,7 +129,7 @@ class StgPayments(ModelContract):
 
 Grouping by `order_id` now holds the currency constant within each group, so `sum(amount)` per order checks clean and dblect stays quiet. The same dependency does **not** silence the sum grouped by *customer*: a customer spans many orders that can differ in currency, so the lifetime-revenue rollup still lights up. The discharge is grain-precise, not a blanket exemption.
 
-Identifiers get the same treatment. An order id and a customer id are both integers, and both are unique, so a join that mixes them up (`on o.order_id = c.customer_id`) still looks like a clean one-to-one join, and no test fails. You can say what each id identifies with a domain type that has no magnitude:
+Identifiers are covered without declarations: the structural pass reads your `unique` and `relationships` tests to tell an order id from a customer id and warns when a join equates the two. That warning is an inference, and an untested 1:1 table (a `customer_details` keyed on `customer_id`) looks the same, so it stays a warning. Declaring what each id identifies settles it either way, with a domain type that has no magnitude:
 
 ```python
 class Entity(NominalEnum):
@@ -141,26 +141,13 @@ class EntityId(DomainType):
     entity: Entity
 
 CustomerId = EntityId.refine(entity=Entity.CUSTOMER)
-OrderId = EntityId.refine(entity=Entity.ORDER)
 
-class StgCustomers(ModelContract):
-    dbt_model = "stg_customers"
-    customer_id: CustomerId.columns(id="customer_id")
-
-class StgOrders(ModelContract):
-    dbt_model = "stg_orders"
-    order_id: OrderId.columns(id="order_id")
+class CustomerDetails(ModelContract):
+    dbt_model = "customer_details"
     customer_id: CustomerId.columns(id="customer_id")
 ```
 
-The rule is that the type's one open field (`id`) is the column, and each field you pin with `.refine` (`entity`) becomes a tag on that column. As with `Money`'s `amount`, `.columns(id=...)` says which column `id` means. Leave it out and the field binds to a column literally named `id`. The tags travel down the DAG, and a join that equates two different entities is reported:
-
-```
-join_key_type_mismatch
-    join key o.order_id = c.customer_id equates a column tagged entity=order with a column tagged entity=customer; the two domain types conflict, so the equated values cannot mean the same thing
-```
-
-`o.customer_id = c.customer_id` stays quiet. An identifier type that never has its entity pinned, or that has more than one open field, is reported as a `contract_issue`, so a declaration can't sit there looking accepted while doing nothing.
+The type's one open field (`id`) is the column, and each field pinned with `.refine` (`entity`) becomes a tag on it. As with `Money`'s `amount`, `.columns(id=...)` names the column; without it the field binds to a column literally named `id`. Where both sides of a join are declared, the declaration decides: the same entity clears the warning, and different entities raise `join_key_type_mismatch` as an error. An identifier type with no pinned entity, or with more than one open field, is a `contract_issue`.
 
 The runnable versions of these live in [`tests/fixtures/scenarios`](tests/fixtures/scenarios), each with a short `story.md`. The test suite runs every one through `dblect check`.
 

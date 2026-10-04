@@ -130,6 +130,10 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
         # grain, but the data may still hold it, so this warns rather than errors.
         case CheckFindingKind.GRAIN_NOT_ESTABLISHED:
             return Severity.WARN
+        # Inferred from keys with no relationship declared between them, which a
+        # correct join over an untested 1:1 table also shows.
+        case CheckFindingKind.JOIN_KEY_ENTITY_MISMATCH:
+            return Severity.WARN
         # Real hazards held at warn while they can over-fire on a legitimate
         # reading: a case-only match depends on the warehouse's collation, a
         # redundant filter is a bug but not a wrong-rows one, and a CASE

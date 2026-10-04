@@ -639,11 +639,14 @@ def join_key_conflicts(
     out: list[tuple[exp.Column, exp.Column, DomainTag, DomainTag]] = []
     for left, right in sg.equality_column_pairs(on):
         tag_left, tag_right = tag_of(left), tag_of(right)
-        if tag_left is None or tag_right is None:
-            continue
-        if DOMAIN_TYPE_LATTICE.meet(tag_left, tag_right) is CONFLICT:
+        if tag_left is not None and tag_right is not None and tags_conflict(tag_left, tag_right):
             out.append((left, right, tag_left, tag_right))
     return tuple(out)
+
+
+def tags_conflict(a: DomainTag, b: DomainTag) -> bool:
+    """Whether two known tags meet to ``CONFLICT``: values that cannot mean the same thing."""
+    return DOMAIN_TYPE_LATTICE.meet(a, b) is CONFLICT
 
 
 # --- the property ------------------------------------------------------------

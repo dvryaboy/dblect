@@ -39,6 +39,7 @@ from dblect.check.findings import (
     UnbuiltModel,
 )
 from dblect.check.grain import declared_grain_findings
+from dblect.check.key_entity import KeyEntity, entity_keys, key_entities
 from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
 from dblect.lineage.builder import (
     BuildIssue,
@@ -59,11 +60,12 @@ from dblect.lineage.graph import (
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
+    Tagged,
     domain_type_display,
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
-    join_key_conflicts,
+    tags_conflict,
 )
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -95,6 +97,7 @@ from dblect.types import (
     active_registry,
     resolve_contracts,
 )
+from dblect.types.bridge import ForeignKeyEdge, merged_foreign_keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +132,9 @@ class CheckGraphs:
     uniqueness_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]]
     """Every declared key per relation, from every channel. Feeds both the uniqueness
     propagation and the grain check, so the two agree on what was claimed."""
+    foreign_keys: tuple[ForeignKeyEdge, ...]
+    """Every declared foreign key, from contracts and ``relationships`` tests. The
+    join-key check reads them to place a child column in its parent's entity."""
     value_domain_facts: Mapping[ColumnRef, tuple[Fact[ValueDomain, ColumnRef], ...]]
     """Every declared value domain per column (contract enums and accepted_values
     tests), with the columns in ``value_domain_conflicts`` already excluded so
@@ -219,6 +225,7 @@ def build_check_graphs(
         uniqueness_facts=uniqueness_facts(
             manifest, profile, extra_facts=resolved.key_facts, parsed=trees
         ),
+        foreign_keys=merged_foreign_keys(resolved, manifest),
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
     )
@@ -382,12 +389,18 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             line_maps,
         )
     )
+    entity_of = key_entities(
+        graphs.column_build.graph,
+        entity_keys(graphs.column_build.graph, graphs.uniqueness_facts, world.uniqueness_inferred),
+        graphs.foreign_keys,
+    )
     findings.extend(
         _join_key_findings(
             graphs.manifest,
             graphs.parsed,
             world.domain_type,
             graphs.join_key_ground,
+            entity_of,
             line_maps,
         )
     )
@@ -687,9 +700,11 @@ def _operand_label(agg: exp.AggFunc) -> str:
 
 
 def _join_key_rows(
+    manifest: Manifest,
     parsed: Mapping[str, Expr],
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    entity_of: Callable[[ColumnRef], KeyEntity | None],
 ) -> Iterator[LocatedRow]:
     """One row per ON-clause equality whose two columns carry conflicting domain
     types: equating a ``MoneyUSD`` key against a ``MoneyEUR`` one, or two incompatible
@@ -699,7 +714,10 @@ def _join_key_rows(
     derivation alone does not carry the join. A column's tag is its propagated value
     where the lineage reached it, falling back to its declared grounding for a join key
     that is never projected, so a key that appears only in the ON clause is still typed.
-    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps)."""
+    A no-claim side never conflicts (the lenient posture ``join_key_conflicts`` keeps).
+
+    Without a declared entity on both sides, two key columns in different inferred
+    entities are flagged too; declaring both sides clears an inferred mismatch."""
     tag_ann_of = annotation_or_grounded(annotations, ground)
 
     def tag_of(col: exp.Column) -> DomainTag | None:
@@ -711,14 +729,57 @@ def _join_key_rows(
             on = join.args.get("on")
             if not isinstance(on, Expr):
                 continue
-            for left, right, left_tag, right_tag in join_key_conflicts(on, tag_of):
+            for left, right in sg.equality_column_pairs(on):
+                left_tag, right_tag = tag_of(left), tag_of(right)
+                if left_tag is not None and right_tag is not None:
+                    if tags_conflict(left_tag, right_tag):
+                        yield LocatedRow(
+                            uid=uid,
+                            nodes=(left, right, on),
+                            kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
+                            message=_join_key_message(left, right, left_tag, right_tag),
+                            column=left.name or None,
+                        )
+                        continue
+                    if _declares_entity(left_tag) and _declares_entity(right_tag):
+                        continue
+                left_ref, right_ref = resolved_column_ref(left), resolved_column_ref(right)
+                if left_ref is None or right_ref is None:
+                    continue
+                left_entity, right_entity = entity_of(left_ref), entity_of(right_ref)
+                if left_entity is None or right_entity is None or left_entity == right_entity:
+                    continue
                 yield LocatedRow(
                     uid=uid,
                     nodes=(left, right, on),
-                    kind=CheckFindingKind.JOIN_KEY_TYPE_MISMATCH,
-                    message=_join_key_message(left, right, left_tag, right_tag),
+                    kind=CheckFindingKind.JOIN_KEY_ENTITY_MISMATCH,
+                    message=_entity_mismatch_message(
+                        manifest, left, right, left_entity, right_entity
+                    ),
                     column=left.name or None,
                 )
+
+
+def _declares_entity(tag: DomainTag) -> bool:
+    """Only a nominal facet says what a key identifies; a bare dimension or conflict does not."""
+    return isinstance(tag, Tagged) and bool(tag.nominal)
+
+
+def _entity_mismatch_message(
+    manifest: Manifest, left: exp.Column, right: exp.Column, *entities: KeyEntity
+) -> str:
+    def label(entity: KeyEntity) -> str:
+        names = (
+            f"{manifest.nodes[k.source.unique_id].relation_name}.{k.column}" for k in entity.keys
+        )
+        return " / ".join(sorted(names))
+
+    return (
+        f"join key {_qualified(left)} = {_qualified(right)} equates "
+        f"{label(entities[0])} with {label(entities[1])}, two keys no relationships test or "
+        "foreign key links; if they identify the same thing, add a relationships test "
+        "between them, otherwise the join condition is wrong"
+    )
 
 
 def _join_key_findings(
@@ -726,11 +787,12 @@ def _join_key_findings(
     parsed: Mapping[str, Expr],
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
     ground: Callable[[ColumnRef], Annotation[DomainTag]],
+    entity_of: Callable[[ColumnRef], KeyEntity | None],
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
     return locate_findings(
         manifest,
-        _join_key_rows(parsed, annotations, ground),
+        _join_key_rows(manifest, parsed, annotations, ground, entity_of),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
     )
