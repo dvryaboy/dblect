@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import pytest
-from sqlglot import Expr, exp
+from sqlglot import Expr, exp, parse_one
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
@@ -104,12 +104,69 @@ def test_join_at_top_level_is_out_of_scope() -> None:
     assert findings == ()
 
 
-def test_order_by_expression_is_skipped() -> None:
+# An ORDER BY key covers a column only when it is that bare column (direction, NULLS placement
+# and parentheses are irrelevant to ties). Any other expression can only add ties relative to
+# the columns it reads, so it covers nothing, while the remaining bare keys still count. A cast
+# is no exception: a narrowing cast (bigint to int, timestamp to date) merges values.
+_INTENTS = _model_keys(intents=(("intent_id",),))
+_OUTCOME_RANK = "case outcome when 'ok' then 0 else 1 end"
+
+# (order by clause, expression key named in the finding or None when silent).
+_ORDER_KEY_SHAPES = [
+    ("day_gap, attempt_no", None),  # baseline: bare columns, none is the key (fires, names none)
+    (f"day_gap, {_OUTCOME_RANK}, attempt_no", _OUTCOME_RANK),
+    (_OUTCOME_RANK, _OUTCOME_RANK),
+    ("date_trunc('day', ts)", "date_trunc('day', ts)"),
+    ("cast(intent_id as varchar)", "cast(intent_id as varchar)"),
+    ("lower(intent_id)", "lower(intent_id)"),
+    ("1", "1"),
+]
+_COVERING_ORDERS = [
+    "intent_id",
+    "intent_id desc nulls last",
+    "(intent_id)",
+    f"{_OUTCOME_RANK}, intent_id",
+    "lower(intent_id), intent_id",
+]
+
+
+@pytest.mark.parametrize(("order", "named"), _ORDER_KEY_SHAPES)
+def test_window_order_key_not_covering_the_key_fires(order: str, named: str | None) -> None:
     parsed = _parse(
-        "select row_number() over (partition by customer_id order by date_trunc('day', ts)) from src"
+        f"select row_number() over (partition by order_id order by {order}) from intents"
     )
-    findings = detect_non_unique_window_order_keys(parsed, model_keys=_model_keys(src=(("id",),)))
-    assert findings == ()
+    findings = detect_non_unique_window_order_keys(parsed, model_keys=_INTENTS)
+    assert len(findings) == 1
+    if named is not None:
+        assert parse_one(named, read="duckdb").sql() in findings[0].message
+
+
+@pytest.mark.parametrize("order", _COVERING_ORDERS)
+def test_window_order_covering_the_key_is_silent(order: str) -> None:
+    parsed = _parse(
+        f"select row_number() over (partition by order_id order by {order}) from intents"
+    )
+    assert detect_non_unique_window_order_keys(parsed, model_keys=_INTENTS) == ()
+
+
+def test_tie_independent_window_over_an_expression_key_stays_silent() -> None:
+    # A peer-closed running count reads no column a tie could reorder.
+    parsed = _parse(
+        f"select count(*) over (partition by order_id order by {_OUTCOME_RANK}) from intents"
+    )
+    assert detect_non_unique_window_order_keys(parsed, model_keys=_INTENTS) == ()
+
+
+# The dedup idiom. An unaliased subquery is legal in duckdb, postgres and snowflake; the scope
+# walk used to give up on it and never reached the window inside.
+@pytest.mark.parametrize("alias", ["", " x"])
+def test_window_inside_derived_table_is_checked(alias: str) -> None:
+    parsed = _parse(
+        "select * from (select intent_id, order_id, row_number() over "
+        "(partition by order_id order by day_gap, attempt_no) as rn from intents)"
+        f"{alias} where rn = 1"
+    )
+    assert len(detect_non_unique_window_order_keys(parsed, model_keys=_INTENTS)) == 1
 
 
 def test_window_against_cte_inherits_model_keys_via_propagation() -> None:
@@ -433,12 +490,12 @@ _AGG_ORDER_CASES = [
     ("limit_zero", "select array_agg(x order by ts limit 0) from src", _SRC_ON_ID, False),
     # No known key on the source: firewall posture, no positive fact to fire on.
     ("no_keys", "select array_agg(x order by ts limit 1) from src", _model_keys(), False),
-    # Non-bare order key needs an equivalence we don't model, silent.
+    # A non-bare order key covers no column, so it cannot make the cut total.
     (
         "order_expression",
         "select array_agg(x order by date_trunc('day', ts) limit 1) from src",
         _SRC_ON_ID,
-        False,
+        True,
     ),
     # Non-bare grouping key, likewise silent.
     (

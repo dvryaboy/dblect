@@ -283,9 +283,11 @@ def _resolve_source(
         return alias, resolved
     if isinstance(node, exp.Subquery):
         inner = node.this
-        alias = node.alias_or_name
-        if not isinstance(inner, Expr) or not alias:
+        if not isinstance(inner, Expr):
             return None
+        # An unaliased subquery (legal in duckdb, postgres, snowflake) cannot be referenced, so
+        # a name no SQL can spell stands in; giving up here would hide every scope beneath it.
+        alias = node.alias_or_name or f"<subquery {id(node)}>"
         return alias.lower(), scope_facts(
             inner, cte_scope=cte_scope, base_resolve=base_resolve, record=record
         )
