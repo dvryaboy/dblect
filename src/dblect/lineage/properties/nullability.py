@@ -65,7 +65,7 @@ from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     ConditionalKey,
     activate_conditional,
-    relation_reduce,
+    conditional_carrier_reduce,
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import (
@@ -342,7 +342,7 @@ def nullability_property(
 # the carrying and predicate-renaming a conditional claim needs are relation-scoped,
 # so we reuse the uniqueness carrier: a conditional NON_NULL column is a one-column
 # conditional "key" (the column is non-null under the predicate), flowed across
-# relations by ``relation_reduce`` and promoted by ``activate_conditional``. The
+# relations by ``conditional_carrier_reduce`` and promoted by ``activate_conditional``. The
 # activated columns then fold NON_NULL into the column annotations.
 
 
@@ -383,7 +383,7 @@ def _conditional_notnull_carrier(
         aggregates={},
         ground=ground,
         reconcile_by_meet=True,
-        reducer=relation_reduce,
+        reducer=conditional_carrier_reduce,
     )
 
 

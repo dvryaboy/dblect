@@ -38,7 +38,6 @@ later). Multi-model chains are the next extension.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 import duckdb
@@ -58,7 +57,7 @@ from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Manifest, Node, ResourceType
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
-from tests.lineage._duckdb_oracle import Table, assert_no_over_claims, scalar
+from tests.lineage._duckdb_oracle import Table, assert_keys_unique
 from tests.lineage._group_spelling import GroupSpelling
 
 _DUCKDB = profile_for_adapter("duckdb")
@@ -76,32 +75,6 @@ def _promoted_keys(manifest: Manifest) -> frozenset[Key]:
     flow = propagate(graph, predicate_flow_property())
     activated = activate_conditional(keys, flow)
     return activated[SourceRef(SourceKind.MODEL, _MODEL_UID)].keys
-
-
-def _assert_keys_sound(
-    con: duckdb.DuckDBPyConnection,
-    tables: Sequence[Table],
-    model_sql: str,
-    keys: frozenset[Key],
-) -> None:
-    """Assert every key in ``keys`` has as many distinct key tuples as the model has
-    rows over the materialization (so it is genuinely unique)."""
-
-    def violations(c: duckdb.DuckDBPyConnection) -> dict[str, int]:
-        total = scalar(c, "SELECT COUNT(*) FROM _m")
-        out: dict[str, int] = {}
-        for key in keys:
-            cols = ", ".join(sorted(key))
-            distinct = scalar(c, f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)")
-            # The violation count is the shortfall: zero when every row's key tuple is
-            # distinct, positive when duplicates collapse the DISTINCT count below the
-            # row count.
-            out[f"unsound key {sorted(key)} ({total} rows, {distinct} distinct tuples)"] = (
-                total - distinct
-            )
-        return out
-
-    assert_no_over_claims(con, tables, model_sql, violations)
 
 
 def _source_node(name: str, schema: str = "raw") -> Node:
@@ -453,7 +426,7 @@ def test_unconditional_promoted_keys_are_unique_over_materialized_rows(
         assert key <= output_cols, f"key {sorted(key)} not in outputs {sorted(output_cols)}"
     data_by_name = dict(s.data)
     tables: list[Table] = [(src.name, src.columns, data_by_name[src.name]) for src in s.sources]
-    _assert_keys_sound(oracle_con, tables, _scenario_sql(s.model), keys)
+    assert_keys_unique(oracle_con, tables, _scenario_sql(s.model), keys)
 
 
 # --- conditional activation -------------------------------------------------------
@@ -532,4 +505,4 @@ def test_conditionally_activated_keys_are_unique_over_materialized_rows(
     the predicate subset) surfaces as a duplicate the data check catches."""
     keys = _promoted_keys(_cond_manifest(s))
     tables: list[Table] = [("orders", ("id", "g"), s.rows)]
-    _assert_keys_sound(oracle_con, tables, _cond_sql(s), keys)
+    assert_keys_unique(oracle_con, tables, _cond_sql(s), keys)

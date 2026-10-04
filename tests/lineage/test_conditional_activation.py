@@ -215,18 +215,27 @@ def test_conditional_key_activates_at_a_consumer_of_a_grouped_cte() -> None:
     assert _key("n") in res["model.shop.dim"].keys
 
 
-def test_conditional_dropped_when_a_predicate_column_is_not_projected() -> None:
-    # ``region`` (the predicate column) is filtered but not projected, so neither the
-    # carried predicate nor the flow can express it: the key stays unactivated and is
-    # not even carried (its predicate could not be tracked).
+def test_conditional_activates_in_scope_when_the_predicate_column_is_not_projected() -> None:
+    # ``region`` (the predicate column) is filtered but not projected. The scope's own
+    # WHERE implies the predicate, so the key activates there; with ``region`` gone from
+    # the output, the conditional itself cannot be carried on to a consumer.
     res = _activated(
         _source("source.shop.raw.orders"),
         _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
         _node("model.shop.dim", "SELECT id FROM orders WHERE region = 'US'"),
     )
     dim = res["model.shop.dim"]
-    assert _key("id") not in dim.keys
+    assert _key("id") in dim.keys
     assert not any(ck.key == _key("id") for ck in dim.conditional)
+
+
+def test_conditional_stays_unactivated_when_the_scope_filter_does_not_imply_it() -> None:
+    res = _activated(
+        _source("source.shop.raw.orders"),
+        _unique("test.shop.u", column="id", target="source.shop.raw.orders", where="region = 'US'"),
+        _node("model.shop.dim", "SELECT id FROM orders WHERE region = 'EU'"),
+    )
+    assert _key("id") not in res["model.shop.dim"].keys
 
 
 # --- cross-model through a join --------------------------------------------------
