@@ -223,14 +223,11 @@ class GroupKey:
     """One ``GROUP BY`` key, read as the shape it wraps one resolved column in.
 
     ``column`` is the column the key is built from (``None`` for an ``OPAQUE`` key),
-    ``sql`` the key as written, for a diagnostic to name it. ``padded`` records that the
-    column's relation is the NULL-padded side of an outer join in this scope, so a column
-    that is NOT NULL upstream can still be NULL here."""
+    ``sql`` the key as written, for a diagnostic to name it."""
 
     shape: KeyShape
     column: ColumnRef | None
     sql: str
-    padded: bool
 
 
 @dataclass(frozen=True, slots=True)

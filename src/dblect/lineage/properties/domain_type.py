@@ -734,11 +734,10 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
 @dataclass(frozen=True, slots=True)
 class CompanionFacts:
     """The declared facts about a companion column that decide what a computed group key
-    holds of it. ``non_null`` answers only for a column proven NOT NULL, and ``members`` is
-    the closed set of values the companion is declared to take (a ``UnitEnum``'s members),
-    ``None`` when nothing is declared. Absence of either leaves the key unproven."""
+    holds of it. ``members`` is the closed set of values the companion is declared to take
+    (a ``UnitEnum``'s members), ``None`` when nothing is declared, which leaves a
+    value-mapping key unproven."""
 
-    non_null: Callable[[ColumnRef], bool]
     members: Callable[[ColumnRef], frozenset[str] | None]
 
 
@@ -779,9 +778,9 @@ def key_verdict_reader(
     each group?
 
     * a bare column holds itself;
-    * ``COALESCE(c, ...)`` with ``c`` first equals ``c`` wherever ``c`` is non-null, so it
-      holds when ``c`` is NOT NULL and not NULL-padded by an outer join here. Otherwise the
-      NULL rows are attributed the fallback and the key does not hold;
+    * ``COALESCE(c, ...)`` with ``c`` first holds: it equals ``c`` wherever ``c`` is
+      non-null, and the fallback is the author's statement of the unit a NULL ``c`` means,
+      the same kind of claim a declaration makes;
     * upper, lower, trim and a lossless text cast hold when the map keeps every declared
       member apart (a collision merges two units into one group);
     * anything else makes no claim.
@@ -794,11 +793,8 @@ def key_verdict_reader(
         if key.column != companion:
             return KeyVerdict.UNRELATED
         match key.shape:
-            case KeyShape.COLUMN:
+            case KeyShape.COLUMN | KeyShape.COALESCE_HEAD:
                 return KeyVerdict.HOLDS
-            case KeyShape.COALESCE_HEAD:
-                proven = facts is not None and facts.non_null(companion) and not key.padded
-                return KeyVerdict.HOLDS if proven else KeyVerdict.NULL_FALLBACK
             case KeyShape.UPPER | KeyShape.LOWER | KeyShape.TRIM | KeyShape.TEXT_CAST:
                 members = facts.members(companion) if facts is not None else None
                 if members is None:

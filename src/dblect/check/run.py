@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from functools import cache
 from typing import assert_never
 
 import sqlglot.expressions as exp
@@ -82,7 +81,6 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
-from dblect.lineage.properties.nullability import Nullability, activated_nullability
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     uniqueness_facts,
@@ -153,8 +151,8 @@ class CheckGraphs:
     a ``CONTRACT_ISSUE`` rather than raising and hiding every other column's
     grounding."""
     companion_facts: CompanionFacts
-    """What a computed group key may rest on: a companion's declared values and whether it
-    is proven NOT NULL. Both come from facts that do not vary across worlds."""
+    """What a value-mapping group key may rest on: a companion's declared values, which do
+    not vary across worlds."""
     unguarded_foreign_keys: UnguardedEdges
     """Declared foreign-key edges (contract markers merged with dbt ``relationships``
     tests) minus those an enabled, unconditional, error-severity ``relationships``
@@ -244,29 +242,16 @@ def build_check_graphs(
         ),
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
-        companion_facts=_companion_facts(manifest, profile, trees, column_build.graph, vd_facts),
+        companion_facts=_companion_facts(vd_facts),
         unguarded_foreign_keys=_unguarded_foreign_keys(manifest, reg),
     )
 
 
 def _companion_facts(
-    manifest: Manifest,
-    profile: AdapterProfile,
-    trees: Mapping[str, Expr],
-    column_graph: ColumnLineageGraph,
     vd_facts: Mapping[ColumnRef, tuple[Fact[ValueDomain, ColumnRef], ...]],
 ) -> CompanionFacts:
-    """Companion facts for the coherence guard. Nullability is propagated on first use
-    only, since most runs never group by a ``COALESCE`` of a companion."""
+    """Companion facts for the coherence guard."""
     vd_ground = value_domain_grounding(vd_facts)
-
-    @cache
-    def nullability() -> Mapping[ColumnRef, Annotation[Nullability]]:
-        return activated_nullability(manifest, profile, parsed=trees, column_graph=column_graph)
-
-    def non_null(ref: ColumnRef) -> bool:
-        ann = nullability().get(ref)
-        return ann is not None and ann.value is Nullability.NON_NULL
 
     def members(ref: ColumnRef) -> frozenset[str] | None:
         domain = vd_ground(ref).value
@@ -276,7 +261,7 @@ def _companion_facts(
             return None
         return frozenset(str(lit.value) for lit in domain.values)
 
-    return CompanionFacts(non_null=non_null, members=members)
+    return CompanionFacts(members=members)
 
 
 def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
@@ -745,8 +730,6 @@ def _blocked_key_clause(key: GroupKey, verdict: KeyVerdict) -> str:
     match verdict:
         case KeyVerdict.OPAQUE:
             return "which is neither a column nor a wrapper of one that the guard can read"
-        case KeyVerdict.NULL_FALLBACK:
-            return f"which gives rows where {column} is NULL a fallback value they do not carry"
         case KeyVerdict.COLLIDES:
             return f"which maps two declared values of {column} to one group"
         case KeyVerdict.UNKNOWN_DOMAIN:

@@ -348,70 +348,71 @@ def test_concrete_binding_emits_no_clear() -> None:
 #
 # A group key holds the companion constant when it determines it within a group. The
 # builder reads the key's shape, the guard decides each shape against the companion's
-# declared values and nullability. Every shape of the closed vocabulary is decided.
+# declared values. Every shape of the closed vocabulary is decided.
 
 _ENUM = frozenset({"USD", "EUR"})
 _CASE_COLLIDING = frozenset({"USD", "usd"})
 _PADDED_COLLIDING = frozenset({" USD", "USD"})
 
 
-def _facts(*, non_null: bool = False, members: frozenset[str] | None = _ENUM) -> CompanionFacts:
-    return CompanionFacts(non_null=lambda _ref: non_null, members=lambda _ref: members)
+def _facts(*, members: frozenset[str] | None = _ENUM) -> CompanionFacts:
+    return CompanionFacts(members=lambda _ref: members)
 
 
 def _by(
-    key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM
+    key: str, *, members: frozenset[str] | None = _ENUM
 ) -> tuple[Mapping[ColumnRef, Annotation[DomainTag]], tuple[CoherenceClear[DomainTag], ...]]:
     sql = f"SELECT {key} AS k, SUM(amount) AS total FROM payments GROUP BY {key}"
-    return _propagate(sql, companions=_facts(non_null=non_null, members=members))
+    return _propagate(sql, companions=_facts(members=members))
 
 
-def _holds(key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM) -> bool:
-    _, clears = _by(key, non_null=non_null, members=members)
+def _holds(key: str, *, members: frozenset[str] | None = _ENUM) -> bool:
+    _, clears = _by(key, members=members)
     return not clears
 
 
 @pytest.mark.parametrize(
-    ("key", "non_null", "members", "holds"),
+    ("key", "members", "holds"),
     [
-        ("currency", False, _ENUM, True),
-        ("(currency)", False, _ENUM, True),
-        # COALESCE: the head column is determined on its non-null rows only.
-        ("coalesce(currency, 'USD')", True, _ENUM, True),
-        ("coalesce(currency, 'USD')", False, _ENUM, False),
-        ("coalesce('USD', currency)", True, _ENUM, False),
-        ("coalesce(upper(currency), 'USD')", True, _ENUM, False),
+        ("currency", _ENUM, True),
+        ("(currency)", _ENUM, True),
+        # COALESCE with the companion first: the fallback states the unit of a NULL
+        # companion. Any other argument order or a wrapped head makes no claim.
+        ("coalesce(currency, 'USD')", _ENUM, True),
+        ("coalesce(currency, other_currency)", _ENUM, True),
+        ("coalesce('USD', currency)", _ENUM, False),
+        ("coalesce(upper(currency), 'USD')", _ENUM, False),
         # UPPER / LOWER / TRIM: only when injective on the declared members.
-        ("upper(currency)", False, _ENUM, True),
-        ("upper(currency)", False, _CASE_COLLIDING, False),
-        ("upper(currency)", False, None, False),
-        ("upper(currency)", False, frozenset({"é", "E"}), False),
-        ("lower(currency)", False, _ENUM, True),
-        ("lower(currency)", False, _CASE_COLLIDING, False),
-        ("trim(currency)", False, _ENUM, True),
-        ("trim(currency)", False, _PADDED_COLLIDING, False),
-        ("trim(currency, 'U')", False, _ENUM, False),
+        ("upper(currency)", _ENUM, True),
+        ("upper(currency)", _CASE_COLLIDING, False),
+        ("upper(currency)", None, False),
+        ("upper(currency)", frozenset({"é", "E"}), False),
+        ("lower(currency)", _ENUM, True),
+        ("lower(currency)", _CASE_COLLIDING, False),
+        ("trim(currency)", _ENUM, True),
+        ("trim(currency)", _PADDED_COLLIDING, False),
+        ("trim(currency, 'U')", _ENUM, False),
         # CAST: a cast to unsized text is the identity on string members; every other
         # target (numbers, dates) makes no claim. Sized targets are pinned in test_vocab.
-        ("cast(currency AS varchar)", False, _ENUM, True),
-        ("cast(currency AS text)", False, _ENUM, True),
-        ("cast(currency AS varchar)", False, None, False),
-        ("cast(currency AS integer)", False, _ENUM, False),
+        ("cast(currency AS varchar)", _ENUM, True),
+        ("cast(currency AS text)", _ENUM, True),
+        ("cast(currency AS varchar)", None, False),
+        ("cast(currency AS integer)", _ENUM, False),
         # Everything else makes no claim.
-        ("CASE WHEN country = 'us' THEN currency END", True, _ENUM, False),
-        ("substr(currency, 1, 2)", True, _ENUM, False),
-        ("currency || country", True, _ENUM, False),
+        ("CASE WHEN country = 'us' THEN currency END", _ENUM, False),
+        ("substr(currency, 1, 2)", _ENUM, False),
+        ("currency || country", _ENUM, False),
     ],
 )
 def test_group_key_holds_the_companion_per_shape(
-    key: str, non_null: bool, members: frozenset[str] | None, holds: bool
+    key: str, members: frozenset[str] | None, holds: bool
 ) -> None:
-    assert _holds(key, non_null=non_null, members=members) is holds
+    assert _holds(key, members=members) is holds
 
 
 def test_a_positional_group_key_is_read_through_the_projection() -> None:
     sql = "SELECT coalesce(currency, 'USD') AS k, SUM(amount) AS total FROM payments GROUP BY 1"
-    _, clears = _propagate(sql, companions=_facts(non_null=True))
+    _, clears = _propagate(sql, companions=_facts())
     assert clears == ()
 
 
@@ -428,38 +429,14 @@ def test_a_key_over_another_column_does_not_hold_the_companion() -> None:
     assert not _holds("upper(country)")
 
 
-def test_coalesce_over_an_outer_join_padded_side_does_not_hold() -> None:
-    """``payments`` is the optional side, so its NOT NULL currency is NULL on the rows
-    the join pads; the fallback then attributes those rows a currency they do not have."""
-    padded = (
-        "SELECT coalesce(p.currency, 'USD') AS k, SUM(p.amount) AS total FROM customers c "
-        "LEFT JOIN payments p ON p.customer_id = c.id GROUP BY 1"
-    )
-    preserved = (
-        "SELECT coalesce(p.currency, 'USD') AS k, SUM(p.amount) AS total FROM payments p "
-        "LEFT JOIN customers c ON p.customer_id = c.id GROUP BY 1"
-    )
-    facts = _facts(non_null=True)
-    assert _propagate(padded, companions=facts)[1] != ()
-    assert _propagate(preserved, companions=facts)[1] == ()
-
-
 # What the finding says about why a key failed, per verdict.
 
 
-def _verdicts(
-    key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM
-) -> list[tuple[str, KeyVerdict]]:
-    _, clears = _by(key, non_null=non_null, members=members)
+def _verdicts(key: str, *, members: frozenset[str] | None = _ENUM) -> list[tuple[str, KeyVerdict]]:
+    _, clears = _by(key, members=members)
     (clear,) = clears
     (undischarged,) = clear.undischarged
     return [(b.key.sql, b.verdict) for b in undischarged.blocked]
-
-
-def test_a_nullable_fallback_names_the_key_and_the_null_fallback() -> None:
-    assert _verdicts("coalesce(currency, 'USD')", non_null=False) == [
-        ("COALESCE(payments.currency, 'USD')", KeyVerdict.NULL_FALLBACK)
-    ]
 
 
 def test_a_colliding_wrapper_is_named_as_colliding() -> None:

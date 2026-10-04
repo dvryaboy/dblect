@@ -126,9 +126,6 @@ class KeyVerdict(StrEnum):
     """The key is built from some other column; it neither proves nor defeats the companion."""
     OPAQUE = auto()
     """A key the vocabulary does not name; it might determine the companion, and is no claim."""
-    NULL_FALLBACK = auto()
-    """``COALESCE(c, fallback)`` where ``c`` may be NULL: those rows carry no value of their
-    own and are attributed the fallback's."""
     COLLIDES = auto()
     """A wrapper that maps two declared values of the companion to one key value."""
     UNKNOWN_DOMAIN = auto()

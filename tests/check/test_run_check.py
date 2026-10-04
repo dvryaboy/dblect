@@ -21,7 +21,7 @@ from dblect.audit import SpanBasis
 from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
-from dblect.manifest import DbtTestMetadata, Manifest, ResourceType
+from dblect.manifest import Manifest, ResourceType
 from dblect.types import (
     Decimal,
     DomainType,
@@ -548,7 +548,7 @@ class SpelledMoney(DomainType):
     currency: Spelling
 
 
-def _ccy_manifest(sql: str, *, currency_not_null: bool = False) -> Manifest:
+def _ccy_manifest(sql: str) -> Manifest:
     source = "source.shop.raw.orders"
     nodes = [
         _node(
@@ -572,16 +572,6 @@ def _ccy_manifest(sql: str, *, currency_not_null: bool = False) -> Manifest:
             columns=_cols(currency="VARCHAR", total="DECIMAL"),
         ),
     ]
-    if currency_not_null:
-        nodes.append(
-            _node(
-                "test.shop.nn",
-                kind=ResourceType.OTHER,
-                depends_on=frozenset({source}),
-                test_metadata=DbtTestMetadata(name="not_null", kwargs={"column_name": "currency"}),
-                attached_node=source,
-            )
-        )
     return _manifest(*nodes)
 
 
@@ -589,7 +579,7 @@ _COALESCED = (
     "SELECT coalesce(currency, 'USD') AS currency, SUM(amount) AS total FROM orders GROUP BY 1"
 )
 _COALESCED_JOIN = (
-    "SELECT coalesce({side}.currency, m.default_currency) AS currency, SUM({side}.amount) AS total "
+    "SELECT coalesce(o.currency, m.default_currency) AS currency, SUM(o.amount) AS total "
     "FROM orders o LEFT JOIN merchants m ON o.merchant_id = m.merchant_id GROUP BY 1"
 )
 
@@ -607,24 +597,11 @@ def _orders_contract() -> None:
         amount: Money.columns(amount="amount", currency="currency")
 
 
-def test_coalesced_group_key_over_a_nullable_currency_names_the_key_and_the_null_rows() -> None:
+def test_coalesced_group_key_is_quiet() -> None:
+    # The fallback states the currency of a NULL one, so the key holds it constant.
     _orders_contract()
-    [message] = _aggregation_findings_of(_ccy_manifest(_COALESCED))
-    assert "COALESCE(orders.currency, 'USD')" in message
-    assert "NULL" in message
-    assert ",;" not in message
-
-
-def test_coalesced_group_key_over_a_not_null_currency_is_quiet() -> None:
-    _orders_contract()
-    assert _aggregation_findings_of(_ccy_manifest(_COALESCED, currency_not_null=True)) == []
-
-
-def test_coalesce_over_the_preserved_side_of_a_left_join_is_quiet() -> None:
-    # The issue's own query: the orders side of the join is never NULL-padded.
-    _orders_contract()
-    sql = _COALESCED_JOIN.format(side="o")
-    assert _aggregation_findings_of(_ccy_manifest(sql, currency_not_null=True)) == []
+    assert _aggregation_findings_of(_ccy_manifest(_COALESCED)) == []
+    assert _aggregation_findings_of(_ccy_manifest(_COALESCED_JOIN)) == []
 
 
 def test_upper_over_declared_currencies_is_quiet() -> None:

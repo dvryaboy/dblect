@@ -848,7 +848,6 @@ class _Walker:
         group = sel.args.get("group")
         if not isinstance(group, exp.Group):
             return ()
-        optional = {alias.lower() for alias in sg.outer_join_optional_aliases(sel)}
         out: list[GroupKey] = []
         for g in group.expressions:
             if isinstance(g, exp.Tuple) and not g.expressions:
@@ -860,10 +859,9 @@ class _Walker:
                 else None
             )
             if head.column is None or ref is None:
-                out.append(GroupKey(KeyShape.OPAQUE, None, g.sql(), padded=False))
+                out.append(GroupKey(KeyShape.OPAQUE, None, g.sql()))
                 continue
-            padded = bool(head.column.table) and head.column.table.lower() in optional
-            out.append(GroupKey(head.shape, ref, g.sql(), padded=padded))
+            out.append(GroupKey(head.shape, ref, g.sql()))
         return tuple(out)
 
     def _pinned_refs(self, sel: exp.Select, scope: Scope) -> frozenset[ColumnRef]:

@@ -104,7 +104,7 @@ class KeyShape(Enum):
 
     COLUMN = auto()
     COALESCE_HEAD = auto()
-    """``COALESCE(c, ...)`` with the column first: the key is ``c`` wherever ``c`` is non-null."""
+    """``COALESCE(c, ...)`` with the column first: the key is ``c`` wherever ``c`` is non-null, and the fallback names the rest."""
     UPPER = auto()
     LOWER = auto()
     TRIM = auto()

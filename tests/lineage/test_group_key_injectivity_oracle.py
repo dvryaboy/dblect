@@ -34,8 +34,8 @@ _MEMBERS = st.frozensets(st.text(alphabet=" aAbB", max_size=3), max_size=6)
 def test_wrapper_holds_the_companion_iff_the_warehouse_keeps_members_apart(
     oracle_con: duckdb.DuckDBPyConnection, shape: KeyShape, members: frozenset[str]
 ) -> None:
-    facts = CompanionFacts(non_null=lambda _ref: True, members=lambda _ref: members)
-    key = GroupKey(shape, _COMPANION, _WRAPPERS[shape], padded=False)
+    facts = CompanionFacts(members=lambda _ref: members)
+    key = GroupKey(shape, _COMPANION, _WRAPPERS[shape])
     holds = key_verdict_reader(facts)(key, _COMPANION) is KeyVerdict.HOLDS
 
     con = oracle_con
