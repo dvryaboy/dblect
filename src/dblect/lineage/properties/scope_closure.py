@@ -506,6 +506,146 @@ def _is_reference_mint(fact: QFD, aliases: frozenset[str]) -> bool:
     return isinstance(only, RowToken) and only.alias == dependent.alias and only.alias in aliases
 
 
+def _input_facts(
+    alias: str,
+    inp: Input,
+    *,
+    referenced: Collection[str],
+    keep_fds: bool = True,
+    key_filter: Callable[[Key], bool] | None = None,
+) -> set[QFD]:
+    """What one input contributes to a scope's closure: its keys determine its row token, the
+    row determines each referenced column, and (when ``keep_fds``) its dependencies."""
+    token = RowToken(alias)
+    facts: set[QFD] = {
+        (frozenset(QCol(alias, c) for c in key), token)
+        for key in inp.keys
+        if key_filter is None or key_filter(key)
+    }
+    facts |= {(frozenset({token}), QCol(alias, c)) for c in referenced}
+    if keep_fds:
+        facts |= {
+            (frozenset(QCol(alias, d) for d in fd.determinant), QCol(alias, fd.dependent))
+            for fd in inp.fds
+        }
+    return facts
+
+
+class JoinChain:
+    """Which sides of a SELECT's join chain repeat, read off the closure that derives scope keys.
+
+    A side's rows repeat when one of its rows cannot determine the row of every keyed side: some
+    join then matches it to two rows. Every join counts as INNER, since null-extension adds output
+    rows but never repeats a source row, and the closure does not depend on the order the sides
+    are written. A side without known keys is never required, so it is never blamed for
+    repeating another; a join the closure cannot read (non-equality ON, CROSS) and SEMI/ANTI
+    joins add no side to ``aliases`` (``sides`` still names the unreadable ones).
+    Index ``p`` below is the number of readable joins applied."""
+
+    def __init__(self, sel: exp.Select, resolve: Callable[[Expr], Input | None]) -> None:
+        self._sel = sel
+        self.joins: list[exp.Join] = []
+        self.aliases: list[str] = []
+        self.sides: set[str] = set()
+        self._keyed: list[bool] = []
+        self._facts: list[frozenset[QFD]] = []
+        self._first = ""
+        from_ = sg.from_of(sel)
+        if from_ is None or not isinstance(from_.this, Expr):
+            return
+        self._first = from_.this.alias_or_name.lower()
+        self._add(from_.this, resolve(from_.this), on=None)
+        anti_arms = anti_join.anti_arm_ids(sel)
+        for j in sg.joins_of(sel):
+            side = sg.join_side_of(j)
+            node = j.this
+            if side in (sg.JoinSide.SEMI, sg.JoinSide.ANTI) or id(j) in anti_arms:
+                continue
+            if not isinstance(node, Expr):
+                continue
+            on = sg.on_of(j)
+            if (
+                on is not None
+                and side is not sg.JoinSide.CROSS
+                and sg.equality_cols_on_alias(on, node.alias_or_name)
+            ):
+                self._add(node, resolve(node), on=on)
+                self.joins.append(j)
+            else:
+                self.sides.add(node.alias_or_name.lower())
+        where = sg.where_of(sel)
+        if where is not None and isinstance(where.this, Expr):
+            # WHERE equalities hold on every output row, so a pinned side stops repeating.
+            pinned = _predicate_qfds(where.this, default_alias=self._first)
+            self._facts = [frozenset(f | pinned) for f in self._facts]
+
+    def _add(self, node: Expr, inp: Input | None, *, on: Expr | None) -> None:
+        alias = node.alias_or_name.lower()
+        facts: set[QFD] = set(self._facts[-1]) if self._facts else set()
+        facts |= _input_facts(
+            alias,
+            inp or Input(),
+            referenced=_referenced_columns(self._sel, alias=alias, from_alias=self._first),
+        )
+        if on is not None:
+            facts |= _predicate_qfds(on, default_alias=self._first)
+        self.aliases.append(alias)
+        self.sides.add(alias)
+        self._keyed.append(inp is not None and bool(inp.keys))
+        self._facts.append(frozenset(facts))
+
+    def determines(self, sides: frozenset[str], p: int) -> bool:
+        """Whether one row of each of ``sides`` fixes the row of every keyed side after ``p``
+        joins (so no two output rows share those source rows)."""
+        return self._fixes_rows(frozenset(RowToken(a) for a in sides), p)
+
+    def _fixes_rows(self, attrs: frozenset[Attr], p: int) -> bool:
+        keyed = {RowToken(a) for a, k in zip(self.aliases[: p + 1], self._keyed, strict=False) if k}
+        return keyed <= closure(self._facts[p], attrs)
+
+    def grouped_to_one_row(self, group: exp.Group) -> bool:
+        """Whether the GROUP BY columns fix the row of every keyed side, so each group holds one
+        joined row and no aggregate over it can over-count. Only plain columns qualified by a
+        side are read; an unqualified or computed key, ROLLUP, CUBE or GROUPING SETS proves
+        nothing."""
+        if not group.expressions or any(v for k, v in group.args.items() if k != "expressions"):
+            return False
+        attrs: set[Attr] = set()
+        for col in group.expressions:
+            if (
+                not isinstance(col, exp.Column)
+                or (sg.column_table(col) or "").lower() not in self.aliases
+            ):
+                return False
+            attrs.add(_qcol(col, default_alias=""))
+        return self._fixes_rows(frozenset(attrs), len(self.joins))
+
+    def repeated(self, p: int) -> frozenset[str]:
+        """The sides whose rows may appear in more than one output row after ``p`` joins."""
+        return frozenset(a for a in self.aliases[: p + 1] if not self.determines(frozenset({a}), p))
+
+    def key_broken(self, sides: frozenset[str], p: int) -> bool:
+        """Whether, after ``p`` joins, a key read only from ``sides`` repeats: those sides are all
+        joined in yet do not fix the output row."""
+        return sides <= set(self.aliases[: p + 1]) and not self.determines(sides, p)
+
+    def projected_sides(self, key: Collection[str]) -> frozenset[str] | None:
+        """The sides ``key``'s output names read from in a plain projection (a bare or aliased
+        column, or the one star), or ``None`` when a name does not resolve to exactly one side:
+        an unqualified or computed column, a blocked star."""
+        proj = _build_projection(self._sel, from_alias="", active_aliases=self.aliases)
+        if proj.blocked:
+            return None
+        out: set[str] = set()
+        for name in key:
+            owners = {qc.alias for qc, names in proj.named.items() if name in names}
+            owners = owners or set(proj.star_aliases)
+            if len(owners) != 1 or name in proj.computed:
+                return None
+            out |= owners
+        return frozenset(out) if out <= set(self.aliases) else None
+
+
 def _select_facts(
     sel: exp.Select,
     *,
@@ -571,18 +711,16 @@ def _select_facts(
     ) -> None:
         nonlocal scope_exact
         scope_exact = scope_exact and inp.exact
-        token = RowToken(alias)
-        for key in inp.keys:
-            if key_filter is not None and not key_filter(key):
-                continue
-            facts.add((frozenset(QCol(alias, c) for c in key), token))
-        for c in _referenced_columns(sel, alias=alias, from_alias=from_alias):
-            facts.add((frozenset({token}), QCol(alias, c)))
+        facts.update(
+            _input_facts(
+                alias,
+                inp,
+                referenced=_referenced_columns(sel, alias=alias, from_alias=from_alias),
+                keep_fds=keep_fds,
+                key_filter=key_filter,
+            )
+        )
         if keep_fds:
-            for fd in inp.fds:
-                facts.add(
-                    (frozenset(QCol(alias, d) for d in fd.determinant), QCol(alias, fd.dependent))
-                )
             declared_by_alias[alias] = inp.declared
             conditional_by_alias[alias] = inp.conditional
         active_aliases.append(alias)

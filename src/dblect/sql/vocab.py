@@ -10,9 +10,14 @@ structural column combination as a key.
 from __future__ import annotations
 
 from datetime import date, datetime
+from enum import Enum, auto
+from typing import Final, final
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.duckdb import DuckDB
+from sqlglot.dialects.postgres import Postgres
 
 from dblect.sql import _sqlglot as sg
 
@@ -25,6 +30,65 @@ _TIMESTAMP_TYPES = (
     exp.DataType.Type.TIMESTAMPNTZ,
     exp.DataType.Type.DATETIME,
 )
+
+# System columns no catalog lists (Redshift subclasses Postgres).
+_IMPLICIT_COLUMNS = (
+    (DuckDB, frozenset({"rowid"})),
+    (Postgres, frozenset({"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid"})),
+)
+
+
+def implicit_column_names(dialect: str | None) -> frozenset[str]:
+    """Names a ``dialect`` supplies on every relation without listing them."""
+    d = Dialect.get_or_raise(dialect)
+    names = {sg.stored_column_name(c) for c in d.PSEUDOCOLUMNS}
+    for cls, system in _IMPLICIT_COLUMNS:
+        if isinstance(d, cls):
+            names |= system
+    return frozenset(names)
+
+
+@final
+class CastTarget(Enum):
+    """What a cast's target type can still hold of a tagged value. Closed over every
+    ``DataType.Type``: a target is a number, a string, or neither."""
+
+    NUMERIC = auto()
+    TEXT = auto()
+    OTHER = auto()
+
+
+# sqlglot's groups are the base; they miss a few spellings (``BPCHAR``, MySQL's sized
+# text, ``SERIAL``) and count ``BIT`` as numeric although it holds a flag, not a magnitude.
+_NUMERIC_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    (
+        exp.DataType.NUMERIC_TYPES
+        | {exp.DType.BIGNUM, exp.DType.SERIAL, exp.DType.SMALLSERIAL, exp.DType.BIGSERIAL}
+    )
+    - {exp.DType.BIT}
+)
+_TEXT_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    exp.DataType.TEXT_TYPES
+    | {
+        exp.DType.BPCHAR,
+        exp.DType.TINYTEXT,
+        exp.DType.MEDIUMTEXT,
+        exp.DType.LONGTEXT,
+        exp.DType.FIXEDSTRING,
+    }
+)
+
+
+def cast_target(to: object) -> CastTarget:
+    """Classify a cast's target type. Anything that is not a plain ``DataType`` (a
+    missing target, a user-defined name) is ``OTHER``, the no-claim side."""
+    if not isinstance(to, exp.DataType) or not isinstance(to.this, exp.DType):
+        return CastTarget.OTHER
+    if to.this in _NUMERIC_TARGETS:
+        return CastTarget.NUMERIC
+    if to.this in _TEXT_TARGETS:
+        return CastTarget.TEXT
+    return CastTarget.OTHER
 
 
 def array_literal_nonempty(expr: Expr) -> bool:

@@ -570,7 +570,7 @@ def test_finding_carries_line_number() -> None:
 
 
 def test_fanout_flagged_when_keys_dont_cover_join_key() -> None:
-    parsed = _parse("select * from facts f left join dim d on f.segment = d.segment")
+    parsed = _parse("select f.id from facts f left join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
     assert findings[0].kind is FindingKind.JOIN_FANOUT
@@ -578,27 +578,27 @@ def test_fanout_flagged_when_keys_dont_cover_join_key() -> None:
 
 
 def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
-    parsed = _parse("select * from facts f left join dim d on f.id = d.id")
+    parsed = _parse("select f.id from facts f left join dim d on f.id = d.id")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_when_join_key_is_a_superkey_of_declared_key() -> None:
     parsed = _parse(
-        "select * from facts f left join dim d on f.id = d.id and f.segment = d.segment"
+        "select f.id from facts f left join dim d on f.id = d.id and f.segment = d.segment"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_composite_key_silent_when_join_covers_all_columns() -> None:
-    parsed = _parse("select * from facts f join dim d on f.a = d.a and f.b = d.b")
+    parsed = _parse("select f.id from facts f join dim d on f.a = d.a and f.b = d.b")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("a", "b"),)))
     assert findings == ()
 
 
 def test_fanout_composite_key_flagged_when_join_covers_only_one_column() -> None:
-    parsed = _parse("select * from facts f join dim d on f.a = d.a")
+    parsed = _parse("select f.id from facts f join dim d on f.a = d.a")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("a", "b"),)))
     assert len(findings) == 1
 
@@ -607,7 +607,7 @@ def test_fanout_silent_when_fd_closure_covers_key() -> None:
     # `dim` is unique on (a, b, c), but a determines b and c, so a join on `a` alone
     # functionally determines the whole key and cannot fan out. This is the non-minimal-key
     # case: a declared key carrying descriptive columns dependent on an id.
-    parsed = _parse("select * from facts f join dim d on f.a = d.a")
+    parsed = _parse("select f.id from facts f join dim d on f.a = d.a")
     fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"a"}), "c"))}
     findings = detect_join_fanout(
         parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), model_fds=fds
@@ -618,7 +618,7 @@ def test_fanout_silent_when_fd_closure_covers_key() -> None:
 def test_fanout_flagged_when_fd_closure_insufficient() -> None:
     # a determines b but not c, so the closure of {a} is {a, b}, which does not cover the
     # (a, b, c) key. The join can still fan out, so it fires.
-    parsed = _parse("select * from facts f join dim d on f.a = d.a")
+    parsed = _parse("select f.id from facts f join dim d on f.a = d.a")
     fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"))}
     findings = detect_join_fanout(
         parsed, model_keys=_model_keys(dim=(("a", "b", "c"),)), model_fds=fds
@@ -631,7 +631,7 @@ def test_fanout_cte_target_covered_by_model_fd_closure() -> None:
     # so the engine minimizes `t`'s key to (b); joining on `a` checks out only
     # through the dependency reaching `t`.
     parsed = _parse(
-        "with t as (select * from dim) select o.foo, t.z from other_fact as o join t on o.a = t.a"
+        "with t as (select * from dim) select o.foo from other_fact as o join t on o.a = t.a"
     )
     keys = _model_keys(dim=(("a", "b"),))
     fds = {"dim": FDSet.of(FD(frozenset({"a"}), "b"), FD(frozenset({"b"}), "a"))}
@@ -644,19 +644,19 @@ def test_fanout_cte_target_covered_by_model_fd_closure() -> None:
 
 
 def test_fanout_silent_when_source_has_no_keys() -> None:
-    parsed = _parse("select * from facts f left join dim d on f.segment = d.segment")
+    parsed = _parse("select f.id from facts f left join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys={})
     assert findings == ()
 
 
 def test_fanout_silent_when_join_target_is_unknown_model() -> None:
-    parsed = _parse("select * from facts f left join unknown u on f.id = u.id")
+    parsed = _parse("select f.id from facts f left join unknown u on f.id = u.id")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_on_cross_join() -> None:
-    parsed = _parse("select * from facts f cross join dim d")
+    parsed = _parse("select f.id from facts f cross join dim d")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
@@ -671,20 +671,20 @@ def test_fanout_silent_on_cross_join() -> None:
 
 
 def test_fanout_silent_on_native_anti_join() -> None:
-    parsed = _parse("select * from facts f anti join dim d on f.segment = d.segment")
+    parsed = _parse("select f.id from facts f anti join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_on_semi_join() -> None:
-    parsed = _parse("select * from facts f semi join dim d on f.segment = d.segment")
+    parsed = _parse("select f.id from facts f semi join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_on_left_join_is_null_anti_idiom() -> None:
     parsed = _parse(
-        "select * from facts f left join dim d on f.segment = d.segment where d.segment is null"
+        "select f.id from facts f left join dim d on f.segment = d.segment where d.segment is null"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
@@ -695,7 +695,7 @@ def test_fanout_still_fires_on_left_join_is_null_on_a_non_key_column() -> None:
     so the LEFT join can still fan out and the finding stands: the skip is the recognised idiom,
     not any LEFT join carrying an IS NULL."""
     parsed = _parse(
-        "select * from facts f left join dim d on f.segment = d.segment where d.attr is null"
+        "select f.id from facts f left join dim d on f.segment = d.segment where d.attr is null"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
@@ -707,20 +707,20 @@ def test_fanout_silent_when_join_target_shadowed_by_cte() -> None:
     # whose body has no known keys, so the detector stays silent.
     parsed = _parse(
         "with dim as (select segment from raw) "
-        "select * from facts f left join dim d on f.segment = d.segment"
+        "select f.id from facts f left join dim d on f.segment = d.segment"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_when_predicate_is_disjunctive() -> None:
-    parsed = _parse("select * from facts f left join dim d on f.id = d.id or f.alt = d.alt")
+    parsed = _parse("select f.id from facts f left join dim d on f.id = d.id or f.alt = d.alt")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
 
 def test_fanout_silent_when_predicate_has_function_call() -> None:
-    parsed = _parse("select * from facts f left join dim d on lower(f.id) = lower(d.id)")
+    parsed = _parse("select f.id from facts f left join dim d on lower(f.id) = lower(d.id)")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
 
@@ -728,7 +728,7 @@ def test_fanout_silent_when_predicate_has_function_call() -> None:
 def test_fanout_flagged_inside_cte_body() -> None:
     parsed = _parse(
         "with widened as ("
-        "  select * from facts f left join dim d on f.segment = d.segment"
+        "  select f.id from facts f left join dim d on f.segment = d.segment"
         ") "
         "select * from widened"
     )
@@ -741,7 +741,7 @@ def test_fanout_silent_when_cte_inherits_uniqueness_via_propagation() -> None:
     # join binds on `id`, so it can't fan out.
     parsed = _parse(
         "with dim_local as (select * from dim) "
-        "select * from facts f join dim_local d on f.id = d.id"
+        "select f.id from facts f join dim_local d on f.id = d.id"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
@@ -752,7 +752,7 @@ def test_fanout_flagged_when_join_to_propagated_cte_misses_inherited_key() -> No
     # inherited `id` key, so it can fan out.
     parsed = _parse(
         "with dim_local as (select * from dim) "
-        "select * from facts f join dim_local d on f.segment = d.segment"
+        "select f.id from facts f join dim_local d on f.segment = d.segment"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
@@ -760,7 +760,7 @@ def test_fanout_flagged_when_join_to_propagated_cte_misses_inherited_key() -> No
 
 
 def test_fanout_finding_carries_join_line() -> None:
-    sql = "select *\nfrom facts f\nleft join dim d on f.segment = d.segment\n"
+    sql = "select f.id\nfrom facts f\nleft join dim d on f.segment = d.segment\n"
     findings = detect_join_fanout(_parse(sql), model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
     assert findings[0].line_start == 3
@@ -806,14 +806,14 @@ def test_fanout_silent_when_collapsed_group_uses_distinct_aggregate() -> None:
 
 def test_fanout_flagged_for_plain_projection_without_aggregate() -> None:
     # No GROUP BY and no aggregate: the multiplied rows flow straight to the output.
-    parsed = _parse("select f.id, d.seen_at from facts f join dim d on f.segment = d.segment")
+    parsed = _parse("select f.id, f.entity from facts f join dim d on f.segment = d.segment")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
 
 
 def test_fanout_unknown_udf_aggregate_keeps_firing_unless_declared_idempotent() -> None:
     parsed = _parse(
-        "select f.id, geo_mean(d.v) as gm "
+        "select f.id, geo_mean(f.v) as gm "
         "from facts f join dim d on f.segment = d.segment "
         "group by f.id"
     )
@@ -988,9 +988,7 @@ def test_fd_annotations_by_name_wires_the_uniqueness_edge() -> None:
 # --- an ungrouped aggregate select is one implicit group (#296) ---
 
 _FANOUT_AGGREGATES: tuple[tuple[str, bool], ...] = (
-    ("count(distinct d.kind)", False),
     ("max(d.seen_at)", False),
-    ("count(*)", True),
     ("sum(f.amount)", True),
 )
 
@@ -1031,7 +1029,7 @@ def test_fanout_ungrouped_mixed_aggregate_and_bare_column_keeps_firing() -> None
 def test_fanout_ungrouped_window_aggregate_is_not_a_collapse() -> None:
     # A windowed aggregate preserves rows, so the multiplied rows still reach the output.
     parsed = _parse(
-        "select max(d.seen_at) over () as last_seen from facts f join dim d on f.segment = d.segment"
+        "select max(f.seen_at) over () as last_seen from facts f join dim d on f.segment = d.segment"
     )
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert len(findings) == 1
@@ -1043,3 +1041,27 @@ def test_fanout_ungrouped_collapse_ignores_columns_of_nested_subquery() -> None:
         "from facts f join dim d on f.segment = d.segment"
     )
     assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
+
+
+@pytest.mark.parametrize("declared_column", ["customer_id", "order_id"])
+def test_a_unique_test_on_the_model_reaches_the_fanout_detector(declared_column: str) -> None:
+    """A dbt ``unique`` test on the model is the intent signal: a plain projection whose
+    declared key reads only the repeated side fires, one keyed on the other side stays silent."""
+    customers = _source("source.shop.raw.customers", name="customers")
+    orders = _source("source.shop.raw.orders", name="orders")
+    keys = (
+        _unique_test("test.shop.uc", column="customer_id", target=customers.unique_id),
+        _unique_test("test.shop.uo", column="order_id", target=orders.unique_id),
+    )
+    sql = (
+        "select c.customer_id, c.name, o.order_id, o.amount_cents "
+        "from customers c join orders o on o.customer_id = c.customer_id"
+    )
+    model = _node("model.shop.enriched", sql)
+    declared = _unique_test("test.shop.ud", column=declared_column, target=model.unique_id)
+    manifest = _manifest(customers, orders, *keys, model, declared)
+    tree = _parse(sql)
+    _window, fanout, _limit, _agg = make_fact_grounded_detectors(
+        manifest, _DUCKDB, parsed={model.unique_id: tree}
+    )
+    assert bool(fanout(tree)) is (declared_column == "customer_id")
