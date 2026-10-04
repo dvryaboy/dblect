@@ -2,15 +2,22 @@
 
 Read a dbt project, work out which columns carry meaning plain validation cannot
 see, draft the dblect declaration layer that pins it, then run `dblect check` and
-correct the draft until it resolves cleanly.
+correct the draft until every declaration lines up and every finding is explained.
 
 dblect already earns its keep with zero declarations: its structural detectors read
 the compiled SQL and flag ordering, join, and NULL hazards on their own, and it
 reads your existing dbt tests directly. A `unique` (or
 `dbt_utils.unique_combination_of_columns`) test becomes a key fact, a
 `relationships` test a foreign-key edge, an `accepted_values` test a value domain.
-**Do not restate any of that.** Re-declaring keys a dbt test already states adds
-noise and no signal.
+Re-declaring a fact a dbt test already states adds noise and no signal.
+
+**But check that the tests exist before relying on them.** Projects often test their
+models thoroughly and their sources not at all, so the raw tables every join starts
+from carry no key dblect can see, and its join and grain checks go quiet exactly where
+the data is messiest. The facts are usually written down anyway, in prose: a source
+description saying "one row per booking", a comment saying a seat number "is unique
+only within its flight", a doc listing the values a status column takes. Step 2 finds
+those gaps and fills them.
 
 What no dbt test can express, and what you add, is *meaning*: a column whose type is
 richer than its SQL type, so two numerically valid values still are not
@@ -40,13 +47,13 @@ Three kinds of meaning propagate today:
   order's currency) or the grain, which keep a rollup well typed. Expressed as
   `determines` and `grain` facts, **not** as types.
 
-Closed categories (`status`, `channel`, `platform`, `country`) usually need no
-declaration: an `accepted_values` test already grounds and propagates a value
-domain for free, so a stray or mistyped literal downstream (`WHERE status =
-'shipd'`) is caught without you writing anything. A bare `NominalEnum`/`UnitEnum`
-column declaration grounds the same fact directly, for a category with no dbt
-test to read. A category earns a full `DomainType` only when it rides on a
-magnitude as its unit, as `currency` does on `Money`.
+Closed categories (`status`, `channel`, `platform`, `country`) need no declaration
+where an `accepted_values` test exists: the test already grounds and propagates a
+value domain, so a stray or mistyped literal downstream (`WHERE status = 'shipd'`)
+is caught without you writing anything. Where no test exists, a bare
+`NominalEnum`/`UnitEnum` column declaration grounds the same fact (Step 2). A category
+earns a full `DomainType` only when it rides on a magnitude as its unit, as
+`currency` does on `Money`.
 
 Restraint is part of the job. Type a column only when one of those kinds
 genuinely lives in it. Give an identifier an entity type when it is a join key and
@@ -58,7 +65,7 @@ in the data rather than in code or a companion column: a "season wins" figure wh
 basis is 80 games some seasons and 82 others has no column to bind to, and pinning it
 would vouch a claim that is wrong half the time. A vouched declaration the data does
 not support is worse than none, because dblect trusts it and propagates it. When in
-doubt, leave it or ask (Step 3).
+doubt, leave it or ask (Step 4).
 
 Out of scope this pass, because they do not run on the `dblect check` path yet:
 configuration flags (`DomainFlag`) and runnable contract predicates (`.within(...)`).
@@ -84,7 +91,7 @@ non-default `target-path` needs no extra flags.
 **Note the Python models, because dblect cannot read them.** dblect parses compiled
 SQL, so a dbt Python model is reported under `skipped:`. This matters downstream: a
 column whose lineage passes through a skipped model loses its provenance, which can
-turn a real check into a conservative artifact (Step 5). Note them up front so you
+turn a real check into a conservative artifact (Step 6). Note them up front so you
 recognize the gap.
 
 **Get column names right; every binding depends on them.** Two sources feed
@@ -101,14 +108,86 @@ unseen. When stubs look thin, read a model's real columns from `catalog.json`
 Then read the structure: the `models/` tree, each `.sql`, and the `schema.yml`
 descriptions, which are often where a human already wrote down what a column means.
 
-## Step 2: find the loaded columns
+## Step 2: fill the gaps in what dblect already knows
+
+List the relations the project's joins and window rankings read, sources first, and
+for each note which key and foreign-key tests dblect can see. Wherever a relation that
+is joined on or ranked has none, find its key: the source description, comments in
+the SQL, docs and runbooks in the repo, a `DISTINCT` or `ROW_NUMBER` dedup that says
+what the author believed was unique. Do the same for closed sets of values: a status,
+type or kind column that the SQL filters on with literals (`where status = '...'`)
+and that has no `accepted_values` test.
+
+**Verify against the data before you vouch.** When the warehouse is reachable, run the
+check a dbt test would (`select k, count(*) from t group by k having count(*) > 1`, or
+`select distinct status from t`). A key that holds is a fact; one that fails is a
+finding to report, not to declare. When you cannot query, declare only what the
+project's own text states outright, and say which facts rest on prose alone.
+
+Declare each fact on the earliest relation that carries it, which for a raw column is
+the source itself (`dbt_model` takes `"<source_name>.<table>"`). Facts flow downstream
+and never upstream, so a set declared on a staging model is invisible to anything
+that reads the raw table directly, such as orchestrator tasks, scripts and notebooks.
+A composite key is one `key(...)` over all its columns, and it matters: a column
+unique only together with another (a seat number within a flight) joined or grouped
+on alone is a classic silent bug. A model whose docs say "one row per X" gets
+`key(X)` when no test states it, intermediate models included, so a join that breaks
+the grain is caught where it happens.
+
+```python
+from dblect import ModelContract, contract, models
+from dblect.types import NominalEnum
+
+class ShipmentStatus(NominalEnum):
+    PENDING = "pending"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+
+class RawShipments(ModelContract):
+    dbt_model = "raw.shipments"
+    status: ShipmentStatus  # a closed value set: a filter on any other literal is dead
+
+    @contract
+    def pk(self):
+        return self.key(self.shipment_id)
+
+class RawShipmentLines(ModelContract):
+    dbt_model = "raw.shipment_lines"
+
+    @contract
+    def pk(self):
+        return self.key(self.shipment_id, self.line_number)
+
+    @contract
+    def parent(self):
+        return self.shipment_id.references(models.shipments.shipment_id)
+```
+
+Mention each of these to the user as a dbt test worth adding too: the test also guards
+the data at run time, which a declaration does not. The converse holds as well. A
+declaration never fails a load, so a project's rules about which runtime tests to keep
+(for instance, no `accepted_values` on staging, since a new status is not a defect) do
+not govern it. When a new value appears, adding it to the declared set is the intended
+step.
+
+**Ids from different systems.** Where two systems each mint ids for the same kind of
+thing (a CRM's account id and the billing system's, a vendor's product code and the
+catalog's SKU), the columns share a name or a SQL type and nothing else.
+Give each an identifier entity type (Step 5) so a join that equates them is caught.
+
+This step fills in keys and value sets; the meaning pass in Steps 3 to 5 still runs
+in full after it. A project needs both.
+
+## Step 3: find the loaded columns
 
 Walk models and macros for columns whose meaning is richer than their SQL type:
 
 - **Magnitudes and their units.** Any `amount`, `price`, `revenue`, `cost`, `spend`,
   `total`, `value` column and the unit qualifying it: currency, net vs gross, tax in
-  or out, pre- or post-discount. A `Decimal` records none of this. Rates (`cpc`,
-  `ctr`, `rate`, `pct`) are magnitudes too: ask the base and the window.
+  or out, pre- or post-discount. A `Decimal` records none of this. Quantities carry
+  units too (`qty` with a `uom`, a duration in seconds or days, a weight in grams or
+  pounds). Rates (`cpc`, `ctr`, `rate`, `pct`) are magnitudes as well: ask the base and
+  the window.
 - **Hierarchies and grain.** A containment chain (`ad` within `adset` within
   `campaign`, `order_line` within `order`) where one identifier determines another,
   and the grain itself when a rollup depends on it. Skip the plain keys a dbt test
@@ -120,7 +199,14 @@ crosses currencies; `group by campaign_id` over an ad-grained model relies on ea
 belonging to one campaign. Trace a loaded column from source through staging to
 marts, watching for where its meaning could change without the type following.
 
-## Step 3: infer what you can, interview for the rest
+Declare a magnitude's type once, on the model where it first meets a complete unit,
+and let dblect carry it downstream. Where a raw unit column is sometimes NULL and a
+later model fills it in (a `coalesce` to the market's currency, say), bind there, and
+report the NULL rows to the user as a finding of their own. Do not re-declare the type
+on models that pass the column through: the type already flows in, and a second
+binding to the downstream copy of the unit column reads as a contradiction.
+
+## Step 4: infer what you can, interview for the rest
 
 Some meaning is readable: `where currency = 'USD'` is single-currency by
 construction, a macro named `to_usd` converts. Lean on the SQL, the descriptions, and
@@ -133,13 +219,17 @@ vouched fact ("I read `stg_payments.amount` as USD because the model filters to 
 orders; still true now that the source carries a `currency` column?"). If you cannot
 ask, draft it and mark the assumption with `# TODO: confirm ...`.
 
-## Step 4: write the declarations
+## Step 5: write the declarations
 
 Put domain types in `dblect/types.py` and contracts under `dblect/contracts/`. Copy
 the shapes below rather than reverse-engineering dblect's source. Every `.py` module
 under `dblect/` is imported and any `ModelContract` subclass registers itself, so you
 wire up no imports or registry; split one module per model group or per model as you
-like.
+like. A contract module imports the project's own types relatively
+(`from ..types import Money`), because `dblect.types` names the library's module.
+Run any Python probe from outside the project's `dblect/` folder and its parent:
+from there, the folder shadows the library on import, and its `types.py` shadows
+Python's own `types` module.
 
 Declare a domain type by subclassing `DomainType`, one typed field per facet. `Money`
 (an amount and its currency) ships in `dblect.demo`:
@@ -157,7 +247,22 @@ class Money(DomainType):
 ```
 
 A `UnitEnum` tag must agree when values combine; a `NominalEnum` tag rides along
-without that constraint.
+without that constraint. The magnitude must be a `Decimal`: dblect does not read an integer
+field as a magnitude, so integer minor units (cents) are `Decimal(38, 0)`.
+
+A quantity in a unit of measure is the same shape:
+
+```python
+from dblect.types import Decimal, DomainType, UnitEnum
+
+class Uom(UnitEnum):
+    EACH = "each"
+    KG = "kg"
+
+class Quantity(DomainType):
+    qty: Decimal(18, 3)
+    uom: Uom
+```
 
 **Refine to fix a meaning-bearing parameter.** Pin a single-currency column's tag;
 bind a multi-currency column's facet to the column recording it:
@@ -266,7 +371,7 @@ class StgPayments(ModelContract):
         return self.order_id.determines(self.currency)
 ```
 
-## Step 5: check and self-correct
+## Step 6: check and self-correct
 
 ```text
 dblect check .
@@ -292,7 +397,8 @@ Then read the findings. Four kinds matter:
 - **`domain_type_contradiction`**: the meaning you declared conflicts with what the
   DAG carries (a currency creeping in where you pinned USD, a net figure flowing into
   a gross contract). The headline catch. Decide whether the declaration is stale (open
-  it up) or the SQL has a real bug (fix it).
+  it up) or the SQL has a real bug (fix it). One cause is your own: a type re-declared
+  on a model that passes the column through. Delete the downstream declaration.
 - **`aggregation_not_well_typed`**: an aggregate combined values the analyzer could
   not prove are the same kind. Often the real catch (a mixed-currency sum), but it can
   be a conservative artifact when the group shape is unresolved or the lineage routes
@@ -305,8 +411,14 @@ Then read the findings. Four kinds matter:
   conflict, most often ids of two different entities. This is nearly always a real
   bug in the join condition; show it to the user.
 
-Iterate until contract issues are gone. A remaining `domain_type_contradiction` may
-be a true finding worth surfacing to the user; explain it and let them decide.
+Run the check once per batch of edits and save its output to a file, so you read it
+rather than rerun it. You are done when no contract issue remains, the resolved-columns
+count matches what you declared, and every remaining contradiction is explained. A
+remaining `domain_type_contradiction` may be a true finding worth surfacing to the
+user; explain it and let them decide. List the can't-prove aggregation findings for the
+user as unproven, with the reason (a computed group key such as `coalesce(currency,
+...)`, a skipped model), and leave the declarations as they are. Report how many
+findings stand; do not describe a run with open findings as clean.
 
 **Suppressing a finding you and the user agree is intentional.** dblect reads
 SQLFluff-compatible `-- noqa` comments, the same syntax dbt Fusion's `dbt lint`
@@ -324,8 +436,9 @@ explained go away.
 
 ## What good looks like
 
-A small, honest declaration layer: domain types on the magnitudes that carry a unit,
-refinements that pin the unit or the net/gross reading you confirmed, and a
-functional-dependency fact or two where a rollup needs it. A handful of contracts, not
-a wall of them. Every binding grounded in a real column name, every vouched fact in a
-real invariant.
+A small, honest declaration layer: the keys, foreign keys and closed value sets the
+project documents but does not test, each checked against the data; domain types on
+the magnitudes that carry a unit, refinements that pin the unit or the net/gross
+reading you confirmed, entity types where ids from different systems meet, and a
+functional-dependency fact or two where a rollup needs it. Every binding grounded in a
+real column name, every vouched fact in a real invariant.
