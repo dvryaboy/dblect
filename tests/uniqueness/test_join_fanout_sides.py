@@ -207,6 +207,10 @@ def test_a_consumer_downstream_of_the_join_decides_as_it_does_on_the_join(
 
 
 _CHAIN = f"with j as ({_WRAPPED_ROWS})"
+_REJOIN = (
+    f"with j as (select c.customer_id, c.region, c.credit, o.order_id, o.amount from {_TO_ORDERS})"
+)
+_REJOINED = "from j join regions r on r.region = j.region"
 
 _TOPOLOGIES: tuple[tuple[str, bool], ...] = (
     # a pass-through CTE chain carries the repeated side to the aggregate
@@ -220,14 +224,39 @@ _TOPOLOGIES: tuple[tuple[str, bool], ...] = (
     # a collapse downstream ends the hazard for rows
     (f"{_CHAIN}, k as (select distinct credit from j) select credit from k", False),
     (f"{_CHAIN}, k as (select name, sum(amount) as t from j group by name) select t from k", False),
+    # a name that came through a star reads the sides that star expands to
+    (f"with j as (select c.*, o.amount from {_TO_ORDERS}) select sum(credit) from j", True),
+    (f"with j as (select c.*, o.amount from {_TO_ORDERS}) select sum(amount) from j", False),
+    (f"with j as (select * from {_TO_ORDERS}) select sum(amount) from j", True),
+    (f"with j as (select c.*, o.amount from {_TO_ORDERS}) select j.* from j", False),
+    (
+        f"with j as (select c.*, o.amount from {_TO_ORDERS}) select sum(credit) from j join regions r on r.region = j.region",
+        True,
+    ),
     # a constant names no side, so an aggregate of it is not proven safe
     (f"with j as (select 1 as one, c.name from {_TO_ORDERS}) select sum(one) from j", True),
     # one hurtful reader is enough when the CTE is read twice
     (f"{_CHAIN} select amount from j union all select credit from j", True),
     (f"{_CHAIN} select amount from j union all select amount from j", False),
+    # a reader that joins the CTE again is a chain of its own: columns of the CTE keep the
+    # sides they read, and a column of the other relation is judged by that chain
+    (f"{_REJOIN} select sum(j.credit) {_REJOINED}", True),
+    (f"{_REJOIN} select sum(j.amount) {_REJOINED}", False),
+    (f"{_REJOIN} select j.credit, r.population {_REJOINED}", True),
+    (f"{_REJOIN} select j.credit, j.amount, r.population {_REJOINED}", False),
+    (f"{_REJOIN} select j.amount, r.population {_REJOINED}", False),
+    (f"{_REJOIN} select sum(credit) {_REJOINED}", True),
+    (f"{_REJOIN} select sum(j.credit) from regions r join j on r.region = j.region", True),
+    (f"{_REJOIN} select sum(j.amount) from regions r join j on r.region = j.region", False),
+    (f"{_REJOIN}, k as (select j.credit as v {_REJOINED}) select sum(v) from k", True),
+    (f"{_REJOIN}, k as (select j.amount as v {_REJOINED}) select sum(v) from k", False),
+    # a CTE that only filters (SEMI or ANTI side) is not followed; a reader joins it on a non-equality
+    # ON is as silent as a top-level one, so only the CTE's own consumers decide
+    (f"{_REJOIN} select sum(j.amount) from regions r semi join j on r.region = j.region", True),
+    (f"{_REJOIN} select sum(j.amount) from j join regions r on r.region > j.region", False),
+    (f"{_REJOIN} select sum(j.credit) from j join regions r on r.region > j.region", True),
     # a reader that joins the CTE again or a union body is not followed; a CTE nobody reads
     # has no consumer
-    (f"{_CHAIN} select sum(amount) from j join regions r on r.region = j.name", True),
     (f"with j as ({_WRAPPED_ROWS} union all {_WRAPPED_ROWS}) select amount from j", True),
     (f"{_CHAIN} select 1 as x", False),
     # nested subqueries follow the same path
@@ -241,6 +270,33 @@ def test_the_rows_of_a_cte_are_followed_through_the_scopes_that_read_them(
     sql: str, fires: bool
 ) -> None:
     assert _fires(sql, _KEYED) is fires
+
+
+@pytest.mark.parametrize(
+    ("sql", "declared", "fires"),
+    [
+        (f"{_CHAIN} select * from j", ("customer_id",), True),
+        (f"{_CHAIN} select customer_id, amount from j", ("customer_id",), True),
+        (f"{_CHAIN} select customer_id as cid, amount from j", ("cid",), True),
+        (f"{_CHAIN}, k as (select * from j) select * from k", ("customer_id",), True),
+        (f"{_CHAIN} select * from j", ("order_id",), False),
+        (f"{_CHAIN} select * from j", ("customer_id", "order_id"), False),
+        (f"{_CHAIN} select distinct customer_id, amount from j", ("customer_id",), False),
+        (
+            f"{_CHAIN} select customer_id, sum(amount) from j group by customer_id",
+            ("customer_id",),
+            False,
+        ),
+        # the key has no name the walk can resolve to one side
+        (f"{_CHAIN} select customer_id + 1 as customer_id, amount from j", ("customer_id",), False),
+        (f"{_REJOIN} select j.customer_id, r.population {_REJOINED}", ("customer_id",), True),
+        (f"{_REJOIN} select j.order_id, r.population {_REJOINED}", ("order_id",), False),
+    ],
+)
+def test_a_declared_key_is_followed_through_the_scopes_that_read_the_join(
+    sql: str, declared: tuple[str, ...], fires: bool
+) -> None:
+    assert _fires(sql, _KEYED, declared) is fires
 
 
 @pytest.mark.parametrize("known", ["orders", "customers"])
