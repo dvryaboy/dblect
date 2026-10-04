@@ -10,6 +10,7 @@ import from here and don't touch the parser's types directly.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -168,6 +169,25 @@ class DbtTestSeverity(StrEnum):
     WARN = "warn"
 
 
+# dbt keeps test kwargs unrendered, so a quoted column arrives as Jinja. These two
+# idioms are the ones a literal name can be read from without rendering.
+_QUOTED_COLUMN_IDIOM = re.compile(
+    r"""\{\{-?\s*(?:quote_column|adapter\.quote)\(\s*(['"])([^'"{}()]+)\1\s*\)\s*-?\}\}"""
+)
+
+
+def declared_column_name(raw: object) -> str | None:
+    """The column a test kwarg names, or ``None`` when it cannot be read without
+    rendering Jinja. A bare name, ``{{ quote_column('x') }}`` and
+    ``{{ adapter.quote('x') }}`` resolve; any other templated value does not."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    idiom = _QUOTED_COLUMN_IDIOM.fullmatch(raw)
+    if idiom is not None:
+        return idiom.group(2)
+    return None if "{{" in raw or "{%" in raw else raw
+
+
 @dataclass(frozen=True, slots=True)
 class DbtTestMetadata:
     """What dblect knows about a dbt test node.
@@ -201,6 +221,20 @@ class DbtTestMetadata:
     enabled: bool = True
     where: str | None = None
     severity: DbtTestSeverity = DbtTestSeverity.ERROR
+
+    def column_kwarg(self, key: str) -> str | None:
+        """The column named by kwarg ``key`` (``column_name``, ``field``), or ``None``."""
+        return declared_column_name(self.kwargs.get(key))
+
+    def column_list_kwarg(self, key: str) -> tuple[str, ...] | None:
+        """The columns named by list kwarg ``key``, or ``None`` unless every entry
+        resolves: a subset of a composite key is not a key."""
+        raw = self.kwargs.get(key)
+        if not isinstance(raw, list):
+            return None
+        names = tuple(declared_column_name(c) for c in cast("list[object]", raw))
+        resolved = tuple(n for n in names if n is not None)
+        return resolved if resolved and len(resolved) == len(names) else None
 
 
 @dataclass(frozen=True, slots=True)

@@ -230,8 +230,8 @@ class _NotNullTestDiscoverer:
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "not_null":
                 continue
-            col = tm.kwargs.get("column_name")
-            if not isinstance(col, str) or not col:
+            col = tm.column_kwarg("column_name")
+            if col is None:
                 continue
             target = generic_test_target_uid(node)
             if target is None:
