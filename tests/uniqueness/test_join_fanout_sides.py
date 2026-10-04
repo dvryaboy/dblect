@@ -259,6 +259,24 @@ _TOPOLOGIES: tuple[tuple[str, bool], ...] = (
     # has no consumer
     (f"with j as ({_WRAPPED_ROWS} union all {_WRAPPED_ROWS}) select amount from j", True),
     (f"{_CHAIN} select 1 as x", False),
+    # a name is read through the star of the relation that carries it; a spelled name the
+    # walk cannot resolve is unknown, never the star's
+    (f"with j as (select *, credit * 2 as c2 from {_TO_ORDERS}) select c2 from j", True),
+    (
+        f"{_CHAIN}, k as (select o2.*, j.credit as cr from j join orders o2 on o2.order_id = j.order_id) select customer_id from k",
+        False,
+    ),
+    # a reference binds to the nearest CTE it can see: not the CTE it sits in, nor an outer
+    # one a nested WITH redefines
+    (
+        f"with orders as (select c.credit, o.order_id from {_TO_ORDERS}) select sum(credit) from orders",
+        True,
+    ),
+    (
+        f"with orders as (select c.credit, o.order_id from {_TO_ORDERS}) select sum(order_id) from orders",
+        False,
+    ),
+    (f"{_CHAIN} select * from (with j as (select 1 as credit) select credit from j) s", False),
     # nested subqueries follow the same path
     (f"select sum(credit) from (select credit from ({_WRAPPED_ROWS}) j) k", True),
     (f"select sum(amount) from (select amount from ({_WRAPPED_ROWS}) j) k", False),

@@ -1169,11 +1169,12 @@ class _Flow:
 
 @dataclass(frozen=True, slots=True)
 class _Names:
-    """What each output name of a select reads. A name no projection spells came through a star,
-    so it reads ``rest`` (``None`` when the select projects no star: the name is unknown).
-    ``whole`` is what the full row reads, ``None`` when part of it cannot be resolved."""
+    """What each output name of a select reads. A projection spells each name of ``known``,
+    ``None`` when the walk cannot resolve it. A name no projection spells came through a star,
+    so it reads ``rest`` (``None`` when no star tells which relation carries it: the name is
+    unknown). ``whole`` is what the full row reads, ``None`` when part of it cannot be resolved."""
 
-    known: Mapping[str, _Reads]
+    known: Mapping[str, _Reads | None]
     rest: _Reads | None
     whole: _Reads | None
 
@@ -1213,12 +1214,12 @@ def _passed_downstream(sel: exp.Select, own: _Consumers, names: _Names, flow: _F
 
 def _output_sides(sel: exp.Select, resolve: _Resolve, star: _Reads | None) -> _Names:
     """What each output name of ``sel`` reads. A name whose expression reads no column, or one
-    the walk cannot resolve, is absent, so a reader of it reads any side."""
-    known: dict[str, _Reads] = {}
+    the walk cannot resolve, is unknown, so a reader of it reads any side."""
+    known: dict[str, _Reads | None] = {}
     for name, expression in sg.projection_expressions_by_output_name(sel).items():
         reads = _row_reads([expression], sel, resolve, star)
-        if not reads.unresolved and sg.find_columns(expression):
-            known[name.lower()] = reads
+        resolved = not reads.unresolved and sg.find_columns(expression)
+        known[name.lower()] = reads if resolved else None
     stars = _row_reads([p for p in sel.expressions if _is_star(p)], sel, resolve, star)
     whole = _row_reads(sel.expressions, sel, resolve, star)
     return _Names(
@@ -1230,12 +1231,33 @@ def _output_sides(sel: exp.Select, resolve: _Resolve, star: _Reads | None) -> _N
 
 def _carried_names(reader: _Reader, names: _Names) -> tuple[_Names, _Resolve]:
     """The output names of ``reader``'s select, with the source's own names carried through a
-    ``*``, and the resolver that reads the source."""
+    star that expands the source, and the resolver that reads the source. A name no projection
+    spells comes from the source's star, or from the other starred relations when the source
+    spells all its names; with both starred it may be either, so it is unknown."""
     resolve, star = reader.view(names)
     own = _output_sides(reader.select, resolve, star)
-    if not _projects_star(reader.select):
+    starred = _starred_relations(reader)
+    if reader.alias not in starred:
         return own, resolve
-    return _Names({**names.known, **own.known}, own.rest, own.whole), resolve
+    others = [reader.others[r] for r in starred - {reader.alias}]
+    if not others:
+        rest = names.rest
+    elif names.rest is None:
+        rest = functools.reduce(_Reads.__or__, others)
+    else:
+        rest = None
+    return _Names({**names.known, **own.known}, rest, own.whole), resolve
+
+
+def _starred_relations(reader: _Reader) -> frozenset[str]:
+    """The relations whose columns ``reader``'s stars expand: every one for a bare ``*``."""
+    out: set[str] = set()
+    for p in reader.select.expressions:
+        if isinstance(p, exp.Star):
+            out |= {reader.alias, *reader.others}
+        elif isinstance(p, exp.Column) and isinstance(p.this, exp.Star):
+            out.add((sg.column_table(p) or "").lower())
+    return frozenset(out)
 
 
 def _downstream(sel: exp.Select, names: _Names, flow: _Flow) -> _Consumers | None:
@@ -1270,28 +1292,23 @@ def _key_sides_downstream(
     tree's last SELECT unchanged. A key whose names do not resolve to one side each is dropped."""
     out: list[frozenset[str]] = []
     for reader in _readers(sel, flow) or ():
-        reader_names, resolve = _carried_names(reader, names)
+        reader_names, _ = _carried_names(reader, names)
         if reader.select is tree:
             if _passes_rows(tree):
-                out += [s for key in keys if (s := _key_sides(tree, key, resolve, names))]
+                out += [s for key in keys if (s := _key_sides(tree, key, reader_names))]
         elif id(reader.select) not in flow.outputs and _passes_rows(reader.select):
             out += _key_sides_downstream(reader.select, reader_names, flow, tree, keys)
     return out
 
 
-def _key_sides(
-    tree: exp.Select, key: Key, resolve: _Resolve, names: _Names
-) -> frozenset[str] | None:
+def _key_sides(tree: exp.Select, key: Key, names: _Names) -> frozenset[str] | None:
     """The one join side each name of ``key`` is read from in ``tree``'s plain projection (a
-    bare or aliased column, or the names a ``*`` carries), or ``None``."""
+    bare or aliased column, or a name a ``*`` carries), or ``None``. ``names`` are ``tree``'s."""
     projected = {n.lower(): e for n, e in sg.projection_expressions_by_output_name(tree).items()}
     found: set[str] = set()
     for name in key:
         expression = projected.get(name)
-        if expression is None:
-            read = names.get(name) if _projects_star(tree) else None
-        else:
-            read = resolve(expression) if isinstance(expression, exp.Column) else None
+        read = names.get(name) if expression is None or isinstance(expression, exp.Column) else None
         if read is None or len(read.sides) != 1:
             return None
         found |= read.sides
@@ -1305,7 +1322,7 @@ def _is_star(projection: Expr) -> bool:
 
 
 def _projects_star(sel: exp.Select) -> bool:
-    """True when ``sel`` projects ``*`` or ``alias.*``, so it also carries its source's names."""
+    """True when ``sel`` projects ``*`` or ``alias.*``."""
     return any(_is_star(p) for p in sel.expressions)
 
 
@@ -1327,12 +1344,8 @@ def _readers(sel: exp.Select, flow: _Flow) -> list[_Reader] | None:
         references = [parent]
     elif isinstance(parent, exp.CTE) and isinstance(parent.parent, exp.With):
         owner = parent.parent.parent
-        name = parent.alias_or_name.lower()
-        references = [
-            t
-            for t in (owner.find_all(exp.Table) if owner is not None else ())
-            if not t.db and t.name.lower() == name
-        ]
+        tables = owner.find_all(exp.Table) if owner is not None else ()
+        references = [t for t in tables if sg.cte_of(t) is parent]
     else:
         return None
     readers: list[_Reader] = []
