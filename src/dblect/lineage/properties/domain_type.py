@@ -34,6 +34,7 @@ source will eventually be the contract bridge in the authoring layer.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
@@ -802,6 +803,95 @@ def domain_type_display(tag: DomainTag) -> AxisDisplay:
     # identifiers, which are not magnitudes.
     lead = "a magnitude in " if dim is not None else "a column tagged "
     return AxisDisplay(name=lead + ", ".join(pieces))
+
+
+# --- where a declared type and an inferred one part ways -------------------------
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class UnitFacet:
+    """The dimensional claim of a tag (currency and units)."""
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class NominalFacet:
+    """One categorical binding of a tag, by its tag name."""
+
+    name: str
+
+
+Facet = UnitFacet | NominalFacet
+FacetValue = Dimension | Nominal
+
+
+def _facet_shape(value: FacetValue) -> Counter[tuple[Concrete | None, int]]:
+    """A facet value with every companion column forgotten: pinned units stay, a per-row
+    unit becomes ``None``. Two values with one shape differ only in which columns they bind."""
+    items = value.exponents if isinstance(value, Dimension) else {(value, 1)}
+    return Counter((None if isinstance(u, PerRow) else u, power) for u, power in items)
+
+
+def _facet_companions(value: FacetValue) -> tuple[ColumnRef, ...]:
+    units = (u for u, _ in value.exponents) if isinstance(value, Dimension) else (value,)
+    columns = {u.column for u in units if isinstance(u, PerRow)}
+    return tuple(sorted(columns, key=lambda c: (c.source.unique_id, c.column)))
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class FacetDifference:
+    """One facet on which a declared tag is not honoured by the inferred one. ``inferred``
+    is ``None`` when the inferred tag makes no claim for the facet at all."""
+
+    facet: Facet
+    declared: FacetValue
+    inferred: FacetValue | None
+
+    @property
+    def companion_identity_only(self) -> bool:
+        """Both sides bind the same shape of unit and differ only in which companion
+        column a per-row binding names."""
+        return self.inferred is not None and _facet_shape(self.declared) == _facet_shape(
+            self.inferred
+        )
+
+    @property
+    def declared_companions(self) -> tuple[ColumnRef, ...]:
+        return _facet_companions(self.declared)
+
+    @property
+    def inferred_companions(self) -> tuple[ColumnRef, ...]:
+        return () if self.inferred is None else _facet_companions(self.inferred)
+
+
+def facet_differences(declared: DomainTag, inferred: DomainTag) -> tuple[FacetDifference, ...]:
+    """The facets of ``declared`` that ``inferred`` does not honour, in a stable order: the
+    unit first, then each nominal tag by name. Empty exactly when the inferred tag refines the
+    declared one, so for two known tags it names the whole gap the check flags. A conflict
+    on either side has no facets to name."""
+    if isinstance(declared, _Conflict) or isinstance(inferred, _Conflict):
+        return ()
+    out: list[FacetDifference] = []
+    if isinstance(declared.dimension, Dimension):
+        seen = inferred.dimension if isinstance(inferred.dimension, Dimension) else None
+        if seen != declared.dimension:
+            out.append(FacetDifference(UnitFacet(), declared.dimension, seen))
+    seen_nominal = inferred.nominal_map()
+    for name, binding in sorted(declared.nominal, key=lambda nb: nb[0]):
+        seen_binding = seen_nominal.get(name)
+        if seen_binding != binding:
+            out.append(FacetDifference(NominalFacet(name), binding, seen_binding))
+    return tuple(out)
+
+
+def facet_value_label(value: FacetValue) -> str:
+    """A facet value as the display hook words it: a pinned literal as itself, a per-row
+    binding as the companion column it rides on."""
+    if isinstance(value, Dimension):
+        return _dimension_label(value) or "dimensionless"
+    return _unit_label(value)
 
 
 # --- join-key type compatibility (a signal, not a finding) -----------------------

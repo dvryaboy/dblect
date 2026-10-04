@@ -75,17 +75,24 @@ _PER_ROW = Money.columns(amount="amount_cents", currency="currency")
 _PASS_THROUGH = "SELECT amount_cents, currency FROM stg_payments"
 
 
-def _contradicted(
+def _contradictions(
     fct_sql: str, *, staging: object = _PER_ROW, fact: object = _PER_ROW
-) -> set[str | None]:
+) -> dict[str | None, str]:
+    """The contradiction message of each model that has one."""
     _declare("stg_payments", staging)
     _declare("fct_payments", fact)
     report = run_check(_manifest_of(fct_sql), _DUCKDB)
     return {
-        f.model_unique_id
+        f.model_unique_id: f.message
         for f in report.findings
         if f.kind is CheckFindingKind.DOMAIN_TYPE_CONTRADICTION
     }
+
+
+def _contradicted(
+    fct_sql: str, *, staging: object = _PER_ROW, fact: object = _PER_ROW
+) -> set[str | None]:
+    return set(_contradictions(fct_sql, staging=staging, fact=fact))
 
 
 @pytest.mark.parametrize(
@@ -127,3 +134,33 @@ def test_a_pinned_facet_decides_the_same_as_before(
 ) -> None:
     found = _FCT in _contradicted(_PASS_THROUGH, staging=staging, fact=fact)
     assert found is contradicts
+
+
+# --- the message names both types and what differs (#330) -------------------------
+
+
+def test_a_unit_conflict_names_both_units() -> None:
+    message = _contradictions(_PASS_THROUGH, staging=_USD, fact=_EUR)[_FCT]
+    assert "usd" in message
+    assert "eur" in message
+    assert "unit" in message
+
+
+def test_a_pinned_unit_against_a_per_row_one_names_both() -> None:
+    message = _contradictions(_PASS_THROUGH, staging=_PER_ROW, fact=_EUR)[_FCT]
+    assert "eur" in message
+    assert "per-row currency" in message
+
+
+def test_a_companion_that_differs_only_in_identity_names_both_columns() -> None:
+    sql = "SELECT amount_cents, UPPER(currency) AS currency FROM stg_payments"
+    message = _contradictions(sql)[_FCT]
+    assert "companion binding" in message
+    assert "fct_payments.currency" in message
+    assert "stg_payments.currency" in message
+
+
+def test_a_model_that_only_inherits_the_conflict_says_it_carries_the_type() -> None:
+    message = _contradictions(_PASS_THROUGH, staging=_USD, fact=_EUR)[_REPORT]
+    assert "carries" in message
+    assert "eur" in message
