@@ -20,6 +20,7 @@ data, which belongs to the fixture/PBT loop, so the static check stays static.
 
 from __future__ import annotations
 
+import difflib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
@@ -50,6 +51,7 @@ from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
     RelationBuildResult,
+    UnknownColumnReference,
     build_manifest_graph,
     build_relation_graph,
 )
@@ -323,6 +325,7 @@ def run_check(
     findings: list[CheckFinding] = []
     findings.extend(_issue_findings(graphs.resolved))
     findings.extend(_value_domain_conflict_findings(graphs))
+    findings.extend(_unknown_column_findings(graphs))
     findings.extend(world_findings(graphs, world))
     findings.extend(_resolution_floor_findings(resolution, resolution_floor))
 
@@ -817,6 +820,41 @@ def _dead_predicate_findings(
         _dead_predicate_rows(graphs, world),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start),
+    )
+
+
+def _unknown_column_findings(graphs: CheckGraphs) -> list[CheckFinding]:
+    """One finding per reference to a column its complete relation lacks. These models are
+    unbuilt, so the findings are located from the build's own nodes, not ``graphs.parsed``."""
+    sites = graphs.column_build.unknown_columns
+    return locate_findings(
+        graphs.manifest,
+        (
+            LocatedRow(
+                uid=site.model_unique_id,
+                nodes=(site.reference.node,),
+                kind=CheckFindingKind.UNKNOWN_COLUMN_REFERENCE,
+                message=_unknown_column_message(site.reference),
+                column=site.reference.column,
+            )
+            for site in sites
+        ),
+        line_maps={},
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
+    )
+
+
+def _unknown_column_message(ref: UnknownColumnReference) -> str:
+    relations = ", ".join(repr(r) for r in ref.relations)
+    where = relations if len(ref.relations) == 1 else f"any of {relations}"
+    closest = difflib.get_close_matches(ref.column.lower(), ref.known, n=3, cutoff=0.5)
+    hint = (
+        f"Closest columns: {', '.join(closest)}."
+        if closest
+        else f"Its columns: {', '.join(ref.known)}."
+    )
+    return (
+        f"column {ref.column!r} does not exist in {where}, so the query fails at run time. {hint}"
     )
 
 
