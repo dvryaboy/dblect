@@ -245,6 +245,7 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     dt_prop = domain_type_property(
         domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
+        uniqueness=uniqueness_prop.ref,
     )
     vd_prop = value_domain_property(graphs.value_domain_facts)
     registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop, vd_prop))

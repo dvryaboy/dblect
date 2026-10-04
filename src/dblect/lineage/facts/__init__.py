@@ -49,6 +49,7 @@ from dblect.lineage.facts.model import (
 )
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     AxisDisplay,
     CoherenceClear,
     CoherenceGuard,
@@ -68,6 +69,7 @@ from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 __all__ = [
     "BASE_WORLD",
     "AggregateRule",
+    "AggregateScope",
     "Annotation",
     "AnnotationStore",
     "AxisDisplay",
