@@ -28,6 +28,7 @@ from dblect.lineage.properties.uniqueness import CandidateKeySet, unique_test_di
 from dblect.manifest import Node, ResourceType
 from dblect.manifest.parse import DbtTestMetadata
 from dblect.types import (
+    BigInt,
     Date,
     Decimal,
     DomainType,
@@ -82,6 +83,22 @@ def test_per_row_companion_binding_lands_on_the_magnitude_column() -> None:
     assert fact.provenance == Declared(DeclaredSource.USER_ASSERTED)
     assert fact.detail is not None
     assert "StgCharges.charge_amount" in fact.detail
+
+
+def test_integer_cents_with_a_per_row_currency_bind_like_a_decimal_amount() -> None:
+    class IntMoney(DomainType):
+        amount: BigInt
+        currency: Currency
+
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+        charge_amount: IntMoney.columns(amount="charge_amount", currency="currency")
+
+    resolved = resolve_contracts(_CHARGES)
+    assert resolved.issues == ()
+    (fact,) = resolved.tag_facts
+    assert fact.scope == ColumnRef(_CHARGES_SRC, "charge_amount")
+    assert fact.value == tagged(dimension=Dimension.of(PerRow(ColumnRef(_CHARGES_SRC, "currency"))))
 
 
 def test_pinned_currency_grounds_a_concrete_unit() -> None:
@@ -201,7 +218,26 @@ def test_several_open_fields_and_no_open_fields_each_get_their_own_message() -> 
 
     issues = {i.field: i.message for i in resolve_contracts(_CHARGES).issues}
     assert "several open fields" in issues["several"]
+    assert "Decimal" not in issues["several"]
     assert "every field is fixed" in issues["none"]
+
+
+def test_ambiguous_integers_beside_a_unit_point_at_the_quantity_not_at_refine() -> None:
+    # `.refine(currency=...)` would pin the unit, the opposite of a per-row binding.
+    class TwoInts(DomainType):
+        units: BigInt
+        cents: BigInt
+        currency: Currency
+
+    class M(ModelContract):
+        dbt_model = "stg_charges"
+        pair: TwoInts
+
+    [issue] = resolve_contracts(_CHARGES).issues
+    assert issue.code is IssueCode.MALFORMED_DECLARATION
+    assert "several open fields" in issue.message
+    assert "Decimal" in issue.message
+    assert "refine" not in issue.message
 
 
 def test_an_identifier_column_with_no_fixed_facet_is_a_finding() -> None:

@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dblect.contracts import ContractSelf, contract
-from dblect.demo import Money
+from dblect.demo import Currency, Money
 from dblect.lineage.builder import build_manifest_graph, build_relation_graph
 from dblect.lineage.facts.grounding import collect
 from dblect.lineage.facts.model import Annotation
@@ -45,6 +45,8 @@ from dblect.lineage.properties.functional_dependency import (
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest
 from dblect.types import (
+    BigInt,
+    DomainType,
     ModelContract,
     contract_fd_discoverer,
     contract_tag_discoverer,
@@ -111,3 +113,28 @@ def test_without_the_dependency_the_sum_clears() -> None:
 
     ann = _aggregate_tag(_revenue_manifest())
     assert ann.value == NAKED  # mixed-currency sum: not well typed, the finding fires
+
+
+class _CentsMoney(DomainType):
+    amount: BigInt
+    currency: Currency
+
+
+def test_summed_integer_cents_keep_the_aggregation_guard() -> None:
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: _CentsMoney.columns(amount="amount", currency="currency")
+
+    assert _aggregate_tag(_revenue_manifest()).value == NAKED
+
+
+def test_summed_integer_cents_clear_when_the_currency_is_determined() -> None:
+    class Payments(ModelContract):
+        dbt_model = "payments"
+        amount: _CentsMoney.columns(amount="amount", currency="currency")
+
+        @contract
+        def country_sets_currency(self: ContractSelf) -> object:
+            return self.country.determines(self.currency)
+
+    assert _aggregate_tag(_revenue_manifest()).value == _PER_ROW

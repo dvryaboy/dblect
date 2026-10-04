@@ -27,7 +27,7 @@ from enum import StrEnum
 from typing import Self, cast
 
 from dblect.types.errors import DomainTypeError
-from dblect.types.scalars import FieldDef, FieldKind, classify
+from dblect.types.scalars import FieldDef, FieldKind, classify, settle_integer_roles
 
 _FIXED_OVERRIDES = "__dblect_fixed_overrides__"
 _COLUMN_OVERRIDES = "__dblect_column_overrides__"
@@ -129,7 +129,7 @@ def _build_spec(
             continue
         for fname, fdef in spec.fields.items():
             existing = fields.get(fname)
-            if existing is not None and existing != fdef:
+            if existing is not None and existing.as_declared() != fdef.as_declared():
                 raise DomainTypeError(
                     f"field {fname!r} is declared with conflicting types across bases"
                 )
@@ -144,11 +144,13 @@ def _build_spec(
             continue
         fdef = classify(fname, annotation)
         existing = fields.get(fname)
-        if existing is not None and existing != fdef:
+        if existing is not None and existing.as_declared() != fdef.as_declared():
             raise DomainTypeError(
                 f"field {fname!r} redeclares an inherited field with a different type"
             )
         fields[fname] = fdef
+
+    fields = settle_integer_roles(fields)
 
     fixed: dict[str, object] = {}
     unresolved: dict[str, set[object]] = {}

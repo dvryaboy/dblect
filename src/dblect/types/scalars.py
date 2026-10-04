@@ -11,15 +11,17 @@ dblect's tag algebra (``docs/design/domain-type-algebra.md``):
   dimensional companion of the magnitude;
 * a :class:`~dblect.types.enums.NominalEnum`, a ``bool``, a ``str``, or a
   :class:`Varchar` is a **nominal** category, carried by equality;
-* a :class:`Date`, a :class:`Timestamp` / ``datetime``, and a bare integer
-  (``int`` / :class:`Integer` / :class:`BigInt`) carry **no** tag.
+* a :class:`Date` and a :class:`Timestamp` / ``datetime`` carry **no** tag.
 
-A bare integer is the one scalar whose role its algebra does not settle: an
-integer is algebraically a quantity, yet by role it is as often an
-identifier or a calendar year, which are tags. The lenient default reads it as
-inert, making no claim either way; a measure is spelled ``Count`` /
-``Decimal`` and an identifier or year carries its own domain type. A future
-strict mode rejects a bare integer instead, per the lenient/strict switch in
+A bare integer (``int`` / :class:`Integer` / :class:`BigInt`) is the one scalar
+whose role its algebra does not settle: an integer is algebraically a quantity,
+yet by role it is as often an identifier or a calendar year, which are tags.
+The type it sits in settles it (:func:`settle_integer_roles`). A unit only
+qualifies a quantity, so a lone integer beside a :class:`UnitEnum` is the
+magnitude (integer cents with a currency). Elsewhere it is inert, making no
+claim either way: an identifier or year such as ``EntityId{id, entity}`` has no
+unit, and a measure is spelled ``Count`` / ``Decimal``. A future strict mode
+rejects a bare integer instead, per the lenient/strict switch in
 ``docs/design/domain-type-algebra.md``.
 
 Each field becomes one :class:`FieldDef`. The kinds are what
@@ -29,7 +31,8 @@ Each field becomes one :class:`FieldDef`. The kinds are what
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum, auto
 
@@ -62,6 +65,13 @@ class FieldDef:
     pytype: type | None = None
     precision: int | None = None
     scale: int | None = None
+    # A bare integer, whose kind the enclosing type settles; see settle_integer_roles.
+    integer: bool = False
+
+    def as_declared(self) -> FieldDef:
+        """The field before its role was settled, so two declarations of the same
+        annotation compare equal wherever each was settled."""
+        return replace(self, kind=FieldKind.INERT) if self.integer else self
 
 
 class Decimal:
@@ -109,6 +119,28 @@ class Varchar:
     """A variable-length string column, treated as a nominal category."""
 
 
+def settle_integer_roles(fields: Mapping[str, FieldDef]) -> dict[str, FieldDef]:
+    """Decide each bare-integer field's kind from the fields around it.
+
+    An integer is the magnitude exactly when a unit qualifies it and nothing else
+    could be the quantity: the type has a :class:`UnitEnum` field, no explicit
+    magnitude, and exactly one integer. Two integers beside a unit leave it open
+    which is the quantity (units sold, or cents?), so both stay inert and the
+    author spells the quantity ``Decimal`` / ``Count``. Without a unit, an integer
+    is an identifier or a year and stays inert. Idempotent, so a subclass re-runs it
+    over its inherited fields.
+    """
+    integers = [f for f in fields.values() if f.integer]
+    has_unit = any(f.kind is FieldKind.UNIT for f in fields.values())
+    has_magnitude = any(f.kind is FieldKind.MAGNITUDE and not f.integer for f in fields.values())
+    kind = (
+        FieldKind.MAGNITUDE
+        if has_unit and not has_magnitude and len(integers) == 1
+        else FieldKind.INERT
+    )
+    return {n: replace(f, kind=kind) if f.integer else f for n, f in fields.items()}
+
+
 def classify(name: str, annotation: object) -> FieldDef:
     """Read one field annotation into a :class:`FieldDef`, or raise.
 
@@ -136,11 +168,11 @@ def classify(name: str, annotation: object) -> FieldDef:
         return FieldDef(name, FieldKind.NOMINAL, pytype=str)
     if annotation is Date or annotation is Timestamp or annotation is datetime:
         return FieldDef(name, FieldKind.INERT)
-    # Lenient default: a bare integer makes no domain claim, so it is inert. A
-    # future strict mode rejects it here and teaches Count/Decimal or a domain
-    # type; see the lenient/strict switch in domain-type-algebra.md.
+    # Lenient default: inert until the enclosing type settles it. A future strict
+    # mode rejects it here and teaches Count/Decimal or a domain type; see the
+    # lenient/strict switch in domain-type-algebra.md.
     if annotation is int or annotation is Integer or annotation is BigInt:
-        return FieldDef(name, FieldKind.INERT)
+        return FieldDef(name, FieldKind.INERT, integer=True)
     raise DomainTypeError(
         f"field {name!r}: {annotation!r} is not a domain field type "
         "(use Decimal/Count/Float, a UnitEnum or NominalEnum subclass, bool, str, "
