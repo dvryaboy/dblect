@@ -26,6 +26,7 @@ upstream model's SQL.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar, cast
 
@@ -33,8 +34,9 @@ from sqlglot import Expr
 from sqlglot import expressions as exp
 from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.resolver import Resolver
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
-from sqlglot.schema import MappingSchema, Schema
+from sqlglot.schema import MappingSchema, Schema, ensure_schema
 
 from dblect.lineage.graph import (
     AggregationSite,
@@ -53,6 +55,8 @@ from dblect.manifest import Manifest, ResourceType, compilation_miss_reason, rel
 from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
+from dblect.sql._sqlglot import stored_column_name
+from dblect.sql.vocab import implicit_column_names
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +200,8 @@ def build_manifest_graph(
     )
     issues: list[BuildIssue] = []
     resolution: list[ModelResolution] = []
+    # Nodes whose column set is complete: catalogued, or models derived without an unexpanded star.
+    complete_sources = {n.unique_id for n in manifest.nodes.values() if n.columns_complete}
     # Accumulate into one pair of dicts and freeze once, rather than `graph.merge(per_model)` per
     # model (which re-copies the whole growing graph: O(models x graph)). Topological order makes
     # last-wins on expressions the same final map; each output column is built by one model anyway.
@@ -221,6 +227,7 @@ def build_manifest_graph(
                 schema=mapping_schema,
                 dialect=dialect,
                 tree=parsed.get(uid) if parsed is not None else None,
+                complete_sources=complete_sources,
             )
             per_model = ColumnLineageGraph(edges=walker.edges, expressions=walker.expressions)
             _record_output_columns(schema, model.relation_name, uid, per_model)
@@ -243,6 +250,8 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
+        if not walker.unexpanded_stars:
+            complete_sources.add(uid)
         resolution.append(
             ModelResolution(
                 unique_id=uid,
@@ -309,6 +318,7 @@ def _walk_model(
     schema: Mapping[str, Mapping[str, str]] | Schema | None = None,
     dialect: str | None = "duckdb",
     tree: Expr | None = None,
+    complete_sources: AbstractSet[str] = frozenset(),
 ) -> _Walker:
     """Parse, qualify, and walk one model, returning the populated walker.
 
@@ -339,12 +349,81 @@ def _walk_model(
     root_scope = build_scope(expression)
     if root_scope is None:
         raise SqlglotError("Cannot build scope from SQL")
+    _reject_unknown_unqualified_columns(
+        root_scope,
+        schema=ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect),
+        name_to_source=name_to_source,
+        complete_sources=complete_sources,
+        dialect=dialect,
+    )
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
     walker.walk(root_scope, scope_path=())
     if original is not None:
         walker.stamp_original(originals, root_scope)
     return walker
+
+
+# Source scopes whose columns are a query's named projections; any other source is unread.
+_PROJECTED_SOURCE_SCOPES = frozenset({ScopeType.CTE, ScopeType.DERIVED_TABLE})
+
+
+def _reject_unknown_unqualified_columns(
+    root: Scope,
+    *,
+    schema: Schema,
+    name_to_source: Mapping[str, SourceRef],
+    complete_sources: AbstractSet[str],
+    dialect: str | None,
+) -> None:
+    """Raise ``Unknown column`` for a bare name that every source in sight lacks.
+
+    Exact only when each visible source (own and enclosing scopes', since a subquery can be
+    correlated) has a complete column set; any incomplete one may own the name, so it stays blind.
+    """
+    implicit = implicit_column_names(dialect)
+    for scope in root.traverse():
+        if not isinstance(scope.expression, exp.Select):
+            continue
+        bare = [c for c in scope.unqualified_columns if c.name]
+        known = (
+            _known_source_columns(scope, schema, name_to_source, complete_sources) if bare else None
+        )
+        if known is None:
+            continue
+        for col in bare:
+            name = stored_column_name(col.name)
+            if name not in known and name not in implicit:
+                raise SqlglotError(f"Unknown column: {col.name}")
+
+
+def _known_source_columns(
+    scope: Scope,
+    schema: Schema,
+    name_to_source: Mapping[str, SourceRef],
+    complete_sources: AbstractSet[str],
+) -> frozenset[str] | None:
+    """Union of the columns of every source ``scope`` can see, or ``None`` when any is not
+    known complete (a relation outside ``complete_sources``, a star, pivot, lateral, unnest...)."""
+    out: set[str] = set()
+    visible: Scope | None = scope
+    while visible is not None:
+        if not visible.sources:
+            return None
+        resolver = Resolver(visible, schema, infer_schema=False)
+        for alias, src in visible.sources.items():
+            if isinstance(src, exp.Table):
+                ref = name_to_source.get(sg.table_relation_key(src))
+                if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
+                    return None
+            elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
+                return None
+            columns = resolver.get_source_columns(alias)
+            if not columns or "*" in columns:
+                return None
+            out.update(stored_column_name(c) for c in columns)
+        visible = visible.parent
+    return frozenset(out)
 
 
 # Meta key carrying the reference-id tag that lets the builder map a column on its

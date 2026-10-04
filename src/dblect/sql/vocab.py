@@ -15,6 +15,9 @@ from typing import Final, final
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.duckdb import DuckDB
+from sqlglot.dialects.postgres import Postgres
 
 from dblect.sql import _sqlglot as sg
 
@@ -27,6 +30,22 @@ _TIMESTAMP_TYPES = (
     exp.DataType.Type.TIMESTAMPNTZ,
     exp.DataType.Type.DATETIME,
 )
+
+# System columns no catalog lists (Redshift subclasses Postgres).
+_IMPLICIT_COLUMNS = (
+    (DuckDB, frozenset({"rowid"})),
+    (Postgres, frozenset({"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid"})),
+)
+
+
+def implicit_column_names(dialect: str | None) -> frozenset[str]:
+    """Names a ``dialect`` supplies on every relation without listing them."""
+    d = Dialect.get_or_raise(dialect)
+    names = {sg.stored_column_name(c) for c in d.PSEUDOCOLUMNS}
+    for cls, system in _IMPLICIT_COLUMNS:
+        if isinstance(d, cls):
+            names |= system
+    return frozenset(names)
 
 
 @final
