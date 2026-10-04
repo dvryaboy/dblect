@@ -697,7 +697,8 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
 
     Walks the AND-conjunction of `predicate`; for each leaf, accepts only
     ``exp.EQ`` between two bare columns where exactly one column's qualifier
-    equals `alias`. Returns the set of column names on the `alias` side.
+    equals `alias`. Returns the set of column names on the `alias` side, in the stored
+    (lowercase) form keys and facts are looked up under, so ``d.ID`` meets a key ``id``.
 
     Returns ``None`` if `predicate` contains anything other than a conjunction
     of such equalities (a disjunction, a function call, a range comparison,
@@ -718,8 +719,13 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(column_name(on_alias[0]))
+        cols.add(stored_column_name(column_name(on_alias[0])))
     return frozenset(cols)
+
+
+def _stored_key(c: exp.Column) -> tuple[str | None, str]:
+    """:func:`column_key` with the name in its stored (lowercase) form."""
+    return (column_table(c), stored_column_name(column_name(c)))
 
 
 def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
@@ -741,7 +747,7 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append((column_key(left), column_key(right)))
+        sides.append((_stored_key(left), _stored_key(right)))
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()

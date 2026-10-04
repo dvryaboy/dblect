@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import pytest
-from sqlglot import Expr
+from sqlglot import Expr, exp
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.builder import build_relation_graph
@@ -581,6 +581,15 @@ def test_fanout_silent_when_join_key_is_a_declared_unique_key() -> None:
     parsed = _parse("select f.id from facts f left join dim d on f.id = d.id")
     findings = detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),)))
     assert findings == ()
+
+
+# The closure folds column case, so every spelling of the join column meets a lowercase key (#293).
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", ["id", "ID", "Id"])
+def test_fanout_silent_for_any_spelling_of_the_key_column(quoted: bool, name: str) -> None:
+    spelling = exp.to_identifier(name, quoted=quoted).sql(dialect="duckdb")
+    parsed = _parse(f"select sum(f.v) from facts f left join dim d on d.{spelling} = f.fk")
+    assert detect_join_fanout(parsed, model_keys=_model_keys(dim=(("id",),))) == ()
 
 
 def test_fanout_silent_when_join_key_is_a_superkey_of_declared_key() -> None:
