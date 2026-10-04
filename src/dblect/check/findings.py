@@ -85,6 +85,13 @@ class CheckFindingKind(StrEnum):
     drop rather than a loud one, so it never claims the key is broken today. See
     ``docs/design/referential-drop-and-dead-predicate.md``."""
 
+    PARTIAL_COMPOSITE_KEY = auto()
+    """A GROUP BY, or the ON equalities of one join, reach into a declared composite
+    key of a relation without covering it, and the missing key columns are neither
+    pinned nor determined by what is used. Rows that differ only in the missing columns
+    are treated as one entity (a line number grouped across orders). A subset is
+    occasionally intended, so it warns."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:

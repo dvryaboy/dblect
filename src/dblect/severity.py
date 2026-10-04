@@ -144,6 +144,9 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
         # The join never refutes the key; it only turns a loud failure into a silent drop.
         case CheckFindingKind.REFERENTIAL_ORPHAN_DROP:
             return Severity.WARN
+        # A subset of a composite key is occasionally the intended grouping.
+        case CheckFindingKind.PARTIAL_COMPOSITE_KEY:
+            return Severity.WARN
     assert_never(kind)
 
 

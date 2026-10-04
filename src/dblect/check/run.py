@@ -40,6 +40,7 @@ from dblect.check.findings import (
 )
 from dblect.check.grain import declared_grain_findings
 from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
+from dblect.check.partial_key import partial_key_message, partial_key_sites
 from dblect.check.referential import (
     OrphanDropSite,
     UnguardedEdges,
@@ -72,6 +73,7 @@ from dblect.lineage.properties.domain_type import (
     join_key_conflicts,
 )
 from dblect.lineage.properties.functional_dependency import (
+    NO_FDS,
     FDSet,
     functional_dependency_grounded_scopes,
     functional_dependency_grounding,
@@ -79,6 +81,7 @@ from dblect.lineage.properties.functional_dependency import (
 )
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
+    Key,
     uniqueness_facts,
     uniqueness_property_from_facts,
 )
@@ -96,6 +99,7 @@ from dblect.sql import _sqlglot as sg
 from dblect.sql.parse import parse_manifest_models
 from dblect.types import (
     ContractRegistry,
+    ForeignKeyEdge,
     IssueCode,
     ResolvedContracts,
     active_registry,
@@ -103,6 +107,7 @@ from dblect.types import (
     relationship_tested_edges,
     resolve_contracts,
 )
+from dblect.uniqueness.detector import declared_keys
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +155,12 @@ class CheckGraphs:
     tests) minus those an enabled, unconditional, error-severity ``relationships``
     test already covers, keyed ``(child, parent)``. Neither input varies across a
     flag enumeration, so this is built once here rather than per world."""
+    declared_keys: Mapping[SourceRef, frozenset[Key]]
+    """Every relation's declared keys (tests, contracts, ``unique_key``), unconditional
+    ones only, read by the partial-composite-key check."""
+    foreign_key_children: frozenset[ColumnRef]
+    """The child column of every declared foreign-key edge, guarded by a test or not: a
+    column known to reference a parent is a reference, not a partial key."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +231,8 @@ def build_check_graphs(
     vd_conflicts = value_domain_conflicts(raw_vd_facts)
     conflicting = set(vd_conflicts)
     vd_facts = {scope: bucket for scope, bucket in raw_vd_facts.items() if scope not in conflicting}
+    key_facts = uniqueness_facts(manifest, profile, extra_facts=resolved.key_facts, parsed=trees)
+    edges = foreign_key_edges(manifest, registry=reg)
     return CheckGraphs(
         manifest=manifest,
         profile=profile,
@@ -229,12 +242,12 @@ def build_check_graphs(
         contracts_resolved=len(reg.contracts),
         parsed=parsed,
         join_key_ground=domain_type_grounding(by_scope(resolved.tag_facts)),
-        uniqueness_facts=uniqueness_facts(
-            manifest, profile, extra_facts=resolved.key_facts, parsed=trees
-        ),
+        uniqueness_facts=key_facts,
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
-        unguarded_foreign_keys=_unguarded_foreign_keys(manifest, reg),
+        unguarded_foreign_keys=_unguarded_foreign_keys(manifest, edges),
+        declared_keys=_declared_keys_by_relation(manifest, key_facts),
+        foreign_key_children=frozenset(edge.child for edge in edges),
     )
 
 
@@ -426,6 +439,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             line_maps,
         )
     )
+    findings.extend(_partial_key_findings(graphs, world, line_maps))
     return findings
 
 
@@ -820,13 +834,59 @@ def _dead_predicate_findings(
     )
 
 
-def _unguarded_foreign_keys(manifest: Manifest, registry: ContractRegistry) -> UnguardedEdges:
+def _unguarded_foreign_keys(
+    manifest: Manifest, edges: tuple[ForeignKeyEdge, ...]
+) -> UnguardedEdges:
     guarded = relationship_tested_edges(manifest)
     return {
         (edge.child, edge.parent): edge
-        for edge in foreign_key_edges(manifest, registry=registry)
+        for edge in edges
         if (edge.child, edge.parent) not in guarded
     }
+
+
+def _declared_keys_by_relation(
+    manifest: Manifest,
+    key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> Mapping[SourceRef, frozenset[Key]]:
+    scopes = {*key_facts, *(SourceRef(SourceKind.MODEL, uid) for uid in manifest.models)}
+    keys = {scope: declared_keys(manifest, scope, key_facts) for scope in scopes}
+    return {scope: bucket for scope, bucket in keys.items() if bucket}
+
+
+def _partial_key_rows(graphs: CheckGraphs, world: WorldAnnotations) -> Iterator[LocatedRow]:
+    """One row per GROUP BY or join that uses part of a declared composite key, located on
+    the clause."""
+    if not graphs.declared_keys:
+        return
+
+    def fds_of(relation: SourceRef) -> FDSet:
+        ann = world.functional_dependency.get(relation)
+        return ann.value if ann is not None else NO_FDS
+
+    ref_of = copy_origin(graphs.column_build.graph)
+    for uid, tree in graphs.parsed.items():
+        for site in partial_key_sites(
+            tree, graphs.declared_keys, fds_of, graphs.foreign_key_children, ref_of
+        ):
+            yield LocatedRow(
+                uid=uid,
+                nodes=(site.node, site.select),
+                kind=CheckFindingKind.PARTIAL_COMPOSITE_KEY,
+                message=partial_key_message(site, _relation_name(graphs.manifest, site.relation)),
+                column=min(site.missing),
+            )
+
+
+def _partial_key_findings(
+    graphs: CheckGraphs, world: WorldAnnotations, line_maps: dict[str, LineMap]
+) -> list[CheckFinding]:
+    return locate_findings(
+        graphs.manifest,
+        _partial_key_rows(graphs, world),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
+    )
 
 
 def _referential_orphan_drop_rows(
