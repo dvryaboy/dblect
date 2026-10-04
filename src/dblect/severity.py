@@ -112,7 +112,8 @@ def _structural_severity(kind: FindingKind) -> Severity:
 
 def _check_severity(kind: CheckFindingKind) -> Severity:
     """A declaration finding's default severity. error: the declared meaning and the
-    computed one disagree. warn: the analysis could not see enough to judge."""
+    computed one disagree. warn: the analysis could not see enough to judge, or found a
+    structural hazard without evidence the declared fact itself is wrong."""
     match kind:
         case (
             CheckFindingKind.CONTRACT_ISSUE
@@ -139,6 +140,9 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             | CheckFindingKind.REDUNDANT_PREDICATE
             | CheckFindingKind.CASE_LEAVES_ENUM_MEMBER_UNHANDLED
         ):
+            return Severity.WARN
+        # The join never refutes the key; it only turns a loud failure into a silent drop.
+        case CheckFindingKind.REFERENTIAL_ORPHAN_DROP:
             return Severity.WARN
     assert_never(kind)
 

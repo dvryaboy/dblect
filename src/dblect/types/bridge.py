@@ -43,8 +43,8 @@ from dblect.lineage.properties.domain_type import (
 from dblect.lineage.properties.functional_dependency import FD, FDSet
 from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.lineage.properties.value_domain import Bounded, ValueDomain
-from dblect.manifest import Manifest, Node, ResourceType
-from dblect.manifest.parse import generic_test_target_uid
+from dblect.manifest import DbtTestSeverity, Manifest, Node, ResourceType
+from dblect.manifest.parse import DbtTestMetadata, generic_test_target_uid
 from dblect.sql._sqlglot import stored_column_name
 from dblect.types.contract import (
     Constraints,
@@ -762,16 +762,17 @@ def _resolve_foreign_key(
 # --- foreign keys from dbt relationships tests ----------------------------------
 
 
-def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
-    """The foreign-key edges a project's dbt ``relationships`` tests already
-    state, read the way a ``unique`` test is read as a key.
+@dataclass(frozen=True, slots=True)
+class _RelationshipTest:
+    """An enabled ``relationships`` test and the edge it resolved to, read once for
+    both :func:`dbt_relationship_edges` and :func:`relationship_tested_edges`."""
 
-    The test is attached to the child model and carries the child column
-    (``column_name``) and parent column (``field``); the parent relation is the
-    other data-flow node the test depends on. A test whose parent cannot be
-    pinned that way is skipped rather than guessed.
-    """
-    edges: list[ForeignKeyEdge] = []
+    test_metadata: DbtTestMetadata
+    edge: ForeignKeyEdge
+
+
+def _relationship_tests(manifest: Manifest) -> list[_RelationshipTest]:
+    out: list[_RelationshipTest] = []
     for node in manifest.nodes.values():
         tm = node.test_metadata
         if tm is None or not tm.enabled or tm.name != "relationships":
@@ -788,13 +789,47 @@ def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
         parent_uid = _relationship_parent(manifest, node, child_uid, tm.kwargs.get("to"))
         if parent_uid is None:
             continue
-        edges.append(
-            ForeignKeyEdge(
-                child=ColumnRef(_source_of(manifest.nodes[child_uid]), child_col),
-                parent=ColumnRef(_source_of(manifest.nodes[parent_uid]), parent_col),
-            )
+        edge = ForeignKeyEdge(
+            child=ColumnRef(_source_of(manifest.nodes[child_uid]), child_col),
+            parent=ColumnRef(_source_of(manifest.nodes[parent_uid]), parent_col),
         )
-    return tuple(edges)
+        out.append(_RelationshipTest(test_metadata=tm, edge=edge))
+    return out
+
+
+def dbt_relationship_edges(manifest: Manifest) -> tuple[ForeignKeyEdge, ...]:
+    """The foreign-key edges a project's dbt ``relationships`` tests already
+    state, read the way a ``unique`` test is read as a key.
+
+    The test is attached to the child model and carries the child column
+    (``column_name``) and parent column (``field``); the parent relation is the
+    other data-flow node the test depends on. A test whose parent cannot be
+    pinned that way is skipped rather than guessed.
+
+    A ``where``-scoped test still contributes an edge here: a conditional test
+    still declares the relationship. Whether it counts as *covering* the edge is a
+    stricter question, answered by :func:`relationship_tested_edges`.
+    """
+    return tuple(rt.edge for rt in _relationship_tests(manifest))
+
+
+def relationship_tested_edges(manifest: Manifest) -> frozenset[tuple[ColumnRef, ColumnRef]]:
+    """The ``(child, parent)`` pairs an enabled, unconditional, error-severity
+    ``relationships`` test already covers.
+
+    This is the guard set a check reads to decide whether an edge's failure mode
+    is already loud: such a test fails the build the moment the foreign key does
+    not hold, so a hazard finding about the same edge would be pure noise. A
+    ``where``-scoped or ``severity: warn`` test still produces an edge (read by
+    :func:`dbt_relationship_edges`), since the relationship is genuinely declared,
+    but neither gives the edge a build-failing check over the whole child
+    relation, so neither counts as coverage here.
+    """
+    return frozenset(
+        (rt.edge.child, rt.edge.parent)
+        for rt in _relationship_tests(manifest)
+        if rt.test_metadata.where is None and rt.test_metadata.severity is DbtTestSeverity.ERROR
+    )
 
 
 def _relationship_parent(manifest: Manifest, node: Node, child_uid: str, to: object) -> str | None:

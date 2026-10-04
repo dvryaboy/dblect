@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from dblect.manifest import Manifest, ResourceType
+from dblect.manifest import DbtTestSeverity, Manifest, ResourceType
 
 
 @pytest.fixture(scope="module")
@@ -196,5 +196,43 @@ def test_jaffle_tests_round_trip_with_default_test_config(jaffle: Manifest) -> N
         assert tm is not None  # for the type checker
         assert tm.enabled is True
         assert tm.where is None
+        assert tm.severity is DbtTestSeverity.ERROR
         # All of jaffle's tests are built-in (no third-party namespace).
         assert tm.namespace is None
+
+
+def _first_test_uid(raw: dict[str, Any]) -> str:
+    return next(uid for uid, n in raw["nodes"].items() if n["resource_type"] == "test")
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("warn", DbtTestSeverity.WARN),
+        ("WARN", DbtTestSeverity.WARN),
+    ],
+)
+def test_test_severity_parses_case_insensitively(
+    jaffle_manifest_path: Path, configured: str, expected: DbtTestSeverity
+) -> None:
+    raw = json.loads(jaffle_manifest_path.read_text())
+    uid = _first_test_uid(raw)
+    raw["nodes"][uid]["config"]["severity"] = configured
+
+    manifest = Manifest.from_raw(raw)
+
+    tm = manifest.nodes[uid].test_metadata
+    assert tm is not None
+    assert tm.severity is expected
+
+
+def test_test_severity_defaults_to_error_when_config_omits_it(jaffle_manifest_path: Path) -> None:
+    raw = json.loads(jaffle_manifest_path.read_text())
+    uid = _first_test_uid(raw)
+    del raw["nodes"][uid]["config"]["severity"]
+
+    manifest = Manifest.from_raw(raw)
+
+    tm = manifest.nodes[uid].test_metadata
+    assert tm is not None
+    assert tm.severity is DbtTestSeverity.ERROR

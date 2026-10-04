@@ -166,7 +166,7 @@ def detect_join_on_nullable_key(
     dropped side simply not joining is the join's defining semantics rather than a hazard,
     and ``where_on_outer_joined_nullable`` and ``null_group_on_nullable_key`` already cover
     that side's downstream effects with more precision. So this gates per join on
-    ``joins_with_outer_dropped_aliases``: it flags every nullable key except the one on the
+    each join's ``outer_dropped`` aliases: it flags every nullable key except the one on the
     join's own dropped side. A FULL join drops nothing (both sides survive NULL-padded), so
     it flags both. A semi join filters its left rows, so a NULL key on either side silently
     drops the row exactly as an inner join does, and it is flagged with the same row-loss
@@ -199,7 +199,8 @@ def detect_join_on_nullable_key(
         # An anti-join reverses the hazard, so it is decided by the shared classifier and the
         # probe side alone; the classifier keys each anti-join arm by its Join node.
         anti_by_join = {id(a.join): a for a in anti_join.anti_joins_of(sel) if a.join is not None}
-        for join, side, dropped in sg.joins_with_outer_dropped_aliases(sel):
+        for effect in sg.join_row_effects(sel):
+            join, side, dropped = effect.join, effect.side, effect.outer_dropped
             on = sg.on_of(join)
             if on is None:
                 continue

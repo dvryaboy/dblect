@@ -40,6 +40,12 @@ from dblect.check.findings import (
 )
 from dblect.check.grain import declared_grain_findings
 from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
+from dblect.check.referential import (
+    OrphanDropSite,
+    UnguardedEdges,
+    copy_origin,
+    orphan_drop_sites,
+)
 from dblect.lineage.builder import (
     BuildIssue,
     BuildResult,
@@ -93,6 +99,8 @@ from dblect.types import (
     IssueCode,
     ResolvedContracts,
     active_registry,
+    foreign_key_edges,
+    relationship_tested_edges,
     resolve_contracts,
 )
 
@@ -137,6 +145,11 @@ class CheckGraphs:
     """Columns whose declarations disagree down to the empty set: reported once as
     a ``CONTRACT_ISSUE`` rather than raising and hiding every other column's
     grounding."""
+    unguarded_foreign_keys: UnguardedEdges
+    """Declared foreign-key edges (contract markers merged with dbt ``relationships``
+    tests) minus those an enabled, unconditional, error-severity ``relationships``
+    test already covers, keyed ``(child, parent)``. Neither input varies across a
+    flag enumeration, so this is built once here rather than per world."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +234,7 @@ def build_check_graphs(
         ),
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
+        unguarded_foreign_keys=_unguarded_foreign_keys(manifest, reg),
     )
 
 
@@ -362,10 +376,11 @@ def suppress_check_findings(
 
 
 def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFinding]:
-    """The findings that vary by world: the domain-type contradictions and the
-    not-well-typed aggregations, read off one world's annotations. The
-    contract-resolution and resolution-floor findings are world-invariant and stay
-    ``run_check``'s to report once."""
+    """The per-model findings of one world: the domain-type contradictions, the
+    not-well-typed aggregations, the join-key and grain findings, and the
+    referential orphan drops (join structure and declared edges do not vary by flag,
+    but the flag-world enumerator reads only this function). The contract-resolution
+    and resolution-floor findings are project-wide and stay ``run_check``'s."""
     findings: list[CheckFinding] = []
     # One source-map per model, shared across both finding kinds: a model that produces
     # both a contradiction and an aggregation finding builds its line map once.
@@ -402,6 +417,15 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
         )
     )
     findings.extend(_dead_predicate_findings(graphs, world, line_maps))
+    findings.extend(
+        _referential_orphan_drop_findings(
+            graphs.manifest,
+            graphs.parsed,
+            graphs.unguarded_foreign_keys,
+            copy_origin(graphs.column_build.graph),
+            line_maps,
+        )
+    )
     return findings
 
 
@@ -794,6 +818,79 @@ def _dead_predicate_findings(
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.line_start),
     )
+
+
+def _unguarded_foreign_keys(manifest: Manifest, registry: ContractRegistry) -> UnguardedEdges:
+    guarded = relationship_tested_edges(manifest)
+    return {
+        (edge.child, edge.parent): edge
+        for edge in foreign_key_edges(manifest, registry=registry)
+        if (edge.child, edge.parent) not in guarded
+    }
+
+
+def _referential_orphan_drop_rows(
+    manifest: Manifest,
+    parsed: Mapping[str, Expr],
+    edges: UnguardedEdges,
+    ref_of: Callable[[exp.Column], ColumnRef | None],
+) -> Iterator[LocatedRow]:
+    """One row per join whose row effect drops a declared foreign key's unmatched
+    child rows, located on the join node like a join-key conflict."""
+    if not edges:
+        return
+    for uid, tree in parsed.items():
+        for site in orphan_drop_sites(tree, edges, ref_of):
+            yield LocatedRow(
+                uid=uid,
+                nodes=(site.join,),
+                kind=CheckFindingKind.REFERENTIAL_ORPHAN_DROP,
+                message=_orphan_drop_message(manifest, site),
+                column=site.edge.child.column,
+            )
+
+
+def _referential_orphan_drop_findings(
+    manifest: Manifest,
+    parsed: Mapping[str, Expr],
+    edges: UnguardedEdges,
+    ref_of: Callable[[exp.Column], ColumnRef | None],
+    line_maps: dict[str, LineMap],
+) -> list[CheckFinding]:
+    return locate_findings(
+        manifest,
+        _referential_orphan_drop_rows(manifest, parsed, edges, ref_of),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
+    )
+
+
+def _orphan_drop_message(manifest: Manifest, site: OrphanDropSite) -> str:
+    """The finding's wording, never claiming the foreign key is broken today (the
+    verdict is "not established", not "violated"; see the design's WARN grade)."""
+    child_relation = _relation_name(manifest, site.edge.child.source)
+    parent_relation = _relation_name(manifest, site.edge.parent.source)
+    message = (
+        f"this {sg.join_side_of(site.join).value.upper()} JOIN discards rows of {child_relation!r} whose "
+        f"non-null {site.edge.child.column!r} has no match in {parent_relation!r}. "
+        f"{site.edge.child.column!r} is declared a foreign key to "
+        f"{parent_relation}.{site.edge.parent.column}, so no such rows are expected; if that "
+        "ever stops holding, they vanish here with nothing reporting it. Guard the edge "
+        "with a relationships test so a break fails loudly, or make "
+        f"{child_relation!r} the preserved side of an outer join and handle its unmatched "
+        "rows explicitly."
+    )
+    if site.narrowed:
+        message += (
+            " The join's ON clause also carries other conditions, so rows can leave here "
+            "even while the foreign key holds."
+        )
+    return message
+
+
+def _relation_name(manifest: Manifest, source: SourceRef) -> str:
+    node = manifest.nodes.get(source.unique_id)
+    return node.name if node is not None else source.unique_id
 
 
 # --- helpers --------------------------------------------------------------------
