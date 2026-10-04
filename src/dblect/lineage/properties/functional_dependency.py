@@ -14,7 +14,7 @@ dependencies is more precise, so ``meet`` (resolution of declarations) unions th
 sets, ``join`` (confluence) intersects them, ``top`` is the empty set, and
 ``bottom`` is a formal universal element no real resolution reaches.
 
-Dependencies come from five places. A declaration grounds one directly (synthetic
+Dependencies come from six places. A declaration grounds one directly (synthetic
 facts until the authoring bridge lands; the ``determines(...)`` contract is its
 eventual source). An equality filter pins a column constant, the empty-determinant
 dependency. A GROUP BY makes its group key determine every output (the key of the
@@ -22,6 +22,8 @@ grouped result). A candidate key read from the uniqueness property determines
 every column selected alongside it, since a relation unique on ``K`` admits one
 row per ``K`` value. And a join carries each kept side's dependencies (qualified
 by source alias) plus an inner join's ``ON`` equalities as mutual determinations.
+A hash id of columns determines each column it hashes, under the named assumption that
+hashed ids are injective (see :mod:`dblect.sql.hash_id`).
 
 A declared dependency is more than a relation fact: it is an axiom about the
 declaring relation's world (``order_id determines user_id`` because one order

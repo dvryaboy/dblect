@@ -37,6 +37,7 @@ from dblect.lineage.graph import SourceRef
 from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
+from dblect.sql.hash_id import injective_hash_inputs
 from dblect.sql.vocab import is_row_multiplying
 
 # --- attributes ------------------------------------------------------------
@@ -824,11 +825,13 @@ def _select_facts(
     group = sg.group_of(sel)
     grouped = group is not None and bool(group.expressions)
     extra_candidates: list[frozenset[Attr]] = []
+    group_attrs: frozenset[Attr] | None = None
     if grouped:
         g_cols = _group_qcols(sel, from_alias=from_alias)
         if g_cols is None:
             return _GIVE_UP  # a GROUP BY target that is not a bare column
         g_attrs: frozenset[Attr] = frozenset(g_cols)
+        group_attrs = g_attrs
         facts, declared_by_alias, r_out = _apply_group_by(facts, declared_by_alias, g_attrs)
         candidate_aliases: list[str] = []
         extra_candidates.append(g_attrs)
@@ -856,6 +859,15 @@ def _select_facts(
         # `WHERE col = 'lit'` mints, so it needs no determinant either.
         facts.add((frozenset(), Computed(name)))
 
+    for name, inputs in proj.hashed.items():
+        facts |= _hash_id_facts(
+            name,
+            inputs,
+            from_alias=from_alias,
+            multi_input=len(active_aliases) > 1,
+            group_attrs=group_attrs,
+        )
+
     if sel.args.get("distinct") is not None:
         distinct_attrs: frozenset[Attr] = frozenset(proj.named) | frozenset(
             Computed(c) for c in proj.computed
@@ -879,6 +891,30 @@ def _select_facts(
         conditional_by_alias=conditional_by_alias,
     )
     return replace(result, exact=scope_exact)
+
+
+def _hash_id_facts(
+    name: str,
+    inputs: Sequence[exp.Column],
+    *,
+    from_alias: str,
+    multi_input: bool,
+    group_attrs: frozenset[Attr] | None,
+) -> set[QFD]:
+    """The dependencies of a hash id the recognizer proved injective: the hash column
+    determines each input and the inputs together determine the hash (the hash is a
+    function of them). Nothing is minted when an unqualified input cannot be pinned to an
+    alias (several inputs resolved), or, under a GROUP BY, when an input is not a group
+    column, since the hash is then not a function of the group's one row."""
+    if multi_input and any(sg.column_table(c) is None for c in inputs):
+        return set()
+    qcols: frozenset[Attr] = frozenset(_qcol(c, default_alias=from_alias) for c in inputs)
+    if group_attrs is not None and not qcols <= group_attrs:
+        return set()
+    hashed: Attr = Computed(name)
+    out: set[QFD] = {(frozenset({hashed}), q) for q in qcols}
+    out.add((qcols, hashed))
+    return out
 
 
 def _rename_declared(
@@ -1182,6 +1218,7 @@ class _Projection:
     computed: frozenset[str]
     duplicate_computed: frozenset[str]
     constant: frozenset[str]
+    hashed: Mapping[str, tuple[exp.Column, ...]]
     star_aliases: frozenset[str]
     blocked: bool
 
@@ -1194,6 +1231,7 @@ def _build_projection(
     unqualified_star = False
     qualified_stars: set[str] = set()
     constant: set[str] = set()
+    hashed: dict[str, tuple[exp.Column, ...]] = {}
     blocked = False
     for proj in sel.expressions:
         if isinstance(proj, exp.Star):
@@ -1224,6 +1262,9 @@ def _build_projection(
             computed_counts[lowered] += 1
             if isinstance(inner, Expr) and sg.literal_constant(inner) is not None:
                 constant.add(lowered)
+            hash_inputs = injective_hash_inputs(inner) if isinstance(inner, Expr) else None
+            if hash_inputs is not None:
+                hashed[lowered] = hash_inputs
 
     active_set = set(active_aliases)
     star_aliases: set[str] = set()
@@ -1247,6 +1288,7 @@ def _build_projection(
         computed=frozenset(computed_counts),
         duplicate_computed=frozenset(name for name, n in computed_counts.items() if n > 1),
         constant=frozenset(constant),
+        hashed=hashed,
         star_aliases=frozenset(star_aliases),
         blocked=blocked,
     )
