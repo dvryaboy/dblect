@@ -113,12 +113,7 @@ def anti_arm_ids(sel: exp.Select) -> set[int]:
 def _sides_of(on: Expr | None) -> dict[str, frozenset[str]]:
     """Per-alias equality columns of a join/correlation predicate, case-folded, empty when the
     predicate is not a clean conjunction of column equalities."""
-    by_alias = (
-        sg.equality_cols_by_alias(on, fold=sg.case_insensitive_column_fold)
-        if on is not None
-        else None
-    )
-    return by_alias or {}
+    return (sg.equality_cols_by_alias(on) if on is not None else None) or {}
 
 
 def _probe_split(

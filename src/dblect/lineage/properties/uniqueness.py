@@ -26,9 +26,9 @@ the discoverers that ground it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import assert_never, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -48,6 +48,7 @@ from dblect.lineage.facts.model import (
     NativeConstraint,
     Opacity,
     Predicate,
+    Provenance,
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
@@ -786,6 +787,37 @@ def uniqueness_facts(
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
     return _UNIQUENESS_KIT.facts(manifest, discoverers, extra_facts=extra_facts)
+
+
+def _claims_grain(provenance: Provenance) -> bool:
+    """Whether a key from this source claims something about the SELECT itself. A native
+    constraint is enforced on write, not by the query (#48 covers the unenforced case); a
+    compile-time value is config, not an assertion."""
+    match provenance:
+        case Declared():
+            return True
+        case NativeConstraint() | CompileValue():
+            return False
+    assert_never(provenance)
+
+
+def declared_grain_claims(
+    facts: Iterable[Fact[CandidateKeySet, SourceRef]],
+) -> Iterator[tuple[Fact[CandidateKeySet, SourceRef], Key]]:
+    """Each unconditional key a relation's SQL is answerable for, with the fact declaring it. A
+    conditional key holds only over a row filter, which activation owns. The grain check and the
+    join fan-out detector both read these as the model's intent about its own rows."""
+    for fact in facts:
+        if _claims_grain(fact.provenance) and fact.condition is None:
+            for authored in fact.value.keys:
+                yield fact, authored
+
+
+def declared_grain_keys(facts: Iterable[Fact[CandidateKeySet, SourceRef]]) -> frozenset[Key]:
+    """The keys of :func:`declared_grain_claims`, lowercased."""
+    return frozenset(
+        frozenset(col.lower() for col in authored) for _, authored in declared_grain_claims(facts)
+    )
 
 
 def uniqueness_property_from_facts(

@@ -26,7 +26,7 @@ from tests._manifest_builders import node as _node
 _DUCKDB = profile_for_adapter("duckdb")
 
 _DIM_SQL = "SELECT a, b, c FROM dim_src GROUP BY a, b, c"
-_FACT_SQL = "SELECT f.a, d.b FROM fact_src AS f JOIN dim AS d ON f.a = d.a"
+_FACT_SQL = "SELECT f.a FROM fact_src AS f JOIN dim AS d ON f.a = d.a"
 
 
 def _shop_model(name: str, sql: str) -> Node:
@@ -108,7 +108,7 @@ def test_declared_dependency_quiets_a_grouped_cte_join_target() -> None:
     # on `a` checks out only through the dependency reaching `tot`.
     report_sql = (
         "WITH tot AS (SELECT a, b, SUM(x) AS s FROM dim GROUP BY a, b) "
-        "SELECT f.a, tot.s FROM fact_src AS f JOIN tot ON f.a = tot.a"
+        "SELECT f.a FROM fact_src AS f JOIN tot ON f.a = tot.a"
     )
     with isolated_registry():
 
@@ -146,7 +146,7 @@ def test_declared_dependency_reaches_through_a_qualified_star_cte() -> None:
         "), tot AS ("
         "SELECT a, b, SUM(x) AS s FROM detail_values GROUP BY a, b"
         ") "
-        "SELECT f.a, tot.s FROM fact_src AS f JOIN tot ON f.a = tot.a"
+        "SELECT f.a FROM fact_src AS f JOIN tot ON f.a = tot.a"
     )
     with isolated_registry():
 

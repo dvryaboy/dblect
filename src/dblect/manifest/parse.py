@@ -283,6 +283,9 @@ class Node:
     schema does not carry one. ``False`` is dbt saying the node was not compiled;
     it feeds :attr:`compilation_status` directly rather than being inferred from the
     code fields."""
+    columns_complete: bool = False
+    """True when :attr:`columns` is the warehouse's full set (set by
+    :meth:`Manifest.merge_catalog`); documented columns alone are a lower bound."""
     language: str | None = None
     """dbt's node ``language`` (``"sql"`` or ``"python"``), or ``None`` on schemas that
     don't carry it. Only SQL nodes are assessed for the stale/absent-compile signal; a
@@ -472,7 +475,7 @@ class Manifest:
                     continue
                 columns[col_name] = Column(name=col_name, data_type=data_type, description=None)
                 present.add(col_name.lower())
-            merged[uid] = replace(node, columns=columns)
+            merged[uid] = replace(node, columns=columns, columns_complete=True)
         return replace(self, nodes=merged)
 
     @property

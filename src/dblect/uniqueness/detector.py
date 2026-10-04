@@ -9,9 +9,8 @@ to make a claim, and stay silent otherwise):
 * ``detect_non_unique_aggregate_order_keys``: the aggregate twin of the window check.
   A top-n ordered aggregate (``ARRAY_AGG(x ORDER BY k LIMIT n)``) whose (group, order)
   columns are not covered by a source key keeps an arbitrary winner among ties.
-* ``detect_join_fanout``: JOINs whose joined-in side has known keys, none of
-  which is covered by the join's equality predicate columns, so the join can
-  multiply rows.
+* ``detect_join_fanout``: JOINs that repeat a side's rows (the ON columns cover no known key
+  of the other side) where a duplicate-sensitive consumer reads the repeated side.
 * ``detect_limit_without_deterministic_order``: a persisted model whose top-scope
   ``LIMIT`` has no ``ORDER BY``, or one whose order keys are not covered by a known
   uniqueness key, so a re-run materializes a different slice of rows.
@@ -30,7 +29,8 @@ the facts of every FROM/JOIN source, CTE, subquery, or model alike.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import assert_never
 
 import sqlglot.expressions as exp
@@ -41,7 +41,13 @@ from dblect.lineage.builder import build_manifest_graph, build_relation_graph, i
 from dblect.lineage.facts.model import Annotation, Fact, by_scope
 from dblect.lineage.facts.property import Property
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
-from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, RelationLineageGraph, SourceRef
+from dblect.lineage.graph import (
+    ColumnLineageGraph,
+    ColumnRef,
+    RelationLineageGraph,
+    SourceKind,
+    SourceRef,
+)
 from dblect.lineage.properties import where_provenance
 from dblect.lineage.properties.functional_dependency import (
     FDSet,
@@ -53,15 +59,17 @@ from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
 )
-from dblect.lineage.properties.scope_closure import Input
+from dblect.lineage.properties.scope_closure import Input, JoinChain
 from dblect.lineage.properties.uniqueness import (
     NO_KEYS,
     CandidateKeySet,
     Key,
     activate_conditional,
+    declared_grain_keys,
     grain_preserved,
     relation_scope_facts,
-    uniqueness_property,
+    uniqueness_facts,
+    uniqueness_property_from_facts,
 )
 from dblect.lineage.property import propagate
 from dblect.manifest import Manifest, Materialization
@@ -70,12 +78,10 @@ from dblect.sql import (
     Finding,
     FindingKind,
     aggregate_behavior,
-    anti_join,
     duplicate_sensitive,
     suppression_hint,
 )
 from dblect.sql import _sqlglot as sg
-from dblect.sql._sqlglot import JoinSide
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
@@ -215,80 +221,108 @@ def detect_join_fanout(
     model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
     duplicate_safe_builtins: frozenset[str] = frozenset(),
-    fold: sg.ColumnFold = sg.DEFAULT_COLUMN_FOLD,
+    declared_keys: frozenset[Key] = frozenset(),
 ) -> tuple[Finding, ...]:
-    """Flag JOINs whose joined-in side has keys that don't cover the join.
+    """Flag JOINs that repeat the rows of a side a duplicate-sensitive consumer reads.
 
-    For each JOIN whose joined-in side resolves to keys (an in-scope CTE or a
-    ref'd model), we ask whether the join's equality columns cover a known key. If yes,
-    the join cannot multiply rows. If no, we flag.
+    A join repeats a row of side A when the ON columns cover no known key of side B (closure
+    under B's dependencies), so it can match two B rows. The joined-in side being uncovered
+    repeats the probe side (everything to its left); the probe being uncovered repeats the
+    joined-in side. A claim needs a known key on the side that would do the repeating. INNER,
+    LEFT, RIGHT and FULL decide alike, so ``a JOIN b`` and ``b JOIN a`` agree. An ON spanning
+    several left sides leaves the probe undecided, and then only an uncovered joined-in side is
+    blamed.
 
-    Coverage is closure-based: a known key ``K`` is covered when the join columns
-    functionally determine every column of ``K`` under the joined-in side's dependencies
-    (plain containment when none are known). So a join on ``(month, wiki_id)`` covers the
-    key ``(month, wiki_id, wiki_name)`` when ``wiki_id`` determines ``wiki_name``.
+    A repeated side is a hazard when a consumer reads it:
 
-    The finding is suppressed when the fan-out is collapsed in the same query before
-    any duplicate-sensitive consumer reads the multiplied rows: a ``GROUP BY`` over a
-    scope whose every aggregate is duplicate-safe (``max``, ``min``, ``any_value``, the
-    boolean folds, a ``DISTINCT`` aggregate). The row multiplication cannot then change
-    any output value, so the structurally-real fan-out is not an output hazard (issue
-    #170). A ``sum``/``count``/``avg`` over the joined rows, or a raw passthrough with no
-    grouping, keeps it firing. ``duplicate_safe_builtins`` lets the adapter name UDF
-    aggregates the duplicate-sensitivity predicate would otherwise treat as sensitive.
+    * an aggregate over columns fires when a column belongs to a repeated side;
+    * ``COUNT(*)`` counts join rows, which equal an unrepeated side's row count, so it fires
+      only when every side repeats (consistent with ``detect_cross_model_fanout``, #179);
+    * an ungrouped, non-``DISTINCT`` projection fires when every side it reads repeats;
+    * such a projection also fires when a key in ``declared_keys`` (the model's own, so the
+      tree's last SELECT) reads only sides one join repeats for a cause outside them, since two
+      output rows then share the key. A key that does not resolve through the projection is not
+      judged.
 
-    Silent when the joined-in side has no known keys, when the ON predicate is not
-    a conjunction of equalities between bare columns with exactly one side on the
-    joined-in alias, on a ``CROSS`` join (an explicit cartesian product), or on a join
-    that filters rather than multiplies the probe rows (a SEMI or ANTI join, and the
-    ``LEFT JOIN ... IS NULL`` anti-join idiom).
+    Duplicate-safe aggregates (and ``duplicate_safe_builtins`` UDFs) are not consumers (#170).
+    Silent on a non-equality ON, ``CROSS``, SEMI and ANTI joins and the ``LEFT JOIN ... IS NULL``
+    idiom.
     """
     scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
+    outputs = {id(sel) for sel in _output_selects(tree)}
+    root = scopes.get(id(tree))
     out: list[Finding] = []
     for sel in sg.find_all_selects(tree):
-        # A SEMI/ANTI join, and the LEFT JOIN ... IS NULL anti-join idiom, filter the probe
-        # rows rather than multiply them, so they can no more fan out than a CROSS join can be
-        # covered; skip them the same way.
-        anti_arms = anti_join.anti_arm_ids(sel)
-        for j in sg.joins_of(sel):
-            if sg.join_side_of(j) in (JoinSide.CROSS, JoinSide.SEMI, JoinSide.ANTI):
-                continue
-            if id(j) in anti_arms:
-                continue
-            target = j.this
-            if not isinstance(target, exp.Table):
-                continue
-            facts = _source_facts(target, scopes)
-            if facts is None or not facts.keys:
-                continue
-            on = sg.on_of(j)
-            if on is None:
-                continue
-            joined_cols = sg.equality_cols_on_alias(on, target.alias_or_name, fold=fold)
-            if not joined_cols:
-                continue
-            if covers(FDSet(facts.fds), joined_cols, facts.keys):
-                continue
-            if _collapsed_before_sensitive_consumer(sel, safe_builtins=duplicate_safe_builtins):
-                continue
-            sample_keys = ", ".join(sorted(joined_cols))
-            known_keys = "; ".join("(" + ", ".join(sorted(k)) + ")" for k in facts.keys)
-            target_name = sg.table_relation_key(target)
-            out.append(
-                Finding(
-                    kind=FindingKind.JOIN_FANOUT,
-                    message=(
-                        f"JOIN to {target_name} on ({sample_keys}) isn't covered by any "
-                        f"known uniqueness key on {target_name} (known: {known_keys}); "
-                        f"the join can multiply rows. Either pin the join to a unique key "
-                        f"or aggregate the joined-in side first."
-                    ),
-                    sql_snippet=sg.render_sql(j),
-                    line_start=_line_start(j),
-                    line_end=_line_end(j),
-                )
-            )
+        chain = JoinChain(sel, lambda node: _source_facts(node, scopes))
+        if not chain.joins:
+            continue
+        group = sg.group_of(sel)
+        if group is not None and chain.grouped_to_one_row(group):
+            continue
+        consumers = _consumers(
+            sel,
+            frozenset(chain.sides),
+            safe_builtins=duplicate_safe_builtins,
+            is_output=id(sel) in outputs,
+        )
+        steps = range(len(chain.joins) + 1)
+        repeated = [chain.repeated(p) for p in steps]
+        key_sides = (
+            _declared_key_sides(sel, chain, declared_keys, root)
+            if sel is tree and consumers.rows is not None
+            else ()
+        )
+        for p, join in enumerate(chain.joins, 1):
+            newly = repeated[p] - repeated[p - 1]
+            broken = [
+                s for s in key_sides if chain.key_broken(s, p) and not chain.key_broken(s, p - 1)
+            ]
+            if broken:
+                out.append(_fanout_finding(join, broken[0]))
+            elif newly and consumers.hurt_by(
+                newly, repeated=repeated[-1], sides=frozenset(chain.sides)
+            ):
+                out.append(_fanout_finding(join, newly))
     return tuple(out)
+
+
+def _declared_keys(
+    manifest: Manifest,
+    uid: str,
+    key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
+) -> frozenset[Key]:
+    """A model's declared keys (tests, contracts) plus its ``unique_key`` config, which claims
+    the grain whether or not the write path enforces it."""
+    keys = declared_grain_keys(key_facts.get(SourceRef(SourceKind.MODEL, uid), ()))
+    node = manifest.models.get(uid)
+    unique_key = node.config.unique_key if node is not None and node.config is not None else ()
+    return keys | {frozenset(col.lower() for col in unique_key)} if unique_key else keys
+
+
+def _output_selects(node: Expr) -> Iterator[exp.Select]:
+    """The SELECTs whose rows are the tree's output: the root, or the arms of a top-level set
+    operation. A CTE or subquery SELECT feeds another scope instead."""
+    if isinstance(node, exp.Select):
+        yield node
+    elif isinstance(node, exp.SetOperation | exp.Subquery):
+        for arm in (node.this, node.args.get("expression")):
+            if isinstance(arm, Expr):
+                yield from _output_selects(arm)
+
+
+def _declared_key_sides(
+    sel: exp.Select, chain: JoinChain, declared_keys: frozenset[Key], root: Input | None
+) -> list[frozenset[str]]:
+    """The sides each declared key is read from, for keys the scope's own derived keys do not
+    cover. A QUALIFY the derivation could not model may have deduplicated, so it judges nothing."""
+    if root is None or (not root.exact and sg.qualify_of(sel) is not None):
+        return []
+    sides = [
+        chain.projected_sides(key)
+        for key in declared_keys
+        if not covers(FDSet(root.fds), key, root.keys)
+    ]
+    return [s for s in sides if s]
 
 
 def detect_limit_without_deterministic_order(
@@ -469,6 +503,7 @@ RelationUniqueness = tuple[
     RelationLineageGraph,
     Mapping[SourceRef, Annotation[CandidateKeySet]],
     Property[CandidateKeySet, SourceRef],
+    Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
 ]
 
 
@@ -493,9 +528,9 @@ def relation_uniqueness(
     """
     if graph is None:
         graph = build_relation_graph(manifest, dialect=profile.sqlglot_dialect, parsed=parsed).graph
-    uniqueness = uniqueness_property(manifest, profile, parsed=parsed, extra_facts=key_facts)
-    keys = propagate(graph, uniqueness)
-    return graph, keys, uniqueness
+    facts = uniqueness_facts(manifest, profile, extra_facts=key_facts, parsed=parsed)
+    uniqueness = uniqueness_property_from_facts(facts)
+    return graph, propagate(graph, uniqueness), uniqueness, facts
 
 
 def fd_annotations_by_name(
@@ -522,7 +557,7 @@ def fd_annotations_by_name(
     if relation_keys is None:
         fd_anns = propagate(graph, functional_dependency_property(ground))
     else:
-        _, keys, uniqueness = relation_keys
+        _, keys, uniqueness, _ = relation_keys
         store = AnnotationStore()
         for scope, ann in keys.items():
             store.record(uniqueness.name, scope, ann)
@@ -572,7 +607,7 @@ def make_fact_grounded_detectors(
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
     )
-    graph, keys, _uniqueness = relation_keys
+    graph, keys, _uniqueness, key_facts = relation_keys
     # Predicate-flow is consulted only where a conditional key waits to activate, so
     # seed the flow pass with those scopes and let it pull in their upstreams rather
     # than walking every relation in the graph. The seed must stay exactly "every
@@ -593,6 +628,9 @@ def make_fact_grounded_detectors(
     # shared graph and threads it in; a standalone caller lets it default and we propagate here.
     if fd_by_name is None:
         fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts, relation_keys=relation_keys)
+    declared_by_tree = {
+        id(tree): _declared_keys(manifest, uid, key_facts) for uid, tree in (parsed or {}).items()
+    }
     cache: dict[int, ScopeIndex] = {}
 
     def scope_index(tree: Expr) -> ScopeIndex:
@@ -625,7 +663,7 @@ def make_fact_grounded_detectors(
             model_keys=model_keys,
             scope_index=scope_index(tree),
             duplicate_safe_builtins=profile.duplicate_safe_aggregate_builtins,
-            fold=sg.dialect_column_fold(profile.sqlglot_dialect),
+            declared_keys=declared_by_tree.get(id(tree), frozenset()),
         )
 
     def limit_order(tree: Expr) -> tuple[Finding, ...]:
@@ -669,7 +707,7 @@ def detect_cross_model_fanout(
     A grain-collapse guard precedes the per-aggregate check: when the relation is provably
     unique at the GROUP BY grain (a candidate key fits within the grouping columns), every
     bucket is a single row and no fold over it can over-count, so the whole select is silent.
-    This is the cross-model analog of the local ``_collapsed_before_sensitive_consumer`` guard,
+    This is the cross-model analog of the local join fan-out's collapse of grouped rows,
     and it clears the magnitude path's grouped-to-a-finer-grain case (``SUM(amount) GROUP BY
     order_id, item_id`` over line-grain staging) as well.
 
@@ -696,7 +734,7 @@ def detect_cross_model_fanout(
         # Grain-collapse guard: when the relation is provably unique at the GROUP BY grain
         # (a candidate key fits within the grouping columns), every bucket is a single row, so
         # no fold over it can over-count, whatever magnitude it reads. This is the cross-model
-        # analog of the local ``_collapsed_before_sensitive_consumer`` guard.
+        # analog of the local join fan-out's collapse of grouped rows.
         if group_cols is not None and grain_preserved(rel_keys, group_cols):
             continue
         for agg in _sensitive_aggregate_consumers(sel, safe_builtins=duplicate_safe_builtins):
@@ -741,7 +779,7 @@ def make_cross_model_fanout_detectors(
     likewise lets the audit pass the manifest column graph it built once, so the heavy
     qualify-and-resolve walk is not repeated per fact family.
     """
-    _, keys, _uniqueness = (
+    _, keys, _uniqueness, _ = (
         relation_keys
         if relation_keys is not None
         else relation_uniqueness(manifest, profile, parsed=parsed)
@@ -926,28 +964,105 @@ def _single_source(sel: exp.Select, scopes: ScopeIndex) -> Input | None:
     return facts
 
 
-def _collapsed_before_sensitive_consumer(sel: exp.Select, *, safe_builtins: frozenset[str]) -> bool:
-    """True when ``sel`` collapses any fan-out into a group before a duplicate-sensitive
-    consumer reads the multiplied rows.
+def _fanout_finding(join: exp.Join, repeated: frozenset[str]) -> Finding:
+    on = sg.on_of(join)
+    target = f"{sg.name_of(join.this)} on ({sg.render_sql(on)})" if on is not None else ""
+    return Finding(
+        kind=FindingKind.JOIN_FANOUT,
+        message=(
+            f"JOIN to {target} can repeat rows of {', '.join(sorted(repeated))}, and a "
+            f"duplicate-sensitive consumer reads them. Either pin the join to a unique key or "
+            f"aggregate the repeated side first."
+        ),
+        sql_snippet=sg.render_sql(join),
+        line_start=_line_start(join),
+        line_end=_line_end(join),
+    )
 
-    A group is a GROUP BY, or the implicit single group of an ungrouped aggregate select
-    (:func:`_is_single_row_scope`) that projects no bare column. After the collapse the output
-    is one row per group, so a row multiplication changes an output value only through a
-    duplicate-sensitive aggregate (``sum``, ``count``, ``array_agg``: it folds the duplicated
-    rows). The collapse clears only when every aggregate consumer of the grouped rows (a
-    projection or a HAVING term) is positively known to be duplicate-safe: an idempotent fold,
-    a ``DISTINCT`` aggregate, or a UDF the adapter named in ``safe_builtins``. An aggregate UDF
-    sqlglot leaves as ``exp.Anonymous`` is sensitive by default, so an unknown fold keeps the
-    finding firing (see :func:`_sensitive_aggregate_consumers` for which nodes count).
 
-    A scope with neither shape (the fan-out flows straight to the rows) is never collapsed. An
-    ungrouped select that mixes an aggregate with a bare column is not collapsed either:
-    SQLite reads that column from an arbitrary row of the group, and the fan-out changes which
-    rows exist.
-    """
-    if sg.group_of(sel) is None and not _is_implicit_single_group(sel):
-        return False
-    return next(_sensitive_aggregate_consumers(sel, safe_builtins=safe_builtins), None) is None
+@dataclass(frozen=True, slots=True)
+class _Reads:
+    """The output sides a consumer reads. ``unresolved`` marks a column whose side cannot be
+    named (unqualified, or qualified by something outside the join), which may be any side."""
+
+    sides: frozenset[str] = frozenset()
+    unresolved: bool = False
+
+    @staticmethod
+    def of(columns: Iterable[exp.Column], sides: frozenset[str]) -> _Reads:
+        named: set[str] = set()
+        unresolved = False
+        for c in columns:
+            qualifier = (sg.column_table(c) or "").lower()
+            if qualifier in sides:
+                named.add(qualifier)
+            else:
+                unresolved = True
+        return _Reads(frozenset(named), unresolved)
+
+
+@dataclass(frozen=True, slots=True)
+class _Consumers:
+    """What reads a select's joined rows: aggregate column reads, a column-free count, and the
+    reads of an ungrouped projection (``None`` under GROUP BY or DISTINCT)."""
+
+    values: tuple[_Reads, ...]
+    counts_rows: bool
+    rows: _Reads | None
+
+    def hurt_by(
+        self, multiplied: frozenset[str], *, repeated: frozenset[str], sides: frozenset[str]
+    ) -> bool:
+        """True when a consumer is hurt by the ``multiplied`` sides repeating. ``repeated`` is
+        every side repeating after the whole chain."""
+        if any(r.sides & multiplied or r.unresolved for r in self.values):
+            return True
+        if self.counts_rows and sides <= repeated:
+            return True
+        rows = self.rows
+        if rows is None or not rows.sides <= repeated:
+            return False
+        return bool(rows.sides & multiplied) or (not rows.sides and rows.unresolved)
+
+
+def _consumers(
+    sel: exp.Select, sides: frozenset[str], *, safe_builtins: frozenset[str], is_output: bool
+) -> _Consumers:
+    """Classify what reads ``sel``'s joined rows; see :class:`_Consumers`. A select that is not
+    the model's output passes its rows to another scope, which may read any side."""
+    values: list[_Reads] = []
+    counts_rows = False
+    for agg in _sensitive_aggregate_consumers(sel, safe_builtins=safe_builtins):
+        columns = [c for c in sg.find_columns(agg) if _node_in_scope(c, sel)]
+        behavior = aggregate_behavior(agg) if isinstance(agg, exp.AggFunc) else None
+        if columns:
+            values.append(_Reads.of(columns, sides))
+        elif behavior is AggregateBehavior.COUNT:
+            counts_rows = True
+        else:
+            values.append(_Reads(unresolved=True))  # sum(1), a UDF: no side to name
+    rows: _Reads | None = None
+    grouped = sg.group_of(sel) is not None or _is_implicit_single_group(sel)
+    if not grouped and not sel.args.get("distinct"):
+        rows = _row_reads(sel, sides) if is_output else _Reads(unresolved=True)
+    return _Consumers(tuple(values), counts_rows, rows)
+
+
+def _row_reads(sel: exp.Select, sides: frozenset[str]) -> _Reads:
+    """The sides ``sel``'s projections read outside a collapsing aggregate. A bare ``*`` reads
+    every side; ``c.*`` parses as a column of ``c``."""
+    columns: list[exp.Column] = []
+    star = False
+    for root in sel.expressions:
+        for node in root.walk():
+            if not _node_in_scope(node, sel) or _under_collapsing_aggregate(node, sel):
+                continue
+            if isinstance(node, exp.Column):
+                columns.append(node)
+            elif isinstance(node, exp.Star) and not isinstance(node.parent, exp.Column):
+                star = True
+    reads = _Reads.of(columns, sides)
+    return _Reads(sides | reads.sides if star else reads.sides, reads.unresolved)
 
 
 def _is_implicit_single_group(sel: exp.Select) -> bool:

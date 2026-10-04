@@ -20,7 +20,6 @@ from typing import TypeGuard, TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
-from sqlglot.dialects.dialect import Dialect
 
 
 class JoinSide(StrEnum):
@@ -168,7 +167,7 @@ def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
     if group is None:
         return ()
     projections = cast("list[Expr]", sel.expressions)
-    projected = _projection_expressions_by_output_name(sel)
+    projected = projection_expressions_by_output_name(sel)
     return tuple(
         _resolve_group_target(target, projections, projected) for target in group.expressions
     )
@@ -220,7 +219,7 @@ def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> tuple[Expr, Gr
     return projection, GroupBinding.PRESUMED
 
 
-def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+def projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
     """Each output name in ``sel``'s projection mapped to the expression behind it.
 
     A name carried by two projections names neither unambiguously, so it is dropped rather than
@@ -557,39 +556,6 @@ def stored_column_name(name: str) -> str:
     return name.lower()
 
 
-ColumnFold = Callable[[exp.Column], str]
-"""Maps a column to the name it is looked up under, in the lowercase form keys and facts are stored."""
-
-
-def case_insensitive_column_fold(c: exp.Column) -> str:
-    """For lookups of a fact that TRIGGERS a finding: conflating case-distinct names over-reports
-    rather than hides."""
-    return stored_column_name(c.name)
-
-
-def dialect_column_fold(dialect: str | None) -> ColumnFold:
-    """For "is this join covered by a stored key": a column meets a key `k` only when it is the
-    same column as `k` written unquoted, per the dialect's own identifier normalization.
-
-    A column that is a different column gets its uppercased name, which no stored (lowercase) key
-    equals; folding it to the stored form would let Snowflake's ``"id"`` pass for ``id``.
-    """
-    d = Dialect.get_or_raise(dialect)
-
-    def fold(c: exp.Column) -> str:
-        stored = stored_column_name(c.name)
-        same_column = (
-            d.normalize_identifier(c.this.copy()).name
-            == d.normalize_identifier(exp.to_identifier(stored, quoted=False)).name
-        )
-        return stored if same_column else c.name.upper()
-
-    return fold
-
-
-DEFAULT_COLUMN_FOLD = dialect_column_fold(None)
-
-
 def column_key(c: exp.Column) -> tuple[str | None, str]:
     """The ``(qualifier, name)`` identity of a column reference, for matching columns by name.
 
@@ -726,14 +692,13 @@ def matches_typed_or_named(
     )
 
 
-def equality_cols_on_alias(
-    predicate: Expr, alias: str, *, fold: ColumnFold
-) -> frozenset[str] | None:
+def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None:
     """Columns on `alias` appearing in conjunctive equalities in `predicate`.
 
     Walks the AND-conjunction of `predicate`; for each leaf, accepts only
     ``exp.EQ`` between two bare columns where exactly one column's qualifier
-    equals `alias`. Returns the set of column names on the `alias` side.
+    equals `alias`. Returns the set of column names on the `alias` side, in the stored
+    (lowercase) form keys and facts are looked up under, so ``d.ID`` meets a key ``id``.
 
     Returns ``None`` if `predicate` contains anything other than a conjunction
     of such equalities (a disjunction, a function call, a range comparison,
@@ -754,13 +719,16 @@ def equality_cols_on_alias(
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(fold(on_alias[0]))
+        cols.add(stored_column_name(column_name(on_alias[0])))
     return frozenset(cols)
 
 
-def equality_cols_by_alias(
-    predicate: Expr, *, fold: ColumnFold
-) -> dict[str, frozenset[str]] | None:
+def _stored_key(c: exp.Column) -> tuple[str | None, str]:
+    """:func:`column_key` with the name in its stored (lowercase) form."""
+    return (column_table(c), stored_column_name(column_name(c)))
+
+
+def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
     """Per-alias join-key columns from a conjunction of column equalities, in one walk.
 
     The multi-alias companion to :func:`equality_cols_on_alias`: it flattens the conjunction
@@ -779,12 +747,7 @@ def equality_cols_by_alias(
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append(
-            (
-                (column_table(left), fold(left)),
-                (column_table(right), fold(right)),
-            )
-        )
+        sides.append((_stored_key(left), _stored_key(right)))
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()
