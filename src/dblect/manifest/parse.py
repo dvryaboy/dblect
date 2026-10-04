@@ -185,7 +185,7 @@ def declared_column_name(raw: object) -> str | None:
     idiom = _QUOTED_COLUMN_IDIOM.fullmatch(raw)
     if idiom is not None:
         return idiom.group(2)
-    return None if "{{" in raw or "{%" in raw else raw
+    return None if any(tag in raw for tag in ("{{", "{%", "{#")) else raw
 
 
 @dataclass(frozen=True, slots=True)

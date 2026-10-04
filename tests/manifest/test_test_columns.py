@@ -36,6 +36,7 @@ _SHAPES: tuple[tuple[object, str | None], ...] = (
     ("{{ quote_column('a') }}_x", None),
     ("{{ quote_column('a') }}{{ quote_column('b') }}", None),
     ("{% if x %}a{% endif %}", None),
+    ("{# note #}plan", None),
     ("a {{ x }}", None),
     ("", None),
     (None, None),
