@@ -597,8 +597,28 @@ class JoinChain:
     def determines(self, sides: frozenset[str], p: int) -> bool:
         """Whether one row of each of ``sides`` fixes the row of every keyed side after ``p``
         joins (so no two output rows share those source rows)."""
+        return self._fixes_rows(frozenset(RowToken(a) for a in sides), p)
+
+    def _fixes_rows(self, attrs: frozenset[Attr], p: int) -> bool:
         keyed = {RowToken(a) for a, k in zip(self.aliases[: p + 1], self._keyed, strict=False) if k}
-        return keyed <= closure(self._facts[p], frozenset(RowToken(a) for a in sides))
+        return keyed <= closure(self._facts[p], attrs)
+
+    def grouped_to_one_row(self, group: exp.Group) -> bool:
+        """Whether the GROUP BY columns fix the row of every keyed side, so each group holds one
+        joined row and no aggregate over it can over-count. Only plain columns qualified by a
+        side are read; an unqualified or computed key, ROLLUP, CUBE or GROUPING SETS proves
+        nothing."""
+        if not group.expressions or any(v for k, v in group.args.items() if k != "expressions"):
+            return False
+        attrs: set[Attr] = set()
+        for col in group.expressions:
+            if (
+                not isinstance(col, exp.Column)
+                or (sg.column_table(col) or "").lower() not in self.aliases
+            ):
+                return False
+            attrs.add(_qcol(col, default_alias=""))
+        return self._fixes_rows(frozenset(attrs), len(self.joins))
 
     def repeated(self, p: int) -> frozenset[str]:
         """The sides whose rows may appear in more than one output row after ``p`` joins."""
