@@ -20,13 +20,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import pytest
+
 from dblect.lineage.builder import build_model_graph, build_relation_graph
 from dblect.lineage.facts.model import Annotation, Declared, DeclaredSource, Fact, Opacity
-from dblect.lineage.facts.property import CoherenceClear, DischargePath
+from dblect.lineage.facts.property import CoherenceClear, DischargePath, KeyVerdict
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import ColumnLineageGraph, ColumnRef, SourceKind, SourceRef
 from dblect.lineage.properties.domain_type import (
     NAKED,
+    CompanionFacts,
     Concrete,
     Dimension,
     DomainTag,
@@ -83,6 +86,7 @@ def _propagate(
     amount: DomainTag = _PER_ROW,
     fds: FDSet = NO_FDS,
     stg_sql: str | None = None,
+    companions: CompanionFacts | None = None,
 ) -> tuple[Mapping[ColumnRef, Annotation[DomainTag]], tuple[CoherenceClear[DomainTag], ...]]:
     """Propagate functional dependencies over the relation graph, then domain type
     over the column graph with the FD store as its dependency context, returning every
@@ -104,7 +108,9 @@ def _propagate(
             Fact(scope=amount_ref, value=amount, provenance=Declared(DeclaredSource.USER_ASSERTED)),
         )
     }
-    dt_prop = domain_type_property(domain_type_grounding(dt_facts), fd=fd_prop.ref)
+    dt_prop = domain_type_property(
+        domain_type_grounding(dt_facts), fd=fd_prop.ref, companion_facts=companions
+    )
     ctx = PropertyRegistry((fd_prop, dt_prop)).dep_context(store)
 
     graph = ColumnLineageGraph.empty()
@@ -131,9 +137,10 @@ def _run(
     fds: FDSet = NO_FDS,
     stg_sql: str | None = None,
     out: str = "total",
+    companions: CompanionFacts | None = None,
 ) -> Annotation[DomainTag]:
     """The aggregate output column ``out`` of the leaf model after propagation."""
-    anns, _ = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql)
+    anns, _ = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql, companions=companions)
     return anns[ColumnRef(_MODEL, out)]
 
 
@@ -143,9 +150,10 @@ def _clears(
     amount: DomainTag = _PER_ROW,
     fds: FDSet = NO_FDS,
     stg_sql: str | None = None,
+    companions: CompanionFacts | None = None,
 ) -> tuple[CoherenceClear[DomainTag], ...]:
     """The coherence clears the guard emitted while propagating ``sql``."""
-    _, clears = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql)
+    _, clears = _propagate(sql, amount=amount, fds=fds, stg_sql=stg_sql, companions=companions)
     return clears
 
 
@@ -334,3 +342,139 @@ def test_declared_fd_discharge_emits_no_clear() -> None:
 def test_concrete_binding_emits_no_clear() -> None:
     """A pinned literal currency has no companion, so the guard has nothing to clear."""
     assert _clears(_HEADLINE, amount=_USD) == ()
+
+
+# --- group keys that determine the companion -----------------------------------
+#
+# A group key holds the companion constant when it determines it within a group. The
+# builder reads the key's shape, the guard decides each shape against the companion's
+# declared values and nullability. Every shape of the closed vocabulary is decided.
+
+_ENUM = frozenset({"USD", "EUR"})
+_CASE_COLLIDING = frozenset({"USD", "usd"})
+_PADDED_COLLIDING = frozenset({" USD", "USD"})
+
+
+def _facts(*, non_null: bool = False, members: frozenset[str] | None = _ENUM) -> CompanionFacts:
+    return CompanionFacts(non_null=lambda _ref: non_null, members=lambda _ref: members)
+
+
+def _by(
+    key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM
+) -> tuple[Mapping[ColumnRef, Annotation[DomainTag]], tuple[CoherenceClear[DomainTag], ...]]:
+    sql = f"SELECT {key} AS k, SUM(amount) AS total FROM payments GROUP BY {key}"
+    return _propagate(sql, companions=_facts(non_null=non_null, members=members))
+
+
+def _holds(key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM) -> bool:
+    _, clears = _by(key, non_null=non_null, members=members)
+    return not clears
+
+
+@pytest.mark.parametrize(
+    ("key", "non_null", "members", "holds"),
+    [
+        ("currency", False, _ENUM, True),
+        ("(currency)", False, _ENUM, True),
+        # COALESCE: the head column is determined on its non-null rows only.
+        ("coalesce(currency, 'USD')", True, _ENUM, True),
+        ("coalesce(currency, 'USD')", False, _ENUM, False),
+        ("coalesce('USD', currency)", True, _ENUM, False),
+        ("coalesce(upper(currency), 'USD')", True, _ENUM, False),
+        # UPPER / LOWER / TRIM: only when injective on the declared members.
+        ("upper(currency)", False, _ENUM, True),
+        ("upper(currency)", False, _CASE_COLLIDING, False),
+        ("upper(currency)", False, None, False),
+        ("upper(currency)", False, frozenset({"é", "E"}), False),
+        ("lower(currency)", False, _ENUM, True),
+        ("lower(currency)", False, _CASE_COLLIDING, False),
+        ("trim(currency)", False, _ENUM, True),
+        ("trim(currency)", False, _PADDED_COLLIDING, False),
+        ("trim(currency, 'U')", False, _ENUM, False),
+        # CAST: a cast to unsized text is the identity on string members; every other
+        # target (numbers, dates) makes no claim. Sized targets are pinned in test_vocab.
+        ("cast(currency AS varchar)", False, _ENUM, True),
+        ("cast(currency AS text)", False, _ENUM, True),
+        ("cast(currency AS varchar)", False, None, False),
+        ("cast(currency AS integer)", False, _ENUM, False),
+        # Everything else makes no claim.
+        ("CASE WHEN country = 'us' THEN currency END", True, _ENUM, False),
+        ("substr(currency, 1, 2)", True, _ENUM, False),
+        ("currency || country", True, _ENUM, False),
+    ],
+)
+def test_group_key_holds_the_companion_per_shape(
+    key: str, non_null: bool, members: frozenset[str] | None, holds: bool
+) -> None:
+    assert _holds(key, non_null=non_null, members=members) is holds
+
+
+def test_a_positional_group_key_is_read_through_the_projection() -> None:
+    sql = "SELECT coalesce(currency, 'USD') AS k, SUM(amount) AS total FROM payments GROUP BY 1"
+    _, clears = _propagate(sql, companions=_facts(non_null=True))
+    assert clears == ()
+
+
+def test_an_unrelated_key_beside_a_holding_key_does_not_block_it() -> None:
+    sql = (
+        "SELECT country, upper(currency) AS k, SUM(amount) AS total FROM payments "
+        "GROUP BY country, upper(currency)"
+    )
+    _, clears = _propagate(sql, companions=_facts())
+    assert clears == ()
+
+
+def test_a_key_over_another_column_does_not_hold_the_companion() -> None:
+    assert not _holds("upper(country)")
+
+
+def test_coalesce_over_an_outer_join_padded_side_does_not_hold() -> None:
+    """``payments`` is the optional side, so its NOT NULL currency is NULL on the rows
+    the join pads; the fallback then attributes those rows a currency they do not have."""
+    padded = (
+        "SELECT coalesce(p.currency, 'USD') AS k, SUM(p.amount) AS total FROM customers c "
+        "LEFT JOIN payments p ON p.customer_id = c.id GROUP BY 1"
+    )
+    preserved = (
+        "SELECT coalesce(p.currency, 'USD') AS k, SUM(p.amount) AS total FROM payments p "
+        "LEFT JOIN customers c ON p.customer_id = c.id GROUP BY 1"
+    )
+    facts = _facts(non_null=True)
+    assert _propagate(padded, companions=facts)[1] != ()
+    assert _propagate(preserved, companions=facts)[1] == ()
+
+
+# What the finding says about why a key failed, per verdict.
+
+
+def _verdicts(
+    key: str, *, non_null: bool = False, members: frozenset[str] | None = _ENUM
+) -> list[tuple[str, KeyVerdict]]:
+    _, clears = _by(key, non_null=non_null, members=members)
+    (clear,) = clears
+    (undischarged,) = clear.undischarged
+    return [(b.key.sql, b.verdict) for b in undischarged.blocked]
+
+
+def test_a_nullable_fallback_names_the_key_and_the_null_fallback() -> None:
+    assert _verdicts("coalesce(currency, 'USD')", non_null=False) == [
+        ("COALESCE(payments.currency, 'USD')", KeyVerdict.NULL_FALLBACK)
+    ]
+
+
+def test_a_colliding_wrapper_is_named_as_colliding() -> None:
+    assert _verdicts("upper(currency)", members=_CASE_COLLIDING) == [
+        ("UPPER(payments.currency)", KeyVerdict.COLLIDES)
+    ]
+
+
+def test_a_wrapper_with_no_declared_members_is_named_as_unknown_domain() -> None:
+    assert _verdicts("lower(currency)", members=None) == [
+        ("LOWER(payments.currency)", KeyVerdict.UNKNOWN_DOMAIN)
+    ]
+
+
+def test_an_unrecognised_key_is_named_as_opaque() -> None:
+    assert _verdicts("substr(currency, 1, 2)") == [
+        ("SUBSTRING(payments.currency, 1, 2)", KeyVerdict.OPAQUE)
+    ]

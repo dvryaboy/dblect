@@ -19,7 +19,12 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import parse_sql
-from dblect.sql.vocab import array_literal_nonempty, generator_provably_nonempty
+from dblect.sql.vocab import (
+    KeyShape,
+    array_literal_nonempty,
+    generator_provably_nonempty,
+    key_head,
+)
 
 
 def _array(frag: str, dialect: str = "bigquery") -> Expr:
@@ -195,3 +200,44 @@ def test_generator_provably_nonempty_postgres_date_series(frag: str, nonempty: b
 
 def test_non_generator_expression_is_not_a_nonempty_generator() -> None:
     assert generator_provably_nonempty(_array("x + 1")) is False
+
+
+# --- group-key shapes ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("frag", "dialect", "shape"),
+    [
+        ("c", "duckdb", KeyShape.COLUMN),
+        ("(c)", "duckdb", KeyShape.COLUMN),
+        ("coalesce(c, 'x')", "duckdb", KeyShape.COALESCE_HEAD),
+        ("ifnull(c, 'x')", "duckdb", KeyShape.COALESCE_HEAD),
+        ("nvl(c, 'x')", "snowflake", KeyShape.COALESCE_HEAD),
+        ("coalesce('x', c)", "duckdb", KeyShape.OPAQUE),
+        ("coalesce(upper(c), 'x')", "duckdb", KeyShape.OPAQUE),
+        ("upper(c)", "duckdb", KeyShape.UPPER),
+        ("lower(c)", "duckdb", KeyShape.LOWER),
+        ("trim(c)", "duckdb", KeyShape.TRIM),
+        ("trim(c, 'x')", "duckdb", KeyShape.OPAQUE),
+        ("ltrim(c)", "duckdb", KeyShape.OPAQUE),
+        ("upper(lower(c))", "duckdb", KeyShape.OPAQUE),
+        # Text casts: unsized varying text is lossless; sized, blank-padded, and non-text
+        # targets are not. DuckDB reads every length as unbounded, so sizes are pinned on
+        # the dialects that keep them.
+        ("cast(c AS varchar)", "postgres", KeyShape.TEXT_CAST),
+        ("cast(c AS text)", "postgres", KeyShape.TEXT_CAST),
+        ("c::text", "postgres", KeyShape.TEXT_CAST),
+        ("try_cast(c AS varchar)", "snowflake", KeyShape.TEXT_CAST),
+        ("cast(c AS varchar(2))", "postgres", KeyShape.OPAQUE),
+        ("cast(c AS char(3))", "postgres", KeyShape.OPAQUE),
+        ("cast(c AS integer)", "postgres", KeyShape.OPAQUE),
+        ("c || d", "duckdb", KeyShape.OPAQUE),
+        ("CASE WHEN d THEN c END", "duckdb", KeyShape.OPAQUE),
+    ],
+)
+def test_key_head_classifies_every_key_shape(frag: str, dialect: str, shape: KeyShape) -> None:
+    head = key_head(_array(frag, dialect))
+    assert head.shape is shape
+    assert (head.column is None) == (shape is KeyShape.OPAQUE)
+    if head.column is not None:
+        assert head.column.name == "c"

@@ -32,6 +32,8 @@ from typing import Protocol, TypeVar
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
+from dblect.sql.vocab import KeyShape
+
 # Invariant: a view both yields subjects (output) and reads a subject back
 # (input), so it cannot vary in either direction.
 S = TypeVar("S", "ColumnRef", "SourceRef")
@@ -217,6 +219,21 @@ def source_ref_meta(table: exp.Table) -> SourceRef | None:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupKey:
+    """One ``GROUP BY`` key, read as the shape it wraps one resolved column in.
+
+    ``column`` is the column the key is built from (``None`` for an ``OPAQUE`` key),
+    ``sql`` the key as written, for a diagnostic to name it. ``padded`` records that the
+    column's relation is the NULL-padded side of an outer join in this scope, so a column
+    that is NOT NULL upstream can still be NULL here."""
+
+    shape: KeyShape
+    column: ColumnRef | None
+    sql: str
+    padded: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AggregationSite:
     """What a guard needs to know to decide whether an aggregate's result can be
     trusted: which relation it aggregates over, what it groups by, and what the
@@ -238,12 +255,16 @@ class AggregationSite:
       ``None`` marks a group shape the builder cannot resolve to plain columns
       (positional or computed group keys), which a guard must treat as unprovable
       rather than as an empty group key.
+    * ``group_keys``: every GROUP BY key with its shape, positional keys read through
+      the projection they name. ``group_refs`` is the all-bare-columns reading of this;
+      a guard that decides what a computed key holds reads the keys.
     * ``pinned``: columns the scope's own WHERE equates to a literal, constant
       across every group by construction.
     """
 
     input_source: SourceRef | None
     group_refs: frozenset[ColumnRef] | None
+    group_keys: tuple[GroupKey, ...]
     pinned: frozenset[ColumnRef]
 
 

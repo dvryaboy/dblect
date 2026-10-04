@@ -9,6 +9,7 @@ structural column combination as a key.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum, auto
 from typing import Final, final
@@ -89,6 +90,77 @@ def cast_target(to: object) -> CastTarget:
     if to.this in _TEXT_TARGETS:
         return CastTarget.TEXT
     return CastTarget.OTHER
+
+
+# Text targets whose cast keeps a string unchanged: unsized varying text. A sized or blank-padded
+# target (``VARCHAR(2)``, ``CHAR``) can truncate or pad, so it is no claim.
+_LOSSLESS_TEXT_TARGETS: Final[frozenset[exp.DType]] = frozenset((exp.DType.TEXT, exp.DType.VARCHAR))
+
+
+@final
+class KeyShape(Enum):
+    """How a ``GROUP BY`` key relates to the one column it is built from. Closed: every key is
+    one of these, and ``OPAQUE`` is the no-claim side (anything this vocabulary does not name)."""
+
+    COLUMN = auto()
+    COALESCE_HEAD = auto()
+    """``COALESCE(c, ...)`` with the column first: the key is ``c`` wherever ``c`` is non-null."""
+    UPPER = auto()
+    LOWER = auto()
+    TRIM = auto()
+    """Plain ``TRIM(c)``: no characters argument, no leading or trailing variant."""
+    TEXT_CAST = auto()
+    """A cast to unsized varying text."""
+    OPAQUE = auto()
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class KeyHead:
+    """A group key read as a shape over at most one column. ``column`` is ``None`` exactly for
+    ``OPAQUE``."""
+
+    shape: KeyShape
+    column: exp.Column | None
+
+
+_OPAQUE_KEY: Final[KeyHead] = KeyHead(KeyShape.OPAQUE, None)
+
+
+def key_head(expr: Expr) -> KeyHead:
+    """Classify a group key by the shape it wraps one column in. Aliases and parentheses are
+    transparent. Only a bare column directly under the wrapper counts, so nested wrappers and
+    a column that is not the coalesce head are ``OPAQUE``."""
+    node = expr
+    while isinstance(node, (exp.Alias, exp.Paren)) and isinstance(node.this, Expr):
+        node = node.this
+    if isinstance(node, exp.Column):
+        return KeyHead(KeyShape.COLUMN, node)
+    inner = node.this if isinstance(node.this, exp.Column) else None
+    if inner is None:
+        return _OPAQUE_KEY
+    match node:
+        case exp.Coalesce():
+            return KeyHead(KeyShape.COALESCE_HEAD, inner)
+        case exp.Upper():
+            return KeyHead(KeyShape.UPPER, inner)
+        case exp.Lower():
+            return KeyHead(KeyShape.LOWER, inner)
+        case exp.Trim() if not node.args.get("expression") and not node.args.get("position"):
+            return KeyHead(KeyShape.TRIM, inner)
+        case exp.Cast() | exp.TryCast() if _lossless_text(node.args.get("to")):
+            return KeyHead(KeyShape.TEXT_CAST, inner)
+        case _:
+            return _OPAQUE_KEY
+
+
+def _lossless_text(to: object) -> bool:
+    return (
+        cast_target(to) is CastTarget.TEXT
+        and isinstance(to, exp.DataType)
+        and to.this in _LOSSLESS_TEXT_TARGETS
+        and not to.expressions
+    )
 
 
 def array_literal_nonempty(expr: Expr) -> bool:

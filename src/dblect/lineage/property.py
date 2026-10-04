@@ -41,11 +41,13 @@ from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     AggregateRule,
     AggregateScope,
+    BlockedKey,
     CoherenceClear,
     CoherenceGuard,
     CoherenceSink,
     DepContext,
     DischargePath,
+    KeyVerdict,
     OperatorTransfer,
     Property,
     Reducer,
@@ -385,33 +387,38 @@ def _undischarged(
     """The companion columns the aggregated value references that are *not* provably
     constant within each group, each with the discharge paths the guard checked.
 
-    A companion is discharged when it is in the group key, pinned by the scope's own
-    filter, or functionally determined by the group columns at the aggregation input.
-    The empty result means every companion discharged (the aggregate keeps its tag); a
-    non-empty result is the clear.
+    A companion is discharged when a group key determines it (the guard decides each key's
+    shape), it is pinned by the scope's own filter, or it is functionally determined by the
+    group columns at the aggregation input. The empty result means every companion
+    discharged (the aggregate keeps its tag); a non-empty result is the clear.
 
-    Posture is silent-when-unproven. No stamped site (a windowed aggregate, an
-    unmodelled scope) or an unresolvable group shape leaves every companion
-    undischarged with no path checkable, rather than guessing. The dependency path
-    applies only to a companion bound to a column of the aggregation input itself: a
-    binding that survived from a relation further upstream is not chased (rebinding
-    companions through projections is a later build), so it discharges only through
-    group membership or a pin.
+    Posture is silent-when-unproven. No stamped site (a windowed aggregate, an unmodelled
+    scope) leaves every companion undischarged with no path checkable, rather than
+    guessing; a computed group key closes only the dependency path, since its columns are
+    no antecedent. The dependency path applies only to a companion bound to a column of the
+    aggregation input itself: a binding that survived from a relation further upstream is
+    not chased (rebinding companions through projections is a later build), so it
+    discharges only through group membership or a pin.
     """
     companions = guard.companions(value)
     if not companions:
         return ()
-    if site is None or site.group_refs is None:
+    if site is None:
         return tuple(UndischargedCompanion(c, frozenset()) for c in companions)
+    # The FD path reads the group columns as an antecedent, which needs every key to be a plain
+    # column; a computed key leaves it unavailable rather than guessed.
     fd_ann = (
         dep_context.annotation(guard.fd, site.input_source)
-        if site.input_source is not None
+        if site.input_source is not None and site.group_refs is not None
         else None
     )
-    antecedent = frozenset(g.column for g in site.group_refs if g.source == site.input_source)
+    antecedent = frozenset(
+        g.column for g in (site.group_refs or frozenset()) if g.source == site.input_source
+    )
     out: list[UndischargedCompanion] = []
     for companion in companions:
-        if companion in site.group_refs or companion in site.pinned:
+        verdicts = tuple((key, guard.key_verdict(key, companion)) for key in site.group_keys)
+        if any(v is KeyVerdict.HOLDS for _, v in verdicts) or companion in site.pinned:
             continue
         # GROUP_KEY and PIN were both checked above; the FD path is reachable only when
         # the dependency property answers for this companion's own relation.
@@ -420,7 +427,8 @@ def _undischarged(
             paths.add(DischargePath.FD)
             if guard.entails(fd_ann.value, antecedent, companion.column):
                 continue
-        out.append(UndischargedCompanion(companion, frozenset(paths)))
+        blocked = tuple(BlockedKey(k, v) for k, v in verdicts if v is not KeyVerdict.UNRELATED)
+        out.append(UndischargedCompanion(companion, frozenset(paths), blocked))
     return tuple(out)
 
 

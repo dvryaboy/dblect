@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from functools import cache
+from typing import assert_never
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -54,16 +56,19 @@ from dblect.lineage.builder import (
     build_relation_graph,
 )
 from dblect.lineage.facts.model import BASE_WORLD, Annotation, Fact, ScopeKind, WorldRef, by_scope
-from dblect.lineage.facts.property import CoherenceClear
+from dblect.lineage.facts.property import CoherenceClear, KeyVerdict
 from dblect.lineage.facts.registry import PropertyRegistry
 from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
+    GroupKey,
     SourceKind,
     SourceRef,
 )
+from dblect.lineage.predicate import LitKind
 from dblect.lineage.properties.domain_type import (
     NAKED,
+    CompanionFacts,
     DomainTag,
     domain_type_display,
     domain_type_grounded_scopes,
@@ -77,12 +82,14 @@ from dblect.lineage.properties.functional_dependency import (
     functional_dependency_grounding,
     functional_dependency_property,
 )
+from dblect.lineage.properties.nullability import Nullability, activated_nullability
 from dblect.lineage.properties.uniqueness import (
     CandidateKeySet,
     uniqueness_facts,
     uniqueness_property_from_facts,
 )
 from dblect.lineage.properties.value_domain import (
+    Bounded,
     ValueDomain,
     value_domain_conflicts,
     value_domain_facts,
@@ -145,6 +152,9 @@ class CheckGraphs:
     """Columns whose declarations disagree down to the empty set: reported once as
     a ``CONTRACT_ISSUE`` rather than raising and hiding every other column's
     grounding."""
+    companion_facts: CompanionFacts
+    """What a computed group key may rest on: a companion's declared values and whether it
+    is proven NOT NULL. Both come from facts that do not vary across worlds."""
     unguarded_foreign_keys: UnguardedEdges
     """Declared foreign-key edges (contract markers merged with dbt ``relationships``
     tests) minus those an enabled, unconditional, error-severity ``relationships``
@@ -234,8 +244,39 @@ def build_check_graphs(
         ),
         value_domain_facts=vd_facts,
         value_domain_conflicts=vd_conflicts,
+        companion_facts=_companion_facts(manifest, profile, trees, column_build.graph, vd_facts),
         unguarded_foreign_keys=_unguarded_foreign_keys(manifest, reg),
     )
+
+
+def _companion_facts(
+    manifest: Manifest,
+    profile: AdapterProfile,
+    trees: Mapping[str, Expr],
+    column_graph: ColumnLineageGraph,
+    vd_facts: Mapping[ColumnRef, tuple[Fact[ValueDomain, ColumnRef], ...]],
+) -> CompanionFacts:
+    """Companion facts for the coherence guard. Nullability is propagated on first use
+    only, since most runs never group by a ``COALESCE`` of a companion."""
+    vd_ground = value_domain_grounding(vd_facts)
+
+    @cache
+    def nullability() -> Mapping[ColumnRef, Annotation[Nullability]]:
+        return activated_nullability(manifest, profile, parsed=trees, column_graph=column_graph)
+
+    def non_null(ref: ColumnRef) -> bool:
+        ann = nullability().get(ref)
+        return ann is not None and ann.value is Nullability.NON_NULL
+
+    def members(ref: ColumnRef) -> frozenset[str] | None:
+        domain = vd_ground(ref).value
+        if not isinstance(domain, Bounded) or any(
+            lit.kind is not LitKind.STR for lit in domain.values
+        ):
+            return None
+        return frozenset(str(lit.value) for lit in domain.values)
+
+    return CompanionFacts(non_null=non_null, members=members)
 
 
 def base_world_facts(resolved: ResolvedContracts) -> WorldFacts:
@@ -260,6 +301,7 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         domain_type_grounding(by_scope(facts.tag_facts)),
         fd=fd_prop.ref,
         uniqueness=uniqueness_prop.ref,
+        companion_facts=graphs.companion_facts,
     )
     vd_prop = value_domain_property(graphs.value_domain_facts)
     registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop, vd_prop))
@@ -689,19 +731,47 @@ def _aggregation_message(output: ColumnRef, clear: CoherenceClear[DomainTag]) ->
     one = len(companions) == 1
     word, verb = ("companion", "is") if one else ("companions", "are")
 
-    group_refs = clear.site.group_refs if clear.site is not None else None
-    if group_refs:
-        groups = ", ".join(repr(g.column) for g in sorted(group_refs, key=lambda r: r.column))
-        tail = f"grouping on {groups}"
-    elif group_refs == frozenset():
-        tail = "the whole-relation reduction"
-    else:
-        tail = "the grouping, which does not resolve to columns,"
+    tail = _grouping_phrase(clear)
     return (
         f"reducing {output.column!r} with {func}({operand}): {descriptor}, whose per-row "
         f"{word} {companion_list} {verb} not held constant by {tail}; "
         "the aggregation is not well typed"
     )
+
+
+def _blocked_key_clause(key: GroupKey, verdict: KeyVerdict) -> str:
+    """Why one group key failed to hold its column constant, as a clause after the key."""
+    column = repr(key.column.column) if key.column is not None else "its column"
+    match verdict:
+        case KeyVerdict.OPAQUE:
+            return "which is neither a column nor a wrapper of one that the guard can read"
+        case KeyVerdict.NULL_FALLBACK:
+            return f"which gives rows where {column} is NULL a fallback value they do not carry"
+        case KeyVerdict.COLLIDES:
+            return f"which maps two declared values of {column} to one group"
+        case KeyVerdict.UNKNOWN_DOMAIN:
+            return f"which holds {column} constant only over its declared values, and none are declared"
+        case KeyVerdict.HOLDS | KeyVerdict.UNRELATED:
+            raise AssertionError(f"{verdict} does not block a key")
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _grouping_phrase(clear: CoherenceClear[DomainTag]) -> str:
+    """How the grouping failed to hold the companions: the key expressions that defeated
+    the proof, each with why, or the plain key list when none of them was a candidate."""
+    site = clear.site
+    assert site is not None  # a clear without a site is skipped before its message is built
+    blocked = {b.key: b.verdict for u in clear.undischarged for b in u.blocked}
+    if blocked:
+        return " and ".join(
+            f"the group key `{key.sql}`, {_blocked_key_clause(key, verdict)}"
+            for key, verdict in sorted(blocked.items(), key=lambda kv: kv[0].sql)
+        )
+    if not site.group_keys:
+        return "the whole-relation reduction"
+    names = sorted(k.column.column if k.column is not None else k.sql for k in site.group_keys)
+    return f"grouping on {', '.join(repr(n) for n in names)}"
 
 
 def _operand_label(agg: exp.AggFunc) -> str:
