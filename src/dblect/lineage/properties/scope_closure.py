@@ -37,6 +37,7 @@ from dblect.lineage.graph import SourceRef
 from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
+from dblect.sql.vocab import is_row_multiplying
 
 # --- attributes ------------------------------------------------------------
 
@@ -388,6 +389,18 @@ def _predicate_is_exact(e: Expr) -> bool:
     if isinstance(e, exp.Not):
         return isinstance(e.this, Expr) and _predicate_is_exact(e.this)
     return _leaf_is_exact(e)
+
+
+def _projection_multiplies_rows(sel: exp.Select) -> bool:
+    """Whether a projected expression is a set-returning function of this scope, which
+    repeats the input row once per element and so breaks every key. One inside a scalar
+    subquery belongs to that subquery's own scope and does not."""
+    return any(
+        node.find_ancestor(exp.Select) is sel
+        for proj in sel.expressions
+        for node in proj.walk()
+        if is_row_multiplying(node)
+    )
 
 
 def _projection_is_exact(sel: exp.Select) -> bool:
@@ -831,6 +844,8 @@ def _select_facts(
         return (
             _GIVE_UP  # an unqualified star over several inputs, or a star naming an unknown alias
         )
+    if _projection_multiplies_rows(sel):
+        return _GIVE_UP
     if not _projection_is_exact(sel):
         scope_exact = False
 
