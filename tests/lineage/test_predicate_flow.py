@@ -340,3 +340,10 @@ def test_filter_accumulates_down_a_passthrough_chain(specs: list[tuple[str, int]
     flow = _flow(src, *models)
     expected: frozenset[Canon] = frozenset[Canon]().union(*(_atoms(s) for s in atom_sqls))
     assert flow[f"model.shop.m{len(specs) - 1}"].atoms == expected
+
+
+def test_parenthesized_conjunctions_split_into_the_same_atoms() -> None:
+    flat = _atoms("status = 'paid' AND amount > 0 AND region = 'eu'")
+    assert _atoms("(status = 'paid' AND amount > 0) AND (region = 'eu')") == flat
+    assert _atoms("((status = 'paid' AND (amount > 0 AND region = 'eu')))") == flat
+    assert len(flat) == 3
