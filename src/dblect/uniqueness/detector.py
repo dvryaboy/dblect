@@ -259,17 +259,19 @@ def detect_join_fanout(
         group = sg.group_of(sel)
         if group is not None and chain.grouped_to_one_row(group):
             continue
+        sides = frozenset(chain.sides)
         consumers = _consumers(
-            sel,
-            frozenset(chain.sides),
-            safe_builtins=duplicate_safe_builtins,
-            is_output=id(sel) in outputs,
+            sel, _by_qualifier(sides), sides, safe_builtins=duplicate_safe_builtins
         )
+        if id(sel) not in outputs:
+            consumers = _passed_downstream(
+                sel, consumers, sides, outputs, safe_builtins=duplicate_safe_builtins
+            )
         steps = range(len(chain.joins) + 1)
         repeated = [chain.repeated(p) for p in steps]
         key_sides = (
             _declared_key_sides(sel, chain, declared_keys, root)
-            if sel is tree and consumers.rows is not None
+            if sel is tree and consumers.passes_rows
             else ()
         )
         for p, join in enumerate(chain.joins, 1):
@@ -1005,35 +1007,52 @@ def _fanout_finding(join: exp.Join, repeated: frozenset[str]) -> Finding:
     )
 
 
+_Resolve = Callable[[exp.Column], frozenset[str] | None]
+"""The join sides a column reads, or ``None`` when it names none."""
+
+
+def _by_qualifier(sides: frozenset[str]) -> _Resolve:
+    def resolve(column: exp.Column) -> frozenset[str] | None:
+        qualifier = (sg.column_table(column) or "").lower()
+        return frozenset({qualifier}) if qualifier in sides else None
+
+    return resolve
+
+
 @dataclass(frozen=True, slots=True)
 class _Reads:
-    """The output sides a consumer reads. ``unresolved`` marks a column whose side cannot be
+    """The join sides a consumer reads. ``unresolved`` marks a column whose side cannot be
     named (unqualified, or qualified by something outside the join), which may be any side."""
 
     sides: frozenset[str] = frozenset()
     unresolved: bool = False
 
     @staticmethod
-    def of(columns: Iterable[exp.Column], sides: frozenset[str]) -> _Reads:
+    def of(columns: Iterable[exp.Column], resolve: _Resolve) -> _Reads:
         named: set[str] = set()
         unresolved = False
         for c in columns:
-            qualifier = (sg.column_table(c) or "").lower()
-            if qualifier in sides:
-                named.add(qualifier)
-            else:
+            read = resolve(c)
+            if read is None:
                 unresolved = True
+            else:
+                named |= read
         return _Reads(frozenset(named), unresolved)
+
+    def __or__(self, other: _Reads) -> _Reads:
+        return _Reads(self.sides | other.sides, self.unresolved or other.unresolved)
 
 
 @dataclass(frozen=True, slots=True)
 class _Consumers:
     """What reads a select's joined rows: aggregate column reads, a column-free count, and the
-    reads of an ungrouped projection (``None`` under GROUP BY or DISTINCT)."""
+    reads of each ungrouped projection (none under GROUP BY or DISTINCT, which hand on
+    different rows: ``passes_rows`` is then false)."""
 
     values: tuple[_Reads, ...]
     counts_rows: bool
-    rows: _Reads | None
+    rows: tuple[_Reads, ...]
+    passes_rows: bool
 
     def hurt_by(
         self, multiplied: frozenset[str], *, repeated: frozenset[str], sides: frozenset[str]
@@ -1044,50 +1063,188 @@ class _Consumers:
             return True
         if self.counts_rows and sides <= repeated:
             return True
-        rows = self.rows
-        if rows is None or not rows.sides <= repeated:
-            return False
-        return bool(rows.sides & multiplied) or (not rows.sides and rows.unresolved)
+        return any(
+            r.sides <= repeated and (bool(r.sides & multiplied) or (not r.sides and r.unresolved))
+            for r in self.rows
+        )
+
+    def merged(self, other: _Consumers) -> _Consumers:
+        """Both consumers reading the same rows; each projection is judged on its own."""
+        return _Consumers(
+            self.values + other.values,
+            self.counts_rows or other.counts_rows,
+            self.rows + other.rows,
+            self.passes_rows or other.passes_rows,
+        )
+
+    def passing_on(self, downstream: _Consumers) -> _Consumers:
+        """This select's own aggregates plus ``downstream``, which reads the rows it hands on."""
+        if not self.passes_rows:
+            return self
+        return _Consumers(
+            self.values + downstream.values,
+            self.counts_rows or downstream.counts_rows,
+            downstream.rows,
+            self.passes_rows,
+        )
+
+
+_NO_CONSUMERS = _Consumers((), False, (), False)
 
 
 def _consumers(
-    sel: exp.Select, sides: frozenset[str], *, safe_builtins: frozenset[str], is_output: bool
+    sel: exp.Select,
+    resolve: _Resolve,
+    star: frozenset[str] | None,
+    *,
+    safe_builtins: frozenset[str],
 ) -> _Consumers:
-    """Classify what reads ``sel``'s joined rows; see :class:`_Consumers`. A select that is not
-    the model's output passes its rows to another scope, which may read any side."""
+    """Classify what reads ``sel``'s rows; see :class:`_Consumers`. ``resolve`` names the join
+    sides a column of ``sel`` reads and ``star`` those a ``*`` reads (``None``: any)."""
     values: list[_Reads] = []
     counts_rows = False
     for agg in _sensitive_aggregate_consumers(sel, safe_builtins=safe_builtins):
         columns = [c for c in sg.find_columns(agg) if _node_in_scope(c, sel)]
         behavior = aggregate_behavior(agg) if isinstance(agg, exp.AggFunc) else None
         if columns:
-            values.append(_Reads.of(columns, sides))
+            values.append(_Reads.of(columns, resolve))
         elif behavior is AggregateBehavior.COUNT:
             counts_rows = True
         else:
             values.append(_Reads(unresolved=True))  # sum(1), a UDF: no side to name
-    rows: _Reads | None = None
     grouped = sg.group_of(sel) is not None or _is_implicit_single_group(sel)
-    if not grouped and not sel.args.get("distinct"):
-        rows = _row_reads(sel, sides) if is_output else _Reads(unresolved=True)
-    return _Consumers(tuple(values), counts_rows, rows)
+    passes_rows = not grouped and not sel.args.get("distinct")
+    rows = (_row_reads(sel.expressions, sel, resolve, star),) if passes_rows else ()
+    return _Consumers(tuple(values), counts_rows, rows, passes_rows)
 
 
-def _row_reads(sel: exp.Select, sides: frozenset[str]) -> _Reads:
-    """The sides ``sel``'s projections read outside a collapsing aggregate. A bare ``*`` reads
-    every side; ``c.*`` parses as a column of ``c``."""
+def _row_reads(
+    projections: Iterable[Expr], sel: exp.Select, resolve: _Resolve, star: frozenset[str] | None
+) -> _Reads:
+    """The sides ``projections`` read outside a collapsing aggregate. A bare ``*`` reads
+    ``star``; ``c.*`` parses as a column of ``c``."""
     columns: list[exp.Column] = []
-    star = False
-    for root in sel.expressions:
+    reads_star = False
+    for root in projections:
         for node in root.walk():
             if not _node_in_scope(node, sel) or _under_collapsing_aggregate(node, sel):
                 continue
             if isinstance(node, exp.Column):
                 columns.append(node)
             elif isinstance(node, exp.Star) and not isinstance(node.parent, exp.Column):
-                star = True
-    reads = _Reads.of(columns, sides)
-    return _Reads(sides | reads.sides if star else reads.sides, reads.unresolved)
+                reads_star = True
+    reads = _Reads.of(columns, resolve)
+    if not reads_star:
+        return reads
+    return reads | (_Reads(star) if star is not None else _Reads(unresolved=True))
+
+
+def _passed_downstream(
+    sel: exp.Select,
+    own: _Consumers,
+    sides: frozenset[str],
+    outputs: set[int],
+    *,
+    safe_builtins: frozenset[str],
+) -> _Consumers:
+    """``own`` plus the consumers of the rows ``sel`` hands to the scopes that read it. A shape
+    the walk cannot follow leaves them unknown: any side may be read."""
+    names = _output_sides(sel, _by_qualifier(sides), sides)
+    downstream = _downstream(sel, names, outputs, safe_builtins=safe_builtins)
+    if downstream is None:
+        downstream = _Consumers((), False, (_Reads(unresolved=True),), False)
+    return own.passing_on(downstream)
+
+
+def _output_sides(
+    sel: exp.Select, resolve: _Resolve, star: frozenset[str] | None
+) -> dict[str, frozenset[str]]:
+    """The join sides each output name of ``sel`` reads, ``*`` standing for the whole row.
+    A name that reads no nameable side is absent, so a reader of it reads any side."""
+    names: dict[str, frozenset[str]] = {}
+    for name, expression in sg.projection_expressions_by_output_name(sel).items():
+        reads = _row_reads([expression], sel, resolve, star)
+        if reads.sides and not reads.unresolved:
+            names[name.lower()] = reads.sides
+    whole = _row_reads(sel.expressions, sel, resolve, star)
+    if not whole.unresolved:
+        names["*"] = whole.sides
+    return names
+
+
+def _downstream(
+    sel: exp.Select,
+    names: Mapping[str, frozenset[str]],
+    outputs: set[int],
+    *,
+    safe_builtins: frozenset[str],
+) -> _Consumers | None:
+    """What reads the rows of ``sel`` (a CTE body or a FROM subquery), each output name of
+    which reads the join sides in ``names``. ``None`` when a reader is not a select whose only
+    source is ``sel``: a union arm, a second join, an unused CTE."""
+    readers = _sole_source_readers(sel)
+    if readers is None:
+        return None
+    total = _NO_CONSUMERS
+    for reader, alias in readers:
+        resolve = _through(alias, names)
+        star = names.get("*")
+        consumers = _consumers(reader, resolve, star, safe_builtins=safe_builtins)
+        if id(reader) not in outputs and consumers.passes_rows:
+            reader_names = _output_sides(reader, resolve, star)
+            if _projects_star(reader):
+                reader_names = {**names, **reader_names}
+            onward = _downstream(reader, reader_names, outputs, safe_builtins=safe_builtins)
+            if onward is None:
+                return None
+            consumers = consumers.passing_on(onward)
+        total = total.merged(consumers)
+    return total
+
+
+def _projects_star(sel: exp.Select) -> bool:
+    """True when ``sel`` projects ``*`` or ``alias.*``, so it also carries its source's names."""
+    return any(
+        isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))
+        for p in sel.expressions
+    )
+
+
+def _through(alias: str, names: Mapping[str, frozenset[str]]) -> _Resolve:
+    """Resolve a column of a select that reads ``alias`` to the join sides behind it."""
+
+    def resolve(column: exp.Column) -> frozenset[str] | None:
+        qualifier = (sg.column_table(column) or alias).lower()
+        return names.get(sg.column_name(column).lower()) if qualifier == alias.lower() else None
+
+    return resolve
+
+
+def _sole_source_readers(sel: exp.Select) -> list[tuple[exp.Select, str]] | None:
+    """Every select that reads the CTE or subquery ``sel`` as its only source, with the alias
+    it reads it by; ``None`` when ``sel`` is neither, or any reference is not such a read."""
+    parent = sel.parent
+    references: list[Expr]
+    if isinstance(parent, exp.Subquery):
+        references = [parent]
+    elif isinstance(parent, exp.CTE) and isinstance(parent.parent, exp.With):
+        owner = parent.parent.parent
+        name = parent.alias_or_name.lower()
+        references = [
+            t
+            for t in (owner.find_all(exp.Table) if owner is not None else ())
+            if not t.db and t.name.lower() == name
+        ]
+    else:
+        return None
+    readers: list[tuple[exp.Select, str]] = []
+    for ref in references:
+        from_ = ref.parent
+        reader = from_.parent if isinstance(from_, exp.From) else None
+        if not isinstance(reader, exp.Select) or sg.joins_of(reader) or sg.laterals_of(reader):
+            return None
+        readers.append((reader, ref.alias_or_name))
+    return readers
 
 
 def _is_implicit_single_group(sel: exp.Select) -> bool:
