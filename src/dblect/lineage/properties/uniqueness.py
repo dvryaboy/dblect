@@ -197,8 +197,8 @@ class _UniqueTestDiscoverer:
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "unique":
                 continue
-            col = tm.kwargs.get("column_name")
-            if not isinstance(col, str) or not col:
+            col = tm.column_kwarg("column_name")
+            if col is None:
                 continue
             target = generic_test_target_uid(node)
             scope = generic_test_source_ref(manifest, target) if target is not None else None
@@ -232,15 +232,10 @@ class _UniqueCombinationDiscoverer:
             # grounds.
             if not tm.name.endswith("unique_combination_of_columns"):
                 continue
-            raw = tm.kwargs.get("combination_of_columns")
-            if not isinstance(raw, list):
-                continue
-            raw_list = cast("list[object]", raw)
-            cols = [c for c in raw_list if isinstance(c, str) and c]
-            # Every entry must be a usable column name; a partially-typed list
-            # (a nested list, a null) is a shape we can't ground, so skip it
-            # rather than ground a partial key.
-            if not cols or len(cols) != len(raw_list):
+            # A list with any unresolvable entry (a null, a nested list, Jinja)
+            # grounds nothing rather than a partial key.
+            cols = tm.column_list_kwarg("combination_of_columns")
+            if cols is None:
                 continue
             target = generic_test_target_uid(node)
             scope = generic_test_source_ref(manifest, target) if target is not None else None
@@ -490,15 +485,11 @@ def _declared_key_columns(tm: object) -> list[str] | None:
     if not isinstance(tm, DbtTestMetadata) or not tm.enabled:
         return None
     if tm.name == "unique":
-        col = tm.kwargs.get("column_name")
-        return [col] if isinstance(col, str) and col else None
+        col = tm.column_kwarg("column_name")
+        return [col] if col is not None else None
     if tm.name.endswith("unique_combination_of_columns"):
-        raw = tm.kwargs.get("combination_of_columns")
-        if not isinstance(raw, list):
-            return None
-        raw_list = cast("list[object]", raw)
-        cols = [c for c in raw_list if isinstance(c, str) and c]
-        return cols if cols and len(cols) == len(raw_list) else None
+        cols = tm.column_list_kwarg("combination_of_columns")
+        return list(cols) if cols is not None else None
     return None
 
 
