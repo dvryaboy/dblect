@@ -80,6 +80,42 @@ def test_key_and_grain_become_candidate_keys() -> None:
     assert (_CHARGES, CandidateKeySet.of(frozenset({"country", "charge_date"}))) in keys
 
 
+def test_unique_per_lowers_to_the_key_plus_the_owner_relation() -> None:
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+
+        @contract
+        def charge_no_is_an_ordinal(self: ContractSelf) -> object:
+            return self.charge_date.unique_per(self.country)
+
+    resolved = resolve_contracts(_shop_manifest())
+    assert resolved.issues == ()
+    assert [(f.scope, f.value) for f in resolved.key_facts] == [
+        (_CHARGES, CandidateKeySet.of(frozenset({"country", "charge_date"})))
+    ]
+    (owned,) = resolved.owned_columns
+    assert (owned.scope, owned.column, owned.owners) == (
+        _CHARGES,
+        "charge_date",
+        frozenset({"country"}),
+    )
+
+
+def test_unique_per_on_an_unknown_column_is_a_finding_and_lowers_nothing() -> None:
+    class StgCharges(ModelContract):
+        dbt_model = "stg_charges"
+
+        @contract
+        def bad(self: ContractSelf) -> object:
+            return self.charge_date.unique_per(self.no_such_column)
+
+    known = {_CHARGES: frozenset({"charge_date", "country"})}
+    resolved = resolve_contracts(_shop_manifest(), known_columns=known)
+    assert [i.code for i in resolved.issues] == [IssueCode.UNKNOWN_COLUMN]
+    assert resolved.key_facts == ()
+    assert resolved.owned_columns == ()
+
+
 def test_key_marker_and_method_key_merge() -> None:
     class FctOrders(ModelContract):
         dbt_model = "fct_orders"

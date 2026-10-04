@@ -1,29 +1,25 @@
-"""Partial composite key: a GROUP BY or a join that reaches into a declared
-composite key without covering it.
+"""Dependent key without owner: a GROUP BY or a join that uses a ``unique_per`` column
+without its owners.
 
-A column that is unique only together with another (a line number within an order, a
-seat within a flight) is easy to group or join on alone, and the numbers come out
-plausible and wrong. A relation with a declared key of two or more columns makes the
-mistake checkable: when one GROUP BY, or the ON equalities of one join, use some of the
-key's columns and the rest are neither used, pinned, nor determined by what is used,
-rows that differ only in the missing columns are treated as the same entity.
+``line_no.unique_per(order_id)`` says a line number means something only inside its
+order. Grouping or joining on ``line_no`` alone treats lines of different orders as the
+same entity, and the numbers come out plausible and wrong. Using the owners without the
+dependent is a normal rollup or parent join and never fires.
 
-A key column is covered when it is used, pinned to a literal anywhere in the model
-(a WHERE, a join-side filter, a CTE body), equated through the select's own
-column-to-column equalities to a covered column, or determined by a covered column under
-the relation's functional dependencies. A clause that covers any declared key of the
-relation, composite or not, is silent. A clause whose only used key columns are foreign
-keys is silent too: rolling lines up to their order, or joining them to it, is what the
-reference is for, and without that carve-out every parent-id join would fire.
+When one GROUP BY, or the ON equalities of one join, use the dependent column, every owner
+must be covered: used, pinned to a literal anywhere in the model (a WHERE, a join-side
+filter, a CTE body), equated through the select's own column-to-column equalities to a
+covered column, or determined by a covered column under the relation's functional
+dependencies. Columns are read through renames, CTEs and derived tables to the relation
+whose column they copy.
 
 This is a direct structural read over the stamped tree, like the orphan-drop check, and
-the pure signal is :func:`partial_key_sites`.
+the pure signal is :func:`owned_key_sites`.
 
 Not handled, by design:
 
-* a relation reached only through another that shares its column (a keyless refunds
-  table grouped by ``line_no`` when only ``order_lines`` declares the key) needs the
-  composite references of #283;
+* a relation reached only through another that shares its column (a keyless refunds table
+  grouped by ``line_no`` when only ``order_lines`` declares the fact);
 * ``USING`` and ``NATURAL`` joins (sqlglot gives no ON), comma joins whose equality lives
   in WHERE, and ``ROLLUP``/``CUBE``/``GROUPING SETS``/``GROUP BY ALL``;
 * a literal pin counts model-wide, so a filter in an unrelated CTE over the same relation
@@ -42,10 +38,9 @@ from sqlglot import Expr
 
 from dblect.lineage.graph import ColumnRef, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
-from dblect.lineage.properties.uniqueness import Key
 from dblect.sql import _sqlglot as sg
+from dblect.types import OwnedColumn
 
-KeysByRelation = Mapping[SourceRef, frozenset[Key]]
 RefOf = Callable[[exp.Column], ColumnRef | None]
 
 
@@ -55,26 +50,18 @@ class KeyedClause(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class PartialKeySite:
-    """One clause whose used columns reach into ``key`` of ``relation`` without covering
-    it. ``used`` are the key columns the clause reads, ``missing`` those it leaves
-    unpinned and undetermined. ``node`` is the ``Group`` or ``Join`` it sits on and
-    ``select`` the statement holding it, the line fallback for a node sqlglot gave none."""
+class OwnedKeySite:
+    """One clause that uses ``column`` of ``relation`` without covering its owners.
+    ``missing`` are the owners it leaves unpinned and undetermined. ``node`` is the
+    ``Group`` or ``Join`` it sits on and ``select`` the statement holding it, the line
+    fallback for a node sqlglot gave none."""
 
     node: Expr
     select: exp.Select
     clause: KeyedClause
     relation: SourceRef
-    key: Key
-    used: frozenset[str]
+    column: str
     missing: frozenset[str]
-
-
-@dataclass(frozen=True, slots=True)
-class _Declarations:
-    keys: KeysByRelation
-    fds_of: Callable[[SourceRef], FDSet]
-    foreign_key_children: frozenset[ColumnRef]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,27 +74,25 @@ class _Scope:
     equalities: tuple[tuple[ColumnRef, ColumnRef], ...]
 
 
-def partial_key_sites(
+def owned_key_sites(
     tree: Expr,
-    keys: KeysByRelation,
+    owned: tuple[OwnedColumn, ...],
     fds_of: Callable[[SourceRef], FDSet],
-    foreign_key_children: frozenset[ColumnRef],
     ref_of: RefOf,
-) -> list[PartialKeySite]:
-    """Every GROUP BY and every join ON in ``tree`` that uses part of a declared
-    composite key of one relation and covers neither that key nor any other key of it.
+) -> list[OwnedKeySite]:
+    """Every GROUP BY and every join ON in ``tree`` that uses an owned column of one
+    relation while some of its owners stay uncovered.
 
     Per join, the used columns are those of one table alias in the ON's top-level
     column-to-column equalities (an equality under ``OR`` is outside the fragment). Per
     GROUP BY, they are the bare grouped columns, read through CTEs and derived tables to
-    the relation they copy. One site per (clause, relation, alias), naming the composite
-    key with the fewest missing columns.
+    the relation they copy. One site per (clause, relation, alias, owned column).
     """
-    if not any(len(key) > 1 for bucket in keys.values() for key in bucket):
-        return []
-    declarations = _Declarations(keys, fds_of, foreign_key_children)
+    by_relation: dict[SourceRef, list[OwnedColumn]] = defaultdict(list)
+    for entry in owned:
+        by_relation[entry.scope].append(entry)
     pins = _literal_pins(tree, ref_of)
-    sites: list[PartialKeySite | None] = []
+    sites: list[OwnedKeySite] = []
     for sel in sg.find_all_selects(tree):
         scope = _Scope(sel, pins, _equalities(sel, ref_of))
         for join in sg.joins_of(sel):
@@ -115,21 +100,22 @@ def partial_key_sites(
             if on is None:
                 continue
             for relation, used in _join_uses(on, ref_of):
-                sites.append(
-                    _judge(scope, declarations, join, KeyedClause.JOIN, relation, used, ())
+                sites.extend(
+                    _judge(scope, by_relation, fds_of, join, KeyedClause.JOIN, relation, used, ())
                 )
         group = sg.group_of(sel)
         if group is None or _unmodelled_grouping(group):
             continue
         grouped, inside = _group_columns(sel, ref_of)
-        by_relation: dict[SourceRef, set[str]] = defaultdict(set)
+        used_by_relation: dict[SourceRef, set[str]] = defaultdict(set)
         for ref in grouped:
-            by_relation[ref.source].add(ref.column)
-        for relation, used in by_relation.items():
-            sites.append(
+            used_by_relation[ref.source].add(ref.column)
+        for relation, used in used_by_relation.items():
+            sites.extend(
                 _judge(
                     scope,
-                    declarations,
+                    by_relation,
+                    fds_of,
                     group,
                     KeyedClause.GROUP_BY,
                     relation,
@@ -137,43 +123,39 @@ def partial_key_sites(
                     (*grouped, *inside),
                 )
             )
-    return [site for site in sites if site is not None]
+    return sites
 
 
 def _judge(
     scope: _Scope,
-    declarations: _Declarations,
+    owned_by_relation: Mapping[SourceRef, list[OwnedColumn]],
+    fds_of: Callable[[SourceRef], FDSet],
     node: Expr,
     clause: KeyedClause,
     relation: SourceRef,
     used: frozenset[str],
     also_fixed: tuple[ColumnRef, ...],
-) -> PartialKeySite | None:
-    declared = declarations.keys.get(relation, frozenset())
-    if not declared:
-        return None
+) -> list[OwnedKeySite]:
+    owned = owned_by_relation.get(relation, [])
+    if not owned:
+        return []
+    used = frozenset(col.lower() for col in used)
     base = {*scope.pins, *also_fixed, *(ColumnRef(relation, col) for col in used)}
     reached = frozenset(
-        ref.column for ref in _close(base, scope.equalities) if ref.source == relation
+        ref.column.lower() for ref in _close(base, scope.equalities) if ref.source == relation
     )
-    fds = declarations.fds_of(relation)
-
-    def covered(col: str) -> bool:
-        return determines(fds, reached, col)
-
-    if any(all(covered(col) for col in key) for key in declared):
-        return None
-    fk = declarations.foreign_key_children
-    candidates = [
-        (key, frozenset(col for col in key if not covered(col)))
-        for key in declared
-        if len(key) > 1 and any(ColumnRef(relation, col) not in fk for col in used & key)
-    ]
-    if not candidates:
-        return None
-    key, missing = min(candidates, key=lambda c: (len(c[1]), sorted(c[0])))
+    fds = fds_of(relation)
     anchor = node if sg.line_range(node) is not None else scope.select
-    return PartialKeySite(anchor, scope.select, clause, relation, key, used & key, missing)
+    sites: list[OwnedKeySite] = []
+    for entry in owned:
+        if entry.column not in used:
+            continue
+        missing = frozenset(o for o in entry.owners if not determines(fds, reached, o))
+        if missing:
+            sites.append(
+                OwnedKeySite(anchor, scope.select, clause, relation, entry.column, missing)
+            )
+    return sites
 
 
 def _close(
@@ -266,17 +248,15 @@ def _unmodelled_grouping(group: exp.Group) -> bool:
     return any(group.args.get(arg) for arg in ("rollup", "cube", "grouping_sets", "all", "totals"))
 
 
-def partial_key_message(site: PartialKeySite, relation_name: str) -> str:
-    """The finding's wording: what the clause reads, which key columns it leaves out, and the
-    ways to settle it. Never claims the data is wrong, only that rows differing in the missing
-    columns are treated as one."""
-    key = ", ".join(sorted(site.key))
-    used = ", ".join(sorted(site.used))
+def owned_key_message(site: OwnedKeySite, relation_name: str) -> str:
+    """The finding's wording: what the clause reads, which owners it leaves out, and the
+    ways to settle it. Never claims the data is wrong, only that rows differing in the
+    missing owners are treated as one."""
     missing = ", ".join(sorted(site.missing))
     action = "groups" if site.clause is KeyedClause.GROUP_BY else "matches"
     return (
-        f"this {site.clause.value} {action} {relation_name!r} on {used} but not the rest of its "
-        f"declared key ({key}), missing {missing}. Rows that differ only in {missing} are treated "
-        f"as one. Use the whole key, filter {missing} to one value, or declare the dependency if "
-        "one holds; add a noqa if the subset is intended."
+        f"this {site.clause.value} {action} {relation_name!r} on {site.column}, which is "
+        f"meaningful only within {missing}, without covering it. Rows that differ only in "
+        f"{missing} are treated as one. Add {missing} to the clause, filter it to one value, "
+        "or declare the dependency if one holds; add a noqa if the rollup is intended."
     )

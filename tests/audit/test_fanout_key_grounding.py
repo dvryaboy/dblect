@@ -72,3 +72,23 @@ def test_declared_key_quiets_the_fanout() -> None:
         assert len(resolve_contracts(manifest).key_facts) == 1
         fired = _fanout_models(manifest)
     assert "model.shop.fact" not in fired
+
+
+def test_unique_per_is_a_key_the_fanout_check_covers() -> None:
+    sql = "SELECT f.id FROM fact_src AS f JOIN dim AS d ON f.id = d.id AND f.name = d.name"
+    manifest = _manifest(
+        _shop_model("dim", "SELECT id, name, region FROM dim_src GROUP BY id, name, region"),
+        _shop_model("fact", sql),
+    )
+    assert "model.shop.fact" in _fanout_models(manifest)
+    with isolated_registry():
+
+        class Dim(ModelContract):
+            dbt_model = "dim"
+
+            @contract
+            def name_is_an_ordinal(self: ContractSelf) -> object:
+                return self.name.unique_per(self.id)
+
+        fired = _fanout_models(manifest)
+    assert "model.shop.fact" not in fired

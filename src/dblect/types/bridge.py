@@ -130,6 +130,17 @@ class ResolvedPredicate:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedColumn:
+    """``column`` of ``scope`` is meaningful only within ``owners`` (a ``unique_per``
+    contract). Names are lowercased like the dependency property's columns."""
+
+    scope: SourceRef
+    column: str
+    owners: frozenset[str]
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedContracts:
     """Everything the bridge derived from the registry against one manifest."""
 
@@ -141,6 +152,7 @@ class ResolvedContracts:
     constraints: tuple[ColumnConstraint, ...]
     predicates: tuple[ResolvedPredicate, ...]
     issues: tuple[ContractIssue, ...]
+    owned_columns: tuple[OwnedColumn, ...]
 
 
 _KIND_OF_RESOURCE: Mapping[ResourceType, SourceKind] = {
@@ -453,6 +465,7 @@ def resolve_contracts(
         constraints=tuple(out.constraints),
         predicates=tuple(out.predicates),
         issues=tuple(out.issues),
+        owned_columns=tuple(out.owned_columns),
     )
 
 
@@ -465,6 +478,7 @@ class _Accumulator:
         "foreign_keys",
         "issues",
         "key_facts",
+        "owned_columns",
         "predicates",
         "tag_facts",
         "value_domain_facts",
@@ -474,6 +488,7 @@ class _Accumulator:
         self.tag_facts: list[Fact[DomainTag, ColumnRef]] = []
         self.value_domain_facts: list[Fact[ValueDomain, ColumnRef]] = []
         self.key_facts: list[Fact[CandidateKeySet, SourceRef]] = []
+        self.owned_columns: list[OwnedColumn] = []
         self.fd_facts: list[Fact[FDSet, SourceRef]] = []
         self.foreign_keys: list[ForeignKeyEdge] = []
         self.constraints: list[ColumnConstraint] = []
@@ -613,8 +628,14 @@ def _lower_fact(
                 detail=f"{contract}.{method.name}",
             )
         )
-    elif isinstance(fact, (ast.KeyFact, ast.GrainFact)):
-        columns = fact.columns if isinstance(fact, ast.KeyFact) else fact.per
+    elif isinstance(fact, (ast.KeyFact, ast.GrainFact, ast.UniquePerFact)):
+        match fact:
+            case ast.KeyFact(key_columns):
+                columns = key_columns
+            case ast.GrainFact(per):
+                columns = per
+            case ast.UniquePerFact(dependent, owners):
+                columns = (*owners, dependent)
         names = _own_columns(columns, contract, method, out.issues, known, fold=False)
         if names is None:
             return
@@ -626,6 +647,13 @@ def _lower_fact(
                 detail=f"{contract}.{method.name}",
             )
         )
+        if isinstance(fact, ast.UniquePerFact):
+            *owner_names, dependent_name = (name.lower() for name in names)
+            out.owned_columns.append(
+                OwnedColumn(
+                    src, dependent_name, frozenset(owner_names), f"{contract}.{method.name}"
+                )
+            )
     else:
         _lower_references(fact, src, known, manifest, contract, method, out)
 

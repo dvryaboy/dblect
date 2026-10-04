@@ -286,15 +286,15 @@ def detect_join_fanout(
     return tuple(out)
 
 
-def declared_keys(
+def _declared_keys(
     manifest: Manifest,
-    scope: SourceRef,
+    uid: str,
     key_facts: Mapping[SourceRef, tuple[Fact[CandidateKeySet, SourceRef], ...]],
 ) -> frozenset[Key]:
-    """A relation's declared keys (tests, contracts) plus, for a model, its ``unique_key``
-    config, which claims the grain whether or not the write path enforces it."""
-    keys = declared_grain_keys(key_facts.get(scope, ()))
-    node = manifest.models.get(scope.unique_id)
+    """A model's declared keys (tests, contracts) plus its ``unique_key`` config, which claims
+    the grain whether or not the write path enforces it."""
+    keys = declared_grain_keys(key_facts.get(SourceRef(SourceKind.MODEL, uid), ()))
+    node = manifest.models.get(uid)
     unique_key = node.config.unique_key if node is not None and node.config is not None else ()
     return keys | {frozenset(col.lower() for col in unique_key)} if unique_key else keys
 
@@ -629,8 +629,7 @@ def make_fact_grounded_detectors(
     if fd_by_name is None:
         fd_by_name = fd_annotations_by_name(manifest, graph, fd_facts, relation_keys=relation_keys)
     declared_by_tree = {
-        id(tree): declared_keys(manifest, SourceRef(SourceKind.MODEL, uid), key_facts)
-        for uid, tree in (parsed or {}).items()
+        id(tree): _declared_keys(manifest, uid, key_facts) for uid, tree in (parsed or {}).items()
     }
     cache: dict[int, ScopeIndex] = {}
 
