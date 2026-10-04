@@ -461,6 +461,32 @@ def _widen_per_row_coordinates(tag: DomainTag) -> DomainTag:
     return Tagged(dim, _froze(nominal))
 
 
+def rebind_companions(
+    tag: DomainTag, copy_in: Callable[[ColumnRef], ColumnRef | None]
+) -> DomainTag:
+    """The tag with each per-row companion moved to its unchanged copy in the relation the
+    tag is flowing into (``copy_in`` finds it). A companion the relation does not carry
+    stays on the upstream column, which is what lets the coherence guard see it is not held
+    there. Two companions that land on one column merge their exponents."""
+
+    def moved(unit: Unit) -> Unit:
+        if not isinstance(unit, PerRow):
+            return unit
+        copy = copy_in(unit.column)
+        return unit if copy is None else PerRow(copy)
+
+    if isinstance(tag, _Conflict):
+        return tag
+    dim = tag.dimension
+    if isinstance(dim, Dimension):
+        merged: dict[Unit, int] = {}
+        for unit, power in dim.exponents:
+            target = moved(unit)
+            merged[target] = merged.get(target, 0) + power
+        dim = Dimension(_drop_zeros(merged))
+    return Tagged(dim, _froze({name: moved(binding) for name, binding in tag.nominal}))
+
+
 def _outer_join_null_rule(
     _expr: Expr, kids: tuple[Annotation[DomainTag], ...], _ctx: DepContext
 ) -> Annotation[DomainTag]:
@@ -860,5 +886,6 @@ def domain_type_property(
         ground=ground,
         column_meta={OUTER_JOIN_NULL_META: _outer_join_null_rule},
         display=domain_type_display,
+        rebind=rebind_companions,
         depends_on=tuple(ref for ref in (fd, uniqueness) if ref is not None),
     )

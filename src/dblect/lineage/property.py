@@ -130,6 +130,7 @@ def propagate(
     """
     reduce = _reducer_for(prop)
     lat = prop.lattice
+    copies = _copy_index(graph) if prop.rebind is not None else {}
     check = consistent(lat)
     # The "no information" value a node grounds to when nothing derives or
     # declares it: a counting/accumulating property's additive identity
@@ -155,6 +156,14 @@ def propagate(
                     result = grounded  # a leaf anchors on its grounded value
                 else:
                     inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
+                    if prop.rebind is not None and isinstance(subject, ColumnRef):
+                        in_relation = subject.source
+                        inferred = replace(
+                            inferred,
+                            value=prop.rebind(
+                                inferred.value, lambda col: copies.get((col, in_relation))
+                            ),
+                        )
                     if inferred_sink is not None:
                         inferred_sink[subject] = inferred
                     result = _reconcile(lat, check, grounded, inferred, prop.reconcile_by_meet)
@@ -166,6 +175,30 @@ def propagate(
     for subject in graph.subjects() if subjects is None else subjects:
         annotate(subject)
     return annotations
+
+
+def _copy_index(graph: LineageView[Any]) -> dict[tuple[ColumnRef, SourceRef], ColumnRef]:
+    """For each column and relation, the column of that relation that copies it unchanged.
+
+    When a relation carries a column under several names, the one that keeps the original
+    name wins, then the alphabetically first, so the choice does not depend on projection order."""
+    index: dict[tuple[ColumnRef, SourceRef], ColumnRef] = {}
+    for subject in graph.subjects():
+        if not isinstance(subject, ColumnRef):
+            continue
+        derivation = graph.derivation(subject)
+        origin = None if derivation is None else copied_column(derivation)
+        if origin is None:
+            continue
+        key = (origin, subject.source)
+        held = index.get(key)
+        if held is None or _copy_rank(origin, subject) < _copy_rank(origin, held):
+            index[key] = subject
+    return index
+
+
+def _copy_rank(origin: ColumnRef, copy: ColumnRef) -> tuple[bool, str]:
+    return (copy.column != origin.column, copy.column)
 
 
 def _reducer_for(prop: Property[Any, Any]) -> Reducer:

@@ -27,6 +27,8 @@ from dblect.lineage.properties.domain_type import (
     PerRow,
     Tagged,
     Unit,
+    companion_columns,
+    rebind_companions,
     tagged,
 )
 from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
@@ -196,3 +198,27 @@ def test_per_row_units_cancel_only_for_the_same_column() -> None:
     assert same.divide(same).is_dimensionless
     mixed = Dimension.of(PerRow(_CURRENCY_COL)).divide(Dimension.of(PerRow(other)))
     assert not mixed.is_dimensionless
+
+
+_DOWNSTREAM = SourceRef(SourceKind.MODEL, "model.shop.report")
+
+
+def _carried(column: ColumnRef) -> ColumnRef | None:
+    """A relation that carries ``currency`` under a new relation and drops ``country``."""
+    return ColumnRef(_DOWNSTREAM, column.column) if column == _CURRENCY_COL else None
+
+
+@given(_values)
+def test_rebinding_moves_exactly_the_carried_companions(tag: DomainTag) -> None:
+    moved = rebind_companions(tag, _carried)
+    expected = {_carried(c) or c for c in companion_columns(tag)}
+    assert companion_columns(moved) == expected
+    if isinstance(tag, Tagged):
+        assert isinstance(moved, Tagged)
+        assert _pinned(moved) == _pinned(tag)  # pinned units stay put
+
+
+def _pinned(tag: Tagged) -> set[Unit]:
+    if not isinstance(tag.dimension, Dimension):
+        return set()
+    return {unit for unit, _ in tag.dimension.exponents if isinstance(unit, Concrete)}
