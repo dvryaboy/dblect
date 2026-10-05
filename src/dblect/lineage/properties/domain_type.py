@@ -797,7 +797,7 @@ def key_verdict_reader(
                 return KeyVerdict.HOLDS
             case KeyShape.UPPER | KeyShape.LOWER | KeyShape.TRIM | KeyShape.TEXT_CAST:
                 members = facts.members(companion) if facts is not None else None
-                if members is None:
+                if not members:  # undeclared, or declared with no values: nothing to prove on
                     return KeyVerdict.UNKNOWN_DOMAIN
                 return (
                     KeyVerdict.HOLDS if _injective_on(key.shape, members) else KeyVerdict.COLLIDES
@@ -928,7 +928,8 @@ def domain_type_property(
     the guard's read is always answered.
 
     ``companion_facts`` lets a computed group key discharge a companion: a ``COALESCE``
-    over a NOT NULL companion, or an upper, lower, trim or text cast that keeps its
+    headed by the companion (its fallback is the author's claim, no nullability is
+    checked), or an upper, lower, trim or text cast that keeps its
     declared members apart. Without it only a bare column discharges by key.
 
     Passing the uniqueness property's ref lets a non-distinct ``COUNT`` read the key of

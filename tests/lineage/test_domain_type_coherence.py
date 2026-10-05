@@ -386,6 +386,7 @@ def _holds(key: str, *, members: frozenset[str] | None = _ENUM) -> bool:
         ("upper(currency)", _ENUM, True),
         ("upper(currency)", _CASE_COLLIDING, False),
         ("upper(currency)", None, False),
+        ("upper(currency)", frozenset(), False),
         ("upper(currency)", frozenset({"é", "E"}), False),
         ("lower(currency)", _ENUM, True),
         ("lower(currency)", _CASE_COLLIDING, False),
@@ -449,6 +450,14 @@ def test_a_wrapper_with_no_declared_members_is_named_as_unknown_domain() -> None
     assert _verdicts("lower(currency)", members=None) == [
         ("LOWER(payments.currency)", KeyVerdict.UNKNOWN_DOMAIN)
     ]
+
+
+@pytest.mark.parametrize(
+    "key", ["upper(currency)", "lower(currency)", "trim(currency)", "cast(currency AS varchar)"]
+)
+def test_a_declared_but_empty_member_set_proves_nothing(key: str) -> None:
+    ((_, verdict),) = _verdicts(key, members=frozenset())
+    assert verdict is KeyVerdict.UNKNOWN_DOMAIN
 
 
 def test_an_unrecognised_key_is_named_as_opaque() -> None:
