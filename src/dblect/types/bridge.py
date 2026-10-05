@@ -777,11 +777,9 @@ def _relationship_tests(manifest: Manifest) -> list[_RelationshipTest]:
         tm = node.test_metadata
         if tm is None or not tm.enabled or tm.name != "relationships":
             continue
-        child_col = tm.kwargs.get("column_name")
-        parent_col = tm.kwargs.get("field")
-        if not isinstance(child_col, str) or not child_col:
-            continue
-        if not isinstance(parent_col, str) or not parent_col:
+        child_col = tm.column_kwarg("column_name")
+        parent_col = tm.column_kwarg("field")
+        if child_col is None or parent_col is None:
             continue
         child_uid = generic_test_target_uid(node)
         if child_uid is None or child_uid not in manifest.nodes:
