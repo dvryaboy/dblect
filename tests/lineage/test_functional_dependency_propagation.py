@@ -28,10 +28,8 @@ from collections.abc import Mapping
 import pytest
 
 from dblect.adapters import profile_for_adapter
-from dblect.lineage.builder import build_relation_graph
 from dblect.lineage.facts.model import (
     BASE_WORLD,
-    Annotation,
     CompileOrigin,
     CompileValue,
     Declared,
@@ -40,7 +38,6 @@ from dblect.lineage.facts.model import (
     NativeConstraint,
     Provenance,
 )
-from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import SourceKind, SourceRef
 from dblect.lineage.properties.functional_dependency import (
     FD,
@@ -49,14 +46,11 @@ from dblect.lineage.properties.functional_dependency import (
     FDSet,
     determines,
     functional_dependency_grounding,
-    functional_dependency_property,
 )
-from dblect.lineage.properties.uniqueness import uniqueness_property
-from dblect.lineage.property import propagate
 from dblect.manifest import DbtTestMetadata, Node, ResourceType
-from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
 from tests._manifest_builders import source as _source
+from tests.lineage._fd_propagation import propagate_fds
 
 _DUCKDB = profile_for_adapter("duckdb")
 
@@ -103,31 +97,11 @@ def _carried(*instances: DeclaredFD, derived: tuple[FD, ...] = ()) -> FDSet:
     return FDSet(frozenset(i.fd for i in instances) | frozenset(derived), frozenset(instances))
 
 
-def _fds(facts: _FdFacts, *nodes: Node, read_keys: bool = False) -> dict[str, FDSet]:
-    """Build a manifest from the nodes, propagate the FD property (after uniqueness
-    when ``read_keys`` is set, so the key-derived source is live), and return each
-    model's FD set keyed by unique_id."""
-    manifest = _manifest(*nodes)
-    graph = build_relation_graph(manifest).graph
-    ground = functional_dependency_grounding(facts)
-    if read_keys:
-        uniq = uniqueness_property(manifest, _DUCKDB)
-        store = AnnotationStore()
-        for scope, ann in propagate(graph, uniq).items():
-            store.record(uniq.name, scope, ann)
-        prop = functional_dependency_property(ground, uniqueness=uniq.ref)
-        ctx = PropertyRegistry((uniq, prop)).dep_context(store)
-        anns: Mapping[SourceRef, Annotation[FDSet]] = propagate(graph, prop, dep_context=ctx)
-    else:
-        anns = propagate(graph, functional_dependency_property(ground))
-    return {ref.unique_id: ann.value for ref, ann in anns.items() if ref.kind is SourceKind.MODEL}
-
-
 # --- carrying and renaming -----------------------------------------------------
 
 
 def test_passthrough_carries_the_declared_fd() -> None:
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country, currency, amount FROM payments"),
@@ -136,7 +110,7 @@ def test_passthrough_carries_the_declared_fd() -> None:
 
 
 def test_projection_renames_both_sides() -> None:
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country AS nation, currency AS curr FROM payments"),
@@ -147,7 +121,7 @@ def test_projection_renames_both_sides() -> None:
 
 
 def test_dropping_a_dependency_column_drops_the_fd() -> None:
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country, amount FROM payments"),
@@ -156,7 +130,7 @@ def test_dropping_a_dependency_column_drops_the_fd() -> None:
 
 
 def test_star_carries_everything() -> None:
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT * FROM payments"),
@@ -167,7 +141,7 @@ def test_star_carries_everything() -> None:
 def test_declared_bijection_does_not_let_instances_rebind_across_each_other() -> None:
     """A declared bijection is not a value equality: each instance binds through
     its own column's output name, never the other's."""
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("b", "a"), _fd("a", "b")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT a AS zzz, b AS aaa FROM payments"),
@@ -181,10 +155,10 @@ def test_declared_bijection_does_not_let_instances_rebind_across_each_other() ->
 # --- WHERE ----------------------------------------------------------------------
 
 
-def test_where_preserves_fds() -> None:
+def test_where_preservespropagate_fds() -> None:
     """A filter removes rows, and a dependency that holds on all rows holds on any
     subset, so the FD survives."""
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.stg", "SELECT country, currency FROM payments WHERE amount > 0"),
@@ -195,7 +169,7 @@ def test_where_preserves_fds() -> None:
 def test_where_equality_pins_a_column_constant() -> None:
     """``WHERE currency = 'usd'`` makes ``currency`` single-valued over the result,
     which is the empty-determinant dependency."""
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.usd", "SELECT country, currency FROM payments WHERE currency = 'usd'"),
@@ -204,7 +178,7 @@ def test_where_equality_pins_a_column_constant() -> None:
 
 
 def test_constancy_flows_through_a_cte_and_a_downstream_model() -> None:
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
         _node(
@@ -252,7 +226,7 @@ _LITERAL_PROJECTIONS: list[tuple[str, str, FD | None]] = [
     ids=[name for name, _sql, _expected in _LITERAL_PROJECTIONS],
 )
 def test_projected_literal_pins_the_output_column_constant(sql: str, expected: FD | None) -> None:
-    out = _fds(_declared(), _source(_PAYMENTS.unique_id), _node("model.shop.lit", sql))
+    out = propagate_fds(_declared(), _source(_PAYMENTS.unique_id), _node("model.shop.lit", sql))
     assert out["model.shop.lit"] == (FDSet.of(expected) if expected is not None else NO_FDS)
 
 
@@ -275,7 +249,9 @@ _GROUP_SPELLINGS: list[tuple[str, str]] = [
     "sql", [sql for _name, sql in _GROUP_SPELLINGS], ids=[name for name, _sql in _GROUP_SPELLINGS]
 )
 def test_group_by_determines_the_aggregates(sql: str) -> None:
-    out = _fds(_declared(), _source(_PAYMENTS.unique_id), _node("model.shop.by_country", sql))
+    out = propagate_fds(
+        _declared(), _source(_PAYMENTS.unique_id), _node("model.shop.by_country", sql)
+    )
     assert out["model.shop.by_country"] == FDSet.of(_fd("total", "country"))
 
 
@@ -285,7 +261,7 @@ def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
     # currency. Two groups sharing a currency then disagree on the total, so `country` in
     # the output determines nothing. Reading the name as its projection would collapse the
     # two targets onto `currency` and mint the dependency anyway.
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source(_PAYMENTS.unique_id),
         _node(
@@ -299,7 +275,7 @@ def test_group_by_name_shadowed_by_an_input_column_determines_nothing() -> None:
 
 def test_group_by_keeps_fds_among_the_group_columns() -> None:
     """``country -> currency`` makes ``country`` alone the minimal group key."""
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("currency", "country")),
         _source(_PAYMENTS.unique_id),
         _node(
@@ -317,7 +293,7 @@ def test_group_by_keeps_fds_among_the_group_columns() -> None:
 def test_group_by_drops_fds_reaching_outside_the_group_key() -> None:
     """``currency`` is aggregated away, so ``country -> currency`` says nothing about
     the output rows and must not survive."""
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("region", "country")),
         _source(_PAYMENTS.unique_id),
         _node(
@@ -328,13 +304,13 @@ def test_group_by_drops_fds_reaching_outside_the_group_key() -> None:
     assert out["model.shop.by_country"] == FDSet.of(_fd("total", "country"))
 
 
-def test_star_over_a_group_by_keeps_only_within_group_fds() -> None:
+def test_star_over_a_group_by_keeps_only_within_grouppropagate_fds() -> None:
     """``SELECT * ... GROUP BY`` parses even where engines reject it, and the star
     bypasses the projection remap, so the grouping step itself must drop any
     dependency reaching outside the group key: in a permissive dialect each group
     surfaces one arbitrary row, and two groups sharing a determinant value can
     surface different dependents."""
-    out = _fds(
+    out = propagate_fds(
         _declared(_fd("region", "country"), _fd("currency", "region")),
         _source(_PAYMENTS.unique_id),
         _node("model.shop.g", "SELECT * FROM payments GROUP BY country"),
@@ -350,7 +326,7 @@ def test_a_key_determines_the_columns_selected_alongside_it() -> None:
     every column drawn from it. Read from the uniqueness property through the
     declared dependency edge."""
     orders = _source("source.shop.raw.orders")
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
@@ -362,7 +338,7 @@ def test_a_key_determines_the_columns_selected_alongside_it() -> None:
 
 def test_without_the_uniqueness_edge_no_key_fd_is_minted() -> None:
     orders = _source("source.shop.raw.orders")
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         orders,
         _unique("test.shop.u", column="id", target=orders.unique_id),
@@ -395,7 +371,7 @@ def test_inner_join_carries_a_joined_relations_fd() -> None:
     rows agreeing on the determinant come from that relation's rows agreeing on it,
     and a join only filters or duplicates rows. So ``country -> currency`` declared on
     ``customers`` survives the join."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -414,7 +390,7 @@ def test_qualified_star_over_a_join_carries_the_joined_relations_fd() -> None:
     already does. The join key ``id`` is only reachable through ``p.*`` here (it
     is never named explicitly), so this also pins that a starred column's output
     name still joins the equivalence class the ON equality builds."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_CUSTOMERS: (_fd("currency", "id"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -426,8 +402,8 @@ def test_qualified_star_over_a_join_carries_the_joined_relations_fd() -> None:
     assert out["model.shop.m"] == _carried(_inst(_fd("currency", "id"), origin=_CUSTOMERS))
 
 
-def test_inner_join_carries_both_sides_fds() -> None:
-    out = _fds(
+def test_inner_join_carries_both_sidespropagate_fds() -> None:
+    out = propagate_fds(
         _declared_on(
             {
                 _PAYMENTS: (_fd("amount", "ref"),),
@@ -453,7 +429,7 @@ def test_inner_join_qualifies_under_a_name_collision() -> None:
     relation's. The walk must track which side each column came from (qualified by
     alias) rather than blurring the two ``country`` columns, or it would mint a
     dependency off the wrong column."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -466,11 +442,11 @@ def test_inner_join_qualifies_under_a_name_collision() -> None:
     assert out["model.shop.m"] == _carried(_inst(_fd("currency", "country"), origin=_CUSTOMERS))
 
 
-def test_left_join_drops_the_optional_sides_fds() -> None:
+def test_left_join_drops_the_optional_sidespropagate_fds() -> None:
     """An outer join pads the optional side with NULL on unmatched rows, so a
     dependency on that side need not survive; the conservative posture drops it
     until the NULL semantics are worked through."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -483,10 +459,10 @@ def test_left_join_drops_the_optional_sides_fds() -> None:
     assert out["model.shop.m"] == NO_FDS
 
 
-def test_left_join_carries_the_kept_sides_fds() -> None:
+def test_left_join_carries_the_kept_sidespropagate_fds() -> None:
     """The kept side's rows come through un-padded, at worst duplicated, and a
     duplicate still agrees on the dependent: its dependencies survive the outer join."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_PAYMENTS: (_fd("amount", "ref"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -503,7 +479,7 @@ def test_left_join_mints_only_the_accumulated_to_joined_in_direction() -> None:
     """Fixing ``p.customer_id`` fixes ``c.id`` on every row (matched or NULL), so
     the forward direction holds. Two padded rows share a NULL ``c.id`` while
     differing on ``p.customer_id``, so the reverse does not."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -519,7 +495,7 @@ def test_left_join_mints_only_the_accumulated_to_joined_in_direction() -> None:
 def test_right_join_keeps_the_joined_in_side() -> None:
     """A RIGHT join pads the accumulated left side and keeps the joined-in one, the
     mirror of LEFT: the joined-in relation's dependencies survive, the left's drop."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on(
             {
                 _PAYMENTS: (_fd("amount", "ref"),),
@@ -539,7 +515,7 @@ def test_right_join_keeps_the_joined_in_side() -> None:
 
 def test_full_join_proves_nothing() -> None:
     """A FULL join can pad either side, so neither side's dependencies survive."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on(
             {
                 _PAYMENTS: (_fd("amount", "ref"),),
@@ -557,11 +533,11 @@ def test_full_join_proves_nothing() -> None:
     assert out["model.shop.m"] == NO_FDS
 
 
-def test_cross_join_carries_side_fds() -> None:
+def test_cross_join_carries_sidepropagate_fds() -> None:
     """A cross join pads nothing: it only duplicates rows, and duplicates still agree
     on the dependent, so each side's dependencies survive (there is just no ON to
     mint an equality from)."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({_CUSTOMERS: (_fd("currency", "country"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -578,7 +554,7 @@ def test_a_later_outer_join_pads_an_earlier_inner_joins_equality() -> None:
     sides: a later RIGHT join pads the whole accumulated left, taking the earlier
     equality's columns with it."""
     extra = SourceRef(SourceKind.SOURCE, "source.shop.raw.extra")
-    out = _fds(
+    out = propagate_fds(
         _declared_on({extra: (_fd("v", "g"),)}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -595,7 +571,7 @@ def test_a_later_outer_join_pads_an_earlier_inner_joins_equality() -> None:
 
 def test_inner_join_carries_a_where_pin_on_either_side() -> None:
     """An equality filter pins its column constant whichever side it sits on."""
-    out = _fds(
+    out = propagate_fds(
         _declared_on({}),
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -620,7 +596,7 @@ _BILL = SourceRef(SourceKind.SOURCE, "source.shop.raw.terminology__bill_type")
 
 def test_lookup_join_on_its_key_determines_the_looked_up_column() -> None:
     bill = _source(_BILL.unique_id)
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source("source.shop.raw.claims"),
         bill,
@@ -641,7 +617,7 @@ def test_lookup_left_join_on_its_key_determines_the_looked_up_column() -> None:
     column of the joined-in alias with NULL, key included, so no two rows can
     disagree on the dependent while agreeing on the (NULL) key."""
     bill = _source(_BILL.unique_id)
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source("source.shop.raw.claims"),
         bill,
@@ -661,7 +637,7 @@ def test_lookup_join_on_a_non_key_column_determines_nothing() -> None:
     """``bill`` is keyed on ``id``, not the join column, and ``id`` is never
     projected, so the lookup's real key has no output name to rewrite through."""
     bill = _source(_BILL.unique_id)
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source("source.shop.raw.claims"),
         bill,
@@ -785,7 +761,7 @@ _SET_OPERATIONS = [
 
 @pytest.mark.parametrize(("facts", "sql", "expected"), _SET_OPERATIONS)
 def test_set_operation_merges(facts: _FdFacts, sql: str, expected: FDSet) -> None:
-    out = _fds(
+    out = propagate_fds(
         facts,
         _source(_PAYMENTS.unique_id),
         _source(_CUSTOMERS.unique_id),
@@ -820,7 +796,7 @@ def test_only_a_declaration_grounds_an_instance(provenance: Provenance, expected
 def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
     """``m.line_number`` is single-valued per ``order_id`` and every surviving ``l``
     row equals it, so ``order_id`` determines ``line_number`` at the output."""
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source("source.shop.raw.lines"),
         _node(
@@ -836,7 +812,7 @@ def test_join_back_to_a_grouped_subquery_determines_line_number() -> None:
 
 def test_group_by_over_a_join_determines_the_aggregate() -> None:
     """The group key determines every other output, over a join as over a table."""
-    out = _fds(
+    out = propagate_fds(
         _declared(),
         _source("source.shop.raw.orders"),
         _source("source.shop.raw.lines"),
