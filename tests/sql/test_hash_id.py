@@ -54,6 +54,14 @@ _SURROGATE_KEY = (
         ("md5(concat_ws('-', a, b))", "duckdb", ("a", "b")),
         ("md5(a || b)", "duckdb", ("a", "b")),
         ("md5(coalesce(a, 'x'))", "duckdb", ("a",)),
+        ("md5(coalesce(a, 'x', 'y'))", "duckdb", ("a",)),
+        ("md5(coalesce(cast(a as varchar), '' || 'x'))", "duckdb", ("a",)),
+        ("md5(cast(ts as varchar))", "duckdb", ("ts",)),
+        ("md5(cast(cast(a as string) as text))", "duckdb", ("a",)),
+        ("md5(replace(a, '|', '%7C'))", "duckdb", ("a",)),
+        ("md5(replace(replace(a, '%', '%25'), '|', '%7C'))", "duckdb", ("a",)),
+        ("md5(concat_ws('-', a, b))", "snowflake", ("a", "b")),
+        ("hashtextextended(a, 0)", "postgres", ("a",)),
         ("md5(cast(a as text))", "duckdb", ("a",)),
         ("md5('kind' || a)", "duckdb", ("a",)),
         ("md5(t.a)", "duckdb", ("a",)),
@@ -64,9 +72,6 @@ _SURROGATE_KEY = (
         ("hash(a, b)", "snowflake", ("a", "b")),
         ("hash(a)", "duckdb", ("a",)),
         ("xxhash64(a)", "duckdb", ("a",)),
-        ("murmur_hash3_32(a)", "duckdb", ("a",)),
-        ("crc32(a)", "duckdb", ("a",)),
-        ("hashtext(a)", "postgres", ("a",)),
         # Wrappers that keep the full digest.
         ("lower(md5(a))", "duckdb", ("a",)),
         ("upper(md5(a))", "duckdb", ("a",)),
@@ -212,3 +217,115 @@ def test_a_column_a_condition_only_tests_is_not_determined(sql: str) -> None:
 )
 def test_null_tagging_keeps_the_column(sql: str, expected: tuple[str, ...]) -> None:
     assert _inputs(sql) == expected
+
+
+# --- an encoding that discards information from an input is declined -------------------
+# Separator collisions and NULL sentinels stay under the injectivity assumption. These
+# shapes lose an input's value outright, so the FD would be a wrong answer.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "md5(coalesce(a, b))",  # b never reaches the hash while a is non-null
+        "md5(coalesce(a, b, 'x'))",
+        "md5(coalesce(coalesce(a, 'x'), b))",
+        "md5(coalesce('x', a))",  # a is only a fallback to a constant
+    ],
+)
+def test_coalesce_with_a_column_fallback_is_declined(sql: str) -> None:
+    assert _inputs(sql) is None
+
+
+def test_coalesce_with_a_column_fallback_collides_on_data() -> None:
+    con = duckdb.connect(":memory:")
+    got = con.execute(
+        "SELECT count(DISTINCT md5(cast(coalesce(a, b) as varchar))) "
+        "FROM (VALUES (NULL, 1), (1, 2)) t(a, b)"
+    ).fetchone()
+    assert got is not None
+    assert got[0] == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "md5(cast(ts as date))",
+        "md5(cast(a as varchar(3)))",
+        "md5(cast(a as tinyint))",
+        "md5(cast(a as boolean))",
+        "md5(cast(a as decimal(5, 0)))",
+        "md5(cast(a as int))",
+        "md5(cast(a as bigint))",
+        "md5(cast(a as double))",
+        "md5(cast(a as date))",
+        "md5(try_cast(a as tinyint))",
+        "md5(cast(a as char(1)))",
+        "md5(coalesce(cast(a as tinyint), 'x'))",
+    ],
+)
+def test_a_lossy_cast_in_the_pre_image_is_declined(sql: str) -> None:
+    # Postgres keeps the length of ``varchar(3)``; duckdb's parser drops it.
+    assert _inputs(sql, "postgres") is None
+
+
+@pytest.mark.parametrize(
+    "lossy",
+    [
+        "cast(a as boolean)",
+        "cast(a / 25 as integer)",
+        "cast(date '2020-01-01' + cast(a as integer) as date) // 1000000"
+        if False
+        else "cast(timestamp '2020-01-01 00:00:00' + to_seconds(a) as date)",
+    ],
+)
+def test_a_lossy_cast_collides_on_data(lossy: str) -> None:
+    con = duckdb.connect(":memory:")
+    got = con.execute(
+        f"SELECT count(DISTINCT h) FROM (SELECT md5(cast({lossy} as varchar)) AS h "
+        "FROM range(50) t(a))"
+    ).fetchone()
+    assert got is not None
+    assert got[0] < 50
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "md5(replace(a, 'x', ''))",  # deletion merges 'ax' and 'a'
+        "md5(replace(a, 'x'))",
+        "md5(replace(a, b, '_'))",
+        "md5(replace(a, 'x', b))",
+        "md5(replace(replace(a, '%', '%25'), '|', ''))",
+    ],
+)
+def test_a_replace_that_deletes_or_is_not_literal_is_declined(sql: str) -> None:
+    assert _inputs(sql) is None
+
+
+def test_replace_deletion_collides_on_data() -> None:
+    con = duckdb.connect(":memory:")
+    got = con.execute(
+        "SELECT count(DISTINCT md5(replace(a, 'x', ''))) FROM (VALUES ('ax'), ('a')) t(a)"
+    ).fetchone()
+    assert got is not None
+    assert got[0] == 1
+
+
+def test_concat_ws_with_a_column_separator_is_declined() -> None:
+    assert _inputs("md5(concat_ws(s, a, b))") is None
+    assert _inputs("md5(concat_ws('-' || s, a, b))") is None
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("crc32(a)", "duckdb"),
+        ("crc32c(a)", "duckdb"),
+        ("hashtext(a)", "postgres"),
+        ("xxhash32(a)", "duckdb"),
+        ("murmur_hash3_32(a)", "duckdb"),
+    ],
+)
+def test_a_32_bit_digest_is_a_bucket_and_declined(sql: str, dialect: str) -> None:
+    assert _inputs(sql, dialect) is None

@@ -31,7 +31,7 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.sql import _sqlglot as sg
-from dblect.sql.vocab import SURROGATE_HASH_FUNCTIONS
+from dblect.sql.vocab import SURROGATE_HASH_FUNCTIONS, CastTarget, cast_target
 
 __all__ = ["injective_hash_inputs"]
 
@@ -41,15 +41,10 @@ _HASH_FUNCTION_NAMES: frozenset[str] = frozenset(
     {
         "hash",
         "hash64",
-        "xxhash32",
         "xxhash64",
         "xxh3_64",
-        "murmur_hash3_32",
         "murmurhash3",
         "murmur3_hash",
-        "crc32",
-        "crc32c",
-        "hashtext",
         "hashtextextended",
         "cityhash64",
         "siphash64",
@@ -58,6 +53,9 @@ _HASH_FUNCTION_NAMES: frozenset[str] = frozenset(
         "fingerprint",
     }
 )
+
+# 32-bit digests (crc32, crc32c, hashtext, xxhash32, murmur_hash3_32) are deliberately
+# absent: that width is a bucket, the same boundary as a truncated digest.
 
 # Wrappers that keep the full digest: a case change, a hex rendering, parentheses.
 _PRESERVING_WRAPPERS: tuple[type[Expr], ...] = (exp.Lower, exp.Upper, exp.Hex, exp.Paren)
@@ -72,6 +70,7 @@ _VALUE_PRESERVING_STRUCTURE: tuple[type[Expr], ...] = (
     exp.DPipe,
     exp.Replace,
 )
+_CONSTANT_LEAVES: tuple[type[Expr], ...] = (exp.Literal, exp.Boolean, exp.Null)
 
 _MAX_WRAPPERS = 6
 
@@ -90,14 +89,16 @@ def _children(node: Expr) -> list[Expr]:
     return out
 
 
-def _is_full_text_cast(node: Expr) -> bool:
-    """A cast of the digest to an unsized text type renders it whole; a sized type
-    (``VARCHAR(8)``) truncates and any other type reduces."""
+def _is_unsized_text_cast(node: Expr) -> bool:
+    """A cast to an unsized text type (``TEXT``, ``STRING``, ``VARCHAR``) renders its operand
+    whole. A sized text type (``VARCHAR(8)``) truncates and every other target narrows or
+    reclassifies (``DATE``, ``TINYINT``, ``BOOLEAN``, ``DECIMAL(5,0)``), so this is the one
+    cast target accepted both around the digest and inside the pre-image."""
     target = node.args.get("to")
     return (
-        type(node) is exp.Cast
+        isinstance(node, exp.Cast)
         and isinstance(target, exp.DataType)
-        and target.is_type(*exp.DataType.TEXT_TYPES)
+        and cast_target(target) is CastTarget.TEXT
         and not target.expressions
     )
 
@@ -129,7 +130,7 @@ def _digest_arguments(e: Expr) -> list[Expr] | None:
             return _hash_arguments(node)
         inner = node.this if isinstance(node.this, Expr) else None
         if inner is None or not (
-            isinstance(node, _PRESERVING_WRAPPERS) or _is_full_text_cast(node)
+            isinstance(node, _PRESERVING_WRAPPERS) or _is_unsized_text_cast(node)
         ):
             return None
         node = inner
@@ -185,19 +186,60 @@ def _columns(e: Expr) -> list[exp.Column] | None:
     value-preserving structure or null tagging; ``None`` when anything else appears."""
     if isinstance(e, exp.Column):
         return None if isinstance(e.this, exp.Star) else [e]
-    if isinstance(e, exp.Literal | exp.Boolean | exp.Null):
+    if isinstance(e, _CONSTANT_LEAVES):
         return []
     if isinstance(e, exp.Case | exp.If):
         return _null_tag_columns(e)
     if not isinstance(e, _VALUE_PRESERVING_STRUCTURE):
         return None
+    if isinstance(e, exp.Cast) and not _is_unsized_text_cast(e):
+        return None
+    if isinstance(e, exp.Replace) and not _is_escaping_replace(e):
+        return None
+    if isinstance(e, exp.ConcatWs) and not _has_literal_separator(e):
+        return None
+    if isinstance(e, exp.Coalesce):
+        return _coalesce_columns(e)
     out: list[exp.Column] = []
     for child in _children(e):
+        if isinstance(e, exp.Replace) and child is not e.this:
+            continue  # the literal pattern and replacement carry no column
         sub = _columns(child)
         if sub is None:
             return None
         out.extend(sub)
     return out
+
+
+def _coalesce_columns(e: exp.Coalesce) -> list[exp.Column] | None:
+    """``coalesce(x, c1, ...)`` keeps ``x`` when every fallback is a constant (a NULL
+    sentinel). A column fallback is declined whole: it never reaches the hash while ``x`` is
+    non-null, and when ``x`` is NULL it stands in for ``x``, so neither column is determined."""
+    first = e.this
+    if not isinstance(first, Expr):
+        return None
+    for fallback in cast("list[object]", e.args.get("expressions") or []):
+        if not isinstance(fallback, Expr) or _columns(fallback) != []:
+            return None
+    return _columns(first)
+
+
+def _is_escaping_replace(e: exp.Replace) -> bool:
+    """``replace(x, 'p', 'r')`` with literal pattern and non-empty literal replacement is
+    escape-style encoding. A deletion (empty or missing replacement) merges ``'ax'`` with
+    ``'a'``, and a non-literal argument has no fixed effect."""
+    pattern, replacement = e.expression, e.args.get("replacement")
+    return (
+        isinstance(pattern, exp.Literal)
+        and isinstance(replacement, exp.Literal)
+        and replacement.is_string
+        and replacement.name != ""
+    )
+
+
+def _has_literal_separator(e: exp.ConcatWs) -> bool:
+    sep = e.expressions[0] if e.expressions else None
+    return isinstance(sep, exp.Literal)
 
 
 def injective_hash_inputs(e: Expr) -> tuple[exp.Column, ...] | None:
