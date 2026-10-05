@@ -87,6 +87,9 @@ class AggregateProfile:
 _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     # COMBINE: synthesize a new value out of many. A duplicated row is folded twice, so the
     # result moves: sensitive.
+    # ``order_use`` stays NONE for the numeric folds below: floating-point rounding can make
+    # ``sum`` and ``avg`` depend on summation order, and that is an accepted assumption (the
+    # same practitioner trade-off as treating hashed ids as injective).
     exp.Sum: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Avg: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Stddev: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
@@ -97,7 +100,10 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     exp.Kurtosis: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Skewness: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Median: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
-    exp.Mode: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
+    # With competing modes the engine returns the one it meets first, so the input order decides.
+    exp.Mode: AggregateProfile(
+        AggregateBehavior.COMBINE, duplicate_sensitive=True, order_use=OrderUse.PICKS
+    ),
     exp.Quantile: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.ApproxQuantile: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.PercentileCont: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),

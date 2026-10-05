@@ -20,8 +20,9 @@ with the per-finding ignore syntax).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum, auto
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -114,46 +115,59 @@ _ARRAY_FLATTEN_NAMES: frozenset[str] = frozenset(
     {"unnest", "explode", "explode_outer", "posexplode", "flatten", "json_array_elements"}
 )
 
-_NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
-    {
-        exp.CurrentTimestamp,
-        exp.CurrentDate,
-        exp.CurrentTime,
-        exp.CurrentDatetime,
-        exp.CurrentUser,
-        exp.SessionUser,
-        exp.Rand,
-        exp.Randn,
-        exp.Randstr,
-        exp.Uuid,
-        exp.Seq1,
-        exp.Seq2,
-        exp.Seq4,
-        exp.Seq8,
-        exp.Systimestamp,
-    }
-)
+
+class Volatility(Enum):
+    """How far a call's value can vary. Run-to-run variation is what the non-determinism
+    detector reports; only ``PER_ROW`` variation can differ between the tied rows of one
+    window evaluation."""
+
+    PER_ROW = auto()
+    PER_STATEMENT = auto()
+
+
+_TYPED_VOLATILITY: Mapping[type[Expr], Volatility] = {
+    exp.Rand: Volatility.PER_ROW,
+    exp.Randn: Volatility.PER_ROW,
+    exp.Randstr: Volatility.PER_ROW,
+    exp.Uuid: Volatility.PER_ROW,
+    exp.Seq1: Volatility.PER_ROW,
+    exp.Seq2: Volatility.PER_ROW,
+    exp.Seq4: Volatility.PER_ROW,
+    exp.Seq8: Volatility.PER_ROW,
+    exp.CurrentTimestamp: Volatility.PER_STATEMENT,
+    exp.CurrentDate: Volatility.PER_STATEMENT,
+    exp.CurrentTime: Volatility.PER_STATEMENT,
+    exp.CurrentDatetime: Volatility.PER_STATEMENT,
+    exp.CurrentUser: Volatility.PER_STATEMENT,
+    exp.SessionUser: Volatility.PER_STATEMENT,
+    exp.Systimestamp: Volatility.PER_STATEMENT,
+}
 
 # Function names that arrive as `exp.Anonymous` rather than a dedicated sqlglot
-# type and whose value changes per run (e.g. `now`). This is the portable baseline:
-# names that read the same across dialects. A target adapter extends it with its
-# own builtins (see `AdapterProfile.non_deterministic_builtins`), and the resolved
-# set is handed to `make_non_determinism_detector`. Matched case-insensitively, so
-# every entry must be lowercase.
-PORTABLE_NON_DETERMINISTIC_BUILTINS: frozenset[str] = frozenset(
-    {
-        "now",
-        "current_database",
-        "current_schema",
-        "gen_random_uuid",
-        "sysdate",
-        "nextval",
-        "clock_timestamp",
-        "statement_timestamp",
-        "transaction_timestamp",
-        "timeofday",
-    }
+# type. This is the portable baseline: names that read the same across dialects. A target
+# adapter extends it with its own builtins (see `AdapterProfile.non_deterministic_builtins`),
+# and the resolved set is handed to `make_non_determinism_detector`. Matched
+# case-insensitively, so every entry must be lowercase.
+_PORTABLE_BUILTIN_VOLATILITY: Mapping[str, Volatility] = {
+    "gen_random_uuid": Volatility.PER_ROW,
+    "nextval": Volatility.PER_ROW,
+    "clock_timestamp": Volatility.PER_ROW,
+    "timeofday": Volatility.PER_ROW,
+    "now": Volatility.PER_STATEMENT,
+    "current_database": Volatility.PER_STATEMENT,
+    "current_schema": Volatility.PER_STATEMENT,
+    "sysdate": Volatility.PER_STATEMENT,
+    "statement_timestamp": Volatility.PER_STATEMENT,
+    "transaction_timestamp": Volatility.PER_STATEMENT,
+}
+PORTABLE_NON_DETERMINISTIC_BUILTINS: frozenset[str] = frozenset(_PORTABLE_BUILTIN_VOLATILITY)
+_PER_ROW_BUILTINS: frozenset[str] = frozenset(
+    name for name, v in _PORTABLE_BUILTIN_VOLATILITY.items() if v is Volatility.PER_ROW
 )
+_PER_ROW_TYPED: tuple[type[Expr], ...] = tuple(
+    t for t, v in _TYPED_VOLATILITY.items() if v is Volatility.PER_ROW
+)
+_NON_DETERMINISTIC_TYPED: tuple[type[Expr], ...] = tuple(_TYPED_VOLATILITY)
 
 
 def list_joins(tree: Expr) -> tuple[JoinSummary, ...]:
@@ -898,11 +912,11 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
     return scopes
 
 
-def contains_non_deterministic(
-    e: Expr, names: frozenset[str] = PORTABLE_NON_DETERMINISTIC_BUILTINS
-) -> bool:
-    """Whether any call under ``e`` can return a different value on each evaluation."""
-    return bool(_find_non_deterministic(e, names))
+def contains_per_row_volatile(e: Expr) -> bool:
+    """Whether any call under ``e`` can return different values for different rows of one
+    statement (``random()``, ``nextval``, ``clock_timestamp()``). ``now()`` and
+    ``statement_timestamp()`` are fixed for the statement and do not count."""
+    return any(sg.matches_typed_or_named(n, _PER_ROW_TYPED, _PER_ROW_BUILTINS) for n in e.walk())
 
 
 def _find_non_deterministic(e: Expr, names: frozenset[str]) -> list[Expr]:
@@ -911,7 +925,7 @@ def _find_non_deterministic(e: Expr, names: frozenset[str]) -> list[Expr]:
 
 
 def _is_non_deterministic(node: Expr, names: frozenset[str]) -> bool:
-    return sg.matches_typed_or_named(node, tuple(_NON_DETERMINISTIC_TYPED), names)
+    return sg.matches_typed_or_named(node, _NON_DETERMINISTIC_TYPED, names)
 
 
 def _non_deterministic_name(call: Expr) -> str:
