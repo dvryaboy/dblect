@@ -26,7 +26,8 @@ _WRAPPERS = {
     KeyShape.TEXT_CAST: "cast(currency AS varchar)",
 }
 # Spaces, both cases and two letters: small enough that collisions are common.
-_MEMBERS = st.frozensets(st.text(alphabet=" aAbB", max_size=3), max_size=6)
+# An empty set is a deliberate no-claim, pinned in the coherence tests, so it is not sampled.
+_MEMBERS = st.frozensets(st.text(alphabet=" aAbB", max_size=3), min_size=1, max_size=6)
 
 
 @settings(max_examples=150, deadline=None)
