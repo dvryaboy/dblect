@@ -37,6 +37,80 @@ class Case:
         return self.window
 
 
+_ROWS_ENDING_AT_CURRENT = (
+    "rows between unbounded preceding and current row",
+    "rows between 1 preceding and current row",
+    "rows between current row and current row",
+    "rows unbounded preceding",
+    "rows current row",
+)
+_ROWS_STARTING_AT_CURRENT = (
+    "rows between current row and unbounded following",
+    "rows between current row and 1 following",
+    "rows between current row and current row",
+)
+# EXCLUDE removes rows by identity or peer group, so it cannot make a tie closed frame depend on
+# the tie order. A running ROWS frame depends on it, except that EXCLUDE GROUP / TIES happens to
+# leave a frame of whole earlier groups (plus the row itself): the detector stays conservative
+# there, which the oracle shows is merely imprecise.
+_FRAMES = {
+    "range between unbounded preceding and current row": False,
+    "groups between 1 preceding and current row": False,
+    _WHOLE: False,
+    _RUNNING: True,
+}
+_RUNNING_EXCLUDES_THAT_CLOSE = ("exclude group", "exclude ties")
+_EXCLUDES = ("", "exclude no others", "exclude current row", "exclude group", "exclude ties")
+
+
+def _frame_cases() -> tuple[Case, ...]:
+    cases = [
+        Case(
+            f"sum(c) over (order by a {frame} {exclude})",
+            fires=moves,
+            hazard=moves and exclude not in _RUNNING_EXCLUDES_THAT_CLOSE,
+        )
+        for frame, moves in _FRAMES.items()
+        for exclude in _EXCLUDES
+    ]
+    # The current row's own value, read through a frame edge that sits on it.
+    cases += [
+        Case(f"last_value(c) over (order by a {frame})", fires=False, hazard=False)
+        for frame in _ROWS_ENDING_AT_CURRENT
+    ]
+    cases += [
+        Case(f"first_value(c) over (order by a {frame})", fires=False, hazard=False)
+        for frame in _ROWS_STARTING_AT_CURRENT
+    ]
+    cases += [
+        Case(f"last_value(c) over (order by a {_RUNNING} exclude no others)", False, False),
+        # Excluding the current row, or ignoring nulls, makes the edge row something else.
+        Case(f"last_value(c) over (order by a {_RUNNING} exclude current row)", True, True),
+        Case(f"last_value(c) over (order by a {_RUNNING} exclude group)", True, True),
+        Case(f"last_value(c ignore nulls) over (order by a {_RUNNING})", True, False),
+        Case(
+            "first_value(c) over (order by a rows between current row and 1 following"
+            " exclude current row)",
+            True,
+            True,
+        ),
+        # The other edge of a ROWS frame is some neighbour.
+        Case(
+            "last_value(c) over (order by a rows between current row and 1 following)", True, True
+        ),
+        Case(
+            "first_value(c) over (order by a rows between 1 preceding and current row)", True, True
+        ),
+        # A tie closed frame with EXCLUDE still reads a sequence of determined values.
+        Case(
+            "first_value(a) over (order by a range unbounded preceding exclude current row)",
+            False,
+            False,
+        ),
+    ]
+    return tuple(cases)
+
+
 _CASES = (
     # Ranking: tied rows share the value.
     Case("rank() over (order by a)", fires=False, hazard=False),
@@ -66,8 +140,6 @@ _CASES = (
     Case("first_value(c ignore nulls) over (order by a)", fires=True, hazard=True),
     Case("last_value(c ignore nulls) over (order by a)", fires=True, hazard=True),
     # Frames over a value function.
-    Case(f"last_value(a) over (order by a {_RUNNING})", fires=True, hazard=False),
-    Case(f"last_value(c) over (order by a {_RUNNING})", fires=True, hazard=False),
     Case(f"first_value(a) over (order by a {_WHOLE})", fires=False, hazard=False),
     Case(f"first_value(c) over (order by a {_WHOLE})", fires=True, hazard=True),
     Case(
@@ -100,12 +172,6 @@ _CASES = (
     Case(
         "sum(c) over (order by a rows between 1 preceding and 1 following)", fires=True, hazard=True
     ),
-    Case(
-        "sum(c) over (order by a range between unbounded preceding and current row"
-        " exclude current row)",
-        fires=True,
-        hazard=False,
-    ),
     # Ordered collections read the sequence of their argument.
     Case("array_agg(a) over (order by a)", fires=False, hazard=False),
     Case("array_agg(c) over (order by a)", fires=True, hazard=True),
@@ -117,9 +183,11 @@ _CASES = (
     Case("string_agg(cast(c as varchar), ',') over (order by a)", fires=True, hazard=True),
     # An aggregate type the registry has no entry for is not assumed order-independent.
     Case("corr(a, c) over (order by a)", fires=True, hazard=False),
-    # Picks among ties.
+    # Picks among ties. With competing modes DuckDB returns the one met first.
+    Case("mode(c) over (order by a)", fires=True, hazard=True),
     Case("any_value(c) over (order by a)", fires=True, hazard=True),
     Case("arg_max(c, a) over (order by a)", fires=True, hazard=True),
+    *_frame_cases(),
 )
 
 # A function the registry does not know keeps the old behaviour: it fires.
@@ -178,7 +246,6 @@ def test_snowflake_spellings(window: str, fires: bool) -> None:
     [
         ("postgres", "nextval('s')"),
         ("postgres", "clock_timestamp()"),
-        ("postgres", "statement_timestamp()"),
         ("postgres", "timeofday()"),
         ("postgres", "random()"),
         ("snowflake", "seq4()"),
@@ -192,6 +259,22 @@ def test_volatile_call_in_value_function_fires(dialect: str, volatile: str) -> N
     order determines every column it reads."""
     assert _fires(f"first_value({volatile}) over (order by a)", _A_DETERMINES_B, dialect=dialect)
     assert _fires(f"first_value(a + {volatile}) over (order by a)", {}, dialect=dialect)
+
+
+@pytest.mark.parametrize(
+    ("dialect", "constant"),
+    [
+        ("postgres", "statement_timestamp()"),
+        ("postgres", "transaction_timestamp()"),
+        ("postgres", "now()"),
+        ("duckdb", "current_timestamp"),
+        ("duckdb", "current_date"),
+    ],
+)
+def test_statement_constant_call_does_not_fire(dialect: str, constant: str) -> None:
+    """A call that is fixed for the whole statement gives every tied row the same value, so tie
+    order cannot move it."""
+    assert not _fires(f"first_value({constant}) over (order by a)", {}, dialect=dialect)
 
 
 def test_unknown_function_fires() -> None:
