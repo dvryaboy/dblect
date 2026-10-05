@@ -178,6 +178,42 @@ _CASES: tuple[_Case, ...] = (
         "select c, a, sum(v) from shipments group by c, a",
         True,
     ),
+    _Case(
+        "owner-inside-a-computed-group-key-is-not-fixed",
+        "select line_no, order_id + 0, sum(price) from order_lines group by line_no, order_id + 0",
+        True,
+    ),
+    _Case(
+        "owner-bucketed-in-a-group-key",
+        "select line_no, floor(order_id / 100), sum(price) from order_lines "
+        "group by line_no, floor(order_id / 100)",
+        True,
+    ),
+    _Case(
+        "owner-in-a-case-group-key",
+        "select line_no, case when order_id = 1 then 1 else 0 end, sum(price) from order_lines "
+        "group by line_no, case when order_id = 1 then 1 else 0 end",
+        True,
+    ),
+    _Case(
+        "pin-in-one-union-branch-does-not-cover-the-other",
+        "select line_no, sum(price) from order_lines where order_id = 1 group by line_no "
+        "union all select line_no, sum(price) from order_lines group by line_no",
+        True,
+    ),
+    _Case(
+        "self-join-pins-different-owner-values",
+        "select a.line_no, sum(a.price) from order_lines a join order_lines b "
+        "on a.line_no = b.line_no where b.order_id = 2 group by a.line_no",
+        True,
+    ),
+    _Case(
+        "pin-in-an-unrelated-cte-does-not-cover-the-read",
+        "with p as (select * from order_lines where order_id = 1), "
+        "q as (select * from order_lines) "
+        "select q.line_no, sum(q.price) from q group by q.line_no",
+        True,
+    ),
     # quiet
     _Case(
         "owners-alone-group-by",
@@ -231,11 +267,6 @@ _CASES: tuple[_Case, ...] = (
         False,
     ),
     _Case(
-        "owner-read-inside-a-computed-group-expression",
-        "select line_no, order_id + 0, sum(price) from order_lines group by line_no, order_id + 0",
-        False,
-    ),
-    _Case(
         "no-owned-column-used",
         "select price, count(*) from order_lines group by price",
         False,
@@ -243,6 +274,24 @@ _CASES: tuple[_Case, ...] = (
     _Case(
         "no-declaration-on-the-relation",
         "select line_no, sum(refund) from refunds group by line_no",
+        False,
+    ),
+    _Case(
+        "pin-in-every-union-branch",
+        "select line_no, sum(price) from order_lines where order_id = 1 group by line_no "
+        "union all select line_no, sum(price) from order_lines where order_id = 1 group by line_no",
+        False,
+    ),
+    _Case(
+        "self-join-pins-the-owner-per-alias",
+        "select a.line_no, sum(a.price) from order_lines a join order_lines b "
+        "on a.line_no = b.line_no where a.order_id = 1 and b.order_id = 2 group by a.line_no",
+        False,
+    ),
+    _Case(
+        "owner-equated-across-the-join-in-where",
+        "select l.price, r.refund from order_lines l join refunds r on r.line_no = l.line_no "
+        "where r.order_id = l.order_id",
         False,
     ),
     # the shapes that made the any-composite-key rule noisy
@@ -361,3 +410,24 @@ def test_join_over_every_subset_of_a_three_column_relation(
     on = " and ".join(f"s.{c} = p.{c}" for c in sorted(used))
     sql = f"select p.v from probe p join shipments s on {on}{_where(pinned)}"
     assert bool(_findings(_project(sql))) is _expected(used, pinned)
+
+
+# --- which ON conjuncts filter which side ------------------------------------------------
+
+_SIDES = ("join", "left join", "right join", "full join")
+# Only an INNER or RIGHT join (whose preserved side is the ``orders`` arm) restricts the
+# ``order_lines`` rows through its ON; a LEFT or FULL ON leaves them unfiltered.
+_RESTRICTS_LINES = {"join": True, "left join": False, "right join": True, "full join": False}
+_ON_PINS = ("l.order_id = 1", "o.order_id = 1")
+
+
+@pytest.mark.parametrize("pin", _ON_PINS)
+@pytest.mark.parametrize("side", _SIDES)
+def test_an_on_pin_covers_the_owner_only_where_the_join_filters_the_rows(
+    side: str, pin: str
+) -> None:
+    sql = (
+        f"select l.line_no, sum(l.price) from order_lines l {side} orders o "
+        f"on l.order_id = o.order_id and {pin} group by l.line_no"
+    )
+    assert bool(_findings(_project(sql))) is not _RESTRICTS_LINES[side]
