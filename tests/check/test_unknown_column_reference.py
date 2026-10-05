@@ -143,3 +143,109 @@ def test_a_derived_upstream_model_is_complete_unless_it_hides_a_star(
         p=("id",),
     )
     assert bool(_unknown(run_check(manifest, _DUCKDB))) is reported
+
+
+def _with_upstream(upstream_sql: str, downstream_sql: str) -> Manifest:
+    return _catalogued(
+        _manifest(
+            _source_with("p", "id"),
+            _node("model.shop.up", upstream_sql, columns={}),
+            _node(
+                _MODEL,
+                downstream_sql,
+                columns=_cols(x="INT"),
+                depends_on=frozenset({"model.shop.up"}),
+            ),
+        ),
+        p=("id",),
+    )
+
+
+@pytest.mark.parametrize(
+    "upstream_sql",
+    [
+        # Output names known only at run time: a column pattern, a struct unnest, a struct
+        # expansion, and the multi-column generators.
+        "select columns('i.*') from raw.p",
+        "select columns(*) from raw.p",
+        "select * columns('i.*') from raw.p",
+        "select unnest({'a': 1, 'b': 2})",
+        "select unnest({'a': 1, 'b': 2}) as s",
+        "select (struct_pack(a := id)).* from raw.p",
+        "select id, unnest(struct_pack(id := id)) from raw.p",
+    ],
+)
+def test_a_runtime_named_projection_makes_a_model_incomplete(upstream_sql: str) -> None:
+    manifest = _with_upstream(upstream_sql, "select up.id from up")
+    assert _unknown(run_check(manifest, _DUCKDB)) == []
+
+
+@pytest.mark.parametrize(
+    "upstream_sql",
+    ["select unnest([1, 2]) as id", "select id from raw.p", "select count(*) as id from raw.p"],
+)
+def test_a_named_scalar_projection_leaves_a_model_complete(upstream_sql: str) -> None:
+    manifest = _with_upstream(upstream_sql, "select up.nosuch from up")
+    assert len(_unknown(run_check(manifest, _DUCKDB))) == 1
+
+
+@pytest.mark.parametrize(
+    "inner",
+    ["select columns('i.*') from raw.p", "select unnest({'a': 1, 'b': 2})"],
+)
+def test_a_runtime_named_cte_is_incomplete(inner: str) -> None:
+    report = run_check(_world(f"with c as ({inner}) select c.id from c"), _DUCKDB)
+    assert _unknown(report) == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select p from raw.p p",
+        "select to_json(p) from raw.p p",
+        "select to_json(P) from raw.p p",
+        "select to_json(p) from raw.p",
+        "select to_json(c) from (select id from raw.p) c",
+        "select 1 from raw.p p where exists (select 1 from raw.q q where to_json(p) is not null)",
+    ],
+)
+def test_a_relation_name_used_as_a_whole_row_is_not_a_missing_column(sql: str) -> None:
+    assert _unknown(run_check(_world(sql), _DUCKDB)) == []
+
+
+def test_a_name_that_is_no_relation_in_scope_is_still_reported() -> None:
+    [finding] = _unknown(run_check(_world("select q from raw.p p"), _DUCKDB))
+    assert finding.column == "q"
+
+
+@pytest.mark.parametrize(
+    ("sql", "missing"),
+    [
+        ("with c(a, b) as (select id, valid_to from raw.p) select c.a, c.b, c.id from c", ["id"]),
+        ("with c(a, b) as (select id, valid_to from raw.p) select c.a, c.zzz from c", ["zzz"]),
+        ("select d.a, d.id from (select id, valid_to from raw.p) d(a, b)", ["id"]),
+        # An alias list shorter than the projection renames only the leading columns.
+        (
+            "with c(a) as (select id, valid_to from raw.p) select c.a, c.valid_to, c.id from c",
+            ["id"],
+        ),
+        ("with c(a, b) as (select id, valid_to from raw.p) select c.a, c.b from c", []),
+    ],
+)
+def test_a_column_alias_list_names_the_relations_columns(sql: str, missing: list[str]) -> None:
+    names = sorted(f.column or "" for f in _unknown(run_check(_world(sql), _DUCKDB)))
+    assert names == missing
+
+
+def test_a_correlated_qualified_reference_is_reported_once() -> None:
+    sql = "select id from raw.p p where exists (select 1 from raw.q q where q.k = p.nosuch)"
+    [finding] = _unknown(run_check(_world(sql), _DUCKDB))
+    assert finding.column == "nosuch"
+
+
+def test_a_wide_relation_lists_a_capped_set_of_columns() -> None:
+    wide = tuple(f"c{i:02d}" for i in range(40))
+    manifest = _world("select p.zzzz from raw.p p", p=wide)
+    [finding] = _unknown(run_check(manifest, _DUCKDB))
+    assert len(finding.message) < 400
+    assert " more." in finding.message

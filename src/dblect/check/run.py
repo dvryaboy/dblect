@@ -844,15 +844,19 @@ def _unknown_column_findings(graphs: CheckGraphs) -> list[CheckFinding]:
     )
 
 
+_LISTED_COLUMNS = 8
+
+
 def _unknown_column_message(ref: UnknownColumnReference) -> str:
     relations = ", ".join(repr(r) for r in ref.relations)
     where = relations if len(ref.relations) == 1 else f"any of {relations}"
     closest = difflib.get_close_matches(ref.column.lower(), ref.known, n=3, cutoff=0.5)
-    hint = (
-        f"Closest columns: {', '.join(closest)}."
-        if closest
-        else f"Its columns: {', '.join(ref.known)}."
-    )
+    if closest:
+        hint = f"Closest columns: {', '.join(closest)}."
+    else:
+        shown = ref.known[:_LISTED_COLUMNS]
+        more = len(ref.known) - len(shown)
+        hint = f"Its columns: {', '.join(shown)}" + (f" and {more} more." if more else ".")
     return (
         f"column {ref.column!r} does not exist in {where}, so the query fails at run time. {hint}"
     )

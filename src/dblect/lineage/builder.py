@@ -25,7 +25,7 @@ upstream model's SQL.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar, cast
@@ -288,7 +288,7 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
-        if not walker.unexpanded_stars:
+        if not walker.unexpanded_stars and not walker.runtime_named_output:
             complete_sources.add(uid)
         resolution.append(
             ModelResolution(
@@ -427,6 +427,7 @@ def _walk_model(
         raise UnknownColumnError(tuple(references))
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
+    walker.runtime_named_output = _output_names_known_only_at_run_time(root_scope.expression)
     walker.walk(root_scope, scope_path=())
     if original is not None:
         walker.stamp_original(originals, root_scope)
@@ -455,14 +456,20 @@ def _unknown_references(
     """
     implicit = implicit_column_names(dialect)
     found: list[UnknownColumnReference] = []
+    # A correlated qualified reference is a column of both its own and the enclosing scope.
+    seen: set[int] = set()
     for scope in root.traverse():
         if not isinstance(scope.expression, exp.Select):
             continue
         known_by_qualifier: dict[str | None, _KnownColumns | None] = {}
         for col in columns_of(scope):
-            if not col.name or isinstance(col.this, exp.Star):
+            if not col.name or isinstance(col.this, exp.Star) or id(col) in seen:
                 continue
+            seen.add(id(col))
             qualifier = col.table or None
+            if qualifier is None and _is_visible_relation_name(scope, col.name):
+                # A bare relation name is the whole row as a value (`to_json(p)`).
+                continue
             if qualifier not in known_by_qualifier:
                 known_by_qualifier[qualifier] = _known_columns(
                     scope, schema, name_to_source, complete_sources, qualifier=qualifier
@@ -478,6 +485,16 @@ def _unknown_references(
                     )
                 )
     return found
+
+
+def _is_visible_relation_name(scope: Scope, name: str) -> bool:
+    folded = stored_column_name(name)
+    visible: Scope | None = scope
+    while visible is not None:
+        if any(stored_column_name(alias) == folded for alias in visible.sources):
+            return True
+        visible = visible.parent
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,14 +558,57 @@ def _complete_source(
         src.scope_type in _PROJECTED_SOURCE_SCOPES
         and isinstance(src.expression, exp.Query)
         and all(sel.output_name for sel in src.expression.selects)
+        and not _output_names_known_only_at_run_time(src.expression)
     ):
         label = alias
     else:
         return None
-    columns = resolver.get_source_columns(alias)
+    columns = _derived_column_names(src, resolver.get_source_columns(alias))
     if not columns or "*" in columns:
         return None
     return label, frozenset(stored_column_name(c) for c in columns)
+
+
+def _derived_column_names(src: exp.Table | Scope, projected: Sequence[str]) -> list[str]:
+    """A CTE's or derived table's column names: its alias list (``c(a, b)``) renames the leading
+    projections, the rest keep their own names. The resolver reads only the projections, so on a
+    tree qualify has not rewritten it would miss the list."""
+    if isinstance(src, exp.Table):
+        return list(projected)
+    parent = src.expression.parent
+    alias = parent.args.get("alias") if parent is not None else None
+    listed = [c.name for c in alias.columns] if isinstance(alias, exp.TableAlias) else []
+    return [*listed, *projected[len(listed) :]]
+
+
+def _output_names_known_only_at_run_time(query: Expr) -> bool:
+    """Whether a query's output column names or count depend on data or catalog contents, so
+    its relation cannot be called complete. Decided from the leading projections' AST shape
+    (a set operation takes its names from its first arm); any query shape not listed is
+    treated as unknown."""
+    if isinstance(query, exp.Subquery):
+        return _output_names_known_only_at_run_time(query.this)
+    if isinstance(query, exp.SetOperation):
+        return _output_names_known_only_at_run_time(query.this)
+    if isinstance(query, exp.Select):
+        return any(_projection_expands_at_run_time(p) for p in query.expressions)
+    return True
+
+
+def _projection_expands_at_run_time(projection: Expr) -> bool:
+    """A projection that yields a data-dependent set of columns: ``COLUMNS(...)`` (a pattern
+    over the input's columns), a struct expansion (``(s).*``, ``t.*`` on a struct) and the
+    generators, whose width follows the value they open (``UNNEST`` of a struct, ``POSEXPLODE``,
+    ``INLINE``, ``STACK``). ``UNNEST``/``EXPLODE`` of an array literal is the one single-column
+    generator we can prove, which a column or any other argument is not."""
+    core = projection.this if isinstance(projection, exp.Alias) else projection
+    if isinstance(core, (exp.Columns, exp.Inline, exp.Stack, exp.Unnest)):
+        return True
+    if isinstance(core, (exp.Explode, exp.ExplodeOuter)):
+        return not (type(core) is exp.Explode and isinstance(core.this, exp.Array))
+    if isinstance(core, exp.Dot):
+        return isinstance(core.expression, exp.Star)
+    return isinstance(core, exp.Column) and isinstance(core.this, exp.Star)
 
 
 # Meta key carrying the reference-id tag that lets the builder map a column on its
@@ -704,6 +764,8 @@ class _Walker:
         self.resolved_columns = 0
         self.blind_columns = 0
         self.unexpanded_stars = 0
+        # Set by the caller from the model's root query; see ``_names_known_only_at_run_time``.
+        self.runtime_named_output = False
 
     def walk(
         self,

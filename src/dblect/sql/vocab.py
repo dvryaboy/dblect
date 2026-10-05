@@ -15,9 +15,14 @@ from typing import Final, final
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.clickhouse import ClickHouse
 from sqlglot.dialects.dialect import Dialect
 from sqlglot.dialects.duckdb import DuckDB
 from sqlglot.dialects.postgres import Postgres
+from sqlglot.dialects.presto import Presto
+from sqlglot.dialects.snowflake import Snowflake
+from sqlglot.dialects.spark import Spark
+from sqlglot.dialects.sqlite import SQLite
 
 from dblect.sql import _sqlglot as sg
 
@@ -31,10 +36,35 @@ _TIMESTAMP_TYPES = (
     exp.DataType.Type.DATETIME,
 )
 
-# System columns no catalog lists (Redshift subclasses Postgres).
+# System columns no catalog lists, beyond those sqlglot's ``PSEUDOCOLUMNS`` names. Subclasses
+# inherit (Redshift is Postgres, Databricks is Spark, Trino and Athena are Presto).
 _IMPLICIT_COLUMNS = (
     (DuckDB, frozenset({"rowid"})),
     (Postgres, frozenset({"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid"})),
+    (SQLite, frozenset({"rowid", "oid", "_rowid_"})),
+    (Spark, frozenset({"_metadata"})),
+    (Presto, frozenset({"$path", "$file_size", "$file_modified_time", "$partition", "$bucket"})),
+    (
+        ClickHouse,
+        frozenset(
+            {"_part", "_part_index", "_part_offset", "_partition_id", "_partition_value", "_table"}
+        ),
+    ),
+    (
+        Snowflake,
+        frozenset(
+            {
+                "metadata$filename",
+                "metadata$file_row_number",
+                "metadata$file_last_modified",
+                "metadata$file_content_key",
+                "metadata$start_scan_time",
+                "metadata$action",
+                "metadata$isupdate",
+                "metadata$row_id",
+            }
+        ),
+    ),
 )
 
 
