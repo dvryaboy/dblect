@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from jinja2 import TemplateError, nodes
 
+from dblect.model_errors import error_reason
 from dblect.templating import shared_environment
 from dblect.varinf.usage import (
     Arithmetic,
@@ -91,7 +92,7 @@ def walk_source(source: str, *, unique_id: str, file_path: str | None = None) ->
     except (TemplateError, SyntaxError, ValueError) as exc:
         # Degrade, don't lie: a body we cannot parse becomes one diagnostic, never a
         # crash and never a silent miss.
-        reason = f"{type(exc).__name__}: {exc}"
+        reason = error_reason(exc)
         return WalkResult(opaque=OpaqueNode(unique_id=unique_id, reason=reason))
 
     walker = _Walker(file_path=file_path)
