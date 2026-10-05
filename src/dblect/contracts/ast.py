@@ -206,7 +206,16 @@ class DeterminesFact:
     dependent: Col
 
 
-FactNode = KeyFact | GrainFact | ReferencesFact | DeterminesFact
+@dataclass(frozen=True, slots=True)
+class UniquePerFact:
+    """``dependent`` is unique within its ``owners`` (the key ``(*owners, dependent)``) and
+    means something only inside them: a line number within an order."""
+
+    dependent: Col
+    owners: tuple[Col, ...]
+
+
+FactNode = KeyFact | GrainFact | ReferencesFact | DeterminesFact | UniquePerFact
 
 
 # The two things a ``@contract`` method may return: a fact the analyzer reads, or

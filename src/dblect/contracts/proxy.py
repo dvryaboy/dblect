@@ -40,6 +40,7 @@ from dblect.contracts.ast import (
     Pred,
     ReferencesFact,
     Tolerance,
+    UniquePerFact,
     ValueExpr,
 )
 
@@ -190,6 +191,17 @@ class ColumnProxy(_ValueProxy):
     def determines(self, dependent: ColumnProxy) -> FactProxy:
         """The functional dependency ``self -> dependent``."""
         return FactProxy(DeterminesFact((self.col,), dependent.col))
+
+    def unique_per(self, *owners: ColumnProxy) -> FactProxy:
+        """The key ``(*owners, self)``, and ``self`` is meaningful only within its owners
+        (a line number within an order). Grouping or joining on ``self`` without the
+        owners is what the ``dependent_key_without_owner`` check flags."""
+        if not owners:
+            raise ContractError("unique_per(...) needs at least one owner column")
+        cols = tuple(_col_of(o, "an owner column") for o in owners)
+        if self.col in cols:
+            raise ContractError("unique_per(...): the column cannot be its own owner")
+        return FactProxy(UniquePerFact(self.col, cols))
 
 
 class AggregateProxy(_ValueProxy):

@@ -123,6 +123,11 @@ closed vocabulary, exactly the structural properties the substrate propagates
 - `self.a.determines(self.b)`. The functional dependency `a -> b`; lets a grouped sum keep
   a per-row tag.
 - `self.grain(per=self.order_id)`. This relation has one row per key.
+- `self.line_no.unique_per(self.order_id)`. The key `(order_id, line_no)`, and `line_no`
+  means something only inside its order. A GROUP BY or join that uses `line_no` without
+  covering `order_id` (used, pinned, equated, or determined) raises
+  `dependent_key_without_owner`; grouping by `order_id` alone never does. Owners may be
+  several columns.
 
 Every fact is a method on its natural subject (a column, or the relation `self`), the same
 shape as the rest of the proxy API. The single-column facts have field-marker sugar
@@ -181,7 +186,7 @@ with one of these is still reachable by indexing, which always names a column:
   relations, so a sum on one model can be grouped by a key from another:
   `payments.amount.sum().group_by(orders.customer_id).joined_on(payments.order_id == orders.order_id)`.
 - `self.a.determines(self.b)`. Builds the functional-dependency fact `a -> b`. The fact
-  vocabulary (`determines`, `references`, `key`, `grain`) is defined under Contracts.
+  vocabulary (`determines`, `references`, `key`, `grain`, `unique_per`) is defined under Contracts.
 - Arithmetic `+`, `-`, `*`, `/`. Builds value expressions. Magnitudes combine by the
   dimensional algebra (`*` adds unit exponents, `/` subtracts); tags must agree, and a
   scalar multiply rides a nominal tag through unchanged.

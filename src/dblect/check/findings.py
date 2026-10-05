@@ -85,6 +85,13 @@ class CheckFindingKind(StrEnum):
     drop rather than a loud one, so it never claims the key is broken today. See
     ``docs/design/referential-drop-and-dead-predicate.md``."""
 
+    DEPENDENT_KEY_WITHOUT_OWNER = auto()
+    """A GROUP BY, or the ON equalities of one join, use a column declared ``unique_per``
+    some owners without covering every owner (a line number grouped across orders). The
+    column means something only inside its owners, so rows of different owners are treated
+    as one. An owner is covered when used, pinned, equated in the ON, or determined by a
+    used column. A deliberate cross-owner rollup exists, so it warns."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:

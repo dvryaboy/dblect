@@ -126,6 +126,21 @@ def test_key_and_grain() -> None:
     assert s.grain(per=s.order_id).fact == ast.GrainFact((ast.Col(None, "order_id"),))
 
 
+def test_unique_per_builds_the_owned_fact() -> None:
+    s = _self()
+    assert s.line_no.unique_per(s.order_id, s.shop).fact == ast.UniquePerFact(
+        ast.Col(None, "line_no"), (ast.Col(None, "order_id"), ast.Col(None, "shop"))
+    )
+
+
+def test_unique_per_needs_an_owner_and_rejects_the_column_as_its_own_owner() -> None:
+    s = _self()
+    with pytest.raises(ContractError):
+        s.line_no.unique_per()
+    with pytest.raises(ContractError):
+        s.line_no.unique_per(s.order_id, s.line_no)
+
+
 def test_grain_accepts_a_tuple() -> None:
     s = _self()
     assert s.grain(per=(s.a, s.b)).fact == ast.GrainFact((ast.Col(None, "a"), ast.Col(None, "b")))

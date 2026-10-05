@@ -40,6 +40,7 @@ from dblect.check.findings import (
 )
 from dblect.check.grain import declared_grain_findings
 from dblect.check.located import LocatedRow, annotation_or_grounded, locate_findings
+from dblect.check.owned_key import owned_key_message, owned_key_sites
 from dblect.check.referential import (
     OrphanDropSite,
     UnguardedEdges,
@@ -72,6 +73,7 @@ from dblect.lineage.properties.domain_type import (
     join_key_conflicts,
 )
 from dblect.lineage.properties.functional_dependency import (
+    NO_FDS,
     FDSet,
     functional_dependency_grounded_scopes,
     functional_dependency_grounding,
@@ -426,6 +428,7 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
             line_maps,
         )
     )
+    findings.extend(_owned_key_findings(graphs, world, line_maps))
     return findings
 
 
@@ -827,6 +830,40 @@ def _unguarded_foreign_keys(manifest: Manifest, registry: ContractRegistry) -> U
         for edge in foreign_key_edges(manifest, registry=registry)
         if (edge.child, edge.parent) not in guarded
     }
+
+
+def _owned_key_rows(graphs: CheckGraphs, world: WorldAnnotations) -> Iterator[LocatedRow]:
+    """One row per GROUP BY or join that uses an owned column without covering its owners,
+    located on the clause."""
+    owned = graphs.resolved.owned_columns
+    if not owned:
+        return
+
+    def fds_of(relation: SourceRef) -> FDSet:
+        ann = world.functional_dependency.get(relation)
+        return ann.value if ann is not None else NO_FDS
+
+    ref_of = copy_origin(graphs.column_build.graph)
+    for uid, tree in graphs.parsed.items():
+        for site in owned_key_sites(tree, owned, fds_of, ref_of):
+            yield LocatedRow(
+                uid=uid,
+                nodes=(site.node, site.select),
+                kind=CheckFindingKind.DEPENDENT_KEY_WITHOUT_OWNER,
+                message=owned_key_message(site, _relation_name(graphs.manifest, site.relation)),
+                column=min(site.missing),
+            )
+
+
+def _owned_key_findings(
+    graphs: CheckGraphs, world: WorldAnnotations, line_maps: dict[str, LineMap]
+) -> list[CheckFinding]:
+    return locate_findings(
+        graphs.manifest,
+        _owned_key_rows(graphs, world),
+        line_maps=line_maps,
+        sort_key=lambda f: (f.model_unique_id or "", f.line_start, f.column or ""),
+    )
 
 
 def _referential_orphan_drop_rows(

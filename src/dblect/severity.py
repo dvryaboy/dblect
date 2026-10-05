@@ -144,6 +144,9 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
         # The join never refutes the key; it only turns a loud failure into a silent drop.
         case CheckFindingKind.REFERENTIAL_ORPHAN_DROP:
             return Severity.WARN
+        # A cross-owner rollup of an owned column is occasionally intended.
+        case CheckFindingKind.DEPENDENT_KEY_WITHOUT_OWNER:
+            return Severity.WARN
     assert_never(kind)
 
 
