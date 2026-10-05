@@ -69,3 +69,40 @@ def test_promoted_keys_are_unique_over_the_materialized_rows(
     keys = promoted_keys("m", model("m", sql))
     tables: list[Table] = [("events", ("c0", "c1", "c2"), rows)]
     assert_keys_unique(oracle_con, tables, sql, keys)
+
+
+_LATER_JOINS = ("JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN")
+_CHAINS = (
+    # the rank filter rides a later join's ON, against the FROM source or an earlier-joined one
+    "f {later} d ON f.c1 = d.c0 AND {predicate}",
+    "d JOIN f ON d.c0 = f.c1 {later} e ON e.c0 = d.c0 AND {predicate}",
+    "d LEFT JOIN f ON d.c0 = f.c1 {later} e ON e.c0 = d.c0 AND {predicate}",
+    "f JOIN e ON e.c0 = f.c1 {later} d ON d.c0 = e.c0 AND {predicate}",
+)
+
+
+@given(
+    chain=st.sampled_from(_CHAINS),
+    later=st.sampled_from(_LATER_JOINS),
+    predicate=st.sampled_from(_PREDICATES),
+    partition=st.sampled_from(_PARTITIONS),
+    rows=_ROWS,
+)
+@settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_keys_promoted_across_a_later_joins_on_are_unique_over_the_materialized_rows(
+    oracle_con: duckdb.DuckDBPyConnection,
+    chain: str,
+    later: str,
+    predicate: str,
+    partition: str,
+    rows: list[tuple[int | None, int | None, int | None]],
+) -> None:
+    sql = (
+        f"WITH f AS (SELECT c0, c1, c2, ROW_NUMBER() OVER "
+        f"(PARTITION BY {partition} ORDER BY c0) AS rn FROM events), "
+        "d AS (SELECT DISTINCT c0 FROM events), e AS (SELECT DISTINCT c0 FROM events) "
+        f"SELECT d.c0, f.c1, f.c2 FROM {chain.format(later=later, predicate=predicate)}"
+    )
+    keys = promoted_keys("m", model("m", sql))
+    tables: list[Table] = [("events", ("c0", "c1", "c2"), rows)]
+    assert_keys_unique(oracle_con, tables, sql, keys)

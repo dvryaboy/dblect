@@ -17,7 +17,6 @@ from sqlglot import exp
 
 from dblect.lineage.properties.scope_closure import source_filter_atoms
 from dblect.lineage.properties.uniqueness import Key
-from dblect.sql import _sqlglot as sg
 from tests.lineage._rownumber_keys import COLS as _COLS
 from tests.lineage._rownumber_keys import model as _model
 from tests.lineage._rownumber_keys import promoted_keys as _promoted
@@ -157,7 +156,10 @@ def test_the_conditional_dies_when_the_pass_through_drops_the_rank() -> None:
 
 # --- join sites (one model, the window in a CTE) ------------------------------------
 
-_CTES = f"WITH f AS ({_window()}), d AS (SELECT DISTINCT c0 FROM events) SELECT d.c0, f.c2 FROM "
+_CTES = (
+    f"WITH f AS ({_window()}), d AS (SELECT DISTINCT c0 FROM events), "
+    "e AS (SELECT DISTINCT c0 FROM events) SELECT d.c0, f.c2 FROM "
+)
 _D_KEY: frozenset[Key] = frozenset({frozenset({"c0"})})
 _NO_KEYS: frozenset[Key] = frozenset()
 
@@ -193,12 +195,46 @@ def _joined(tail: str) -> frozenset[Key]:
         ("d FULL JOIN f ON d.c0 = f.c1 AND f.rn = 1", _NO_KEYS),
         # The ON conjunct that names the other side filters nothing on f.
         ("d JOIN f ON d.c0 = f.c1 AND d.c0 = 1", _NO_KEYS),
+        # A later INNER join's ON conjunct filters every earlier source it names, the FROM
+        # source included.
+        ("f JOIN d ON f.c1 = d.c0 AND f.rn = 1", _D_KEY),
+        ("f JOIN d ON f.c1 = d.c0 AND f.rn = 2", _NO_KEYS),
+        ("d JOIN f ON d.c0 = f.c1 JOIN e ON e.c0 = d.c0 AND f.rn = 1", _D_KEY),
+        ("f JOIN e ON e.c0 = f.c1 JOIN d ON d.c0 = e.c0 AND f.rn = 1", _D_KEY),
+        # A later LEFT join preserves every earlier source, so its ON never filters them.
+        ("f LEFT JOIN d ON f.c1 = d.c0 AND f.rn = 1", _NO_KEYS),
+        ("d JOIN f ON d.c0 = f.c1 LEFT JOIN e ON e.c0 = d.c0 AND f.rn = 1", _NO_KEYS),
+        # FULL preserves both sides.
+        ("f FULL JOIN d ON f.c1 = d.c0 AND f.rn = 1", _NO_KEYS),
+        # A source an earlier LEFT join null-pads is filtered by a later INNER ON: the padded
+        # NULL rank fails the comparison, so those rows are dropped.
+        ("d LEFT JOIN f ON d.c0 = f.c1 JOIN e ON e.c0 = d.c0 AND f.rn = 1", _D_KEY),
     ],
 )
 def test_the_filter_site_decides_whether_the_window_key_activates(
     tail: str, expected: frozenset[Key]
 ) -> None:
     assert _joined(tail) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "filters_earlier_side"),
+    [
+        ("JOIN", True),
+        ("INNER JOIN", True),
+        ("LEFT JOIN", False),
+        ("RIGHT JOIN", True),
+        ("FULL JOIN", False),
+    ],
+)
+def test_a_later_on_conjunct_filters_an_earlier_side_only_when_the_join_drops_its_unmatched_rows(
+    kind: str, filters_earlier_side: bool
+) -> None:
+    """The guard itself is the contract: a preserved side keeps rows its ON conjunct rejects,
+    so those atoms must not count, whatever a later stage does with the keys."""
+    sel = sqlglot.parse_one(f"SELECT 1 FROM f {kind} d ON f.c1 = d.c0 AND f.rn = 1")
+    assert isinstance(sel, exp.Select)
+    assert bool(source_filter_atoms(sel, "f")) is filters_earlier_side
 
 
 @pytest.mark.parametrize(
@@ -214,13 +250,9 @@ def test_the_filter_site_decides_whether_the_window_key_activates(
 def test_an_on_conjunct_filters_the_joined_side_only_when_the_join_does_not_preserve_it(
     kind: str, filters_joined_side: bool
 ) -> None:
-    """The guard itself is the contract: a preserved side keeps rows its ON conjunct rejects,
-    so those atoms must not count, whatever a later stage does with the keys."""
     sel = sqlglot.parse_one(f"SELECT 1 FROM d {kind} f ON d.c0 = f.c1 AND f.rn = 1")
     assert isinstance(sel, exp.Select)
-    (join,) = sg.joins_of(sel)
-    atoms = source_filter_atoms(sel, "f", join=join)
-    assert bool(atoms) is filters_joined_side
+    assert bool(source_filter_atoms(sel, "f")) is filters_joined_side
 
 
 def test_a_filter_inside_the_same_model_cte_activates_the_key() -> None:
