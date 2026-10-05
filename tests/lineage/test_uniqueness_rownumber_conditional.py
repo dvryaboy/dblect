@@ -12,8 +12,12 @@ Every source declares no key, so the rule under test is the only thing that can 
 from __future__ import annotations
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
+from dblect.lineage.properties.scope_closure import source_filter_atoms
 from dblect.lineage.properties.uniqueness import Key
+from dblect.sql import _sqlglot as sg
 from tests.lineage._rownumber_keys import COLS as _COLS
 from tests.lineage._rownumber_keys import model as _model
 from tests.lineage._rownumber_keys import promoted_keys as _promoted
@@ -55,6 +59,11 @@ _NON_ACTIVATING = (
     "rn <> 1",
     "rn IN (1, 2)",
     "rn IS NULL",
+    # Equivalent to a top-rank filter, but the engine has no BETWEEN or NOT normalizer
+    # and these stay inert rather than growing a parallel one.
+    "rn BETWEEN 1 AND 1",
+    "NOT rn <> 1",
+    "NOT (rn > 1)",
     "rn = 1 OR c0 > 5",
     "c0 = 1",
     "c1 = 1",
@@ -87,6 +96,8 @@ def test_a_rank_that_ties_mints_no_key(fn: str) -> None:
 
 
 def test_a_partitionless_window_mints_no_key() -> None:
+    """``rn = 1`` over the whole relation keeps one row, whose key is the empty set. A key
+    set cannot carry that (a consumer never reads an empty key), so nothing is minted."""
     sql = f"SELECT {_COLS}, ROW_NUMBER() OVER (ORDER BY c0) AS rn FROM events"
     assert _consumer_keys("rn = 1", window=sql) == frozenset()
 
@@ -188,6 +199,28 @@ def test_the_filter_site_decides_whether_the_window_key_activates(
     tail: str, expected: frozenset[Key]
 ) -> None:
     assert _joined(tail) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "filters_joined_side"),
+    [
+        ("JOIN", True),
+        ("INNER JOIN", True),
+        ("LEFT JOIN", True),
+        ("RIGHT JOIN", False),
+        ("FULL JOIN", False),
+    ],
+)
+def test_an_on_conjunct_filters_the_joined_side_only_when_the_join_does_not_preserve_it(
+    kind: str, filters_joined_side: bool
+) -> None:
+    """The guard itself is the contract: a preserved side keeps rows its ON conjunct rejects,
+    so those atoms must not count, whatever a later stage does with the keys."""
+    sel = sqlglot.parse_one(f"SELECT 1 FROM d {kind} f ON d.c0 = f.c1 AND f.rn = 1")
+    assert isinstance(sel, exp.Select)
+    (join,) = sg.joins_of(sel)
+    atoms = source_filter_atoms(sel, "f", join=join)
+    assert bool(atoms) is filters_joined_side
 
 
 def test_a_filter_inside_the_same_model_cte_activates_the_key() -> None:

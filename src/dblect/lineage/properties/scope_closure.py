@@ -705,7 +705,7 @@ class JoinChain:
         return frozenset(out) if out <= set(self.aliases) else None
 
 
-def _filter_atoms(sel: exp.Select, alias: str, *, join: exp.Join | None) -> frozenset[Canon]:
+def source_filter_atoms(sel: exp.Select, alias: str, *, join: exp.Join | None) -> frozenset[Canon]:
     """The atoms every row of ``alias`` that reaches the output satisfies, as the source's own
     column names: the WHERE conjuncts local to ``alias``, plus (for the alias an INNER or LEFT
     join introduces) the ON conjuncts local to it. An ON conjunct filters only the side it
@@ -872,7 +872,7 @@ def _select_facts(
     mint(
         from_alias,
         from_resolved[1],
-        filter_atoms=_filter_atoms(sel, from_alias, join=None),
+        filter_atoms=source_filter_atoms(sel, from_alias, join=None),
     )
 
     for (alias, inp), j in zip(join_sources, joins, strict=True):
@@ -893,7 +893,7 @@ def _select_facts(
                 inp,
                 keep_fds=False,
                 key_filter=(lambda k, on_a=on_a: k <= on_a) if clean else (lambda _k: False),
-                filter_atoms=_filter_atoms(sel, alias, join=j),
+                filter_atoms=source_filter_atoms(sel, alias, join=j),
             )
             if clean:
                 for c in on_a:
@@ -905,7 +905,7 @@ def _select_facts(
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
                 conditional_by_alias.pop(a2, None)
-            mint(alias, inp, filter_atoms=_filter_atoms(sel, alias, join=j))
+            mint(alias, inp, filter_atoms=source_filter_atoms(sel, alias, join=j))
         elif side is sg.JoinSide.FULL:
             accumulated = frozenset(active_aliases)
             facts = {
@@ -922,10 +922,10 @@ def _select_facts(
                 inp,
                 keep_fds=False,
                 key_filter=lambda _k: False,
-                filter_atoms=_filter_atoms(sel, alias, join=j),
+                filter_atoms=source_filter_atoms(sel, alias, join=j),
             )
         else:  # INNER, CROSS
-            mint(alias, inp, filter_atoms=_filter_atoms(sel, alias, join=j))
+            mint(alias, inp, filter_atoms=source_filter_atoms(sel, alias, join=j))
             if side is sg.JoinSide.INNER:
                 on = sg.on_of(j)
                 if on is not None:
