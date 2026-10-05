@@ -274,8 +274,8 @@ class _AcceptedValuesTestDiscoverer:
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "accepted_values":
                 continue
-            col = tm.kwargs.get("column_name")
-            if not isinstance(col, str) or not col:
+            col = tm.column_kwarg("column_name")
+            if col is None:
                 continue
             values = tm.kwargs.get("values")
             if not isinstance(values, list) or not values:

@@ -30,7 +30,7 @@ from tests._manifest_builders import node as _node
 _DUCKDB = profile_for_adapter("duckdb")
 
 _DIM_SQL = "SELECT id, name FROM dim_src GROUP BY id, name"
-_FACT_SQL = "SELECT f.id, d.name FROM fact_src AS f JOIN dim AS d ON f.id = d.id"
+_FACT_SQL = "SELECT f.id FROM fact_src AS f JOIN dim AS d ON f.id = d.id"
 
 
 def _shop_model(name: str, sql: str) -> Node:

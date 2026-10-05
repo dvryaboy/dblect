@@ -10,6 +10,7 @@ import from here and don't touch the parser's types directly.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -156,14 +157,45 @@ class ConstraintSpec:
     expression: str | None = None
 
 
+class DbtTestSeverity(StrEnum):
+    """A dbt test's configured failure severity.
+
+    ``ERROR`` fails the run; ``WARN`` surfaces the failure without failing it.
+    dbt's own default is ``error``, so a test with no explicit ``severity``
+    config reads as ``ERROR`` here too.
+    """
+
+    ERROR = "error"
+    WARN = "warn"
+
+
+# dbt keeps test kwargs unrendered, so a quoted column arrives as Jinja. These two
+# idioms are the ones a literal name can be read from without rendering.
+_QUOTED_COLUMN_IDIOM = re.compile(
+    r"""\{\{-?\s*(?:quote_column|adapter\.quote)\(\s*(['"])([^'"{}()]+)\1\s*\)\s*-?\}\}"""
+)
+
+
+def declared_column_name(raw: object) -> str | None:
+    """The column a test kwarg names, or ``None`` when it cannot be read without
+    rendering Jinja. A bare name, ``{{ quote_column('x') }}`` and
+    ``{{ adapter.quote('x') }}`` resolve; any other templated value does not."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    idiom = _QUOTED_COLUMN_IDIOM.fullmatch(raw)
+    if idiom is not None:
+        return idiom.group(2)
+    return None if any(tag in raw for tag in ("{{", "{%", "{#")) else raw
+
+
 @dataclass(frozen=True, slots=True)
 class DbtTestMetadata:
     """What dblect knows about a dbt test node.
 
     Mostly mirrors dbt's ``test_metadata`` block on the node (``name``,
     ``kwargs``, ``namespace``), enriched with the test-relevant slice of
-    node-level config (``enabled``, ``where``) so consumers can reason
-    about test semantics from one place.
+    node-level config (``enabled``, ``where``, ``severity``) so consumers can
+    reason about test semantics from one place.
 
     * ``name``: generic-test name (``"unique"``, ``"not_null"``,
       ``"dbt_utils.unique_combination_of_columns"``, etc.).
@@ -179,6 +211,8 @@ class DbtTestMetadata:
       under; a non-``None`` value means the test only asserts its
       property over rows matching ``where``, so any fact derived from it
       is conditional.
+    * ``severity``: from ``node.config.severity``, read case-insensitively.
+      Defaults to ``ERROR``, dbt's own default, when unset or unrecognized.
     """
 
     name: str
@@ -186,6 +220,21 @@ class DbtTestMetadata:
     namespace: str | None = None
     enabled: bool = True
     where: str | None = None
+    severity: DbtTestSeverity = DbtTestSeverity.ERROR
+
+    def column_kwarg(self, key: str) -> str | None:
+        """The column named by kwarg ``key`` (``column_name``, ``field``), or ``None``."""
+        return declared_column_name(self.kwargs.get(key))
+
+    def column_list_kwarg(self, key: str) -> tuple[str, ...] | None:
+        """The columns named by list kwarg ``key``, or ``None`` unless every entry
+        resolves: a subset of a composite key is not a key."""
+        raw = self.kwargs.get(key)
+        if not isinstance(raw, list):
+            return None
+        names = tuple(declared_column_name(c) for c in cast("list[object]", raw))
+        resolved = tuple(n for n in names if n is not None)
+        return resolved if resolved and len(resolved) == len(names) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +332,9 @@ class Node:
     schema does not carry one. ``False`` is dbt saying the node was not compiled;
     it feeds :attr:`compilation_status` directly rather than being inferred from the
     code fields."""
+    columns_complete: bool = False
+    """True when :attr:`columns` is the warehouse's full set (set by
+    :meth:`Manifest.merge_catalog`); documented columns alone are a lower bound."""
     language: str | None = None
     """dbt's node ``language`` (``"sql"`` or ``"python"``), or ``None`` on schemas that
     don't carry it. Only SQL nodes are assessed for the stale/absent-compile signal; a
@@ -472,7 +524,7 @@ class Manifest:
                     continue
                 columns[col_name] = Column(name=col_name, data_type=data_type, description=None)
                 present.add(col_name.lower())
-            merged[uid] = replace(node, columns=columns)
+            merged[uid] = replace(node, columns=columns, columns_complete=True)
         return replace(self, nodes=merged)
 
     @property
@@ -770,10 +822,25 @@ def _test_metadata_from_parsed(node: Any) -> DbtTestMetadata | None:
     enabled = bool(raw_enabled) if raw_enabled is not None else True
     raw_where = getattr(config, "where", None)
     where = raw_where if isinstance(raw_where, str) and raw_where else None
+    severity = _test_severity_of(getattr(config, "severity", None))
     return DbtTestMetadata(
         name=name,
         kwargs=kwargs,
         namespace=namespace,
         enabled=enabled,
         where=where,
+        severity=severity,
     )
+
+
+def _test_severity_of(raw: object) -> DbtTestSeverity:
+    """``raw`` (``node.config.severity``) read case-insensitively into a
+    :class:`DbtTestSeverity`, defaulting to ``ERROR`` when absent or unrecognized
+    (a templated value dbt left unrendered, or a manifest schema predating the
+    field)."""
+    if isinstance(raw, str):
+        try:
+            return DbtTestSeverity(raw.strip().lower())
+        except ValueError:
+            pass
+    return DbtTestSeverity.ERROR

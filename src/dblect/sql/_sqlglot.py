@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TypeGuard, TypeVar, cast
+from typing import TypeGuard, TypeVar, assert_never, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -167,7 +167,7 @@ def group_targets(sel: exp.Select) -> tuple[GroupTarget, ...]:
     if group is None:
         return ()
     projections = cast("list[Expr]", sel.expressions)
-    projected = _projection_expressions_by_output_name(sel)
+    projected = projection_expressions_by_output_name(sel)
     return tuple(
         _resolve_group_target(target, projections, projected) for target in group.expressions
     )
@@ -219,7 +219,7 @@ def _resolve_name(target: Expr, projected: Mapping[str, Expr]) -> tuple[Expr, Gr
     return projection, GroupBinding.PRESUMED
 
 
-def _projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
+def projection_expressions_by_output_name(sel: exp.Select) -> dict[str, Expr]:
     """Each output name in ``sel``'s projection mapped to the expression behind it.
 
     A name carried by two projections names neither unambiguously, so it is dropped rather than
@@ -476,6 +476,96 @@ def name_of(e: Expr) -> str:
     return e.alias_or_name
 
 
+@dataclass(frozen=True)
+class JoinRowEffect:
+    """What one join does to the rows on either side of it: which aliases it
+    NULL-pads on a non-match, and which aliases lose their non-matching rows
+    outright.
+
+    ``optional`` and ``dropped_unmatched`` answer two different questions a
+    consumer may ask about the same join. A nullability reader wants the first:
+    which columns can now be NULL. An orphan-drop reader wants the second: does an
+    unmatched row of *this* alias survive to the output at all. The two coincide
+    for LEFT/RIGHT (the dropped side is exactly the padded side) and diverge
+    everywhere else: INNER pads nothing but drops both sides' unmatched rows, FULL
+    pads both sides but drops neither, and SEMI/ANTI pad nothing while dropping
+    (SEMI) or keeping (ANTI) the probe side by definition rather than by padding.
+    """
+
+    join: exp.Join
+    side: JoinSide
+    optional: frozenset[str]
+    dropped_unmatched: frozenset[str]
+    outer_dropped: frozenset[str]
+    """The aliases an outer join (LEFT or RIGHT) drops by design: ``dropped_unmatched``
+    for those two sides, empty for the rest. The nullable-key detector skips a key on
+    this side, since the join's own semantics say its no-match is intended; INNER's
+    or SEMI's dropped rows must not silence it."""
+
+
+def _join_row_effect(
+    side: JoinSide, *, right: str, accumulated_left: frozenset[str]
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """The ``(optional, dropped_unmatched, outer_dropped)`` triple one join
+    contributes, decided by its side alone. See :class:`JoinRowEffect`.
+
+    Closed over every ``JoinSide`` so a side sqlglot adds later is a type error here
+    rather than silently falling through to the wrong answer. CROSS has no match
+    predicate, so nothing is "unmatched"; ANTI's unmatched probe rows are exactly
+    what it keeps, so it drops nothing either.
+    """
+    match side:
+        case JoinSide.INNER:
+            # Neither side's unmatched row survives an inner join, whichever side
+            # the row started on.
+            return frozenset(), frozenset({right}) | accumulated_left, frozenset()
+        case JoinSide.LEFT:
+            return frozenset({right}), frozenset({right}), frozenset({right})
+        case JoinSide.RIGHT:
+            return accumulated_left, accumulated_left, accumulated_left
+        case JoinSide.FULL:
+            return frozenset({right}) | accumulated_left, frozenset(), frozenset()
+        case JoinSide.CROSS:
+            return frozenset(), frozenset(), frozenset()
+        case JoinSide.SEMI:
+            # A probe row (the accumulated left) with no match is dropped, the same
+            # row-loss shape as an inner join's left side.
+            return frozenset(), accumulated_left, frozenset()
+        case JoinSide.ANTI:
+            return frozenset(), frozenset(), frozenset()
+    assert_never(side)
+
+
+def join_row_effects(sel: exp.Select) -> list[JoinRowEffect]:
+    """Every join in ``sel``, each with the row effect its ``JoinSide`` decides.
+
+    The accumulated-left context grows left to right, so a later RIGHT or SEMI join
+    sees every table joined in before it, not only the immediately preceding one.
+    """
+    from_ = from_of(sel)
+    out: list[JoinRowEffect] = []
+    if from_ is None:
+        return out
+    accumulated_left: set[str] = {name_of(from_.this)} if from_.this is not None else set()
+    for j in joins_of(sel):
+        right_name = name_of(j.this)
+        side = join_side_of(j)
+        optional, dropped, outer_dropped = _join_row_effect(
+            side, right=right_name, accumulated_left=frozenset(accumulated_left)
+        )
+        out.append(
+            JoinRowEffect(
+                join=j,
+                side=side,
+                optional=optional,
+                dropped_unmatched=dropped,
+                outer_dropped=outer_dropped,
+            )
+        )
+        accumulated_left.add(right_name)
+    return out
+
+
 def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
     """The aliases an outer join in ``sel`` leaves NULL-padded: its non-preserved sides.
 
@@ -484,61 +574,13 @@ def outer_join_optional_aliases(sel: exp.Select) -> set[str]:
     nothing. The aliases are returned by ``alias_or_name`` to line up with callers that
     qualify columns by the same alias. An alias absent from this set is on a preserved
     side: its rows survive the join un-padded.
+
+    A projection of :func:`join_row_effects`: the union of every join's ``optional``.
     """
-    from_ = from_of(sel)
-    if from_ is None:
-        return set()
     optional: set[str] = set()
-    accumulated_left: set[str] = {name_of(from_.this)} if from_.this is not None else set()
-    for j in joins_of(sel):
-        right_name = name_of(j.this)
-        side = join_side_of(j)
-        if side is JoinSide.LEFT:
-            optional.add(right_name)
-        elif side is JoinSide.RIGHT:
-            optional.update(accumulated_left)
-        elif side is JoinSide.FULL:
-            optional.add(right_name)
-            optional.update(accumulated_left)
-        accumulated_left.add(right_name)
+    for effect in join_row_effects(sel):
+        optional.update(effect.optional)
     return optional
-
-
-def joins_with_outer_dropped_aliases(
-    sel: exp.Select,
-) -> list[tuple[exp.Join, JoinSide, frozenset[str]]]:
-    """Each join in ``sel`` with its side and the aliases whose unmatched rows it drops.
-
-    A LEFT join drops its unmatched right rows; a RIGHT join its unmatched left rows (every
-    alias accumulated to its left). A FULL join drops nothing, since both sides survive
-    NULL-padded, and inner, cross, semi, and anti joins report an empty set (an inner join's
-    unmatched rows belong to no single side, and semi/anti filter rather than pad). The
-    accumulated-left context grows left to right, so a later RIGHT join sees the earlier
-    tables.
-
-    This is the per-join view a caller gates on when it cares about one join's own dropped
-    side. It differs from :func:`outer_join_optional_aliases`, the output-nullable union that
-    counts both sides of a FULL join (both can be NULL in the result) and is not scoped to a
-    single join.
-    """
-    from_ = from_of(sel)
-    out: list[tuple[exp.Join, JoinSide, frozenset[str]]] = []
-    if from_ is None:
-        return out
-    accumulated_left: set[str] = {name_of(from_.this)} if from_.this is not None else set()
-    for j in joins_of(sel):
-        right_name = name_of(j.this)
-        side = join_side_of(j)
-        dropped: frozenset[str]
-        if side is JoinSide.LEFT:
-            dropped = frozenset({right_name})
-        elif side is JoinSide.RIGHT:
-            dropped = frozenset(accumulated_left)
-        else:
-            dropped = frozenset()
-        out.append((j, side, dropped))
-        accumulated_left.add(right_name)
-    return out
 
 
 def column_table(c: exp.Column) -> str | None:
@@ -548,6 +590,12 @@ def column_table(c: exp.Column) -> str | None:
 
 def column_name(c: exp.Column) -> str:
     return c.name
+
+
+def stored_column_name(name: str) -> str:
+    """The form the lineage keys a column under: lowercase, so a name spelled as the
+    warehouse does still meets its propagated scope."""
+    return name.lower()
 
 
 def column_key(c: exp.Column) -> tuple[str | None, str]:
@@ -691,7 +739,8 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
 
     Walks the AND-conjunction of `predicate`; for each leaf, accepts only
     ``exp.EQ`` between two bare columns where exactly one column's qualifier
-    equals `alias`. Returns the set of column names on the `alias` side.
+    equals `alias`. Returns the set of column names on the `alias` side, in the stored
+    (lowercase) form keys and facts are looked up under, so ``d.ID`` meets a key ``id``.
 
     Returns ``None`` if `predicate` contains anything other than a conjunction
     of such equalities (a disjunction, a function call, a range comparison,
@@ -712,8 +761,13 @@ def equality_cols_on_alias(predicate: Expr, alias: str) -> frozenset[str] | None
         off_alias = [c for c, t in ((left, left_alias), (right, right_alias)) if t != alias]
         if len(on_alias) != 1 or len(off_alias) != 1:
             return None
-        cols.add(column_name(on_alias[0]))
+        cols.add(stored_column_name(column_name(on_alias[0])))
     return frozenset(cols)
+
+
+def _stored_key(c: exp.Column) -> tuple[str | None, str]:
+    """:func:`column_key` with the name in its stored (lowercase) form."""
+    return (column_table(c), stored_column_name(column_name(c)))
 
 
 def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
@@ -735,7 +789,7 @@ def equality_cols_by_alias(predicate: Expr) -> dict[str, frozenset[str]] | None:
         left, right = leaf.this, leaf.expression
         if not isinstance(left, exp.Column) or not isinstance(right, exp.Column):
             return None
-        sides.append((column_key(left), column_key(right)))
+        sides.append((_stored_key(left), _stored_key(right)))
     out: dict[str, frozenset[str]] = {}
     for alias in {a for pair in sides for a, _ in pair if a is not None}:
         cols: set[str] = set()
@@ -797,7 +851,10 @@ def equality_column_pairs(predicate: Expr) -> tuple[tuple[exp.Column, exp.Column
 
 
 def conjunctive_leaves(predicate: Expr) -> list[Expr]:
-    """Flatten an ``AND``-only conjunction into its leaves; non-AND nodes are leaves."""
+    """Flatten an ``AND``-only conjunction into its leaves, looking through parentheses;
+    non-AND nodes are leaves."""
+    if isinstance(predicate, exp.Paren):
+        return conjunctive_leaves(predicate.this)
     if isinstance(predicate, exp.And):
         return [*conjunctive_leaves(predicate.this), *conjunctive_leaves(predicate.expression)]
     return [predicate]

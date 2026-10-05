@@ -26,9 +26,9 @@ the discoverers that ground it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import assert_never, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
@@ -48,6 +48,7 @@ from dblect.lineage.facts.model import (
     NativeConstraint,
     Opacity,
     Predicate,
+    Provenance,
 )
 from dblect.lineage.facts.property import DepContext, FactDiscoverer, Property, relation_property
 from dblect.lineage.graph import SourceKind, SourceRef, source_ref_meta
@@ -196,8 +197,8 @@ class _UniqueTestDiscoverer:
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "unique":
                 continue
-            col = tm.kwargs.get("column_name")
-            if not isinstance(col, str) or not col:
+            col = tm.column_kwarg("column_name")
+            if col is None:
                 continue
             target = generic_test_target_uid(node)
             scope = generic_test_source_ref(manifest, target) if target is not None else None
@@ -231,15 +232,10 @@ class _UniqueCombinationDiscoverer:
             # grounds.
             if not tm.name.endswith("unique_combination_of_columns"):
                 continue
-            raw = tm.kwargs.get("combination_of_columns")
-            if not isinstance(raw, list):
-                continue
-            raw_list = cast("list[object]", raw)
-            cols = [c for c in raw_list if isinstance(c, str) and c]
-            # Every entry must be a usable column name; a partially-typed list
-            # (a nested list, a null) is a shape we can't ground, so skip it
-            # rather than ground a partial key.
-            if not cols or len(cols) != len(raw_list):
+            # A list with any unresolvable entry (a null, a nested list, Jinja)
+            # grounds nothing rather than a partial key.
+            cols = tm.column_list_kwarg("combination_of_columns")
+            if cols is None:
                 continue
             target = generic_test_target_uid(node)
             scope = generic_test_source_ref(manifest, target) if target is not None else None
@@ -489,15 +485,11 @@ def _declared_key_columns(tm: object) -> list[str] | None:
     if not isinstance(tm, DbtTestMetadata) or not tm.enabled:
         return None
     if tm.name == "unique":
-        col = tm.kwargs.get("column_name")
-        return [col] if isinstance(col, str) and col else None
+        col = tm.column_kwarg("column_name")
+        return [col] if col is not None else None
     if tm.name.endswith("unique_combination_of_columns"):
-        raw = tm.kwargs.get("combination_of_columns")
-        if not isinstance(raw, list):
-            return None
-        raw_list = cast("list[object]", raw)
-        cols = [c for c in raw_list if isinstance(c, str) and c]
-        return cols if cols and len(cols) == len(raw_list) else None
+        cols = tm.column_list_kwarg("combination_of_columns")
+        return list(cols) if cols is not None else None
     return None
 
 
@@ -786,6 +778,37 @@ def uniqueness_facts(
     # The uniqueness discoverers ground against the manifest directly, so they
     # need no name-to-source map; pass an empty one to the shared collector.
     return _UNIQUENESS_KIT.facts(manifest, discoverers, extra_facts=extra_facts)
+
+
+def _claims_grain(provenance: Provenance) -> bool:
+    """Whether a key from this source claims something about the SELECT itself. A native
+    constraint is enforced on write, not by the query (#48 covers the unenforced case); a
+    compile-time value is config, not an assertion."""
+    match provenance:
+        case Declared():
+            return True
+        case NativeConstraint() | CompileValue():
+            return False
+    assert_never(provenance)
+
+
+def declared_grain_claims(
+    facts: Iterable[Fact[CandidateKeySet, SourceRef]],
+) -> Iterator[tuple[Fact[CandidateKeySet, SourceRef], Key]]:
+    """Each unconditional key a relation's SQL is answerable for, with the fact declaring it. A
+    conditional key holds only over a row filter, which activation owns. The grain check and the
+    join fan-out detector both read these as the model's intent about its own rows."""
+    for fact in facts:
+        if _claims_grain(fact.provenance) and fact.condition is None:
+            for authored in fact.value.keys:
+                yield fact, authored
+
+
+def declared_grain_keys(facts: Iterable[Fact[CandidateKeySet, SourceRef]]) -> frozenset[Key]:
+    """The keys of :func:`declared_grain_claims`, lowercased."""
+    return frozenset(
+        frozenset(col.lower() for col in authored) for _, authored in declared_grain_claims(facts)
+    )
 
 
 def uniqueness_property_from_facts(

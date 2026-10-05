@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from sqlglot import exp
 
 from dblect.adapters import profile_for_adapter
 from dblect.lineage.properties.functional_dependency import FD, FDSet
@@ -651,3 +652,62 @@ def test_schema_qualified_reference_does_not_inherit_a_same_named_relations_null
         if f.kind is FindingKind.JOIN_ON_NULLABLE_KEY
     ]
     assert findings == []
+
+
+# Nullability facts are keyed case-folded and a nullable column triggers the finding, so every
+# spelling reaches them, quoted or not: a case-distinct quoted name over-reports rather than
+# drops a real error. The lookup is dialect-independent, so one adapter covers it.
+_NAMES = ["PatientID", "patientid", "PATIENTID"]
+
+_CASE_STG_SQL = "SELECT a.id AS id, b.tag AS PatientID FROM base a LEFT JOIN lkp b ON a.fk = b.id"
+
+
+def _mixed_case_kinds(mart_sql: str, *, mixed_source_not_null: bool = False) -> list[FindingKind]:
+    profile = profile_for_adapter("duckdb")
+    nodes = [
+        _source("base"),
+        _source("lkp"),
+        _source("other"),
+        _source("pets"),
+        _not_null("base", "id"),
+        _not_null("base", "fk"),
+        _not_null("lkp", "id"),
+        _not_null("lkp", "tag"),
+        _not_null("other", "k"),
+        _model(
+            "stg",
+            _CASE_STG_SQL,
+            depends_on=frozenset({"source.shop.raw.base", "source.shop.raw.lkp"}),
+        ),
+        _model(
+            "mart",
+            mart_sql,
+            depends_on=frozenset(
+                {"model.shop.stg", "source.shop.raw.other", "source.shop.raw.pets"}
+            ),
+        ),
+    ]
+    if mixed_source_not_null:
+        nodes.append(_not_null("pets", "PatientID"))
+    tree = parse_sql(mart_sql, dialect=profile.sqlglot_dialect)
+    return [
+        f.kind
+        for detector in make_nullability_detectors(_manifest(*nodes), profile)
+        for f in detector(tree)
+    ]
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("name", _NAMES)
+def test_nullable_key_fires_in_every_spelling_and_not_null_key_stays_clean(
+    quoted: bool, name: str
+) -> None:
+    col = exp.to_identifier(name, quoted=quoted).sql(dialect="duckdb")
+    join = f"SELECT s.id FROM other o JOIN stg s ON o.k = s.{col}"
+    not_exists = (
+        f"SELECT s.id FROM stg s WHERE NOT EXISTS (SELECT 1 FROM other o WHERE o.k = s.{col})"
+    )
+    clean = f"SELECT p.k FROM other o JOIN pets p ON o.k = p.{col}"
+    assert FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(join)
+    assert FindingKind.JOIN_ON_NULLABLE_KEY in _mixed_case_kinds(not_exists)
+    assert _mixed_case_kinds(clean, mixed_source_not_null=True) == []

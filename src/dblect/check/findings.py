@@ -77,6 +77,14 @@ class CheckFindingKind(StrEnum):
     A remap may lump a value into its default on purpose, so this says
     "unhandled", never "wrong"."""
 
+    REFERENTIAL_ORPHAN_DROP = auto()
+    """A join's row effect discards a declared foreign key's unmatched child rows,
+    with no enabled, unconditional, error-severity ``relationships`` test already
+    giving that edge a loud failure mode. The foreign key is trusted forward, not
+    disproven; the finding is about the join turning a violation into a silent
+    drop rather than a loud one, so it never claims the key is broken today. See
+    ``docs/design/referential-drop-and-dead-predicate.md``."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:

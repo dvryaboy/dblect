@@ -10,9 +10,14 @@ structural column combination as a key.
 from __future__ import annotations
 
 from datetime import date, datetime
+from enum import Enum, auto
+from typing import Final, final
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
+from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.duckdb import DuckDB
+from sqlglot.dialects.postgres import Postgres
 
 from dblect.sql import _sqlglot as sg
 
@@ -25,6 +30,65 @@ _TIMESTAMP_TYPES = (
     exp.DataType.Type.TIMESTAMPNTZ,
     exp.DataType.Type.DATETIME,
 )
+
+# System columns no catalog lists (Redshift subclasses Postgres).
+_IMPLICIT_COLUMNS = (
+    (DuckDB, frozenset({"rowid"})),
+    (Postgres, frozenset({"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid"})),
+)
+
+
+def implicit_column_names(dialect: str | None) -> frozenset[str]:
+    """Names a ``dialect`` supplies on every relation without listing them."""
+    d = Dialect.get_or_raise(dialect)
+    names = {sg.stored_column_name(c) for c in d.PSEUDOCOLUMNS}
+    for cls, system in _IMPLICIT_COLUMNS:
+        if isinstance(d, cls):
+            names |= system
+    return frozenset(names)
+
+
+@final
+class CastTarget(Enum):
+    """What a cast's target type can still hold of a tagged value. Closed over every
+    ``DataType.Type``: a target is a number, a string, or neither."""
+
+    NUMERIC = auto()
+    TEXT = auto()
+    OTHER = auto()
+
+
+# sqlglot's groups are the base; they miss a few spellings (``BPCHAR``, MySQL's sized
+# text, ``SERIAL``) and count ``BIT`` as numeric although it holds a flag, not a magnitude.
+_NUMERIC_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    (
+        exp.DataType.NUMERIC_TYPES
+        | {exp.DType.BIGNUM, exp.DType.SERIAL, exp.DType.SMALLSERIAL, exp.DType.BIGSERIAL}
+    )
+    - {exp.DType.BIT}
+)
+_TEXT_TARGETS: Final[frozenset[exp.DType]] = frozenset(
+    exp.DataType.TEXT_TYPES
+    | {
+        exp.DType.BPCHAR,
+        exp.DType.TINYTEXT,
+        exp.DType.MEDIUMTEXT,
+        exp.DType.LONGTEXT,
+        exp.DType.FIXEDSTRING,
+    }
+)
+
+
+def cast_target(to: object) -> CastTarget:
+    """Classify a cast's target type. Anything that is not a plain ``DataType`` (a
+    missing target, a user-defined name) is ``OTHER``, the no-claim side."""
+    if not isinstance(to, exp.DataType) or not isinstance(to.this, exp.DType):
+        return CastTarget.OTHER
+    if to.this in _NUMERIC_TARGETS:
+        return CastTarget.NUMERIC
+    if to.this in _TEXT_TARGETS:
+        return CastTarget.TEXT
+    return CastTarget.OTHER
 
 
 def array_literal_nonempty(expr: Expr) -> bool:
@@ -231,6 +295,9 @@ SURROGATE_HASH_FUNCTIONS: tuple[type[Expr], ...] = tuple(
 SURROGATE_HASH_PASSTHROUGH: tuple[type[Expr], ...] = tuple(
     getattr(exp, n) for n in ("Hex", "Lower", "Upper") if hasattr(exp, n)
 )
+# Wrappers that keep a column's value a function of that one column alone.
+VALUE_PRESERVING_WRAPPERS: tuple[type[Expr], ...] = (exp.Alias, exp.Paren, exp.Cast, exp.TryCast)
+
 # Structural combinators that assemble columns into the hashed value without making
 # the input anything other than those columns.
 SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
@@ -238,3 +305,47 @@ SURROGATE_HASH_STRUCTURAL: tuple[type[Expr], ...] = tuple(
     for n in ("Concat", "DPipe", "Cast", "TryCast", "Coalesce", "Lower", "Upper", "Trim", "Paren")
     if hasattr(exp, n)
 )
+
+# Set-returning functions: in a projection each emits several rows per input row.
+_ROW_MULTIPLYING_CLASSES: tuple[type[Expr], ...] = tuple(
+    getattr(exp, n)
+    for n in ("Unnest", "Explode", "Posexplode", "Inline", "GenerateSeries", "Stack")
+    if hasattr(exp, n)
+)
+# The rest parse as ``exp.Anonymous``, so they are matched by lowercase name.
+_ROW_MULTIPLYING_NAMES: frozenset[str] = frozenset(
+    {
+        # postgres
+        "generate_subscripts",
+        "json_array_elements",
+        "json_array_elements_text",
+        "json_each",
+        "json_each_text",
+        "json_object_keys",
+        "jsonb_array_elements",
+        "jsonb_array_elements_text",
+        "jsonb_each",
+        "jsonb_each_text",
+        "jsonb_object_keys",
+        "jsonb_path_query",
+        "regexp_matches",
+        "regexp_split_to_table",
+        "string_to_table",
+        # spark
+        "explode_outer",
+        "inline_outer",
+        "posexplode_outer",
+        "stack",
+        # snowflake
+        "flatten",
+        "split_to_table",
+        "strtok_split_to_table",
+    }
+)
+
+
+def is_row_multiplying(node: Expr) -> bool:
+    """Whether ``node`` is a set-returning function call."""
+    if isinstance(node, _ROW_MULTIPLYING_CLASSES):
+        return True
+    return isinstance(node, exp.Anonymous) and node.name.lower() in _ROW_MULTIPLYING_NAMES

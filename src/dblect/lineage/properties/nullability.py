@@ -230,8 +230,8 @@ class _NotNullTestDiscoverer:
             tm = node.test_metadata
             if tm is None or not tm.enabled or tm.name != "not_null":
                 continue
-            col = tm.kwargs.get("column_name")
-            if not isinstance(col, str) or not col:
+            col = tm.column_kwarg("column_name")
+            if col is None:
                 continue
             target = generic_test_target_uid(node)
             if target is None:
@@ -499,33 +499,22 @@ def _optional_alias_sides(select: exp.Select) -> dict[str, JoinSide]:
     """Each optional-side alias mapped to the join kind that makes it optional.
 
     The same reading as :func:`_optional_join_aliases`, retaining the side so a consumer can
-    name *which* outer join padded the column. A LEFT join's joined-in side reports LEFT, a
-    RIGHT join's accumulated left side reports RIGHT, a FULL join reports FULL for both. When
-    an alias becomes optional through more than one join, the last to taint it wins; the side
-    is descriptive, the optionality itself is what the taint relies on."""
+    name *which* outer join padded the column. Which side a join pads is
+    :func:`sg.join_row_effects`'s decision; this keeps only the sources that lend a qualifier
+    (:func:`_relation_alias`). When an alias becomes optional through more than one join, the
+    last to taint it wins; the side is descriptive, the optionality itself is what the taint
+    relies on."""
     from_ = sg.from_of(select)
-    left: set[str] = set()
-    if from_ is not None:
-        base = _relation_alias(from_.this)
-        if base is not None:
-            left.add(base)
-    optional: dict[str, JoinSide] = {}
-    for join in sg.joins_of(select):
-        side = sg.join_side_of(join)
-        alias = _relation_alias(join.this)
-        if side is JoinSide.LEFT and alias is not None:
-            optional[alias] = JoinSide.LEFT
-        elif side is JoinSide.RIGHT:
-            for a in left:
-                optional[a] = JoinSide.RIGHT
-        elif side is JoinSide.FULL:
-            if alias is not None:
-                optional[alias] = JoinSide.FULL
-            for a in left:
-                optional[a] = JoinSide.FULL
-        if alias is not None:
-            left.add(alias)
-    return optional
+    sources = [j.this for j in sg.joins_of(select)]
+    if from_ is not None and isinstance(from_.this, Expr):
+        sources.append(from_.this)
+    qualifier = {sg.name_of(s): q for s in sources if (q := _relation_alias(s)) is not None}
+    return {
+        qualifier[alias]: effect.side
+        for effect in sg.join_row_effects(select)
+        for alias in effect.optional
+        if alias in qualifier
+    }
 
 
 def _outer_join_output_columns(

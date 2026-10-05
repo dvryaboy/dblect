@@ -75,6 +75,10 @@ class SourceKind(StrEnum):
     UNION_ARM = "union_arm"
 
 
+# Base relations: a column on one of these traces to itself.
+BASE_SOURCE_KINDS = frozenset({SourceKind.SOURCE, SourceKind.SEED, SourceKind.SNAPSHOT})
+
+
 @dataclass(frozen=True, slots=True)
 class SourceRef:
     """Identifier for the node a column belongs to.

@@ -40,6 +40,7 @@ from dblect.lineage.facts.lattice import Lattice, consistent
 from dblect.lineage.facts.model import Annotation, Opacity, ScopeKind
 from dblect.lineage.facts.property import (
     AggregateRule,
+    AggregateScope,
     CoherenceClear,
     CoherenceGuard,
     CoherenceSink,
@@ -52,6 +53,7 @@ from dblect.lineage.facts.property import (
 )
 from dblect.lineage.facts.registry import AnnotationStore, PropertyRegistry
 from dblect.lineage.graph import (
+    BASE_SOURCE_KINDS,
     AggregationSite,
     ColumnRef,
     Derivation,
@@ -60,6 +62,7 @@ from dblect.lineage.graph import (
     UnionConfluence,
     aggregation_site_meta,
 )
+from dblect.sql.vocab import VALUE_PRESERVING_WRAPPERS
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
@@ -316,7 +319,7 @@ def _column_reduce(
             if child is None:
                 return default_ann
             child_ann = _column_reduce(child, prop, annotate, dep_context, default_ann, sink)
-            return _apply_aggregate(rule, expr, child_ann, dep_context, lat, sink)
+            return _apply_aggregate(rule, expr, child_ann, dep_context, lat, annotate, sink)
         # An aggregate with no registered rule falls through to operator dispatch.
 
     op = _lookup_subclass(prop.operators, type(expr))
@@ -338,11 +341,14 @@ def _apply_aggregate(
     child: Annotation[K],
     dep_context: DepContext,
     lat: Lattice[K],
+    annotate: Callable[[ColumnRef], Annotation[K]],
     sink: CoherenceSink[K] | None = None,
 ) -> Annotation[K]:
-    """Apply an aggregate rule's pure ``core``, then its coherence guard.
+    """Apply an aggregate rule's ``core`` (or its ``reads_relation`` variant), then its
+    coherence guard.
 
-    The guard is the one channel a dependency enters an aggregate through: where a
+    The guard is the one channel a dependency enters an aggregate through, bar a rule
+    that opts in to reading its relation: where a
     per-row companion of the aggregated value is not provably constant per group,
     the result clears to the lattice top. The cleared top is IMPLICIT, so a
     downstream consumer warns on it rather than reading it as a declared opt-out. When the
@@ -350,11 +356,14 @@ def _apply_aggregate(
     and the undischarged companions with the paths checked) is recorded there, so the
     consumer reads the event rather than re-inferring it from the cleared output.
     """
-    result = rule.core(expr, child)
+    site = aggregation_site_meta(expr)
+    if rule.reads_relation is None:
+        result = rule.core(expr, child)
+    else:
+        result = rule.reads_relation(expr, child, AggregateScope(site, dep_context, annotate))
     guard = rule.coherence
     if guard is None:
         return result
-    site = aggregation_site_meta(expr)
     undischarged = _undischarged(guard, child.value, site, dep_context)
     if not undischarged:
         return result
@@ -489,6 +498,35 @@ def resolved_column_ref(col: exp.Column) -> ColumnRef | None:
     return _column_ref_meta(col)
 
 
+def copied_column(derivation: Derivation) -> ColumnRef | None:
+    """The one column ``derivation`` copies unchanged, through renames, parentheses and
+    casts; ``None`` for anything computed (a call, a window) or a union."""
+    node = derivation
+    while isinstance(node, VALUE_PRESERVING_WRAPPERS) and isinstance(node.this, Expr):
+        node = node.this
+    return resolved_column_ref(node) if isinstance(node, exp.Column) else None
+
+
+def value_origin(graph: LineageView[ColumnRef], col: ColumnRef) -> ColumnRef | None:
+    """The base column ``col`` is an unchanged copy of, or ``None``.
+
+    Follows ``copied_column`` steps down to a source, seed or snapshot column. Where-provenance
+    cannot say this: it also lists every column an expression merely reads. A relation unique
+    on a copy of ``x`` is unique on ``x``, so a key can be re-expressed through it. Anything
+    computed, a union, or a cycle returns ``None``, the safe direction."""
+    seen: set[ColumnRef] = set()
+    while col not in seen:
+        seen.add(col)
+        derivation = graph.derivation(col)
+        if derivation is None:
+            return col if col.source.kind in BASE_SOURCE_KINDS else None
+        nxt = copied_column(derivation)
+        if nxt is None:
+            return None
+        col = nxt
+    return None
+
+
 # The operator-transfer alias re-exported for callers that build properties next
 # to the propagator; the canonical definition lives in dblect.lineage.facts.
 __all__ = [
@@ -496,7 +534,9 @@ __all__ = [
     "OperatorTransfer",
     "UnionConfluence",
     "attach_column_ref",
+    "copied_column",
     "propagate",
     "resolved_column_ref",
     "run",
+    "value_origin",
 ]

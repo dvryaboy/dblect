@@ -354,3 +354,10 @@ def test_unrenderable_conjunct_is_an_atom_that_matches_only_itself() -> None:
     assert same == _atoms(_UNRENDERABLE)
     assert same != _atoms(_UNRENDERABLE.replace("35", "36"))
     assert same != _atoms(_UNRENDERABLE.replace("birthday", "deathday"))
+
+
+def test_parenthesized_conjunctions_split_into_the_same_atoms() -> None:
+    flat = _atoms("status = 'paid' AND amount > 0 AND region = 'eu'")
+    assert _atoms("(status = 'paid' AND amount > 0) AND (region = 'eu')") == flat
+    assert _atoms("((status = 'paid' AND (amount > 0 AND region = 'eu')))") == flat
+    assert len(flat) == 3

@@ -25,6 +25,7 @@ from dblect.types.bridge import (
     dbt_relationship_edges,
     domain_tag,
     foreign_key_edges,
+    relationship_tested_edges,
     resolve_contracts,
 )
 from dblect.types.contract import (
@@ -104,5 +105,6 @@ __all__ = [
     "domain_tag",
     "foreign_key_edges",
     "isolated_registry",
+    "relationship_tested_edges",
     "resolve_contracts",
 ]

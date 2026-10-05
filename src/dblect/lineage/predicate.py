@@ -35,6 +35,8 @@ import sqlglot.expressions as exp
 from sqlglot import Expr
 from sqlglot.errors import SqlglotError
 
+from dblect.sql import _sqlglot as sg
+
 
 class Op(StrEnum):
     """An order comparison between a term and a literal."""
@@ -188,7 +190,7 @@ def implies(strong: Expr, weak: Expr) -> bool:
     if isinstance(strong, exp.Or):
         return implies(strong.left, weak) and implies(strong.right, weak)
 
-    conjuncts = _conjuncts(strong)
+    conjuncts = sg.conjunctive_leaves(strong)
     weak_canon = _canon(weak)
     if any(_canon(c) == weak_canon for c in conjuncts):
         return True
@@ -239,7 +241,7 @@ def atoms_of(e: Expr) -> frozenset[Canon]:
     """The conjuncts of ``e``, each canonicalised to an atom. A conjunct outside the
     fragment (an ``OR``, an unmodelled shape) becomes an :class:`OpaqueAtom`, carried
     but inert to interval reasoning."""
-    return frozenset(_canon(c) for c in _conjuncts(e))
+    return frozenset(_canon(c) for c in sg.conjunctive_leaves(e))
 
 
 def atom_column(atom: Canon) -> str | None:
@@ -284,13 +286,6 @@ def unparen(e: Expr) -> Expr:
     while isinstance(e, exp.Paren) and isinstance(e.this, Expr):
         e = e.this
     return e
-
-
-def _conjuncts(e: Expr) -> list[Expr]:
-    e = unparen(e)
-    if isinstance(e, exp.And):
-        return _conjuncts(e.left) + _conjuncts(e.right)
-    return [e]
 
 
 def _canon(e: Expr) -> Canon:

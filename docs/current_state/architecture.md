@@ -210,10 +210,11 @@ The facts themselves come from declarations (`unique`, dbt-utils `unique_combina
 - A key whose columns are a **subset** of the window's key set counts as coverage. Any superkey of a key is still a key (e.g. `id` declared unique covers a `(id, ts)` ranking).
 - Only **bare column** order/partition keys are reasoned about. `order by date_trunc(...)` and similar computed keys are skipped.
 
-**`detect_join_fanout`** flags JOINs whose joined-in side has known keys, none covering the join's equality predicate. A JOIN multiplies rows when the joined-in side has duplicates on the join key; a key of the joined-in side within the join columns rules that out.
+**`detect_join_fanout`** flags JOINs that repeat the rows of a side a duplicate-sensitive consumer reads: a side repeats when the join columns cover no known key of the other side, and the verdict is the same whichever table is written first. The full contract is in the function's docstring.
 
 - Every SELECT is inspected (including JOINs inside CTEs).
-- The joined-in side must resolve to known keys (a ref'd model, or an in-scope CTE via the scope index). With no keys, we stay silent.
+- A side is blamed only through a known key (a ref'd model, or an in-scope CTE via the scope index); a side with no known keys is never blamed.
+- A key declared on the model (`unique` test, contract grain, `unique_key` config) that a plain projection reads only from a repeated side also fires.
 - The ON predicate must be a **conjunction of equalities between bare columns**, exactly one of which is qualified by the joined-in side's alias. Disjunctions, function calls, and range comparisons are skipped conservatively.
 - A key whose columns are a **subset** of the join's right-side equality columns counts as coverage (superkey logic, same as window-keys).
 - `CROSS JOIN` is skipped (it's an explicit cartesian, not a fanout-by-accident).
