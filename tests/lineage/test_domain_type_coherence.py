@@ -386,7 +386,7 @@ def _holds(key: str, *, members: frozenset[str] | None = _ENUM) -> bool:
         ("upper(currency)", _ENUM, True),
         ("upper(currency)", _CASE_COLLIDING, False),
         ("upper(currency)", None, False),
-        ("upper(currency)", frozenset(), False),
+        ("upper(currency)", frozenset[str](), False),
         ("upper(currency)", frozenset({"é", "E"}), False),
         ("lower(currency)", _ENUM, True),
         ("lower(currency)", _CASE_COLLIDING, False),
