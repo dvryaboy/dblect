@@ -25,7 +25,7 @@ from sqlglot import Expr
 
 from dblect.lineage.facts.lattice import Lattice
 from dblect.lineage.facts.model import Annotation, Fact, ScopeKind
-from dblect.lineage.graph import AggregationSite, ColumnRef, SourceRef
+from dblect.lineage.graph import AggregationSite, ColumnRef, GroupKey, SourceRef
 from dblect.lineage.semiring import Semiring
 
 if TYPE_CHECKING:
@@ -109,6 +109,27 @@ class CoherenceGuard(Generic[K, F]):
     fd: PropertyRef[F, SourceRef]
     companions: Callable[[K], Collection[ColumnRef]]
     entails: Callable[[F, frozenset[str], str], bool]
+    key_verdict: Callable[[GroupKey, ColumnRef], KeyVerdict]
+    """Whether one GROUP BY key determines a companion within each group. Decided by the
+    carrying property, since it rests on facts the engine does not know (a column's
+    declared values and nullability). Membership of the bare column is the simplest case
+    of it."""
+
+
+class KeyVerdict(StrEnum):
+    """What one GROUP BY key says about one companion. ``HOLDS`` discharges it; the rest name
+    why a key that mentions the companion (or could) does not, so a diagnostic can show the
+    expression that defeated the proof. Closed: every key gets exactly one."""
+
+    HOLDS = auto()
+    UNRELATED = auto()
+    """The key is built from some other column; it neither proves nor defeats the companion."""
+    OPAQUE = auto()
+    """A key the vocabulary does not name; it might determine the companion, and is no claim."""
+    COLLIDES = auto()
+    """A wrapper that maps two declared values of the companion to one key value."""
+    UNKNOWN_DOMAIN = auto()
+    """A wrapper that is injective only on declared values, and none are declared."""
 
 
 class DischargePath(StrEnum):
@@ -134,6 +155,14 @@ class UndischargedCompanion:
 
     companion: ColumnRef
     paths_tried: frozenset[DischargePath]
+    blocked: tuple[BlockedKey, ...] = ()
+    """The group keys that could have held the companion and did not, each with its verdict."""
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedKey:
+    key: GroupKey
+    verdict: KeyVerdict
 
 
 @dataclass(frozen=True, slots=True)

@@ -51,19 +51,20 @@ from dblect.lineage.facts.property import (
     AxisDisplay,
     CoherenceGuard,
     DepContext,
+    KeyVerdict,
     OperatorTransfer,
     Property,
     PropertyRef,
     column_property,
 )
-from dblect.lineage.graph import ColumnRef, SourceRef
+from dblect.lineage.graph import ColumnRef, GroupKey, SourceRef
 from dblect.lineage.properties.functional_dependency import FDSet, determines
 from dblect.lineage.properties.nullability import OUTER_JOIN_NULL_META
 from dblect.lineage.properties.uniqueness import CandidateKeySet
 from dblect.lineage.property import resolved_column_ref
 from dblect.sql import AGGREGATE_BEHAVIORS, AggregateBehavior
 from dblect.sql import _sqlglot as sg
-from dblect.sql.vocab import CastTarget, cast_target
+from dblect.sql.vocab import CastTarget, KeyShape, cast_target
 
 # --- unit and tag identities -------------------------------------------------
 
@@ -726,6 +727,87 @@ def companion_columns(tag: DomainTag) -> frozenset[ColumnRef]:
     return frozenset(out)
 
 
+# --- what a group key holds of a companion ----------------------------------------
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CompanionFacts:
+    """The declared facts about a companion column that decide what a computed group key
+    holds of it. ``members`` is the closed set of values the companion is declared to take
+    (a ``UnitEnum``'s members), ``None`` when nothing is declared, which leaves a
+    value-mapping key unproven."""
+
+    members: Callable[[ColumnRef], frozenset[str] | None]
+
+
+def _printable_ascii(value: str) -> bool:
+    return all(" " <= ch <= "~" for ch in value)
+
+
+def _wrapped(shape: KeyShape, value: str) -> str:
+    """What a value-mapping key shape does to one member. Restricted to printable ASCII by
+    the caller, where upper, lower and trim (spaces only) mean the same in every dialect."""
+    match shape:
+        case KeyShape.UPPER:
+            return value.upper()
+        case KeyShape.LOWER:
+            return value.lower()
+        case KeyShape.TRIM:
+            return value.strip(" ")
+        case KeyShape.TEXT_CAST:
+            return value
+        case KeyShape.COLUMN | KeyShape.COALESCE_HEAD | KeyShape.OPAQUE:
+            raise AssertionError(f"{shape} does not map member values")
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _injective_on(shape: KeyShape, members: frozenset[str]) -> bool:
+    """Whether a value-mapping key keeps every two declared members apart. A member outside
+    printable ASCII has dialect-dependent case and whitespace rules, so it is no claim."""
+    if not all(_printable_ascii(m) for m in members):
+        return False
+    return len({_wrapped(shape, m) for m in members}) == len(members)
+
+
+def key_verdict_reader(
+    facts: CompanionFacts | None,
+) -> Callable[[GroupKey, ColumnRef], KeyVerdict]:
+    """The coherence guard's per-key decision: does this key determine ``companion`` within
+    each group?
+
+    * a bare column holds itself;
+    * ``COALESCE(c, ...)`` with ``c`` first holds: it equals ``c`` wherever ``c`` is
+      non-null, and the fallback is the author's statement of the unit a NULL ``c`` means,
+      the same kind of claim a declaration makes;
+    * upper, lower, trim and a lossless text cast hold when the map keeps every declared
+      member apart (a collision merges two units into one group);
+    * anything else makes no claim.
+
+    Without ``facts`` only the bare column holds."""
+
+    def verdict(key: GroupKey, companion: ColumnRef) -> KeyVerdict:
+        if key.shape is KeyShape.OPAQUE:
+            return KeyVerdict.OPAQUE
+        if key.column != companion:
+            return KeyVerdict.UNRELATED
+        match key.shape:
+            case KeyShape.COLUMN | KeyShape.COALESCE_HEAD:
+                return KeyVerdict.HOLDS
+            case KeyShape.UPPER | KeyShape.LOWER | KeyShape.TRIM | KeyShape.TEXT_CAST:
+                members = facts.members(companion) if facts is not None else None
+                if not members:  # undeclared, or declared with no values: nothing to prove on
+                    return KeyVerdict.UNKNOWN_DOMAIN
+                return (
+                    KeyVerdict.HOLDS if _injective_on(key.shape, members) else KeyVerdict.COLLIDES
+                )
+            case _ as unreachable:
+                assert_never(unreachable)
+
+    return verdict
+
+
 # --- naming a tag for the dropped-refinement warning --------------------------
 
 
@@ -828,6 +910,7 @@ def domain_type_property(
     *,
     fd: PropertyRef[FDSet, SourceRef] | None = None,
     uniqueness: PropertyRef[CandidateKeySet, SourceRef] | None = None,
+    companion_facts: CompanionFacts | None = None,
 ) -> Property[DomainTag, ColumnRef]:
     """The column-scoped domain-type property over a caller-supplied grounding.
 
@@ -844,13 +927,23 @@ def domain_type_property(
     edge is declared in ``depends_on``, so the registry evaluates dependencies first and
     the guard's read is always answered.
 
+    ``companion_facts`` lets a computed group key discharge a companion: a ``COALESCE``
+    headed by the companion (its fallback is the author's claim, no nullability is
+    checked), or an upper, lower, trim or text cast that keeps its
+    declared members apart. Without it only a bare column discharges by key.
+
     Passing the uniqueness property's ref lets a non-distinct ``COUNT`` read the key of
     the relation it counts, so it can carry that key's entity.
     """
     guard = (
         None
         if fd is None
-        else CoherenceGuard(fd=fd, companions=companion_columns, entails=determines)
+        else CoherenceGuard(
+            fd=fd,
+            companions=companion_columns,
+            entails=determines,
+            key_verdict=key_verdict_reader(companion_facts),
+        )
     )
     return column_property(
         name="domain_type",

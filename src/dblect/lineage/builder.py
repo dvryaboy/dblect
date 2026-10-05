@@ -43,6 +43,7 @@ from dblect.lineage.graph import (
     ColumnLineageGraph,
     ColumnRef,
     Derivation,
+    GroupKey,
     RelationLineageGraph,
     SourceKind,
     SourceRef,
@@ -56,7 +57,7 @@ from dblect.manifest import Node as ManifestNode
 from dblect.sql import SQLParseError, parse_sql
 from dblect.sql import _sqlglot as sg
 from dblect.sql._sqlglot import stored_column_name
-from dblect.sql.vocab import implicit_column_names
+from dblect.sql.vocab import KeyShape, implicit_column_names, key_head
 
 
 @dataclass(frozen=True, slots=True)
@@ -798,10 +799,12 @@ class _Walker:
         key = id(scope)
         if key not in self._site_by_scope:
             sel = scope.expression
+            keys = self._group_keys(sel, scope) if isinstance(sel, exp.Select) else ()
             self._site_by_scope[key] = (
                 AggregationSite(
                     input_source=self._aggregation_input(sel, scope),
-                    group_refs=self._group_refs(sel, scope),
+                    group_refs=self._group_refs(keys),
+                    group_keys=keys,
                     pinned=self._pinned_refs(sel, scope),
                 )
                 if isinstance(sel, exp.Select)
@@ -826,28 +829,40 @@ class _Walker:
             return self._scope_source_ref.get(id(src))
         return None
 
-    def _group_refs(self, sel: exp.Select, scope: Scope) -> frozenset[ColumnRef] | None:
-        """The GROUP BY columns resolved to their upstream refs; ``None`` for a
-        group shape that is not all plain resolvable columns (positional or
-        computed keys), which a guard must treat as unprovable."""
+    def _group_refs(self, keys: tuple[GroupKey, ...]) -> frozenset[ColumnRef] | None:
+        """The GROUP BY columns resolved to their upstream refs; ``None`` for a group
+        shape that is not all plain resolvable columns (computed or unresolvable keys),
+        which a guard must treat as unprovable. No keys (no GROUP BY, or the ``GROUP BY ()``
+        grand-total set) is the whole-relation fold, the empty set."""
+        refs: set[ColumnRef] = set()
+        for key in keys:
+            if key.shape is not KeyShape.COLUMN or key.column is None:
+                return None
+            refs.add(key.column)
+        return frozenset(refs)
+
+    def _group_keys(self, sel: exp.Select, scope: Scope) -> tuple[GroupKey, ...]:
+        """Each GROUP BY key read as a shape over one resolved column. ``GROUP BY ()`` is the
+        grand-total grouping set (an empty ``exp.Tuple``) and contributes no key, exactly like
+        no GROUP BY. A key whose column does not resolve is ``OPAQUE``, never guessed."""
         group = sel.args.get("group")
-        if not isinstance(group, exp.Group) or not group.expressions:
-            return frozenset()
-        # ``GROUP BY ()`` is the grand-total grouping set: an empty ``exp.Tuple`` that
-        # folds the whole relation into one group, exactly like no GROUP BY. It grounds
-        # the same whole-relation facts as the empty case above rather than the
-        # "unresolvable keys" ``None`` below (which marks real but opaque group keys).
-        if all(isinstance(g, exp.Tuple) and not g.expressions for g in group.expressions):
-            return frozenset()
-        out: set[ColumnRef] = set()
+        if not isinstance(group, exp.Group):
+            return ()
+        out: list[GroupKey] = []
         for g in group.expressions:
-            if not isinstance(g, exp.Column) or isinstance(g.this, exp.Star):
-                return None
-            ref = self._resolve_column(g, scope=scope)
-            if ref is None:
-                return None
-            out.add(ref)
-        return frozenset(out)
+            if isinstance(g, exp.Tuple) and not g.expressions:
+                continue
+            head = key_head(g)
+            ref = (
+                self._resolve_column(head.column, scope=scope)
+                if head.column is not None and not isinstance(head.column.this, exp.Star)
+                else None
+            )
+            if head.column is None or ref is None:
+                out.append(GroupKey(KeyShape.OPAQUE, None, g.sql()))
+                continue
+            out.append(GroupKey(head.shape, ref, g.sql()))
+        return tuple(out)
 
     def _pinned_refs(self, sel: exp.Select, scope: Scope) -> frozenset[ColumnRef]:
         """Columns the scope's own WHERE equates to a literal, constant across

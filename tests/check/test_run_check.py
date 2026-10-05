@@ -22,7 +22,16 @@ from dblect.check import CheckFindingKind, run_check
 from dblect.contracts import ContractSelf, contract
 from dblect.demo import Currency, Money
 from dblect.manifest import Manifest, ResourceType
-from dblect.types import DomainType, Integer, IssueCode, ModelContract, NominalEnum, Varchar
+from dblect.types import (
+    Decimal,
+    DomainType,
+    Integer,
+    IssueCode,
+    ModelContract,
+    NominalEnum,
+    UnitEnum,
+    Varchar,
+)
 from tests._manifest_builders import cols as _cols
 from tests._manifest_builders import manifest as _manifest
 from tests._manifest_builders import node as _node
@@ -524,6 +533,93 @@ def test_sum_grouped_by_a_computed_key_is_flagged() -> None:
     [agg] = [f for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED]
     assert agg.column == "total"
     assert "currency" in agg.message
+
+
+# --- computed group keys (#331) -------------------------------------------------
+
+
+class Spelling(UnitEnum):
+    SHOUTED = "USD"
+    QUIET = "usd"
+
+
+class SpelledMoney(DomainType):
+    amount: Decimal(38, 0)
+    currency: Spelling
+
+
+def _ccy_manifest(sql: str) -> Manifest:
+    source = "source.shop.raw.orders"
+    nodes = [
+        _node(
+            source,
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(
+                amount="DECIMAL", currency="VARCHAR", merchant_id="INT", default_currency="VARCHAR"
+            ),
+        ),
+        _node(
+            "source.shop.raw.merchants",
+            kind=ResourceType.SOURCE,
+            sql=None,
+            columns=_cols(merchant_id="INT", default_currency="VARCHAR"),
+        ),
+        _node(
+            "model.shop.by_ccy",
+            kind=ResourceType.MODEL,
+            sql=sql,
+            columns=_cols(currency="VARCHAR", total="DECIMAL"),
+        ),
+    ]
+    return _manifest(*nodes)
+
+
+_COALESCED = (
+    "SELECT coalesce(currency, 'USD') AS currency, SUM(amount) AS total FROM orders GROUP BY 1"
+)
+_COALESCED_JOIN = (
+    "SELECT coalesce(o.currency, m.default_currency) AS currency, SUM(o.amount) AS total "
+    "FROM orders o LEFT JOIN merchants m ON o.merchant_id = m.merchant_id GROUP BY 1"
+)
+
+
+def _aggregation_findings_of(manifest: Manifest) -> list[str]:
+    report = run_check(manifest, _DUCKDB)
+    return [
+        f.message for f in report.findings if f.kind is CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
+    ]
+
+
+def _orders_contract() -> None:
+    class Orders(ModelContract):
+        dbt_model = "orders"
+        amount: Money.columns(amount="amount", currency="currency")
+
+
+def test_coalesced_group_key_is_quiet() -> None:
+    # The fallback states the currency of a NULL one, so the key holds it constant.
+    _orders_contract()
+    assert _aggregation_findings_of(_ccy_manifest(_COALESCED)) == []
+    assert _aggregation_findings_of(_ccy_manifest(_COALESCED_JOIN)) == []
+
+
+def test_upper_over_declared_currencies_is_quiet() -> None:
+    # Every ISO code is its own upper-case form, so upper() keeps the members apart.
+    _orders_contract()
+    sql = "SELECT upper(currency) AS currency, SUM(amount) AS total FROM orders GROUP BY upper(currency)"
+    assert _aggregation_findings_of(_ccy_manifest(sql)) == []
+
+
+def test_upper_over_currencies_that_differ_only_by_case_names_the_collision() -> None:
+    class Orders(ModelContract):
+        dbt_model = "orders"
+        amount: SpelledMoney.columns(amount="amount", currency="currency")
+
+    sql = "SELECT upper(currency) AS currency, SUM(amount) AS total FROM orders GROUP BY upper(currency)"
+    [message] = _aggregation_findings_of(_ccy_manifest(sql))
+    assert "UPPER(orders.currency)" in message
+    assert "two declared values" in message
 
 
 def test_declared_dependency_discharges_the_sum() -> None:
