@@ -26,6 +26,7 @@ import sqlglot.expressions as exp
 from dblect.sql import _sqlglot as sg
 from dblect.sql.aggregates import aggregate_order_use
 from dblect.sql.order_use import OrderUse
+from dblect.sql.patterns import contains_non_deterministic
 
 __all__ = ["window_order_use", "window_tie_independent"]
 
@@ -44,8 +45,9 @@ _WINDOW_FUNCTIONS: Mapping[type[exp.Expr], OrderUse] = {
     exp.NthValue: OrderUse.SEQUENCE,
 }
 
-# Nodes whose value need not repeat for the same row, or that bring rows of their own.
-_UNDETERMINED_NODES = (exp.Select, exp.Subquery, exp.Order, exp.Window, exp.Rand, exp.Uuid)
+# Nodes that bring rows or an order of their own. Volatile calls are matched by
+# `contains_non_deterministic`.
+_UNDETERMINED_NODES = (exp.Select, exp.Subquery, exp.Order, exp.Window)
 
 
 class _FrameKind(StrEnum):
@@ -106,7 +108,7 @@ def _reads_only(fn: exp.Expr, determined: frozenset[str]) -> bool:
     """Whether every column ``fn`` reads is in ``determined`` and nothing in its arguments
     can differ between evaluations for the same row."""
     for arg in fn.iter_expressions():
-        if arg.find(*_UNDETERMINED_NODES) is not None:
+        if arg.find(*_UNDETERMINED_NODES) is not None or contains_non_deterministic(arg):
             return False
         if any(sg.column_name(col) not in determined for col in arg.find_all(exp.Column)):
             return False

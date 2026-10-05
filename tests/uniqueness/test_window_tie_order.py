@@ -173,6 +173,27 @@ def test_snowflake_spellings(window: str, fires: bool) -> None:
     assert _fires(window, {}, dialect="snowflake") is fires
 
 
+@pytest.mark.parametrize(
+    ("dialect", "volatile"),
+    [
+        ("postgres", "nextval('s')"),
+        ("postgres", "clock_timestamp()"),
+        ("postgres", "statement_timestamp()"),
+        ("postgres", "timeofday()"),
+        ("postgres", "random()"),
+        ("snowflake", "seq4()"),
+        ("snowflake", "uniform(1, 10, random())"),
+        ("bigquery", "generate_uuid()"),
+        ("duckdb", "uuid()"),
+    ],
+)
+def test_volatile_call_in_value_function_fires(dialect: str, volatile: str) -> None:
+    """A value function that reads a volatile call is not pinned by the order, even when the
+    order determines every column it reads."""
+    assert _fires(f"first_value({volatile}) over (order by a)", _A_DETERMINES_B, dialect=dialect)
+    assert _fires(f"first_value(a + {volatile}) over (order by a)", {}, dialect=dialect)
+
+
 def test_unknown_function_fires() -> None:
     assert _fires(_UNKNOWN, {})
     assert _fires(_UNKNOWN, _A_DETERMINES_B)

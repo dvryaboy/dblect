@@ -123,7 +123,14 @@ _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
         exp.CurrentUser,
         exp.SessionUser,
         exp.Rand,
+        exp.Randn,
+        exp.Randstr,
         exp.Uuid,
+        exp.Seq1,
+        exp.Seq2,
+        exp.Seq4,
+        exp.Seq8,
+        exp.Systimestamp,
     }
 )
 
@@ -134,7 +141,18 @@ _NON_DETERMINISTIC_TYPED: frozenset[type[Expr]] = frozenset(
 # set is handed to `make_non_determinism_detector`. Matched case-insensitively, so
 # every entry must be lowercase.
 PORTABLE_NON_DETERMINISTIC_BUILTINS: frozenset[str] = frozenset(
-    {"now", "current_database", "current_schema", "gen_random_uuid", "sysdate"}
+    {
+        "now",
+        "current_database",
+        "current_schema",
+        "gen_random_uuid",
+        "sysdate",
+        "nextval",
+        "clock_timestamp",
+        "statement_timestamp",
+        "transaction_timestamp",
+        "timeofday",
+    }
 )
 
 
@@ -878,6 +896,13 @@ def _load_bearing_scopes(sel: exp.Select) -> list[tuple[str, Expr]]:
         if order is not None:
             scopes.extend(("a window ORDER BY", e) for e in order.expressions)
     return scopes
+
+
+def contains_non_deterministic(
+    e: Expr, names: frozenset[str] = PORTABLE_NON_DETERMINISTIC_BUILTINS
+) -> bool:
+    """Whether any call under ``e`` can return a different value on each evaluation."""
+    return bool(_find_non_deterministic(e, names))
 
 
 def _find_non_deterministic(e: Expr, names: frozenset[str]) -> list[Expr]:
