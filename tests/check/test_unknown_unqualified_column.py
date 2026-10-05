@@ -178,3 +178,39 @@ def test_a_correlated_name_may_belong_to_an_incomplete_enclosing_source(sql: str
 def test_an_implicit_column_is_never_reported(adapter: str, name: str) -> None:
     report = run_check(_p_world(f"select {name} from raw.p"), profile_for_adapter(adapter))
     assert not report.unbuilt
+
+
+@pytest.mark.parametrize(
+    ("dialect", "name"),
+    [
+        ("sqlite", "rowid"),
+        ("sqlite", "oid"),
+        ("sqlite", "_rowid_"),
+        ("spark", "_metadata"),
+        ("databricks", "_metadata"),
+        ("trino", '"$path"'),
+        ("trino", '"$file_size"'),
+        ("trino", '"$file_modified_time"'),
+        ("clickhouse", "_part"),
+        ("clickhouse", "_partition_id"),
+        ("clickhouse", "_table"),
+        ("oracle", "rowid"),
+        ("oracle", "rownum"),
+        ("snowflake", "metadata$filename"),
+        ("snowflake", "metadata$file_row_number"),
+        ("snowflake", "metadata$file_last_modified"),
+        ("snowflake", "metadata$file_content_key"),
+        ("snowflake", "metadata$start_scan_time"),
+        ("bigquery", "_table_suffix"),
+        ("duckdb", "rowid"),
+        ("postgres", "ctid"),
+    ],
+)
+def test_a_dialect_pseudo_column_is_never_reported(dialect: str, name: str) -> None:
+    build = build_manifest_graph(_p_world(f"select {name} from raw.p"), dialect=dialect)
+    assert build.issues == ()
+
+
+def test_the_same_name_is_reported_where_the_dialect_has_no_such_column() -> None:
+    build = build_manifest_graph(_p_world("select _metadata from raw.p"), dialect="duckdb")
+    assert [i.message for i in build.issues] == ["sqlglot: Unknown column: _metadata"]

@@ -25,14 +25,15 @@ upstream model's SQL.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TypeVar, cast
 
 from sqlglot import Expr
 from sqlglot import expressions as exp
-from sqlglot.errors import SqlglotError
+from sqlglot.errors import OptimizeError, SqlglotError
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.resolver import Resolver
 from sqlglot.optimizer.scope import Scope, ScopeType, build_scope
@@ -100,10 +101,44 @@ class ModelResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class UnknownColumnReference:
+    """A column reference that no relation in its scope has, where every such relation's
+    column set is complete, so the reference fails at run time rather than merely being unseen.
+
+    ``relations`` are the display names of the relations consulted (one for a qualified
+    reference, every visible one for a bare name) and ``known`` their combined columns."""
+
+    node: exp.Column
+    relations: tuple[str, ...]
+    known: tuple[str, ...]
+
+    @property
+    def column(self) -> str:
+        return self.node.name
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownColumnSite:
+    model_unique_id: str
+    reference: UnknownColumnReference
+
+
+class UnknownColumnError(SqlglotError):
+    """Raised for a model that reads columns its complete relations lack. The message is
+    sqlglot's own ``Unknown column`` wording, so the coverage reason is the same whichever
+    layer found the column."""
+
+    def __init__(self, references: tuple[UnknownColumnReference, ...]) -> None:
+        super().__init__(f"Unknown column: {references[0].column}")
+        self.references = references
+
+
+@dataclass(frozen=True, slots=True)
 class BuildResult:
     graph: ColumnLineageGraph
     issues: tuple[BuildIssue, ...]
     resolution: tuple[ModelResolution, ...] = ()
+    unknown_columns: tuple[UnknownColumnSite, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +234,7 @@ def build_manifest_graph(
         cast("dict[str, object]", schema), dialect=dialect, normalize=True
     )
     issues: list[BuildIssue] = []
+    unknown_columns: list[UnknownColumnSite] = []
     resolution: list[ModelResolution] = []
     # Nodes whose column set is complete: catalogued, or models derived without an unexpanded star.
     complete_sources = {n.unique_id for n in manifest.nodes.values() if n.columns_complete}
@@ -242,6 +278,8 @@ def build_manifest_graph(
             raise
         except SqlglotError as e:
             issues.append(BuildIssue(model_unique_id=uid, message=f"sqlglot: {e}"))
+            if isinstance(e, UnknownColumnError):
+                unknown_columns.extend(UnknownColumnSite(uid, ref) for ref in e.references)
             continue
         except Exception as e:
             # Parse + qualify + scope-build is a deep call chain through
@@ -250,7 +288,7 @@ def build_manifest_graph(
             # blank lineage for every downstream model.
             issues.append(BuildIssue(model_unique_id=uid, message=f"{type(e).__name__}: {e}"))
             continue
-        if not walker.unexpanded_stars:
+        if not walker.unexpanded_stars and not walker.runtime_named_output:
             complete_sources.add(uid)
         resolution.append(
             ModelResolution(
@@ -262,7 +300,12 @@ def build_manifest_graph(
         )
         ColumnLineageGraph.fold_into(acc_edges, acc_exprs, per_model)
     graph = ColumnLineageGraph(edges=acc_edges, expressions=acc_exprs)
-    return BuildResult(graph=graph, issues=tuple(issues), resolution=tuple(resolution))
+    return BuildResult(
+        graph=graph,
+        issues=tuple(issues),
+        resolution=tuple(resolution),
+        unknown_columns=tuple(unknown_columns),
+    )
 
 
 def _record_output_columns(
@@ -339,25 +382,52 @@ def _walk_model(
         originals = _tag_references(original)
     expression: Expr = original.copy() if original is not None else parse_sql(sql, dialect=dialect)
     _expand_inline_struct_generators(expression)
-    expression = qualify(
-        expression,
-        dialect=dialect,
-        schema=cast("dict[str, object] | Schema | None", schema),
-        validate_qualify_columns=False,
-        identify=False,
-    )
+    schema_ = ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect)
+    try:
+        expression = qualify(
+            expression,
+            dialect=dialect,
+            schema=schema_,
+            validate_qualify_columns=False,
+            identify=False,
+        )
+    except OptimizeError as e:
+        # sqlglot's qualified-name check says only that a name is unknown. Re-read the
+        # untouched tree to learn whether the relation is complete (a finding) or not.
+        fresh = original.copy() if original is not None else parse_sql(sql, dialect=dialect)
+        _expand_inline_struct_generators(fresh)
+        fresh_scope = build_scope(normalize_identifiers(fresh, dialect=dialect))
+        references = (
+            _unknown_references(
+                fresh_scope,
+                schema=schema_,
+                name_to_source=name_to_source,
+                complete_sources=complete_sources,
+                dialect=dialect,
+                columns_of=lambda scope: [c for c in scope.columns if c.table],
+            )
+            if fresh_scope is not None
+            else []
+        )
+        if references:
+            raise UnknownColumnError(tuple(references)) from e
+        raise
     root_scope = build_scope(expression)
     if root_scope is None:
         raise SqlglotError("Cannot build scope from SQL")
-    _reject_unknown_unqualified_columns(
+    references = _unknown_references(
         root_scope,
-        schema=ensure_schema(cast("dict[str, object] | Schema | None", schema), dialect=dialect),
+        schema=schema_,
         name_to_source=name_to_source,
         complete_sources=complete_sources,
         dialect=dialect,
+        columns_of=lambda scope: scope.unqualified_columns,
     )
+    if references:
+        raise UnknownColumnError(tuple(references))
 
     walker = _Walker(model_uid=model_uid, self_ref=self_ref, name_to_source=name_to_source)
+    walker.runtime_named_output = _output_names_known_only_at_run_time(root_scope.expression)
     walker.walk(root_scope, scope_path=())
     if original is not None:
         walker.stamp_original(originals, root_scope)
@@ -368,62 +438,177 @@ def _walk_model(
 _PROJECTED_SOURCE_SCOPES = frozenset({ScopeType.CTE, ScopeType.DERIVED_TABLE})
 
 
-def _reject_unknown_unqualified_columns(
+def _unknown_references(
     root: Scope,
     *,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
     complete_sources: AbstractSet[str],
     dialect: str | None,
-) -> None:
-    """Raise ``Unknown column`` for a bare name that every source in sight lacks.
+    columns_of: Callable[[Scope], Iterable[exp.Column]],
+) -> list[UnknownColumnReference]:
+    """The ``columns_of`` references that no relation they could name has.
 
-    Exact only when each visible source (own and enclosing scopes', since a subquery can be
-    correlated) has a complete column set; any incomplete one may own the name, so it stays blind.
+    A qualified reference concerns only the relation its qualifier names; a bare one concerns
+    every visible relation (own and enclosing scopes', since a subquery can be correlated).
+    Either way the verdict is exact only when each relation concerned has a complete column
+    set; an incomplete one may own the name, so the reference stays unjudged.
     """
     implicit = implicit_column_names(dialect)
+    found: list[UnknownColumnReference] = []
+    # A correlated qualified reference is a column of both its own and the enclosing scope.
+    seen: set[int] = set()
     for scope in root.traverse():
         if not isinstance(scope.expression, exp.Select):
             continue
-        bare = [c for c in scope.unqualified_columns if c.name]
-        known = (
-            _known_source_columns(scope, schema, name_to_source, complete_sources) if bare else None
-        )
-        if known is None:
-            continue
-        for col in bare:
+        known_by_qualifier: dict[str | None, _KnownColumns | None] = {}
+        for col in columns_of(scope):
+            if not col.name or isinstance(col.this, exp.Star) or id(col) in seen:
+                continue
+            seen.add(id(col))
+            qualifier = col.table or None
+            if qualifier is None and _is_visible_relation_name(scope, col.name):
+                # A bare relation name is the whole row as a value (`to_json(p)`).
+                continue
+            if qualifier not in known_by_qualifier:
+                known_by_qualifier[qualifier] = _known_columns(
+                    scope, schema, name_to_source, complete_sources, qualifier=qualifier
+                )
+            known = known_by_qualifier[qualifier]
+            if known is None:
+                continue
             name = stored_column_name(col.name)
-            if name not in known and name not in implicit:
-                raise SqlglotError(f"Unknown column: {col.name}")
+            if name not in known.columns and name not in implicit:
+                found.append(
+                    UnknownColumnReference(
+                        node=col, relations=known.relations, known=tuple(sorted(known.columns))
+                    )
+                )
+    return found
 
 
-def _known_source_columns(
+def _is_visible_relation_name(scope: Scope, name: str) -> bool:
+    folded = stored_column_name(name)
+    visible: Scope | None = scope
+    while visible is not None:
+        if any(stored_column_name(alias) == folded for alias in visible.sources):
+            return True
+        visible = visible.parent
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _KnownColumns:
+    relations: tuple[str, ...]
+    columns: frozenset[str]
+
+
+def _known_columns(
     scope: Scope,
     schema: Schema,
     name_to_source: Mapping[str, SourceRef],
     complete_sources: AbstractSet[str],
-) -> frozenset[str] | None:
-    """Union of the columns of every source ``scope`` can see, or ``None`` when any is not
-    known complete (a relation outside ``complete_sources``, a star, pivot, lateral, unnest...)."""
-    out: set[str] = set()
+    *,
+    qualifier: str | None,
+) -> _KnownColumns | None:
+    """The columns a reference in ``scope`` could resolve against, or ``None`` when any
+    relation concerned is not known complete. ``qualifier`` names the one relation a qualified
+    reference concerns (the nearest scope that has it); ``None`` concerns every visible one."""
+    relations: list[str] = []
+    columns: set[str] = set()
     visible: Scope | None = scope
     while visible is not None:
-        if not visible.sources:
+        if qualifier is None and not visible.sources:
             return None
         resolver = Resolver(visible, schema, infer_schema=False)
         for alias, src in visible.sources.items():
-            if isinstance(src, exp.Table):
-                ref = name_to_source.get(sg.table_relation_key(src))
-                if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
-                    return None
-            elif src.scope_type not in _PROJECTED_SOURCE_SCOPES:
+            if qualifier is not None and alias != qualifier:
+                continue
+            known = _complete_source(alias, src, resolver, name_to_source, complete_sources)
+            if known is None:
                 return None
-            columns = resolver.get_source_columns(alias)
-            if not columns or "*" in columns:
-                return None
-            out.update(stored_column_name(c) for c in columns)
+            label, source_columns = known
+            if label not in relations:
+                relations.append(label)
+            columns |= source_columns
+        if qualifier is not None and relations:
+            break
         visible = visible.parent
-    return frozenset(out)
+    if not relations:
+        return None
+    return _KnownColumns(tuple(relations), frozenset(columns))
+
+
+def _complete_source(
+    alias: str,
+    src: exp.Table | Scope,
+    resolver: Resolver,
+    name_to_source: Mapping[str, SourceRef],
+    complete_sources: AbstractSet[str],
+) -> tuple[str, frozenset[str]] | None:
+    """A source's display name and columns, or ``None`` unless its column set is known complete
+    (a relation outside ``complete_sources``, a star, an unnamed projection, pivot, lateral,
+    unnest...)."""
+    if isinstance(src, exp.Table):
+        ref = name_to_source.get(sg.table_relation_key(src))
+        if src.args.get("pivots") or ref is None or ref.unique_id not in complete_sources:
+            return None
+        label = src.name
+    elif (
+        src.scope_type in _PROJECTED_SOURCE_SCOPES
+        and isinstance(src.expression, exp.Query)
+        and all(sel.output_name for sel in src.expression.selects)
+        and not _output_names_known_only_at_run_time(src.expression)
+    ):
+        label = alias
+    else:
+        return None
+    columns = _derived_column_names(src, resolver.get_source_columns(alias))
+    if not columns or "*" in columns:
+        return None
+    return label, frozenset(stored_column_name(c) for c in columns)
+
+
+def _derived_column_names(src: exp.Table | Scope, projected: Sequence[str]) -> list[str]:
+    """A CTE's or derived table's column names: its alias list (``c(a, b)``) renames the leading
+    projections, the rest keep their own names. The resolver reads only the projections, so on a
+    tree qualify has not rewritten it would miss the list."""
+    if isinstance(src, exp.Table):
+        return list(projected)
+    parent = src.expression.parent
+    alias = parent.args.get("alias") if parent is not None else None
+    listed = [c.name for c in alias.columns] if isinstance(alias, exp.TableAlias) else []
+    return [*listed, *projected[len(listed) :]]
+
+
+def _output_names_known_only_at_run_time(query: Expr) -> bool:
+    """Whether a query's output column names or count depend on data or catalog contents, so
+    its relation cannot be called complete. Decided from the leading projections' AST shape
+    (a set operation takes its names from its first arm); any query shape not listed is
+    treated as unknown."""
+    if isinstance(query, exp.Subquery):
+        return _output_names_known_only_at_run_time(query.this)
+    if isinstance(query, exp.SetOperation):
+        return _output_names_known_only_at_run_time(query.this)
+    if isinstance(query, exp.Select):
+        return any(_projection_expands_at_run_time(p) for p in query.expressions)
+    return True
+
+
+def _projection_expands_at_run_time(projection: Expr) -> bool:
+    """A projection that yields a data-dependent set of columns: ``COLUMNS(...)`` (a pattern
+    over the input's columns), a struct expansion (``(s).*``, ``t.*`` on a struct) and the
+    generators, whose width follows the value they open (``UNNEST`` of a struct, ``POSEXPLODE``,
+    ``INLINE``, ``STACK``). ``UNNEST``/``EXPLODE`` of an array literal is the one single-column
+    generator we can prove, which a column or any other argument is not."""
+    core = projection.this if isinstance(projection, exp.Alias) else projection
+    if isinstance(core, (exp.Columns, exp.Inline, exp.Stack, exp.Unnest)):
+        return True
+    if isinstance(core, (exp.Explode, exp.ExplodeOuter)):
+        return not (type(core) is exp.Explode and isinstance(core.this, exp.Array))
+    if isinstance(core, exp.Dot):
+        return isinstance(core.expression, exp.Star)
+    return isinstance(core, exp.Column) and isinstance(core.this, exp.Star)
 
 
 # Meta key carrying the reference-id tag that lets the builder map a column on its
@@ -579,6 +764,8 @@ class _Walker:
         self.resolved_columns = 0
         self.blind_columns = 0
         self.unexpanded_stars = 0
+        # Set by the caller from the model's root query; see ``_names_known_only_at_run_time``.
+        self.runtime_named_output = False
 
     def walk(
         self,

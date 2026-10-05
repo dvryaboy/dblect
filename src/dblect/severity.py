@@ -121,6 +121,7 @@ def _check_severity(kind: CheckFindingKind) -> Severity:
             | CheckFindingKind.AGGREGATION_NOT_WELL_TYPED
             | CheckFindingKind.JOIN_KEY_TYPE_MISMATCH
             | CheckFindingKind.DEAD_PREDICATE
+            | CheckFindingKind.UNKNOWN_COLUMN_REFERENCE
         ):
             return Severity.ERROR
         # A coverage gap, warned so thin coverage is visible without failing a run that

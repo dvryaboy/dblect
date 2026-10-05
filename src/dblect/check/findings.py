@@ -85,6 +85,12 @@ class CheckFindingKind(StrEnum):
     drop rather than a loud one, so it never claims the key is broken today. See
     ``docs/design/referential-drop-and-dead-predicate.md``."""
 
+    UNKNOWN_COLUMN_REFERENCE = auto()
+    """A query reads a column that its relation does not have, where that relation's
+    column set is fully known (a catalog, or columns derived from SQL), so the query fails
+    at run time. A relation with only a documented, possibly partial column list yields no
+    finding, since the column may exist; the model then stays a coverage entry alone."""
+
 
 @dataclass(frozen=True, slots=True)
 class CheckFinding:
