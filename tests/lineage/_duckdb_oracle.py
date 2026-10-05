@@ -13,7 +13,7 @@ DDL here if a future PBT needs another type.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 
 import duckdb
@@ -81,3 +81,29 @@ def assert_no_over_claims(
         counts = violations(c)
     bad = {label: n for label, n in counts.items() if n != 0}
     assert not bad, f"over-claimed: {bad} for sql={model_sql!r} tables={tables!r}"
+
+
+def assert_keys_unique(
+    con: duckdb.DuckDBPyConnection,
+    tables: Sequence[Table],
+    model_sql: str,
+    keys: Collection[Collection[str]],
+) -> None:
+    """Assert every key in ``keys`` has as many distinct key tuples as the model has
+    rows over the materialization (so it is genuinely unique)."""
+
+    def violations(c: duckdb.DuckDBPyConnection) -> dict[str, int]:
+        total = scalar(c, "SELECT COUNT(*) FROM _m")
+        out: dict[str, int] = {}
+        for key in keys:
+            cols = ", ".join(sorted(key))
+            distinct = scalar(c, f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols} FROM _m)")
+            # The violation count is the shortfall: zero when every row's key tuple is
+            # distinct, positive when duplicates collapse the DISTINCT count below the
+            # row count.
+            out[f"unsound key {sorted(key)} ({total} rows, {distinct} distinct tuples)"] = (
+                total - distinct
+            )
+        return out
+
+    assert_no_over_claims(con, tables, model_sql, violations)

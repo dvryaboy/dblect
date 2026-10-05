@@ -28,13 +28,26 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import TypeVar, cast
 
 import sqlglot.expressions as exp
 from sqlglot import Expr
 
 from dblect.lineage.graph import SourceRef
-from dblect.lineage.predicate import Canon, CmpAtom, InAtom, atom_column, rename_atom
+from dblect.lineage.predicate import (
+    Canon,
+    CmpAtom,
+    InAtom,
+    Lit,
+    LitKind,
+    Op,
+    atom_column,
+    atoms_of,
+    rename_atom,
+)
+from dblect.lineage.predicate import Column as PredColumn
+from dblect.lineage.properties.activation import activate
 from dblect.sql import _sqlglot as sg
 from dblect.sql import anti_join
 from dblect.sql.vocab import is_row_multiplying
@@ -240,14 +253,30 @@ def scope_facts(
     cte_scope: Mapping[str, Input],
     base_resolve: BaseResolve,
     record: dict[int, Input] | None = None,
+    derive_conditional: bool = True,
 ) -> Input:
     """The ``Input`` a SELECT or UNION scope projects. ``record``, when given,
     collects every nested scope's result and every resolved FROM/JOIN table's
-    ``Input`` by ``id(node)``."""
+    ``Input`` by ``id(node)``. ``derive_conditional`` lets the scope mint conditional
+    keys of its own (a projected ``ROW_NUMBER``) and activate carried ones against
+    its own filters; those are uniqueness claims, so a caller that reads
+    ``conditional`` as another claim turns it off."""
     if isinstance(node, exp.Select):
-        result = _select_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
+        result = _select_facts(
+            node,
+            cte_scope=cte_scope,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
+        )
     elif isinstance(node, exp.Union):
-        result = _union_facts(node, cte_scope=cte_scope, base_resolve=base_resolve, record=record)
+        result = _union_facts(
+            node,
+            cte_scope=cte_scope,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
+        )
     else:
         return _GIVE_UP  # INTERSECT, EXCEPT, or any other shape outside the modelled fragment
     if record is not None:
@@ -260,11 +289,18 @@ def _with_scope(
     cte_scope: Mapping[str, Input],
     base_resolve: BaseResolve,
     record: dict[int, Input] | None,
+    derive_conditional: bool,
 ) -> dict[str, Input]:
     return sg.with_scope(
         node,
         cte_scope,
-        lambda n, s: scope_facts(n, cte_scope=s, base_resolve=base_resolve, record=record),
+        lambda n, s: scope_facts(
+            n,
+            cte_scope=s,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
+        ),
     )
 
 
@@ -274,6 +310,7 @@ def _resolve_source(
     cte_scope: Mapping[str, Input],
     base_resolve: BaseResolve,
     record: dict[int, Input] | None,
+    derive_conditional: bool,
 ) -> tuple[str, Input] | None:
     if isinstance(node, exp.Table):
         alias = node.alias_or_name.lower()
@@ -287,7 +324,11 @@ def _resolve_source(
         if not isinstance(inner, Expr) or not alias:
             return None
         return alias.lower(), scope_facts(
-            inner, cte_scope=cte_scope, base_resolve=base_resolve, record=record
+            inner,
+            cte_scope=cte_scope,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
         )
     return None
 
@@ -426,18 +467,23 @@ def _left_join_breakdown(
 ) -> tuple[frozenset[str], frozenset[QCol]] | None:
     """A LEFT join's ON split around the joined-in ``alias``: its own columns
     (``on_a``) and the qualified columns they are equated to (``on_l``). ``None``
-    unless every leaf is a column equality touching ``alias`` exactly once. Built
+    unless every leaf is a column equality touching ``alias`` exactly once, or a
+    conjunct over ``alias`` alone: that only filters the joined side's rows, so each
+    left row still matches the rows its equalities select, fewer of them. Built
     leaf by leaf so ``on_l`` may span several accumulated aliases
     (``ON l1.x = a.d1 AND l2.y = a.d2``)."""
     if on is None:
         return None
-    leaves = sg.conjunctive_leaves(on)
-    pairs = sg.equality_column_pairs(on)
-    if len(pairs) != len(leaves):
-        return None
+    own = {id(leaf) for leaf in sg.local_conjuncts(on, alias=alias, require_qualifier=True)}
     on_a: set[str] = set()
     on_l: set[QCol] = set()
-    for left, right in pairs:
+    for leaf in sg.conjunctive_leaves(on):
+        if id(leaf) in own:
+            continue
+        pairs = sg.equality_column_pairs(leaf)
+        if len(pairs) != 1:
+            return None
+        ((left, right),) = pairs
         left_qc = _qcol(left, default_alias=default_alias)
         right_qc = _qcol(right, default_alias=default_alias)
         left_is_a = left_qc.alias == alias
@@ -659,20 +705,102 @@ class JoinChain:
         return frozenset(out) if out <= set(self.aliases) else None
 
 
+def source_filter_atoms(sel: exp.Select, alias: str) -> frozenset[Canon]:
+    """The atoms every row of ``alias`` that reaches the output satisfies, as the source's own
+    column names: the WHERE conjuncts local to ``alias``, plus the ON conjuncts local to it
+    from every join that drops ``alias``'s unmatched rows
+    (:func:`~dblect.sql._sqlglot.join_row_effects`). That covers the join that introduces
+    ``alias`` (INNER or LEFT) and any later INNER, RIGHT or SEMI join, whose ON rejects an
+    earlier source's row just as it rejects an unmatched one. A LEFT join's ON never filters
+    the preserved side, and a FULL join preserves both. If an earlier LEFT join null-pads
+    ``alias``, a later INNER ON conjunct drops those rows, since a padded NULL satisfies no
+    comparison. A WHERE conjunct holds of every output row, padded ones included, for the same
+    reason. Without a qualifier a column in a scope with several sources could belong to any of
+    them, so only a qualified one counts there."""
+    leaves: list[Expr] = []
+    where = sg.where_of(sel)
+    if where is not None and isinstance(where.this, Expr):
+        ambiguous = bool(sg.joins_of(sel)) or sg.nested_in_join_arm(sel)
+        leaves += sg.local_conjuncts(where.this, alias=alias, require_qualifier=ambiguous)
+    for effect in sg.join_row_effects(sel):
+        on = sg.on_of(effect.join)
+        if on is not None and alias.lower() in {a.lower() for a in effect.dropped_unmatched}:
+            leaves += sg.local_conjuncts(on, alias=alias, require_qualifier=True)
+    return frozenset[Canon]().union(*(atoms_of(leaf) for leaf in leaves))
+
+
+def _activate_keys(inp: Input, atoms: frozenset[Canon]) -> Input:
+    """``inp`` with every conditional key whose predicate ``atoms`` entail added to its keys:
+    the scope's own filter already restricts the source to the rows the key holds over."""
+    if not inp.conditional or not atoms:
+        return inp
+    keys = activate(
+        inp.keys,
+        ((frozenset({ck.key}), ck.predicate) for ck in inp.conditional),
+        atoms,
+        lambda have, new: have | new,
+    )
+    return replace(inp, keys=keys)
+
+
+# A row number is an integer from 1, so ``rn <= 1`` and ``rn < 2`` both select exactly the
+# top row of each partition. Both are minted because the entailment check reasons over
+# order, not over integrality: a consumer's ``rn < 2`` does not entail ``rn <= 1`` on its own.
+_TOP_RANK = tuple((op, Lit(LitKind.NUM, Decimal(bound))) for op, bound in ((Op.LE, 1), (Op.LT, 2)))
+
+
+def _rownumber_conditionals(
+    sel: exp.Select,
+    *,
+    from_alias: str,
+    classes: Mapping[Attr, frozenset[Attr]],
+    proj: _Projection,
+) -> frozenset[ConditionalKey]:
+    """The conditional keys of this SELECT's projected ``ROW_NUMBER() OVER (PARTITION BY p ...)
+    AS rn``: ``p`` is unique over the rows where ``rn`` is the top rank, because each partition
+    hands out rank 1 exactly once. Rank functions that tie give no such guarantee and mint
+    nothing, and neither does a partition that is not a set of projected bare columns. The key
+    and the predicate are in this scope's output names, so a consumer that filters ``rn`` in
+    its WHERE or ON activates the key. A window evaluates before QUALIFY, DISTINCT and LIMIT,
+    which only remove rows, so the claim survives them."""
+    out: set[ConditionalKey] = set()
+    for item in sel.expressions:
+        if not isinstance(item, exp.Alias) or not isinstance(item.this, Expr):
+            continue
+        window = sg.row_number_window(item.this)
+        name = item.alias.lower()
+        if window is None or name not in proj.computed or name in proj.duplicate_computed:
+            continue
+        partition = _qcol_set(sg.partition_of(window), default_alias=from_alias)
+        key = _rewrite(partition, classes, proj) if partition is not None else None
+        if key is None:
+            continue
+        out.update(
+            ConditionalKey(key, frozenset({CmpAtom(PredColumn(name), op, lit)}))
+            for op, lit in _TOP_RANK
+        )
+    return frozenset(out)
+
+
 def _select_facts(
     sel: exp.Select,
     *,
     cte_scope: Mapping[str, Input],
     base_resolve: BaseResolve,
     record: dict[int, Input] | None,
+    derive_conditional: bool,
 ) -> Input:
-    local = _with_scope(sel, cte_scope, base_resolve, record)
+    local = _with_scope(sel, cte_scope, base_resolve, record, derive_conditional)
 
     from_ = sg.from_of(sel)
     if from_ is None or not isinstance(from_.this, Expr):
         return _GIVE_UP  # no FROM, or a shape sqlglot did not give an Expr for
     from_resolved = _resolve_source(
-        from_.this, cte_scope=local, base_resolve=base_resolve, record=record
+        from_.this,
+        cte_scope=local,
+        base_resolve=base_resolve,
+        record=record,
+        derive_conditional=derive_conditional,
     )
     if from_resolved is None:
         return _GIVE_UP  # a FROM that is a function, UNNEST, VALUES, or other unmodelled shape
@@ -693,7 +821,11 @@ def _select_facts(
         if not isinstance(j.this, Expr):
             return _GIVE_UP  # a join source sqlglot did not give an Expr for
         resolved = _resolve_source(
-            j.this, cte_scope=local, base_resolve=base_resolve, record=record
+            j.this,
+            cte_scope=local,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
         )
         if resolved is None:
             return _GIVE_UP  # a join source that is a function, UNNEST, VALUES, or the like
@@ -721,9 +853,12 @@ def _select_facts(
         *,
         keep_fds: bool = True,
         key_filter: Callable[[Key], bool] | None = None,
+        filter_atoms: frozenset[Canon] = frozenset(),
     ) -> None:
         nonlocal scope_exact
         scope_exact = scope_exact and inp.exact
+        if derive_conditional:
+            inp = _activate_keys(inp, filter_atoms)
         facts.update(
             _input_facts(
                 alias,
@@ -738,7 +873,11 @@ def _select_facts(
             conditional_by_alias[alias] = inp.conditional
         active_aliases.append(alias)
 
-    mint(from_alias, from_resolved[1])
+    mint(
+        from_alias,
+        from_resolved[1],
+        filter_atoms=source_filter_atoms(sel, from_alias),
+    )
 
     for (alias, inp), j in zip(join_sources, joins, strict=True):
         side = sg.join_side_of(j)
@@ -758,6 +897,7 @@ def _select_facts(
                 inp,
                 keep_fds=False,
                 key_filter=(lambda k, on_a=on_a: k <= on_a) if clean else (lambda _k: False),
+                filter_atoms=source_filter_atoms(sel, alias),
             )
             if clean:
                 for c in on_a:
@@ -769,7 +909,7 @@ def _select_facts(
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
                 conditional_by_alias.pop(a2, None)
-            mint(alias, inp)
+            mint(alias, inp, filter_atoms=source_filter_atoms(sel, alias))
         elif side is sg.JoinSide.FULL:
             accumulated = frozenset(active_aliases)
             facts = {
@@ -781,9 +921,15 @@ def _select_facts(
             for a2 in accumulated:
                 declared_by_alias.pop(a2, None)
                 conditional_by_alias.pop(a2, None)
-            mint(alias, inp, keep_fds=False, key_filter=lambda _k: False)
+            mint(
+                alias,
+                inp,
+                keep_fds=False,
+                key_filter=lambda _k: False,
+                filter_atoms=source_filter_atoms(sel, alias),
+            )
         else:  # INNER, CROSS
-            mint(alias, inp)
+            mint(alias, inp, filter_atoms=source_filter_atoms(sel, alias))
             if side is sg.JoinSide.INNER:
                 on = sg.on_of(j)
                 if on is not None:
@@ -878,6 +1024,12 @@ def _select_facts(
         classes=classes,
         conditional_by_alias=conditional_by_alias,
     )
+    if derive_conditional:
+        result = replace(
+            result,
+            conditional=result.conditional
+            | _rownumber_conditionals(sel, from_alias=from_alias, classes=classes, proj=proj),
+        )
     return replace(result, exact=scope_exact)
 
 
@@ -1075,6 +1227,7 @@ def _union_facts(
     cte_scope: Mapping[str, Input],
     base_resolve: BaseResolve,
     record: dict[int, Input] | None,
+    derive_conditional: bool,
 ) -> Input:
     """The union merge: the declared instances every arm shares after positional
     alignment (derived facts are arm-local and die), plus the DISTINCT full-tuple
@@ -1087,13 +1240,19 @@ def _union_facts(
     if first is None or any(n is None or len(n) != len(first) for n in names):
         return Input(frozenset(), exact=False)  # an arm's output columns can't be read positionally
     keys = _union_key(u)
-    local = _with_scope(u, cte_scope, base_resolve, record)
+    local = _with_scope(u, cte_scope, base_resolve, record, derive_conditional)
     shared: frozenset[DeclaredFD] | None = None
     arms_exact = True
     for arm_names, arm in zip(names, arms, strict=True):
         assert arm_names is not None
         rename = {src: (dst,) for src, dst in zip(arm_names, first, strict=True)}
-        arm_input = scope_facts(arm, cte_scope=local, base_resolve=base_resolve, record=record)
+        arm_input = scope_facts(
+            arm,
+            cte_scope=local,
+            base_resolve=base_resolve,
+            record=record,
+            derive_conditional=derive_conditional,
+        )
         arms_exact = arms_exact and arm_input.exact
         aligned = _remap_declared(arm_input.declared, rename)
         shared = aligned if shared is None else shared & aligned

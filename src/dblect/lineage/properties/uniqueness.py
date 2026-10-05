@@ -603,6 +603,33 @@ def relation_reduce(
     _default: Annotation[CandidateKeySet],
     _sink: object = None,
 ) -> Annotation[CandidateKeySet]:
+    """Reduce a model's relational tree to its inferred candidate-key set, minting the
+    conditional keys its own SQL proves (a projected ``ROW_NUMBER``) and activating
+    carried ones against the scope's own filters."""
+    return _reduce(deriv, recurse, derive_conditional=True)
+
+
+def conditional_carrier_reduce(
+    deriv: Expr,
+    prop: Property[CandidateKeySet, SourceRef],
+    recurse: Callable[[SourceRef], Annotation[CandidateKeySet]],
+    _ctx: DepContext,
+    _default: Annotation[CandidateKeySet],
+    _sink: object = None,
+) -> Annotation[CandidateKeySet]:
+    """:func:`relation_reduce` for a carrier whose conditional payload is another claim
+    (nullability's conditional NON_NULL columns). It only renames and carries what it was
+    grounded with: a key the SQL mints is a uniqueness claim and would read there as a
+    NON_NULL one."""
+    return _reduce(deriv, recurse, derive_conditional=False)
+
+
+def _reduce(
+    deriv: Expr,
+    recurse: Callable[[SourceRef], Annotation[CandidateKeySet]],
+    *,
+    derive_conditional: bool,
+) -> Annotation[CandidateKeySet]:
     """Reduce a model's relational tree to its inferred candidate-key set.
 
     A base table resolves through ``recurse`` on its stamped ``SourceRef``, so
@@ -625,7 +652,9 @@ def relation_reduce(
         provisional = provisional or ann.provisional
         return Input(ann.value.keys, conditional=ann.value.conditional, exact=ann.exact)
 
-    resolved = scope_facts(deriv, cte_scope={}, base_resolve=base_resolve)
+    resolved = scope_facts(
+        deriv, cte_scope={}, base_resolve=base_resolve, derive_conditional=derive_conditional
+    )
     value = CandidateKeySet(resolved.keys, resolved.conditional)
     opacity = Opacity.CONCRETE if (resolved.keys or resolved.conditional) else Opacity.IMPLICIT
     return Annotation(value, opacity, provisional=provisional, exact=resolved.exact)

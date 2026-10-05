@@ -101,3 +101,20 @@ def test_unconditional_not_null_is_unaffected() -> None:
         _node("model.shop.dim", "SELECT email FROM events"),
     )
     assert res[_model_col("model.shop.dim", "email")] is Nullability.NON_NULL
+
+
+def test_a_window_rank_filter_does_not_make_the_partition_column_non_null() -> None:
+    """``rn = 1`` makes the partition unique, not present: a NULL partition value is one
+    group like any other, so the nullability carrier must not read the minted
+    conditional key as a NON_NULL claim."""
+    window = "SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY k) AS rn FROM events"
+    res = _activated(
+        _source("source.shop.raw.events"),
+        _node("model.shop.a", window, depends_on=frozenset({"source.shop.raw.events"})),
+        _node(
+            "model.shop.b",
+            "SELECT k FROM a WHERE rn = 1",
+            depends_on=frozenset({"model.shop.a"}),
+        ),
+    )
+    assert res[_model_col("model.shop.b", "k")] is not Nullability.NON_NULL
