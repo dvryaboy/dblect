@@ -630,27 +630,42 @@ def table_relation_key(t: exp.Table) -> str:
 
 
 def cte_shadows(table: exp.Table) -> bool:
-    """True when ``table`` is a bare reference to a CTE declared in an enclosing WITH,
-    walking outward from ``table``'s own position to honour lexical CTE scoping (a name
-    defined only in an unrelated sibling scope does not shadow a genuine relation read).
+    """True when ``table`` is a bare reference to a CTE it can see; see :func:`cte_of`."""
+    return cte_of(table) is not None
+
+
+def cte_of(table: exp.Table) -> exp.CTE | None:
+    """The CTE a bare ``table`` reference reads, or ``None`` for a genuine relation read.
+
+    The walk goes outward from ``table``'s own position to honour lexical CTE scoping: the
+    nearest enclosing WITH that declares the name binds it, and a name defined only in an
+    unrelated sibling scope binds nothing. A CTE's body sees only the CTEs declared before it
+    in its WITH (every one under RECURSIVE), so ``orders`` inside
+    ``with orders as (select * from orders)`` reads the relation.
 
     A CTE reference is never schema-qualified in SQL, so a schema-qualified ``table``
-    (``analytics.orders``) can only mean the real relation, never a CTE named ``orders``,
-    and this is ``False`` for it without walking anything.
+    (``analytics.orders``) can only mean the real relation, never a CTE named ``orders``.
     """
     if table.db:
-        return False
-    name = table.name
+        return None
+    name = table.name.lower()
+    child: Expr = table
     current: Expr | None = table.parent
     while current is not None:
-        if isinstance(current, exp.Select):
-            w = current.args.get("with_")
-            if isinstance(w, exp.With) and any(
-                isinstance(cte, exp.CTE) and cte.alias_or_name == name for cte in w.expressions
-            ):
-                return True
-        current = current.parent
-    return False
+        if isinstance(current, exp.With):
+            ctes = [cte for cte in current.expressions if isinstance(cte, exp.CTE)]
+            within = next((i for i, cte in enumerate(ctes) if cte is child), None)
+            if within is not None and not current.args.get("recursive"):
+                ctes = ctes[:within]
+            for cte in reversed(ctes):
+                if cte.alias_or_name.lower() == name:
+                    return cte
+        elif (w := current.args.get("with_")) is not None and w is not child:
+            for cte in reversed(w.expressions):
+                if isinstance(cte, exp.CTE) and cte.alias_or_name.lower() == name:
+                    return cte
+        child, current = current, current.parent
+    return None
 
 
 def literal_constant(e: Expr) -> exp.Literal | exp.Boolean | None:
