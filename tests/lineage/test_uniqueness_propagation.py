@@ -645,6 +645,20 @@ def test_unaliased_derived_tables_in_one_select_stay_distinct_sources() -> None:
     assert _key("id") not in scopes[id(tree)].keys
 
 
+def test_identical_unaliased_join_subqueries_get_distinct_stand_in_names() -> None:
+    """sqlglot compares nodes by structure, so two identical JOIN subqueries are equal
+    nodes. Their stand-in names must still differ, or their row identities merge."""
+    from dblect.lineage.properties.scope_closure import (
+        _unaliased_subquery_name,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    tree = parse_sql(
+        "SELECT 1 FROM t JOIN (SELECT id FROM orders) ON TRUE JOIN (SELECT id FROM orders) ON TRUE"
+    )
+    names = {_unaliased_subquery_name(sub) for sub in tree.find_all(exp.Subquery)}
+    assert len(names) == 2
+
+
 def test_declared_model_key_unions_with_sql_derived_key() -> None:
     """A native PRIMARY KEY declared on the model and a DISTINCT-derived key both
     hold, so the model carries both (reconcile by meet, no conflict)."""

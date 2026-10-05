@@ -302,7 +302,10 @@ def _unaliased_subquery_name(node: exp.Subquery) -> str:
     per source within one SELECT."""
     join = node.parent
     if isinstance(join, exp.Join) and join.parent is not None:
-        return f"<subquery join {join.parent.args['joins'].index(join)}>"
+        # By identity: sqlglot nodes compare by structure, so `list.index` would give two
+        # identical JOIN subqueries the same position.
+        position = next(i for i, j in enumerate(join.parent.args["joins"]) if j is join)
+        return f"<subquery join {position}>"
     return "<subquery from>"
 
 
