@@ -637,6 +637,14 @@ def test_relation_scope_keys_exposes_cte_intermediate_keys() -> None:
     assert scopes[id(tree)].keys == frozenset({_key("id")})
 
 
+def test_unaliased_derived_tables_in_one_select_stay_distinct_sources() -> None:
+    """Two unaliased derived tables are two relations: a cross join of unique inputs repeats
+    each side's rows, so no single-column key survives. Stand-in aliases must not collide."""
+    tree = parse_sql("SELECT id FROM (SELECT id FROM orders) JOIN (SELECT id FROM orders) ON TRUE")
+    scopes = relation_scope_facts(tree, {"orders": frozenset({_key("id")})})
+    assert _key("id") not in scopes[id(tree)].keys
+
+
 def test_declared_model_key_unions_with_sql_derived_key() -> None:
     """A native PRIMARY KEY declared on the model and a DISTINCT-derived key both
     hold, so the model carries both (reconcile by meet, no conflict)."""

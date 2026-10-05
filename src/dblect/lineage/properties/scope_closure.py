@@ -285,13 +285,25 @@ def _resolve_source(
         inner = node.this
         if not isinstance(inner, Expr):
             return None
-        # An unaliased subquery (legal in duckdb, postgres, snowflake) cannot be referenced, so
-        # a name no SQL can spell stands in; giving up here would hide every scope beneath it.
-        alias = node.alias_or_name or f"<subquery {id(node)}>"
+        # An unaliased subquery (legal in duckdb, postgres, snowflake) gets a stand-in name from
+        # its position in the SELECT, so it is stable across parses and distinct within a scope;
+        # giving up here would hide every scope beneath it. DuckDB lets a query spell the
+        # subquery as `unnamed_subquery`; that qualifier matches no alias here, so such a
+        # reference stays unresolved and the analysis stays conservative.
+        alias = node.alias_or_name or _unaliased_subquery_name(node)
         return alias.lower(), scope_facts(
             inner, cte_scope=cte_scope, base_resolve=base_resolve, record=record
         )
     return None
+
+
+def _unaliased_subquery_name(node: exp.Subquery) -> str:
+    """``<subquery from>`` or ``<subquery join N>``: not a legal bare identifier, and unique
+    per source within one SELECT."""
+    join = node.parent
+    if isinstance(join, exp.Join) and join.parent is not None:
+        return f"<subquery join {join.parent.args['joins'].index(join)}>"
+    return "<subquery from>"
 
 
 def _qcol(col: exp.Column, *, default_alias: str) -> QCol:
