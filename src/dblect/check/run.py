@@ -65,10 +65,14 @@ from dblect.lineage.graph import (
 from dblect.lineage.properties.domain_type import (
     NAKED,
     DomainTag,
+    FacetDifference,
+    NominalFacet,
     domain_type_display,
     domain_type_grounded_scopes,
     domain_type_grounding,
     domain_type_property,
+    facet_differences,
+    facet_value_label,
     join_key_conflicts,
 )
 from dblect.lineage.properties.functional_dependency import (
@@ -165,6 +169,15 @@ class WorldFacts:
 
 
 @dataclass(frozen=True, slots=True)
+class DeclaredAndInferred:
+    """The two tags a flagged column was reconciled from: the type declared on it and the
+    type the SQL derived for it, before the reconcile kept the declaration."""
+
+    declared: DomainTag
+    inferred: DomainTag
+
+
+@dataclass(frozen=True, slots=True)
 class WorldAnnotations:
     """One world's propagation result, keyed by the world it holds under. A bundle
     rather than a bare mapping so a later property can ride alongside the domain-type
@@ -177,6 +190,10 @@ class WorldAnnotations:
     world: WorldRef
     domain_type: Mapping[ColumnRef, Annotation[DomainTag]]
     coherence_clears: tuple[CoherenceClear[DomainTag], ...]
+    declared_vs_inferred: Mapping[ColumnRef, DeclaredAndInferred]
+    """For each flagged domain-type column that carries its own declaration, the declared
+    and the inferred tag, so a contradiction can say what differs. A flagged column that
+    only inherits the conflict from upstream has no entry."""
     functional_dependency: Mapping[SourceRef, Annotation[FDSet]]
     """Per-relation functional dependencies, kept so the grain check need not
     propagate them again."""
@@ -256,8 +273,9 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         functional_dependency_grounding(by_scope(facts.fd_facts)),
         uniqueness=uniqueness_prop.ref,
     )
+    tag_ground = domain_type_grounding(by_scope(facts.tag_facts))
     dt_prop = domain_type_property(
-        domain_type_grounding(by_scope(facts.tag_facts)),
+        tag_ground,
         fd=fd_prop.ref,
         uniqueness=uniqueness_prop.ref,
     )
@@ -265,6 +283,7 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
     registry = PropertyRegistry((uniqueness_prop, fd_prop, dt_prop, vd_prop))
     uniqueness_inferred: dict[SourceRef, Annotation[CandidateKeySet]] = {}
     clears: list[CoherenceClear[DomainTag]] = []
+    tag_inferred: dict[ColumnRef, Annotation[DomainTag]] = {}
     store = run(
         {
             ScopeKind.RELATION: graphs.relation_build.graph,
@@ -272,12 +291,19 @@ def propagate_world(graphs: CheckGraphs, facts: WorldFacts) -> WorldAnnotations:
         },
         registry,
         sinks={dt_prop.name: clears},
-        inferred_sinks={uniqueness_prop.name: uniqueness_inferred},
+        inferred_sinks={uniqueness_prop.name: uniqueness_inferred, dt_prop.name: tag_inferred},
     )
+    domain_type = store.scoped(dt_prop.ref)
     return WorldAnnotations(
         world=facts.world,
-        domain_type=store.scoped(dt_prop.ref),
+        domain_type=domain_type,
         coherence_clears=tuple(clears),
+        declared_vs_inferred={
+            ref: DeclaredAndInferred(declared=declared, inferred=tag_inferred[ref].value)
+            for ref, ann in domain_type.items()
+            if _is_contradiction(ann) and ref in tag_inferred
+            if (declared := tag_ground(ref).value) != NAKED
+        },
         functional_dependency=store.scoped(fd_prop.ref),
         uniqueness_inferred=uniqueness_inferred,
         value_domain=store.scoped(vd_prop.ref),
@@ -387,7 +413,11 @@ def world_findings(graphs: CheckGraphs, world: WorldAnnotations) -> list[CheckFi
     line_maps: dict[str, LineMap] = {}
     findings.extend(
         _contradiction_findings(
-            graphs.manifest, world.domain_type, graphs.column_build.graph, line_maps
+            graphs.manifest,
+            world.domain_type,
+            world.declared_vs_inferred,
+            graphs.column_build.graph,
+            line_maps,
         )
     )
     findings.extend(
@@ -565,28 +595,73 @@ def _value_domain_conflict_findings(graphs: CheckGraphs) -> list[CheckFinding]:
     ]
 
 
+def _is_contradiction(ann: Annotation[DomainTag]) -> bool:
+    return ann.provisional and ann.value != NAKED
+
+
 def _contradiction_rows(
+    manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    declared_vs_inferred: Mapping[ColumnRef, DeclaredAndInferred],
     column_graph: ColumnLineageGraph,
 ) -> Iterator[LocatedRow]:
     for ref, ann in _sorted(annotations):
-        if not ann.provisional or ann.value == NAKED:
+        if not _is_contradiction(ann):
             continue
         yield LocatedRow(
             uid=ref.source.unique_id,
             nodes=(column_graph.derivation(ref),),
             kind=CheckFindingKind.DOMAIN_TYPE_CONTRADICTION,
-            message=(
-                f"declared domain type for {ref.column!r} is contradicted by the type "
-                "that flows in from upstream"
-            ),
+            message=_contradiction_message(manifest, ref, ann.value, declared_vs_inferred.get(ref)),
             column=ref.column,
         )
+
+
+def _contradiction_message(
+    manifest: Manifest,
+    ref: ColumnRef,
+    carried: DomainTag,
+    pair: DeclaredAndInferred | None,
+) -> str:
+    """Name the declared and the inferred type and the facets on which they part ways.
+
+    A column that declares nothing of its own, or whose declaration agrees with what flows in
+    (it is flagged only because the flow is tainted from further up), has no gap of its own
+    to name, so it reports the type it carries."""
+    differences = () if pair is None else facet_differences(pair.declared, pair.inferred)
+    if pair is None or not differences:
+        return (
+            f"{ref.column!r} carries {domain_type_display(carried).name}, a type declared "
+            "upstream that the types flowing in from there contradict"
+        )
+    clauses = "; ".join(_difference_clause(manifest, ref, d) for d in differences)
+    return (
+        f"declared {ref.column!r} ({domain_type_display(pair.declared).name}) contradicts "
+        f"the type flowing in from upstream ({domain_type_display(pair.inferred).name}): "
+        f"{clauses}"
+    )
+
+
+def _difference_clause(manifest: Manifest, ref: ColumnRef, diff: FacetDifference) -> str:
+    if diff.companion_identity_only:
+        here = _column_names(manifest, diff.declared_companions)
+        upstream = _column_names(manifest, diff.inferred_companions)
+        return f"the companion binding names {here} here and {upstream} upstream"
+    facet = f"{diff.facet.name!r}" if isinstance(diff.facet, NominalFacet) else "the unit"
+    declared = facet_value_label(diff.declared)
+    if diff.inferred is None:
+        return f"{facet} is {declared} here and not claimed upstream"
+    return f"{facet} is {declared} here and {facet_value_label(diff.inferred)} upstream"
+
+
+def _column_names(manifest: Manifest, columns: tuple[ColumnRef, ...]) -> str:
+    return ", ".join(f"{_relation_name(manifest, c.source)}.{c.column}" for c in columns)
 
 
 def _contradiction_findings(
     manifest: Manifest,
     annotations: Mapping[ColumnRef, Annotation[DomainTag]],
+    declared_vs_inferred: Mapping[ColumnRef, DeclaredAndInferred],
     column_graph: ColumnLineageGraph,
     line_maps: dict[str, LineMap],
 ) -> list[CheckFinding]:
@@ -594,7 +669,7 @@ def _contradiction_findings(
     reported wherever the disagreement flows downstream."""
     return locate_findings(
         manifest,
-        _contradiction_rows(annotations, column_graph),
+        _contradiction_rows(manifest, annotations, declared_vs_inferred, column_graph),
         line_maps=line_maps,
         sort_key=lambda f: (f.model_unique_id or "", f.column or ""),
     )

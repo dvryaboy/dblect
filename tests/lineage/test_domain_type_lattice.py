@@ -10,7 +10,7 @@ tests pin the free-abelian-group arithmetic ``*`` and ``/`` ride on.
 
 from __future__ import annotations
 
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from dblect.lineage.facts.lattice import resolve
@@ -23,10 +23,16 @@ from dblect.lineage.properties.domain_type import (
     Concrete,
     Dimension,
     DomainTag,
+    FacetDifference,
     Nominal,
+    NominalFacet,
     PerRow,
     Tagged,
     Unit,
+    UnitFacet,
+    companion_columns,
+    facet_differences,
+    rebind_companions,
     tagged,
 )
 from tests.lineage._lattice_laws import assert_consistency_laws, assert_lattice_laws
@@ -196,3 +202,65 @@ def test_per_row_units_cancel_only_for_the_same_column() -> None:
     assert same.divide(same).is_dimensionless
     mixed = Dimension.of(PerRow(_CURRENCY_COL)).divide(Dimension.of(PerRow(other)))
     assert not mixed.is_dimensionless
+
+
+_DOWNSTREAM = SourceRef(SourceKind.MODEL, "model.shop.report")
+
+
+def _carried(column: ColumnRef) -> ColumnRef | None:
+    """A relation that carries ``currency`` under a new relation and drops ``country``."""
+    return ColumnRef(_DOWNSTREAM, column.column) if column == _CURRENCY_COL else None
+
+
+@given(_values)
+def test_rebinding_moves_exactly_the_carried_companions(tag: DomainTag) -> None:
+    moved = rebind_companions(tag, _carried)
+    expected = {_carried(c) or c for c in companion_columns(tag)}
+    assert companion_columns(moved) == expected
+    if isinstance(tag, Tagged):
+        assert isinstance(moved, Tagged)
+        assert _pinned(moved) == _pinned(tag)  # pinned units stay put
+
+
+def _pinned(tag: Tagged) -> set[Unit]:
+    if not isinstance(tag.dimension, Dimension):
+        return set()
+    return {unit for unit, _ in tag.dimension.exponents if isinstance(unit, Concrete)}
+
+
+@given(_tagged(), _tagged())
+def test_facet_differences_exist_exactly_when_the_declaration_is_not_honoured(
+    declared: Tagged, inferred: Tagged
+) -> None:
+    """The check flags a declaration its inferred type does not refine; the facets named
+    are that gap, no more and no fewer. (A no-claim inference is never checked.)"""
+    assume(declared != NAKED and inferred != NAKED)
+    honoured = DOMAIN_TYPE_LATTICE.refines(inferred, declared)
+    assert bool(facet_differences(declared, inferred)) is (not honoured)
+
+
+def test_each_kind_of_gap_names_its_facet() -> None:
+    usd, eur = Dimension.of(Concrete("usd")), Dimension.of(Concrete("eur"))
+    taxed = {"contains_tax": Concrete("true")}
+    untaxed = {"contains_tax": Concrete("false")}
+    assert facet_differences(tagged(dimension=usd), tagged(dimension=eur)) == (
+        FacetDifference(UnitFacet(), usd, eur),
+    )
+    assert facet_differences(tagged(dimension=usd), tagged(nominal=taxed)) == (
+        FacetDifference(UnitFacet(), usd, None),
+    )
+    assert facet_differences(tagged(nominal=taxed), tagged(nominal=untaxed)) == (
+        FacetDifference(NominalFacet("contains_tax"), Concrete("true"), Concrete("false")),
+    )
+    assert facet_differences(tagged(nominal=taxed), tagged(dimension=usd, nominal=taxed)) == ()
+
+
+def test_a_difference_in_companion_identity_alone_is_flagged_as_such() -> None:
+    here = Dimension.of(PerRow(ColumnRef(_DOWNSTREAM, "currency")))
+    upstream = Dimension.of(PerRow(ColumnRef(_REL, "currency")))
+    (same_shape,) = facet_differences(tagged(dimension=here), tagged(dimension=upstream))
+    assert same_shape.companion_identity_only
+    (other_shape,) = facet_differences(
+        tagged(dimension=here), tagged(dimension=Dimension.of(Concrete("usd")))
+    )
+    assert not other_shape.companion_identity_only

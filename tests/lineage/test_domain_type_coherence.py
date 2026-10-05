@@ -53,6 +53,10 @@ _STG = SourceRef(SourceKind.MODEL, "model.shop.stg")
 _MODEL = SourceRef(SourceKind.MODEL, "model.shop.m")
 
 _PER_ROW = tagged(dimension=Dimension.of(PerRow(ColumnRef(_SRC, "currency"))))
+# The same binding once the aggregating model itself carries the currency column: a companion
+# follows the amount into every relation that projects it unchanged.
+_PER_ROW_HERE = tagged(dimension=Dimension.of(PerRow(ColumnRef(_MODEL, "currency"))))
+_PER_ROW_IN_STG = tagged(dimension=Dimension.of(PerRow(ColumnRef(_STG, "currency"))))
 _USD = tagged(dimension=Dimension.of(Concrete("usd")))
 
 _SCHEMA: Mapping[str, Mapping[str, str]] = {
@@ -183,7 +187,7 @@ def test_declared_fd_discharges_the_sum() -> None:
 def test_group_by_membership_discharges_the_sum() -> None:
     sql = "SELECT country, currency, SUM(amount) AS total FROM payments GROUP BY country, currency"
     ann = _run(sql)
-    assert ann.value == _PER_ROW
+    assert ann.value == _PER_ROW_HERE
 
 
 def test_where_pin_discharges_the_sum() -> None:
@@ -253,21 +257,32 @@ def test_group_membership_still_discharges_over_a_join() -> None:
         "SELECT p.country, p.currency, SUM(p.amount) AS total FROM payments p "
         "JOIN customers c ON p.customer_id = c.id GROUP BY p.country, p.currency"
     )
-    assert _run(sql).value == _PER_ROW
+    assert _run(sql).value == _PER_ROW_HERE
 
 
-def test_companion_bound_to_another_relation_clears() -> None:
-    """The amount reaches the aggregate through an intermediate model, so its
-    companion still names the original source's column while the aggregation input
-    is the intermediate. The guard does not chase bindings across relations yet, so
-    it clears; rebinding the companion through projections is future work."""
+def test_companion_the_intermediate_model_drops_clears() -> None:
+    """The amount reaches the aggregate through an intermediate model that does not carry
+    the currency column, so its companion still names the original source's column while the
+    aggregation input is the intermediate: nothing there holds it constant, so the sum clears."""
+    fds = FDSet.of(FD(frozenset({"country"}), "currency"))
+    ann = _run(
+        "SELECT country, SUM(amount) AS total FROM stg GROUP BY country",
+        fds=fds,
+        stg_sql="SELECT country, amount FROM payments",
+    )
+    assert ann.value == NAKED
+
+
+def test_companion_the_intermediate_model_carries_discharges() -> None:
+    """The intermediate model projects the currency column, so the companion follows the
+    amount onto it and the dependency declared there discharges the sum."""
     fds = FDSet.of(FD(frozenset({"country"}), "currency"))
     ann = _run(
         "SELECT country, SUM(amount) AS total FROM stg GROUP BY country",
         fds=fds,
         stg_sql="SELECT country, currency, amount FROM payments",
     )
-    assert ann.value == NAKED
+    assert ann.value == _PER_ROW_IN_STG
 
 
 def test_windowed_aggregate_clears() -> None:

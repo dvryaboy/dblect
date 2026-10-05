@@ -240,6 +240,13 @@ class Property(Generic[K, S]):
     semiring: Semiring[K] | None = None
     display: Callable[[K], AxisDisplay] | None = None
     depends_on: tuple[PropertyRef[Any, Any], ...] = ()
+    rebind: Callable[[K, Callable[[ColumnRef], ColumnRef | None]], K] | None = None
+    """Re-point the columns a value names at their unchanged copies in the subject's relation.
+
+    A value that names a companion column (a per-row currency) names it on the relation where
+    it was grounded. As the value flows into a relation that projects that column unchanged,
+    the second argument finds the copy there (``None`` when the column was not carried), and
+    the value moves with it, so a companion keeps its meaning across models. Column scope only."""
     reconcile_by_meet: bool = False
     """How a node's declared value (from a fact) and its value inferred from
     the SQL combine when both exist.
@@ -331,6 +338,7 @@ def column_property(
     semiring: Semiring[K] | None = None,
     display: Callable[[K], AxisDisplay] | None = None,
     depends_on: tuple[PropertyRef[Any, Any], ...] = (),
+    rebind: Callable[[K, Callable[[ColumnRef], ColumnRef | None]], K] | None = None,
     reconcile_by_meet: bool = False,
 ) -> Property[K, ColumnRef]:
     """Mint a column-scoped property: ``scope_kind`` is COLUMN and facts address columns."""
@@ -345,6 +353,7 @@ def column_property(
         semiring=semiring,
         display=display,
         depends_on=depends_on,
+        rebind=rebind,
         reconcile_by_meet=reconcile_by_meet,
     )  # column scope leaves reducer unset: the propagator's generic reducer serves it.
 
