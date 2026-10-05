@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import sqlglot
+import sqlglot.expressions as exp
 
 from dblect.lineage.graph import ColumnRef, SourceKind, SourceRef
 from dblect.lineage.property import attach_column_ref, copied_column
@@ -13,7 +14,7 @@ _ORIGIN = ColumnRef(SourceRef(SourceKind.MODEL, "model.shop.stg"), "currency")
 
 def _derivation(sql: str, dialect: str):
     expr = sqlglot.parse_one(sql, read=dialect)
-    for col in expr.find_all(sqlglot.exp.Column):
+    for col in expr.find_all(exp.Column):
         attach_column_ref(col, _ORIGIN)
     return expr
 
