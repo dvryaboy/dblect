@@ -62,7 +62,7 @@ from dblect.lineage.graph import (
     UnionConfluence,
     aggregation_site_meta,
 )
-from dblect.sql.vocab import VALUE_PRESERVING_WRAPPERS
+from dblect.sql.vocab import VALUE_PRESERVING_WRAPPERS, CastTarget, cast_target
 
 K = TypeVar("K")
 S = TypeVar("S", ColumnRef, SourceRef)
@@ -157,11 +157,10 @@ def propagate(
                 else:
                     inferred = reduce(deriv, prop, annotate, dep_context, default_ann, sink)
                     if prop.rebind is not None and isinstance(subject, ColumnRef):
-                        in_relation = subject.source
                         inferred = replace(
                             inferred,
                             value=prop.rebind(
-                                inferred.value, lambda col: copies.get((col, in_relation))
+                                inferred.value, _copy_finder(copies, subject.source, deriv)
                             ),
                         )
                     if inferred_sink is not None:
@@ -177,24 +176,53 @@ def propagate(
     return annotations
 
 
-def _copy_index(graph: LineageView[Any]) -> dict[tuple[ColumnRef, SourceRef], ColumnRef]:
-    """For each column and relation, the column of that relation that copies it unchanged.
+def _occurrences(derivation: Derivation) -> frozenset[str]:
+    """The relation occurrences (FROM/JOIN aliases) a derivation reads. The builder has
+    qualified every column, so a self-join's two sides carry different aliases."""
+    if not isinstance(derivation, Expr):
+        return frozenset()
+    return frozenset(c.table for c in derivation.find_all(exp.Column))
 
-    When a relation carries a column under several names, the one that keeps the original
-    name wins, then the alphabetically first, so the choice does not depend on projection order."""
-    index: dict[tuple[ColumnRef, SourceRef], ColumnRef] = {}
+
+_CopyKey = tuple[ColumnRef, SourceRef, str]
+
+
+def _copy_index(graph: LineageView[Any]) -> dict[_CopyKey, ColumnRef]:
+    """For each column, relation and occurrence of that column in the relation's FROM, the
+    column of the relation that copies it whole.
+
+    Keyed per occurrence because a self-join reads one column twice, and a companion must
+    be the copy from the same side as the amount it rides with. When a relation carries a
+    column under several names, the one that keeps the original name wins, then the
+    alphabetically first, so the choice does not depend on projection order."""
+    index: dict[_CopyKey, ColumnRef] = {}
     for subject in graph.subjects():
         if not isinstance(subject, ColumnRef):
             continue
         derivation = graph.derivation(subject)
-        origin = None if derivation is None else copied_column(derivation)
-        if origin is None:
+        node = None if derivation is None else _copied_node(derivation, whole_value=True)
+        origin = None if node is None else resolved_column_ref(node)
+        if node is None or origin is None:
             continue
-        key = (origin, subject.source)
+        key = (origin, subject.source, node.table)
         held = index.get(key)
         if held is None or _copy_rank(origin, subject) < _copy_rank(origin, held):
             index[key] = subject
     return index
+
+
+def _copy_finder(
+    copies: Mapping[_CopyKey, ColumnRef], relation: SourceRef, derivation: Derivation
+) -> Callable[[ColumnRef], ColumnRef | None]:
+    """Find a column's whole copy in ``relation`` among the occurrences ``derivation`` reads,
+    so a companion is never taken from the other side of a self-join."""
+    occurrences = _occurrences(derivation)
+
+    def find(col: ColumnRef) -> ColumnRef | None:
+        held = [copies[key] for o in sorted(occurrences) if (key := (col, relation, o)) in copies]
+        return min(held, key=lambda c: _copy_rank(col, c)) if held else None
+
+    return find
 
 
 def _copy_rank(origin: ColumnRef, copy: ColumnRef) -> tuple[bool, str]:
@@ -531,13 +559,35 @@ def resolved_column_ref(col: exp.Column) -> ColumnRef | None:
     return _column_ref_meta(col)
 
 
-def copied_column(derivation: Derivation) -> ColumnRef | None:
-    """The one column ``derivation`` copies unchanged, through renames, parentheses and
-    casts; ``None`` for anything computed (a call, a window) or a union."""
+def _is_whole_value_cast(node: Expr) -> bool:
+    """A cast that cannot change a text value: to unsized text. A sized text target can
+    truncate, a numeric or other target reinterprets, so neither keeps a code whole."""
+    if not isinstance(node, exp.Cast | exp.TryCast):
+        return True
+    to = node.args.get("to")
+    return (
+        cast_target(to) is CastTarget.TEXT and isinstance(to, exp.DataType) and not to.expressions
+    )
+
+
+def _copied_node(derivation: Derivation, *, whole_value: bool) -> exp.Column | None:
     node = derivation
     while isinstance(node, VALUE_PRESERVING_WRAPPERS) and isinstance(node.this, Expr):
+        if whole_value and not _is_whole_value_cast(node):
+            return None
         node = node.this
-    return resolved_column_ref(node) if isinstance(node, exp.Column) else None
+    return node if isinstance(node, exp.Column) else None
+
+
+def copied_column(derivation: Derivation, *, whole_value: bool = False) -> ColumnRef | None:
+    """The one column ``derivation`` copies unchanged, through renames, parentheses and
+    casts; ``None`` for anything computed (a call, a window) or a union.
+
+    A cast keeps the result a function of that one column, which is what key re-expression
+    needs. ``whole_value`` asks for more: the same value, so only a cast to unsized text
+    passes (a code cast to ``VARCHAR(1)`` or ``INT`` is no longer the code)."""
+    node = _copied_node(derivation, whole_value=whole_value)
+    return None if node is None else resolved_column_ref(node)
 
 
 def value_origin(graph: LineageView[ColumnRef], col: ColumnRef) -> ColumnRef | None:

@@ -101,6 +101,8 @@ def _contradicted(
         "SELECT amount_cents, currency FROM stg_payments",
         "SELECT amount_cents, (currency) AS currency FROM stg_payments",
         "SELECT amount_cents, CAST(currency AS VARCHAR) AS currency FROM stg_payments",
+        "SELECT amount_cents, CAST(currency AS TEXT) AS currency FROM stg_payments",
+        "SELECT amount_cents, TRY_CAST(currency AS VARCHAR) AS currency FROM stg_payments",
         "WITH s AS (SELECT * FROM stg_payments) SELECT amount_cents, currency FROM s",
     ],
 )
@@ -115,6 +117,13 @@ def test_a_plain_copy_of_the_companion_is_a_restatement(sql: str) -> None:
         "SELECT amount_cents, COALESCE(currency, 'USD') AS currency FROM stg_payments",
         "SELECT p.amount_cents, r.currency "
         "FROM stg_payments AS p JOIN rates AS r ON r.rate = p.amount_cents",
+        # A cast that can change the code: numeric, or neither text nor number.
+        "SELECT amount_cents, CAST(currency AS INT) AS currency FROM stg_payments",
+        "SELECT amount_cents, CAST(currency AS DECIMAL(10, 2)) AS currency FROM stg_payments",
+        "SELECT amount_cents, CAST(currency AS DATE) AS currency FROM stg_payments",
+        # A self-join: the companion is a copy of the same column, from the other occurrence.
+        "SELECT a.amount_cents, b.currency "
+        "FROM stg_payments AS a JOIN stg_payments AS b ON a.amount_cents = b.amount_cents + 1",
     ],
 )
 def test_a_companion_that_is_not_a_plain_copy_still_contradicts(sql: str) -> None:
