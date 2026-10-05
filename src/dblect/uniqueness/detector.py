@@ -59,7 +59,7 @@ from dblect.lineage.properties.predicate_flow import (
     predicate_flow_property,
     relation_scope_filters,
 )
-from dblect.lineage.properties.scope_closure import Input, JoinChain
+from dblect.lineage.properties.scope_closure import Input, JoinChain, closure
 from dblect.lineage.properties.uniqueness import (
     NO_KEYS,
     CandidateKeySet,
@@ -82,6 +82,7 @@ from dblect.sql import (
     suppression_hint,
 )
 from dblect.sql import _sqlglot as sg
+from dblect.sql.window_ties import window_tie_independent
 
 Detector = Callable[[Expr], tuple[Finding, ...]]
 
@@ -99,7 +100,8 @@ def detect_non_unique_window_order_keys(
     model_fds: Mapping[str, FDSet] = {},
     scope_index: ScopeIndex | None = None,
 ) -> tuple[Finding, ...]:
-    """Flag window ORDER BYs whose partition+order keys are not a unique tuple.
+    """Flag window ORDER BYs whose partition+order keys are not a unique tuple, when the
+    window's result depends on the tie order (:func:`~dblect.sql.window_ties.window_tie_independent`).
 
     A scope is checkable when its FROM resolves to a single relation with known
     keys (a ref'd model or an in-scope CTE) and there are no joins. Multi-source
@@ -121,6 +123,12 @@ def detect_non_unique_window_order_keys(
             if uncovered is None:
                 continue
             order_cols, partition_cols = uncovered
+            fixed = closure(
+                tuple((fd.determinant, fd.dependent) for fd in source.fds),
+                frozenset(order_cols) | frozenset(partition_cols),
+            )
+            if window_tie_independent(w, fixed):
+                continue
             rendered = sg.render_sql(w)
             out.append(
                 Finding(

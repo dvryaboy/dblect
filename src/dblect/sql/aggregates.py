@@ -49,10 +49,13 @@ from enum import Enum, auto
 
 import sqlglot.expressions as exp
 
+from dblect.sql.order_use import OrderUse
+
 __all__ = [
     "AGGREGATE_BEHAVIORS",
     "AggregateBehavior",
     "aggregate_behavior",
+    "aggregate_order_use",
     "duplicate_sensitive",
     "strips_duplicates",
 ]
@@ -70,10 +73,12 @@ class AggregateBehavior(Enum):
 class AggregateProfile:
     """Both axes for one aggregate type. ``behavior`` is ``None`` when the fold lives on a
     non-magnitude domain (boolean, bitwise, collection); ``duplicate_sensitive`` is always
-    definite, since duplication is meaningful for every fold."""
+    definite, since duplication is meaningful for every fold. ``order_use`` is how the fold
+    reads row order (see :class:`OrderUse`); it is ``NONE`` unless an entry says otherwise."""
 
     behavior: AggregateBehavior | None
     duplicate_sensitive: bool
+    order_use: OrderUse = OrderUse.NONE
 
 
 # One entry per aggregate type, both axes together. ``duplicate_sensitive=True`` means a
@@ -82,6 +87,9 @@ class AggregateProfile:
 _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     # COMBINE: synthesize a new value out of many. A duplicated row is folded twice, so the
     # result moves: sensitive.
+    # ``order_use`` stays NONE for the numeric folds below: floating-point rounding can make
+    # ``sum`` and ``avg`` depend on summation order, and that is an accepted assumption (the
+    # same practitioner trade-off as treating hashed ids as injective).
     exp.Sum: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Avg: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Stddev: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
@@ -92,7 +100,10 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     exp.Kurtosis: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Skewness: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.Median: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
-    exp.Mode: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
+    # With competing modes the engine returns the one it meets first, so the input order decides.
+    exp.Mode: AggregateProfile(
+        AggregateBehavior.COMBINE, duplicate_sensitive=True, order_use=OrderUse.PICKS
+    ),
     exp.Quantile: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.ApproxQuantile: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
     exp.PercentileCont: AggregateProfile(AggregateBehavior.COMBINE, duplicate_sensitive=True),
@@ -101,11 +112,21 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     # extremal or selected (the combine is idempotent), so not sensitive.
     exp.Min: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
     exp.Max: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
-    exp.ArgMin: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
-    exp.ArgMax: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
-    exp.AnyValue: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
-    exp.First: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
-    exp.Last: AggregateProfile(AggregateBehavior.SELECT, duplicate_sensitive=False),
+    exp.ArgMin: AggregateProfile(
+        AggregateBehavior.SELECT, duplicate_sensitive=False, order_use=OrderUse.PICKS
+    ),
+    exp.ArgMax: AggregateProfile(
+        AggregateBehavior.SELECT, duplicate_sensitive=False, order_use=OrderUse.PICKS
+    ),
+    exp.AnyValue: AggregateProfile(
+        AggregateBehavior.SELECT, duplicate_sensitive=False, order_use=OrderUse.PICKS
+    ),
+    exp.First: AggregateProfile(
+        AggregateBehavior.SELECT, duplicate_sensitive=False, order_use=OrderUse.SEQUENCE
+    ),
+    exp.Last: AggregateProfile(
+        AggregateBehavior.SELECT, duplicate_sensitive=False, order_use=OrderUse.SEQUENCE
+    ),
     # COUNT: yield a cardinality. Plain count moves with multiplicity (sensitive); an
     # approximate *distinct* count deduplicates by nature, so it is safe.
     exp.Count: AggregateProfile(AggregateBehavior.COUNT, duplicate_sensitive=True),
@@ -120,8 +141,8 @@ _REGISTRY: Mapping[type[exp.AggFunc], AggregateProfile] = {
     exp.BitwiseAndAgg: AggregateProfile(None, duplicate_sensitive=False),
     exp.BitwiseOrAgg: AggregateProfile(None, duplicate_sensitive=False),
     exp.BitwiseXorAgg: AggregateProfile(None, duplicate_sensitive=True),
-    exp.ArrayAgg: AggregateProfile(None, duplicate_sensitive=True),
-    exp.GroupConcat: AggregateProfile(None, duplicate_sensitive=True),
+    exp.ArrayAgg: AggregateProfile(None, duplicate_sensitive=True, order_use=OrderUse.SEQUENCE),
+    exp.GroupConcat: AggregateProfile(None, duplicate_sensitive=True, order_use=OrderUse.SEQUENCE),
 }
 
 
@@ -149,6 +170,13 @@ def aggregate_behavior(agg: exp.AggFunc) -> AggregateBehavior | None:
     """The magnitude behavior class of ``agg``, or ``None`` if it carries no obligation."""
     profile = _profile(agg)
     return profile.behavior if profile is not None else None
+
+
+def aggregate_order_use(agg: exp.Func) -> OrderUse:
+    """How ``agg`` reads the order of its input rows. An aggregate with no registry entry (an
+    ``exp.Anonymous`` UDF) is ``PICKS``, so an unknown fold never reads as order-independent."""
+    profile = _profile(agg)
+    return profile.order_use if profile is not None else OrderUse.PICKS
 
 
 def strips_duplicates(agg: exp.Func) -> bool:

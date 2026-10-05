@@ -984,6 +984,13 @@ def test_now_in_join_on_detected() -> None:
     assert findings[0].kind is FindingKind.NON_DETERMINISTIC_FUNCTION
 
 
+@pytest.mark.parametrize("call", ["statement_timestamp()", "transaction_timestamp()"])
+def test_statement_constant_calls_still_vary_between_runs(call: str) -> None:
+    """Fixed within a statement, but a different value on the next run: the detector's concern."""
+    sql = f"select * from a join b on a.k = b.k and b.created_at < {call}"
+    assert len(_non_determinism(sql)) == 1
+
+
 def test_now_in_positional_group_by_detected() -> None:
     # `group by 1` names the first projection, so the grouped expression is the one holding
     # now() even though the GROUP BY target in the AST is the literal 1.
