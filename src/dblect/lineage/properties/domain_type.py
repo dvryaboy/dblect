@@ -502,19 +502,24 @@ def _cast_rule(
     come after it and carry no tag."""
     if not kids:
         return _no_claim_rule(expr, kids, _ctx)
-    operand = kids[0].value
-    match cast_target(expr.args.get("to")):
-        case CastTarget.NUMERIC:
-            kept = operand
-        case CastTarget.TEXT:
-            kept = operand if isinstance(operand, Tagged) and operand.dimension is None else NAKED
-        case CastTarget.OTHER:
-            kept = NAKED
-        case _ as unreachable:
-            assert_never(unreachable)
+    kept = _cast_tag(kids[0].value, expr.args.get("to"))
     if kept == NAKED:
         return _no_claim_rule(expr, kids, _ctx)
     return _annotate(kept, kids[:1])
+
+
+def _cast_tag(operand: DomainTag, to: object) -> DomainTag:
+    """The tag ``operand`` keeps through a cast to ``to`` (``NAKED`` when it keeps none);
+    the one classification the cast rule and the join-key reader share."""
+    match cast_target(to):
+        case CastTarget.NUMERIC:
+            return operand
+        case CastTarget.TEXT:
+            return operand if isinstance(operand, Tagged) and operand.dimension is None else NAKED
+        case CastTarget.OTHER:
+            return NAKED
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 # The kit's catch-all (no-claim top, IMPLICIT, provisional carried through): a comparison
@@ -802,13 +807,37 @@ def join_key_conflicts(
     projection column) and falls back to the column's declared grounding for a join key
     that is never projected, so an unprojected key is still typed."""
     out: list[tuple[exp.Column, exp.Column, DomainTag, DomainTag]] = []
-    for left, right in sg.equality_column_pairs(on):
-        tag_left, tag_right = tag_of(left), tag_of(right)
-        if tag_left is None or tag_right is None:
+    for left_side, right_side in sg.equality_pairs(on):
+        left, right = _keyed_tag(left_side, tag_of), _keyed_tag(right_side, tag_of)
+        if left is None or right is None:
             continue
+        (left_col, tag_left), (right_col, tag_right) = left, right
         if DOMAIN_TYPE_LATTICE.meet(tag_left, tag_right) is CONFLICT:
-            out.append((left, right, tag_left, tag_right))
+            out.append((left_col, right_col, tag_left, tag_right))
     return tuple(out)
+
+
+def _keyed_tag(
+    side: Expr, tag_of: Callable[[exp.Column], DomainTag | None]
+) -> tuple[exp.Column, DomainTag] | None:
+    """The key column under ``side`` and the tag it carries out of any parentheses and
+    casts (``CAST``, ``TRY_CAST``, ``::``), each applying :func:`_cast_tag`. ``None`` when
+    the side is not a column under such wrappers, or no claim survives."""
+    match side:
+        case exp.Paren():
+            return _keyed_tag(side.this, tag_of)
+        case exp.Cast():
+            inner = _keyed_tag(side.this, tag_of)
+            if inner is None:
+                return None
+            col, tag = inner
+            kept = _cast_tag(tag, side.args.get("to"))
+            return None if kept == NAKED else (col, kept)
+        case exp.Column() if not isinstance(side.this, exp.Star):
+            tag = tag_of(side)
+            return None if tag is None or tag == NAKED else (side, tag)
+        case _:
+            return None
 
 
 # --- the property ------------------------------------------------------------
