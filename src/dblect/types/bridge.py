@@ -287,10 +287,18 @@ def _identifier_carrier(decl_name: str, spec: DomainSpec) -> FieldDef | Contract
         )
     if len(physical) > 1:
         names = ", ".join(repr(f.name) for f in physical)
+        # `.refine(unit=...)` pins the unit, the opposite of a per-row binding, so with
+        # an open unit the way out is to name the quantity.
+        fix = (
+            "spell the quantity `Decimal` or `Count` (a lone integer beside a unit is read "
+            "as the quantity) and leave the unit open to bind per row"
+            if any(f.kind is FieldKind.UNIT for f in physical)
+            else "fix all but one with `.refine(...)`"
+        )
         return _malformed(
             decl_name,
             f"declaration {decl_name!r} has no magnitude and several open fields ({names}), "
-            "so the column its tag rides on is ambiguous; fix all but one with `.refine(...)`",
+            f"so the column its tag rides on is ambiguous; {fix}",
         )
     (only,) = physical
     match only.kind:

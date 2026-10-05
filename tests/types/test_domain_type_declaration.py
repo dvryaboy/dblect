@@ -10,6 +10,8 @@ required where two bases fix the same field.
 """
 
 from datetime import datetime
+from itertools import product
+from typing import cast
 
 import pytest
 
@@ -25,6 +27,8 @@ from dblect.types import (
     Integer,
     Timestamp,
 )
+from dblect.types.domain import DomainTypeMeta
+from dblect.types.scalars import classify
 
 
 class Revenue(Money):
@@ -112,6 +116,57 @@ def test_bare_integer_is_inert_lenient_default() -> None:
     assert spec.fields["user_id"].kind is FieldKind.INERT
     assert spec.fields["signup_year"].kind is FieldKind.INERT
     assert spec.fields["external_ref"].kind is FieldKind.INERT
+
+
+@pytest.mark.parametrize(
+    ("integers", "has_unit", "has_magnitude"),
+    list(product((0, 1, 2), (False, True), (False, True))),
+)
+def test_an_integer_is_the_magnitude_only_when_a_unit_qualifies_it_alone(
+    integers: int, has_unit: bool, has_magnitude: bool
+) -> None:
+    # Every combination of integer count, unit presence and explicit magnitude
+    # presence. A unit only qualifies a quantity, so a lone integer beside a unit
+    # (and no Decimal/Count/Float) is that quantity. Two integers leave no way to
+    # tell which is the quantity, and an explicit magnitude already is it, so
+    # integers stay inert there; without a unit an integer is an id or a year.
+    annotations: dict[str, object] = {f"n{i}": BigInt for i in range(integers)}
+    if has_unit:
+        annotations["currency"] = Currency
+    if has_magnitude:
+        annotations["amount"] = Decimal
+    made = cast(
+        "type[DomainType]", DomainTypeMeta("T", (DomainType,), {"__annotations__": annotations})
+    )
+    spec = made.spec()
+
+    promoted = integers == 1 and has_unit and not has_magnitude
+    expected = FieldKind.MAGNITUDE if promoted else FieldKind.INERT
+    for i in range(integers):
+        assert spec.fields[f"n{i}"].kind is expected
+
+
+def test_an_identifier_with_a_nominal_enum_stays_inert() -> None:
+    class EntityId(DomainType):
+        id: Integer
+        entity: Country
+
+    assert EntityId.spec().fields["id"].kind is FieldKind.INERT
+
+
+def test_a_subclass_adding_a_unit_promotes_an_inherited_integer() -> None:
+    class Quantity(DomainType):
+        amount: BigInt
+
+    class Cents(Quantity):
+        currency: Currency
+
+    assert Quantity.spec().fields["amount"].kind is FieldKind.INERT
+    assert Cents.spec().fields["amount"].kind is FieldKind.MAGNITUDE
+
+
+def test_a_bare_integer_scalar_declaration_stays_inert() -> None:
+    assert classify("n", BigInt).kind is FieldKind.INERT
 
 
 def test_unsupported_annotation_is_an_authoring_error() -> None:
