@@ -187,8 +187,10 @@ def _unqualified(consumer: str) -> str:
 
 
 # Each shape the direct-select table decides is decided the same way one scope downstream.
-# c.* has no unqualified spelling, and the grouped-by-key collapse is not followed downstream.
-_NOT_FOLLOWED = {"c.*", "o.order_id, sum(c.credit) group by o.order_id"}
+# c.* has no unqualified spelling.
+_NOT_FOLLOWED = {"c.*"}
+# Downstream, an unqualified grouping name resolves through the CTE to the column it projects.
+_RESOLVED_DOWNSTREAM = {"order_id, sum(c.credit) group by order_id": False}
 
 
 @pytest.mark.parametrize(
@@ -203,7 +205,7 @@ def test_a_consumer_downstream_of_the_join_decides_as_it_does_on_the_join(
         sql = f"with j as ({_WRAPPED_ROWS}) {_select(downstream, 'j')}"
     else:
         sql = _select(downstream, f"({_WRAPPED_ROWS}) j")
-    assert _fires(sql, _KEYED) is fires
+    assert _fires(sql, _KEYED) is _RESOLVED_DOWNSTREAM.get(consumer, fires)
 
 
 _CHAIN = f"with j as ({_WRAPPED_ROWS})"
@@ -277,6 +279,38 @@ _TOPOLOGIES: tuple[tuple[str, bool], ...] = (
         False,
     ),
     (f"{_CHAIN} select * from (with j as (select 1 as credit) select credit from j) s", False),
+    # a projection with no column of its own scope (a correlated subquery) is unresolved, not empty
+    (
+        f"{_CHAIN}, k as (select (select max(p.population) from regions p where p.region = j.name) as m from j) select sum(m) from k",
+        True,
+    ),
+    # a CTE that reads itself ends the walk with the conservative verdict
+    (
+        f"with recursive x as (select c.credit from {_TO_ORDERS} join x on x.credit = c.credit) select sum(credit) from x",
+        True,
+    ),
+    (
+        f"with recursive y as (select credit from (select c.credit from {_TO_ORDERS}) q join y on 1 = 1) select 1",
+        True,
+    ),
+    # a lateral or unnest reader is not followed
+    (f"{_CHAIN} select j.amount, l.a from j, lateral (select j.amount as a) l", True),
+    (f"{_CHAIN} select 1 from j cross join unnest([j.amount]) as u(a)", True),
+    # a grouping that fixes the joined row on a downstream key is as safe as on the join
+    (f"{_CHAIN} select order_id, sum(credit) from j group by order_id", False),
+    (f"{_CHAIN} select j.order_id, sum(credit) from j group by j.order_id", False),
+    (f"{_CHAIN} select customer_id, sum(credit) from j group by customer_id", True),
+    (
+        f"{_CHAIN} select order_id, sum(credit) from j join regions r on 1 = 1 group by order_id",
+        True,
+    ),
+    (f"{_CHAIN} select order_id, sum(credit) from j group by rollup(order_id)", True),
+    # a CTE read only to filter hands no rows on
+    (
+        f"{_CHAIN} select 1 as x from regions r where exists (select 1 from j where j.credit = r.population)",
+        False,
+    ),
+    (f"{_CHAIN} select 1 as x from regions r where r.population in (select credit from j)", False),
     # nested subqueries follow the same path
     (f"select sum(credit) from (select credit from ({_WRAPPED_ROWS}) j) k", True),
     (f"select sum(amount) from (select amount from ({_WRAPPED_ROWS}) j) k", False),
