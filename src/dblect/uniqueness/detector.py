@@ -122,7 +122,7 @@ def detect_non_unique_window_order_keys(
             uncovered = _uncovered_order_keys(order.expressions, sg.partition_of(w), source)
             if uncovered is None:
                 continue
-            order_cols, partition_cols = uncovered
+            order_cols, partition_cols = uncovered.order_cols, uncovered.group_cols
             fixed = closure(
                 tuple((fd.determinant, fd.dependent) for fd in source.fds),
                 frozenset(order_cols) | frozenset(partition_cols),
@@ -138,7 +138,7 @@ def detect_non_unique_window_order_keys(
                         f"partitioned by {sorted(partition_cols) or '()'}, "
                         f"and no known uniqueness key on the source covers the combined "
                         f"key set. Ties in the order keys produce a non-deterministic "
-                        f"ranking; add a stable tiebreaker."
+                        f"ranking; add a stable tiebreaker.{uncovered.expression_note()}"
                     ),
                     sql_snippet=rendered,
                     line_start=_line_start(w),
@@ -180,8 +180,8 @@ def detect_non_unique_aggregate_order_keys(
     ``ORDER BY`` at all is that detector's job too, and stays silent here.
 
     Conservative toward silence, like the window check: single-source scopes only (a join or
-    ``UNION`` needs column-level lineage), bare-column order and group keys only (an expression
-    needs an equivalence we do not model), and silent when no source key is known (the firewall
+    ``UNION`` needs column-level lineage), bare-column group keys only (an expression
+    needs an equivalence we do not model; an expression order key covers no column), and silent when no source key is known (the firewall
     posture: with no grain to name, there is no positive fact to fire on).
     """
     scopes = _scope_index_for(tree, model_keys, model_fds, scope_index)
@@ -202,7 +202,7 @@ def detect_non_unique_aggregate_order_keys(
             uncovered = _uncovered_order_keys(order.expressions, grouping, source)
             if uncovered is None:
                 continue
-            order_cols, group_cols = uncovered
+            order_cols, group_cols = uncovered.order_cols, uncovered.group_cols
             rendered = sg.render_sql(agg)
             out.append(
                 Finding(
@@ -213,6 +213,7 @@ def detect_non_unique_aggregate_order_keys(
                         f"on the source covers the combined key set. The LIMIT keeps an arbitrary "
                         f"winner among rows that tie on the order keys, so which elements survive "
                         f"can drift across runs; add a stable tiebreaker."
+                        f"{uncovered.expression_note()}"
                     ),
                     sql_snippet=rendered,
                     line_start=_line_start(agg),
@@ -1192,23 +1193,49 @@ def _node_in_scope(node: Expr, sel: exp.Select) -> bool:
     return False
 
 
+@dataclass(frozen=True, slots=True)
+class _UncoveredOrder:
+    """An order that may tie: its bare columns, the grouping columns, and the order keys that
+    are expressions (these cover no column, so they are named in the finding)."""
+
+    order_cols: list[str]
+    group_cols: list[str]
+    expression_keys: list[str]
+
+    def expression_note(self) -> str:
+        if not self.expression_keys:
+            return ""
+        return f" The expression order keys {self.expression_keys} cover no column."
+
+
 def _uncovered_order_keys(
     order: list[Expr], grouping: list[Expr], source: Input
-) -> tuple[list[str], list[str]] | None:
-    """The bare order and grouping column names when their union does not cover any
-    source key under the source's dependencies, so the order may not be total. ``None``
-    when it is provably total or we cannot judge it: an empty order, or an order or
-    grouping key that is not a bare column."""
+) -> _UncoveredOrder | None:
+    """The order's shape when its covered columns do not cover any source key under the
+    source's dependencies, so the order may not be total. ``None`` when it is provably total
+    or we cannot judge it: an empty order, or a grouping key that is not a bare column.
+
+    An order key covers a column only when it is that bare column (direction, NULLS placement
+    and parentheses do not change ties). Any other expression can only add ties relative to the
+    columns it reads, so it covers nothing; the remaining bare keys still count. A cast is not
+    an exception: a narrowing cast merges values."""
     if not order:
         return None
-    order_cols = _bare_column_names(order)
     grouping_cols = _bare_column_names(grouping)
-    if order_cols is None or grouping_cols is None:
+    if grouping_cols is None:
         return None
+    order_cols: list[str] = []
+    expression_keys: list[str] = []
+    for key in order:
+        target = (key.this if isinstance(key, exp.Ordered) else key).unnest()
+        if isinstance(target, exp.Column):
+            order_cols.append(sg.column_name(target))
+        else:
+            expression_keys.append(sg.render_sql(target))
     key_set = frozenset(order_cols) | frozenset(grouping_cols)
     if covers(FDSet(source.fds), key_set, source.keys):
         return None
-    return order_cols, grouping_cols
+    return _UncoveredOrder(order_cols, grouping_cols, expression_keys)
 
 
 def _bare_column_names(expressions: list[Expr]) -> list[str] | None:
