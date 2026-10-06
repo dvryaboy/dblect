@@ -291,3 +291,41 @@ def test_oracle_agrees_and_detector_is_sound(
     if varies:
         assert _fires(case.window, {})
         assert _fires(case.window, _A_DETERMINES_B)
+
+
+# DuckDB names an unaliased derived table `unnamed_subquery`, then `unnamed_subqueryN` for the
+# Nth one in FROM-then-JOIN order; an aliased source takes no number. A query may qualify a
+# column by that name, and the key must survive the projection as it does for a real alias.
+_UNNAMED_FORMS = {
+    "from": "select unnamed_subquery.id as id, unnamed_subquery.v as v from (select id, v from t)",
+    "second_join": (
+        "select unnamed_subquery.id as id, unnamed_subquery.v as v"
+        " from (select id, v from t) join (select id as id2 from t)"
+        " on unnamed_subquery.id = unnamed_subquery2.id2"
+    ),
+    "after_aliased": (
+        "select a.id as id, a.v as v"
+        " from (select id, v from t) a join (select id as id2 from t)"
+        " on a.id = unnamed_subquery.id2"
+    ),
+    "third_join": (
+        "select unnamed_subquery.id as id, unnamed_subquery.v as v"
+        " from (select id, v from t) join (select id as id2 from t)"
+        " on unnamed_subquery.id = unnamed_subquery2.id2"
+        " join (select id as id3 from t) on unnamed_subquery.id = unnamed_subquery3.id3"
+    ),
+}
+
+
+@pytest.mark.parametrize("form", _UNNAMED_FORMS)
+def test_unnamed_subquery_qualifier_keeps_the_key(form: str) -> None:
+    """Dropping the key makes a later window check see a keyless source and go silent."""
+    inner = _UNNAMED_FORMS[form]
+    with duckdb.connect() as con:
+        con.execute("create table t(id int, v int)")
+        con.execute(inner)  # DuckDB accepts the implicit qualifiers
+
+    sql = f"with o as ({inner}) select sum(v) over (order by v rows unbounded preceding) from o"
+    tree = parse_sql(sql, dialect="duckdb")
+    keys = {"t": frozenset({frozenset({"id"})})}
+    assert detect_non_unique_window_order_keys(tree, model_keys=keys)

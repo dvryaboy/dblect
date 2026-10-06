@@ -659,6 +659,23 @@ def test_identical_unaliased_join_subqueries_get_distinct_stand_in_names() -> No
     assert len(names) == 2
 
 
+def test_unaliased_subquery_never_takes_a_real_aliass_name() -> None:
+    """A real alias spelled like DuckDB's implicit name must not merge with the unaliased
+    source that would otherwise get it."""
+    from dblect.lineage.properties.scope_closure import (
+        _unaliased_subquery_name,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    tree = parse_sql(
+        "SELECT 1 FROM (SELECT id FROM orders) JOIN (SELECT id FROM orders) ON TRUE"
+        " JOIN (SELECT id FROM orders) unnamed_subquery2 ON TRUE"
+    )
+    first, second, _ = tree.find_all(exp.Subquery)
+    names = {_unaliased_subquery_name(first), _unaliased_subquery_name(second)}
+    assert len(names) == 2
+    assert "unnamed_subquery2" not in names
+
+
 def test_declared_model_key_unions_with_sql_derived_key() -> None:
     """A native PRIMARY KEY declared on the model and a DISTINCT-derived key both
     hold, so the model carries both (reconcile by meet, no conflict)."""

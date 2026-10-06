@@ -287,9 +287,9 @@ def _resolve_source(
             return None
         # An unaliased subquery (legal in duckdb, postgres, snowflake) gets a stand-in name from
         # its position in the SELECT, so it is stable across parses and distinct within a scope;
-        # giving up here would hide every scope beneath it. DuckDB lets a query spell the
-        # subquery as `unnamed_subquery`; that qualifier matches no alias here, so such a
-        # reference stays unresolved and the analysis stays conservative.
+        # giving up here would hide every scope beneath it. The stand-in is DuckDB's own name
+        # for the source, so a reference qualified `unnamed_subquery` resolves to it; an
+        # unresolved reference would drop the key, and a keyless source silences the detectors.
         alias = node.alias_or_name or _unaliased_subquery_name(node)
         return alias.lower(), scope_facts(
             inner, cte_scope=cte_scope, base_resolve=base_resolve, record=record
@@ -298,15 +298,29 @@ def _resolve_source(
 
 
 def _unaliased_subquery_name(node: exp.Subquery) -> str:
-    """``<subquery from>`` or ``<subquery join N>``: not a legal bare identifier, and unique
-    per source within one SELECT."""
-    join = node.parent
-    if isinstance(join, exp.Join) and join.parent is not None:
-        # By identity: sqlglot nodes compare by structure, so `list.index` would give two
-        # identical JOIN subqueries the same position.
-        position = next(i for i, j in enumerate(join.parent.args["joins"]) if j is join)
-        return f"<subquery join {position}>"
-    return "<subquery from>"
+    """The name a query can qualify an unaliased derived table by: DuckDB's `unnamed_subquery`,
+    then `unnamed_subqueryN` for the Nth unaliased one in FROM-then-JOIN order (an aliased source
+    takes no number). A real alias that already uses the name would merge two sources, so that
+    case falls back to ``<subquery from>`` / ``<subquery join N>``: not a legal bare identifier,
+    and unique per source within one SELECT. Other dialects reject such a qualifier, so the name
+    only ever matches a reference DuckDB itself accepts."""
+    container = node.parent
+    sel = container.parent if isinstance(container, (exp.From, exp.Join)) else None
+    if not isinstance(sel, exp.Select):
+        return "<subquery from>"
+    from_ = sg.from_of(sel)
+    # By identity: sqlglot nodes compare by structure, so equality would give two identical
+    # JOIN subqueries the same position.
+    sources = [s for s in (from_.this if from_ else None, *(j.this for j in sg.joins_of(sel))) if s]
+    unaliased = [s for s in sources if isinstance(s, exp.Subquery) and not s.alias_or_name]
+    ordinal = next(i for i, s in enumerate(unaliased, start=1) if s is node)
+    duckdb_name = "unnamed_subquery" if ordinal == 1 else f"unnamed_subquery{ordinal}"
+    if duckdb_name in {s.alias_or_name.lower() for s in sources}:
+        if isinstance(container, exp.Join):
+            position = next(i for i, j in enumerate(sg.joins_of(sel)) if j is container)
+            return f"<subquery join {position}>"
+        return "<subquery from>"
+    return duckdb_name
 
 
 def _qcol(col: exp.Column, *, default_alias: str) -> QCol:
